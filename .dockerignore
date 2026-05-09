@@ -1,9 +1,7 @@
 # Secrets - nunca en imagen
 .env
 .env.*
-config/*.pem
 config/*.key
-*.pem
 *.key
 secrets/
 
