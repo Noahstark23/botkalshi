@@ -1,0 +1,113 @@
+# =====================================================
+# CRITICAL: Secrets - NUNCA commits estos archivos
+# =====================================================
+.env
+.env.*
+!.env.example
+config/*.pem
+config/*.key
+config/*.p12
+*.pem
+*.key
+secrets/
+.kalshi-keys/
+
+# =====================================================
+# Python
+# =====================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# =====================================================
+# Testing & coverage
+# =====================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+nosetests.xml
+
+# =====================================================
+# Type checking
+# =====================================================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# =====================================================
+# IDE / Editors
+# =====================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# =====================================================
+# OS
+# =====================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# =====================================================
+# Bot data y logs (persisten en volumes Docker, no Git)
+# =====================================================
+data/
+logs/
+backups/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# =====================================================
+# Docker
+# =====================================================
+docker-compose.override.yml
+
+# =====================================================
+# Jupyter (si lo usamos para análisis offline)
+# =====================================================
+.ipynb_checkpoints/
+*.ipynb

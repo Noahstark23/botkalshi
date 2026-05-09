@@ -1,0 +1,103 @@
+# =====================================================
+# docker-compose.yml para Coolify deployment
+#
+# Coolify lee este archivo automáticamente. Las env vars vienen
+# del panel de Coolify, no del .env (excepto en local dev).
+# =====================================================
+
+services:
+  kalshi-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kalshi-bot
+    restart: unless-stopped
+
+    # Variables de entorno - Coolify las inyecta desde su panel
+    # En .env vacíos por default para que Coolify las defina
+    environment:
+      KALSHI_ENV: ${KALSHI_ENV:-demo}
+      KALSHI_API_KEY_ID: ${KALSHI_API_KEY_ID}
+      KALSHI_PRIVATE_KEY_PATH: /app/secrets/kalshi_private_key.pem
+      DATABASE_URL: sqlite:////app/data/trades.db
+
+      # Risk management
+      MAX_DAILY_LOSS_PCT: ${MAX_DAILY_LOSS_PCT:-3.0}
+      MAX_WEEKLY_LOSS_PCT: ${MAX_WEEKLY_LOSS_PCT:-8.0}
+      MAX_MONTHLY_LOSS_PCT: ${MAX_MONTHLY_LOSS_PCT:-15.0}
+      MAX_SIMULTANEOUS_EXPOSURE_PCT: ${MAX_SIMULTANEOUS_EXPOSURE_PCT:-25.0}
+      MAX_TRADE_SIZE_PCT: ${MAX_TRADE_SIZE_PCT:-5.0}
+      KELLY_FRACTION: ${KELLY_FRACTION:-0.25}
+      MIN_EDGE_PCT: ${MIN_EDGE_PCT:-2.0}
+      MIN_LIQUIDITY_CONTRACTS: ${MIN_LIQUIDITY_CONTRACTS:-10}
+
+      # Capital
+      ACTIVE_CAPITAL_USD: ${ACTIVE_CAPITAL_USD:-300.00}
+
+      # Telegram (opcional)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+
+      # Health server
+      HEALTH_HOST: 0.0.0.0
+      HEALTH_PORT: 8080
+
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # Operational toggles - default todo OFF
+      TRADING_ENABLED: ${TRADING_ENABLED:-false}
+      MOTOR_1_ARBITRAGE_ENABLED: ${MOTOR_1_ARBITRAGE_ENABLED:-false}
+      MOTOR_2_SPORTSBOOK_ENABLED: ${MOTOR_2_SPORTSBOOK_ENABLED:-false}
+      MOTOR_3_CLV_ENABLED: ${MOTOR_3_CLV_ENABLED:-false}
+
+      # Optional
+      SENTRY_DSN: ${SENTRY_DSN:-}
+
+    volumes:
+      # Persistencia entre re-deploys
+      - kalshi_data:/app/data
+      - kalshi_logs:/app/logs
+      # Private key montada como volume secret
+      # En Coolify: usar "Persistent Storage" + "Secret Files"
+      - kalshi_secrets:/app/secrets:ro
+
+    ports:
+      # Health endpoint - Coolify lo expone vía su proxy
+      - "8080:8080"
+
+    # Resource limits para no joder otros servicios del VPS
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+    # Healthcheck nativo Docker (además del de Dockerfile)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+    # Logging - Coolify captura stdout
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# =====================================================
+# Volumes - Coolify los gestiona automáticamente
+# =====================================================
+volumes:
+  kalshi_data:
+    driver: local
+  kalshi_logs:
+    driver: local
+  kalshi_secrets:
+    driver: local

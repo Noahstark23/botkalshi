@@ -1,0 +1,53 @@
+# Secrets - nunca en imagen
+.env
+.env.*
+config/*.pem
+config/*.key
+*.pem
+*.key
+secrets/
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# Tests y desarrollo
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+tests/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Docs (no necesarios en runtime)
+docs/
+*.md
+!README.md
+
+# Data del desarrollo
+data/
+logs/
+backups/
+*.db
+*.sqlite
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
