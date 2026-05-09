@@ -58,9 +58,6 @@ services:
       # Persistencia entre re-deploys
       - kalshi_data:/app/data
       - kalshi_logs:/app/logs
-      # Private key montada como volume secret
-      # En Coolify: usar "Persistent Storage" + "Secret Files"
-      - kalshi_secrets:/app/secrets:ro
 
     ports:
       # Health endpoint - Coolify lo expone vía su proxy
@@ -98,6 +95,4 @@ volumes:
   kalshi_data:
     driver: local
   kalshi_logs:
-    driver: local
-  kalshi_secrets:
     driver: local
