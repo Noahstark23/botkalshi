@@ -60,6 +60,7 @@ WORKDIR /app
 # Copiar código (orden por frecuencia de cambio - cache friendly)
 COPY --chown=botuser:botuser src/ ./src/
 COPY --chown=botuser:botuser scripts/ ./scripts/
+COPY --chown=botuser:botuser config/ ./config/
 
 # Crear directorios para volúmenes (data, logs, secrets)
 RUN mkdir -p /app/data /app/logs /app/secrets \

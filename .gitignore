@@ -4,10 +4,8 @@
 .env
 .env.*
 !.env.example
-config/*.pem
 config/*.key
 config/*.p12
-*.pem
 *.key
 secrets/
 .kalshi-keys/
