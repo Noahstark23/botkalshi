@@ -8,8 +8,10 @@ Features:
     - Logging estructurado de cada request
     - Async context manager para session management
 """
+
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import urlencode
 
@@ -29,10 +31,17 @@ from src.utils.config import get_settings
 class KalshiAPIError(Exception):
     """Error genérico de Kalshi API."""
 
-    def __init__(self, status_code: int, message: str, response_body: str = ""):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        response_body: str = "",
+        retry_after: float = 0.0,
+    ):
         self.status_code = status_code
         self.message = message
         self.response_body = response_body
+        self.retry_after = retry_after
         super().__init__(f"[{status_code}] {message}")
 
 
@@ -105,12 +114,14 @@ class KalshiRestClient:
         return sign_path
 
     @staticmethod
-    def _classify_error(status_code: int, response_text: str) -> KalshiAPIError:
+    def _classify_error(
+        status_code: int, response_text: str, retry_after: float = 0.0
+    ) -> KalshiAPIError:
         """Mapea status code → excepción específica."""
         if status_code in (401, 403):
             return KalshiAuthError(status_code, "Auth failed", response_text)
         if status_code == 429:
-            return KalshiRateLimitError(status_code, "Rate limited", response_text)
+            return KalshiRateLimitError(status_code, "Rate limited", response_text, retry_after)
         if 500 <= status_code < 600:
             return KalshiServerError(status_code, "Server error", response_text)
         return KalshiClientError(status_code, "Client error", response_text)
@@ -152,10 +163,24 @@ class KalshiRestClient:
                 )
 
                 if resp.status_code >= 400:
-                    err = self._classify_error(resp.status_code, resp.text[:500])
+                    retry_after_str = resp.headers.get("Retry-After", "")
+                    try:
+                        retry_after = float(retry_after_str) if retry_after_str else 0.0
+                    except ValueError:
+                        retry_after = 0.0
+
+                    err = self._classify_error(resp.status_code, resp.text[:500], retry_after)
                     logger.warning(
-                        f"{method} {path} → {resp.status_code}: {resp.text[:200]}"
+                        f"{method} {path} → {resp.status_code}"
+                        + (f" (retry-after: {retry_after}s)" if retry_after > 0 else "")
+                        + f": {resp.text[:200]}"
                     )
+
+                    # Si Kalshi nos pide esperar, respetarlo antes de tirar la excepción
+                    # (tenacity retry tomará el control después)
+                    if isinstance(err, KalshiRateLimitError) and retry_after > 0:
+                        await asyncio.sleep(min(retry_after, 30.0))
+
                     raise err
 
                 return resp.json()
@@ -276,8 +301,7 @@ class KalshiRestClient:
             body["client_order_id"] = client_order_id
 
         logger.info(
-            f"Placing order: {action} {count} {side} {ticker} @ "
-            f"yes={yes_price} no={no_price}"
+            f"Placing order: {action} {count} {side} {ticker} @ yes={yes_price} no={no_price}"
         )
         return await self._request("POST", "/portfolio/orders", json=body)
 

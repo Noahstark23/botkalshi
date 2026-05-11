@@ -9,6 +9,7 @@ Endpoints:
     POST /admin/resume     - Reanuda trading
     GET  /admin/stats      - Estadísticas operacionales
 """
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -146,16 +147,16 @@ async def status() -> dict[str, Any]:
         trades_today = list(s.exec(select(Trade).where(Trade.placed_at >= today_start)).all())
         trades_week = list(s.exec(select(Trade).where(Trade.placed_at >= week_start)).all())
 
-        last_pnl = s.exec(
-            select(DailyPnL).order_by(DailyPnL.date.desc()).limit(1)
-        ).first()
+        last_pnl = s.exec(select(DailyPnL).order_by(DailyPnL.date.desc()).limit(1)).first()
 
-        recent_risks = list(s.exec(
-            select(RiskEvent)
-            .where(RiskEvent.severity.in_(["warning", "critical"]))
-            .order_by(RiskEvent.triggered_at.desc())
-            .limit(5)
-        ).all())
+        recent_risks = list(
+            s.exec(
+                select(RiskEvent)
+                .where(RiskEvent.severity.in_(["warning", "critical"]))
+                .order_by(RiskEvent.triggered_at.desc())
+                .limit(5)
+            ).all()
+        )
 
     return {
         "bot": {
@@ -163,9 +164,19 @@ async def status() -> dict[str, Any]:
             "uptime_hours": round((now - BotState.started_at).total_seconds() / 3600, 2),
             "is_paused": BotState.is_paused,
             "pause_reason": BotState.pause_reason,
+            "capture_running": BotState.capture_running,
+            "ws_connected": (
+                BotState.last_ws_message is not None
+                and (now - BotState.last_ws_message).total_seconds() < 60
+            ),
+            "last_ws_message": (
+                BotState.last_ws_message.isoformat() if BotState.last_ws_message else None
+            ),
             "tracked_markets": BotState.tracked_markets_count,
             "last_error": BotState.last_error,
-            "last_error_at": BotState.last_error_at.isoformat() if BotState.last_error_at else None,
+            "last_error_at": (
+                BotState.last_error_at.isoformat() if BotState.last_error_at else None
+            ),
         },
         "config": {
             "environment": settings.KALSHI_ENV,

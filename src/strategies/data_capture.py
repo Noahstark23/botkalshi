@@ -12,6 +12,7 @@ Estrategia:
 
 Esto corre 24/7. La data acumulada es input para los motores de trading.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -30,13 +31,13 @@ from src.utils.config import get_settings
 # Ajustar según evolucione el roadmap.
 TARGET_SERIES_PREFIXES = [
     # Deportes
-    "KXMLB",   # MLB
-    "KXNBA",   # NBA
-    "KXNHL",   # NHL
-    "KXNFL",   # NFL (en temporada)
-    "KXEPL",   # Premier League
-    "KXUCL",   # Champions League
-    "KXUEL",   # Europa League
+    "KXMLB",  # MLB
+    "KXNBA",  # NBA
+    "KXNHL",  # NHL
+    "KXNFL",  # NFL (en temporada)
+    "KXEPL",  # Premier League
+    "KXUCL",  # Champions League
+    "KXUEL",  # Europa League
     # Política y eventos (donde menos competencia algorítmica)
     "KXPRES",
     "KXPOTUS",
@@ -99,14 +100,12 @@ class DataCaptureService:
 
     async def _discover_markets(self) -> None:
         """Descubre markets activos en las series target."""
+        errors_by_prefix: dict[str, str] = {}
         async with KalshiRestClient() as client:
             for prefix in TARGET_SERIES_PREFIXES:
                 try:
-                    events_resp = await client.list_events(
-                        series_ticker=prefix, limit=100
-                    )
+                    events_resp = await client.list_events(series_ticker=prefix, limit=100)
                     events = events_resp.get("events", [])
-
                     for event in events:
                         for market in event.get("markets", []):
                             ticker = market.get("ticker")
@@ -114,8 +113,11 @@ class DataCaptureService:
                             if ticker and status == "open":
                                 self._tracked_tickers.add(ticker)
                 except Exception as e:
-                    logger.debug(f"No events for {prefix}: {e}")
+                    errors_by_prefix[prefix] = type(e).__name__
+                    logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
 
+        if errors_by_prefix:
+            logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
         BotState.tracked_markets_count = len(self._tracked_tickers)
         logger.success(f"Tracking {len(self._tracked_tickers)} markets")
 
@@ -181,11 +183,27 @@ class DataCaptureService:
 
     async def run(self) -> None:
         """Loop principal del servicio."""
-        await self._discover_markets()
+        # Discovery con retry: la primera llamada al arranque suele topar 429
+        # si Kalshi tiene rate limit acumulado por deploys/restarts previos.
+        backoff = 5.0
+        max_backoff = 300.0  # 5 min cap
+        while not self._stop_event.is_set():
+            await self._discover_markets()
+            if self._tracked_tickers:
+                break
+            logger.warning(
+                f"Discovery vacío - reintento en {backoff:.0f}s "
+                f"(verifica series prefixes, rate limits, status API)"
+            )
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                return  # stop solicitado durante backoff
+            except TimeoutError:
+                pass
+            backoff = min(backoff * 1.5, max_backoff)
 
         if not self._tracked_tickers:
-            logger.error("No se descubrieron markets - verificar series prefixes y status de API")
-            return
+            return  # llegamos aquí solo si stop_event se activó
 
         # Registrar handlers
         self.ws.on("orderbook_delta", self._on_orderbook_delta)
@@ -194,7 +212,7 @@ class DataCaptureService:
 
         # Encolar suscripciones (se aplicarán al conectar el WS)
         ticker_list = list(self._tracked_tickers)
-        for i in range(0, len(ticker_list), 100):  # Kalshi acepta batches grandes
+        for i in range(0, len(ticker_list), 100):
             batch = ticker_list[i : i + 100]
             self.ws.queue_subscription(
                 channels=["orderbook_delta", "ticker"],
