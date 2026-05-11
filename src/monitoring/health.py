@@ -86,12 +86,19 @@ async def health() -> dict[str, Any]:
         "uptime_ok": uptime > 0,
     }
 
-    # Si el WS lleva más de 5 min sin actividad después del minuto inicial, fallar
-    if BotState.last_ws_message and uptime > 60:
-        ws_silence = (now - BotState.last_ws_message).total_seconds()
-        checks["ws_alive"] = ws_silence < 300
+    # ws_alive: si ya estamos capturando, vigilar silencio del WS.
+    # Si aún estamos en discovery/startup (capture_running=False), dar gracia larga:
+    # el backoff exponencial puede llegar a 300s/intento antes de que Kalshi libere
+    # el rate limit, y no queremos que Coolify mate el container durante ese wait.
+    if BotState.capture_running:
+        if BotState.last_ws_message:
+            ws_silence = (now - BotState.last_ws_message).total_seconds()
+            checks["ws_alive"] = ws_silence < 300
+        else:
+            checks["ws_alive"] = False
     else:
-        checks["ws_alive"] = uptime < 60  # gracia inicial
+        # Gracia de 10 min para discovery inicial (cubre worst-case backoff)
+        checks["ws_alive"] = uptime < 600
 
     all_ok = all(checks.values())
 
