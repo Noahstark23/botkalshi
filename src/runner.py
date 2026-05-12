@@ -149,6 +149,11 @@ class ProductionRunner:
             BotState.db_initialized = True
             logger.success("DB inicializada")
 
+            # TODO Fase 6 Motor 1: cuando se integre el ArbitrageExecutor al loop principal,
+            # llamar `await executor.initialize()` en este punto (después de init_db,
+            # antes de _run_data_capture). Esto ejecuta reconcile_pending_trades() para
+            # resolver estados huérfanos post-crash.
+
             self._record_run_start()
             await alert_startup()
 

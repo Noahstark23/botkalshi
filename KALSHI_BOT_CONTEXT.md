@@ -389,6 +389,11 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 | `data_capture` sin retry de discovery (bug arranque 2026-05-09) | Resuelto | Loop con backoff exponencial 5s→300s |
 | Cliente REST no respetaba `Retry-After` en 429 | Resuelto | Parseado con cap de 30s |
 | Migración API V2 fixed-point pendiente (`yes_price` integer deprecating) | Media | Fase 3 de Motor 1 |
+| Reconciliation post-crash en boot no integrada a runner.py todavía | Alta | Fase 6 (integración) |
+| Rollback parcial iterativo (vendiste 5 de 10, queda residual) | Alta | Después de Motor 1 v1 estable |
+| Timeout en asyncio.gather de órdenes concurrentes | Media | Después de Motor 1 v1 estable |
+| Slippage calculado contra depth=5, no representa fill real grande | Baja | Refactor cuando counts > 50 sean comunes |
+| get_orders en reconcile sin paginación (limit=100 hard cap) | Baja | Si > 100 trades pending al arranque |
 
 ---
 
