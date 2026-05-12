@@ -204,7 +204,16 @@ src/
 - 100 req/sec REST en producción
 - WS sin límite específico pero respeta backpressure
 - **Importante:** al arranque del container puede topar 429 si hay rate limit
-  acumulado de despliegues previos. El cliente respeta header `Retry-After`.
+  acumulado de despliegues previos.
+- **Kalshi NO envía header `Retry-After`** (confirmado docs mayo 2026).
+  El cliente usa backoff exponencial puro (1s, 2s, 4s… cap 60s).
+  No existe ningún header `X-RateLimit-*` tampoco.
+- **Endpoint de diagnóstico:** `GET /account/limits` retorna los límites
+  configurados para la API key actual.
+- **API V2 fixed-point (marzo 2026):** Los campos `yes_bid`, `yes_ask`,
+  `no_bid`, `no_ask` como integers fueron deprecados. Ahora vienen como
+  strings `"0.4500"` en campos `yes_bid_dollars` etc. El cliente tiene
+  helper `parse_price_to_cents()` con fallback a campos legacy.
 
 ### Comisiones (CRÍTICO para cálculo de edge)
 - **~7% sobre profit aproximación high-level** (para Kelly sizing rough).
@@ -309,6 +318,27 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 - `/status` endpoint expone `capture_running`, `ws_connected`, `last_ws_message`
   para detectar muertes silenciosas.
 
+### Lección 5 (Mayo 12, 2026): Loop perpetuo de 429s por Retry-After inexistente
+**Contexto:** 560 errores 429 consecutivos en 19 horas. 0 markets descubiertos.
+`last_error: null` en `/status` (el campo no se actualizaba al agotar retries).
+
+**Causa raíz:** Triple combo:
+1. El cliente tenía código para parsear `Retry-After` header de Kalshi — pero Kalshi NO
+   envía ese header. El código caía al `else: pass` y dormía 0s, causando loop tight
+   de 429s sin exponential backoff real.
+2. Discovery hacía 9 requests en burst (un prefix por serie): KXMLB, KXNBA, KXNHL...
+   sin ninguna pausa entre ellos. El backoff estaba en `max=10s` (insuficiente).
+3. `_record_api_error` no existía: `BotState.last_error` nunca se actualizaba al
+   agotar retries, por eso `/status` mostraba `last_error: null` con 560 errores.
+
+**Fixes aplicados (2026-05-12):**
+- Eliminado todo el parsing de `Retry-After` del cliente REST.
+- `wait_exponential(max=10)` → `wait_exponential(max=60)`.
+- `_record_api_error()` helper en `kalshi_rest.py` actualiza `BotState` al agotar retries.
+- `asyncio.sleep(2.0)` entre prefixes en `_discover_markets`.
+- `TARGET_SERIES_PREFIXES` reducido a 2 (KXMLB, KXNBA) temporalmente.
+- Script `scripts/diagnose_kalshi.py` standalone para debug de conectividad.
+
 ---
 
 ## 10. ROADMAP TÉCNICO
@@ -387,13 +417,19 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 | Operando en `KALSHI_ENV=production` sin validación previa en demo | Media | Mitigado por `TRADING_ENABLED=false` + checklist sección 5 |
 | Telegram chat_id no validado en arranque | Baja | Validar al boot que `send_alert` funciona, sino warning |
 | `data_capture` sin retry de discovery (bug arranque 2026-05-09) | Resuelto | Loop con backoff exponencial 5s→300s |
-| Cliente REST no respetaba `Retry-After` en 429 | Resuelto | Parseado con cap de 30s |
-| Migración API V2 fixed-point pendiente (`yes_price` integer deprecating) | Media | Fase 3 de Motor 1 |
+| Cliente REST parseaba `Retry-After` que Kalshi no envía | Resuelto 2026-05-12 | Eliminado; backoff exponencial puro max=60s |
+| Migración API V2 fixed-point (`yes_bid_dollars` string) | Resuelto 2026-05-12 | `parse_price_to_cents()` con fallback a legacy integers |
+| `TARGET_SERIES_PREFIXES` reducido a 2 temporalmente | Baja | Restaurar a 9 una vez discovery estable sin 429s |
 | Reconciliation post-crash en boot no integrada a runner.py todavía | Alta | Fase 6 (integración) |
 | Rollback parcial iterativo (vendiste 5 de 10, queda residual) | Alta | Después de Motor 1 v1 estable |
 | Timeout en asyncio.gather de órdenes concurrentes | Media | Después de Motor 1 v1 estable |
 | Slippage calculado contra depth=5, no representa fill real grande | Baja | Refactor cuando counts > 50 sean comunes |
 | get_orders en reconcile sin paginación (limit=100 hard cap) | Baja | Si > 100 trades pending al arranque |
+| Stop-Loss Semanal (-8%) no implementado en RiskManager | Alta | Antes de TRADING_ENABLED=true |
+| Stop-Loss Mensual (-15%) no implementado en RiskManager | Alta | Antes de TRADING_ENABLED=true |
+| `_get_current_exposure_usd` sobrestima exposición de arbitrajes ya fillados completos | Media | Cuando volumen de arbitrajes crezca |
+| PnL realized-only en daily stop loss (no cuenta filled-not-settled) | Baja | Aceptable para Motor 1, revisar para Motor 3 |
+| Race condition entre check_pre_trade concurrentes (single executor mitiga) | Baja | Cuando haya múltiples motores corriendo |
 
 ---
 

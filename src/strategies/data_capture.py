@@ -21,27 +21,39 @@ from typing import Any
 
 from loguru import logger
 
-from src.clients.kalshi_rest import KalshiRateLimitError, KalshiRestClient
+from src.clients.kalshi_rest import KalshiRestClient
 from src.clients.kalshi_ws import KalshiWebSocket
 from src.monitoring.health import BotState
 from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
-# Series de Kalshi a trackear. Foco en mercados con liquidez decente.
-# Ajustar según evolucione el roadmap.
+# Series de Kalshi a trackear. Reducido temporalmente a 2 para diagnóstico de 429s.
+# TODO: Restaurar lista completa una vez confirmado que discovery no genera burst.
 TARGET_SERIES_PREFIXES = [
-    # Deportes
     "KXMLB",  # MLB
     "KXNBA",  # NBA
-    "KXNHL",  # NHL
-    "KXNFL",  # NFL (en temporada)
-    "KXEPL",  # Premier League
-    "KXUCL",  # Champions League
-    "KXUEL",  # Europa League
-    # Política y eventos (donde menos competencia algorítmica)
-    "KXPRES",
-    "KXPOTUS",
+    # "KXNHL",   # NHL
+    # "KXNFL",   # NFL (en temporada)
+    # "KXEPL",   # Premier League
+    # "KXUCL",   # Champions League
+    # "KXUEL",   # Europa League
+    # "KXPRES",  # Política
+    # "KXPOTUS", # Política
 ]
+
+
+def parse_price_to_cents(value: object) -> int:
+    """Convierte precio de API (int, float, o string fixed-point) a centavos enteros."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(round(float(value) * 100))
+        except ValueError:
+            return 0
+    return 0
 
 
 class DataCaptureService:
@@ -99,7 +111,10 @@ class DataCaptureService:
     # =====================================================
 
     async def _discover_markets(self) -> None:
-        """Descubre markets activos en las series target."""
+        """Descubre markets activos en las series target.
+
+        2s de pausa entre prefixes para no generar burst de 429s en discovery.
+        """
         errors_by_prefix: dict[str, str] = {}
         async with KalshiRestClient() as client:
             for prefix in TARGET_SERIES_PREFIXES:
@@ -112,13 +127,10 @@ class DataCaptureService:
                             status = market.get("status")
                             if ticker and status == "open":
                                 self._tracked_tickers.add(ticker)
-                except KalshiRateLimitError:
-                    errors_by_prefix[prefix] = "KalshiRateLimitError"
-                    logger.warning(f"Discovery rate-limited en {prefix} — abortando ciclo")
-                    raise  # no quemar los prefixes restantes; run() gestiona el backoff
                 except Exception as e:
                     errors_by_prefix[prefix] = type(e).__name__
                     logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
+                await asyncio.sleep(2.0)  # evitar burst de requests entre prefixes
 
         if errors_by_prefix:
             logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
@@ -165,10 +177,20 @@ class DataCaptureService:
                         snap = MarketSnapshot(
                             ticker=ticker,
                             event_ticker=market.get("event_ticker", ""),
-                            yes_bid=market.get("yes_bid", 0) or 0,
-                            yes_ask=market.get("yes_ask", 0) or 0,
-                            no_bid=market.get("no_bid", 0) or 0,
-                            no_ask=market.get("no_ask", 0) or 0,
+                            # API V2 migró a fixed-point strings (e.g. "0.4500") en marzo 2026.
+                            # Fallback a campos enteros legacy para compatibilidad.
+                            yes_bid=parse_price_to_cents(
+                                market.get("yes_bid_dollars") or market.get("yes_bid")
+                            ),
+                            yes_ask=parse_price_to_cents(
+                                market.get("yes_ask_dollars") or market.get("yes_ask")
+                            ),
+                            no_bid=parse_price_to_cents(
+                                market.get("no_bid_dollars") or market.get("no_bid")
+                            ),
+                            no_ask=parse_price_to_cents(
+                                market.get("no_ask_dollars") or market.get("no_ask")
+                            ),
                             last_price=market.get("last_price"),
                             volume=market.get("volume", 0) or 0,
                             open_interest=market.get("open_interest", 0) or 0,
@@ -192,8 +214,10 @@ class DataCaptureService:
         backoff = 5.0
         max_backoff = 300.0  # 5 min cap
         while not self._stop_event.is_set():
-            with suppress(KalshiRateLimitError):  # ya logueado en _discover_markets
+            try:
                 await self._discover_markets()
+            except Exception as e:
+                logger.warning(f"_discover_markets falló: {type(e).__name__}: {e}")
             if self._tracked_tickers:
                 break
             logger.warning(

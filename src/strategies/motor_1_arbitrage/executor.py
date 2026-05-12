@@ -152,7 +152,7 @@ class ArbitrageExecutor:
             True  — either successfully filled (live) or dry-run (TRADING_ENABLED=false).
             False — risk check failed, or partial/full placement failure.
         """
-        decision = self.risk_manager.check_pre_trade(opp)
+        decision = await self.risk_manager.check_pre_trade(opp)
         if not decision.approved:
             logger.info(f"ArbitrageExecutor: risk check rejected — {decision.reason}")
             return False

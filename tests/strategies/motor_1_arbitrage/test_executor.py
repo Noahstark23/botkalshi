@@ -48,8 +48,8 @@ def mock_client() -> AsyncMock:
 @pytest.fixture
 def mock_risk_manager() -> MagicMock:
     rm = MagicMock(spec=RiskManager)
-    rm.check_pre_trade.return_value = TradeDecision(
-        approved=True, reason="ok", max_allowed_count=10
+    rm.check_pre_trade = AsyncMock(
+        return_value=TradeDecision(approved=True, reason="ok", max_allowed_count=10)
     )
     return rm
 
@@ -422,8 +422,10 @@ async def test_reconcile_get_orders_exception_returns_early(executor, mock_clien
 
 @pytest.mark.asyncio
 async def test_execute_returns_false_when_risk_rejected(executor, mock_client, binary_opp):
-    executor.risk_manager.check_pre_trade.return_value = TradeDecision(
-        approved=False, reason="capital cap: allowed=0", max_allowed_count=0
+    executor.risk_manager.check_pre_trade = AsyncMock(
+        return_value=TradeDecision(
+            approved=False, reason="capital cap: allowed=0", max_allowed_count=0
+        )
     )
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",

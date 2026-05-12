@@ -11,7 +11,6 @@ Features:
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 from urllib.parse import urlencode
 
@@ -31,17 +30,10 @@ from src.utils.config import get_settings
 class KalshiAPIError(Exception):
     """Error genérico de Kalshi API."""
 
-    def __init__(
-        self,
-        status_code: int,
-        message: str,
-        response_body: str = "",
-        retry_after: float = 0.0,
-    ):
+    def __init__(self, status_code: int, message: str, response_body: str = ""):
         self.status_code = status_code
         self.message = message
         self.response_body = response_body
-        self.retry_after = retry_after
         super().__init__(f"[{status_code}] {message}")
 
 
@@ -68,6 +60,18 @@ _RETRYABLE_EXCEPTIONS = (
     KalshiRateLimitError,
     KalshiServerError,
 )
+
+
+def _record_api_error(method: str, path: str, exc: Exception) -> None:
+    """Record API error in BotState. Lazy import avoids potential circular deps."""
+    try:
+        from src.monitoring.health import BotState  # noqa: PLC0415
+
+        BotState.record_error(
+            f"Kalshi {method} {path}: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    except Exception:
+        pass  # best-effort; never let logging crash a request
 
 
 class KalshiRestClient:
@@ -114,14 +118,12 @@ class KalshiRestClient:
         return sign_path
 
     @staticmethod
-    def _classify_error(
-        status_code: int, response_text: str, retry_after: float = 0.0
-    ) -> KalshiAPIError:
+    def _classify_error(status_code: int, response_text: str) -> KalshiAPIError:
         """Mapea status code → excepción específica."""
         if status_code in (401, 403):
             return KalshiAuthError(status_code, "Auth failed", response_text)
         if status_code == 429:
-            return KalshiRateLimitError(status_code, "Rate limited", response_text, retry_after)
+            return KalshiRateLimitError(status_code, "Rate limited", response_text)
         if 500 <= status_code < 600:
             return KalshiServerError(status_code, "Server error", response_text)
         return KalshiClientError(status_code, "Client error", response_text)
@@ -142,51 +144,49 @@ class KalshiRestClient:
         sign_params = params if method.upper() == "GET" else None
         sign_path = self._build_sign_path(path, sign_params)
 
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(4),
-            wait=wait_exponential(multiplier=1, min=1, max=10),
-            retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
-            reraise=True,
-        ):
-            with attempt:
-                # Re-firma cada attempt (timestamp cambia)
-                headers = self.signer.sign(method, sign_path)
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(4),
+                # Kalshi no envía Retry-After; backoff puro: 1s, 2s, 4s... cap 60s
+                wait=wait_exponential(multiplier=1, min=1, max=60),
+                retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
+                reraise=True,
+            ):
+                with attempt:
+                    # Re-firma cada attempt (timestamp cambia)
+                    headers = self.signer.sign(method, sign_path)
+                    attempt_num = attempt.retry_state.attempt_number
 
-                logger.debug(f"{method} {path} attempt={attempt.retry_state.attempt_number}")
+                    logger.debug(f"{method} {path} attempt={attempt_num}")
 
-                resp = await self._client.request(
-                    method,
-                    path,
-                    params=params,
-                    json=json,
-                    headers=headers,
-                )
-
-                if resp.status_code >= 400:
-                    retry_after_str = resp.headers.get("Retry-After", "")
-                    try:
-                        retry_after = float(retry_after_str) if retry_after_str else 0.0
-                    except ValueError:
-                        retry_after = 0.0
-
-                    err = self._classify_error(resp.status_code, resp.text[:500], retry_after)
-                    logger.warning(
-                        f"{method} {path} → {resp.status_code}"
-                        + (f" (retry-after: {retry_after}s)" if retry_after > 0 else "")
-                        + f": {resp.text[:200]}"
+                    resp = await self._client.request(
+                        method,
+                        path,
+                        params=params,
+                        json=json,
+                        headers=headers,
                     )
 
-                    # Si Kalshi nos pide esperar, respetarlo antes de tirar la excepción.
-                    # Cap de 300s: respetar el Retry-After real evita quemar más quota
-                    # intentando antes de que el bucket de Kalshi se libere.
-                    if isinstance(err, KalshiRateLimitError) and retry_after > 0:
-                        await asyncio.sleep(min(retry_after, 300.0))
+                    if resp.status_code >= 400:
+                        err = self._classify_error(resp.status_code, resp.text[:500])
+                        if isinstance(err, KalshiRateLimitError):
+                            logger.warning(
+                                f"{method} {path} → 429 (attempt {attempt_num}/4): "
+                                f"{resp.text[:200]}"
+                            )
+                        else:
+                            logger.warning(
+                                f"{method} {path} → {resp.status_code}: {resp.text[:200]}"
+                            )
+                        raise err
 
-                    raise err
+                    return resp.json()
 
-                return resp.json()
+        except Exception as exc:
+            _record_api_error(method, path, exc)
+            raise
 
-        # Inalcanzable, pero mypy quiere return
+        # Inalcanzable (always return or raise above), but mypy requires a return path
         raise RuntimeError("Retries inesperadamente agotados")
 
     # =====================================================
