@@ -21,7 +21,7 @@ from typing import Any
 
 from loguru import logger
 
-from src.clients.kalshi_rest import KalshiRestClient
+from src.clients.kalshi_rest import KalshiRateLimitError, KalshiRestClient
 from src.clients.kalshi_ws import KalshiWebSocket
 from src.monitoring.health import BotState
 from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
@@ -112,6 +112,10 @@ class DataCaptureService:
                             status = market.get("status")
                             if ticker and status == "open":
                                 self._tracked_tickers.add(ticker)
+                except KalshiRateLimitError:
+                    errors_by_prefix[prefix] = "KalshiRateLimitError"
+                    logger.warning(f"Discovery rate-limited en {prefix} — abortando ciclo")
+                    raise  # no quemar los prefixes restantes; run() gestiona el backoff
                 except Exception as e:
                     errors_by_prefix[prefix] = type(e).__name__
                     logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
@@ -188,7 +192,8 @@ class DataCaptureService:
         backoff = 5.0
         max_backoff = 300.0  # 5 min cap
         while not self._stop_event.is_set():
-            await self._discover_markets()
+            with suppress(KalshiRateLimitError):  # ya logueado en _discover_markets
+                await self._discover_markets()
             if self._tracked_tickers:
                 break
             logger.warning(

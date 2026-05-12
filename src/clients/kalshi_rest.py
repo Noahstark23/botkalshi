@@ -176,10 +176,11 @@ class KalshiRestClient:
                         + f": {resp.text[:200]}"
                     )
 
-                    # Si Kalshi nos pide esperar, respetarlo antes de tirar la excepción
-                    # (tenacity retry tomará el control después)
+                    # Si Kalshi nos pide esperar, respetarlo antes de tirar la excepción.
+                    # Cap de 300s: respetar el Retry-After real evita quemar más quota
+                    # intentando antes de que el bucket de Kalshi se libere.
                     if isinstance(err, KalshiRateLimitError) and retry_after > 0:
-                        await asyncio.sleep(min(retry_after, 30.0))
+                        await asyncio.sleep(min(retry_after, 300.0))
 
                     raise err
 

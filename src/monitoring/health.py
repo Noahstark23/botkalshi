@@ -97,8 +97,9 @@ async def health() -> dict[str, Any]:
         else:
             checks["ws_alive"] = False
     else:
-        # Gracia de 10 min para discovery inicial (cubre worst-case backoff)
-        checks["ws_alive"] = uptime < 600
+        # Gracia de 30 min para discovery inicial.
+        # Kalshi puede mantener rate-limit activo 20-30 min tras un burst de restarts.
+        checks["ws_alive"] = uptime < 1800
 
     all_ok = all(checks.values())
 
