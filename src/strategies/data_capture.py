@@ -113,7 +113,9 @@ class DataCaptureService:
     async def _discover_markets(self) -> None:
         """Descubre markets activos en las series target.
 
-        2s de pausa entre prefixes para no generar burst de 429s en discovery.
+        list_events() solo retorna metadatos del evento, NO markets[].
+        Para obtener los markets hay que llamar get_event(event_ticker) por separado.
+        2s de pausa entre requests para no generar burst de 429s.
         """
         errors_by_prefix: dict[str, str] = {}
         async with KalshiRestClient() as client:
@@ -122,15 +124,30 @@ class DataCaptureService:
                     events_resp = await client.list_events(series_ticker=prefix, limit=100)
                     events = events_resp.get("events", [])
                     for event in events:
-                        for market in event.get("markets", []):
-                            ticker = market.get("ticker")
-                            status = market.get("status")
-                            if ticker and status in ("open", "active"):
-                                self._tracked_tickers.add(ticker)
+                        event_ticker = event.get("event_ticker")
+                        if not event_ticker:
+                            continue
+                        await asyncio.sleep(2.0)  # pausa entre get_event calls
+                        try:
+                            event_detail = await client.get_event(event_ticker)
+                            # get_event retorna {"event": {...}, "markets": [...]}
+                            # markets está siempre en la raíz, NO dentro de "event"
+                            markets = event_detail.get("markets", [])
+                            for market in markets:
+                                ticker = market.get("ticker")
+                                status = market.get("status", "")
+                                if ticker and status in ("open", "active"):
+                                    self._tracked_tickers.add(ticker)
+                            logger.debug(
+                                f"Discovery {event_ticker}: {len(markets)} markets, "
+                                f"{sum(1 for m in markets if m.get('status') in ('open','active'))} activos"
+                            )
+                        except Exception as e:
+                            logger.warning(f"get_event({event_ticker}) error: {type(e).__name__}: {e}")
                 except Exception as e:
                     errors_by_prefix[prefix] = type(e).__name__
                     logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
-                await asyncio.sleep(2.0)  # evitar burst de requests entre prefixes
+                await asyncio.sleep(2.0)  # pausa entre prefixes
 
         if errors_by_prefix:
             logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
