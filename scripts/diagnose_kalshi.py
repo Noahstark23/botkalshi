@@ -23,7 +23,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+BASE_URL = os.getenv(
+    "KALSHI_API_BASE_URL",
+    "https://api.elections.kalshi.com/trade-api/v2",
+)
 PAUSE_BETWEEN_REQUESTS = 3.0  # segundos entre requests para no generar 429s
 
 
@@ -113,7 +116,8 @@ async def main() -> None:
         print(f"❌ Clave privada no encontrada: {key_path}")
         return
 
-    print(f"Diagnóstico Kalshi API — {BASE_URL}")
+    print(f"=== Kalshi diagnostic - target host: {BASE_URL} ===")
+    print()
     print(f"API Key ID: {api_key_id[:12]}...")
 
     try:
