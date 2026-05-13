@@ -125,7 +125,7 @@ class DataCaptureService:
                         for market in event.get("markets", []):
                             ticker = market.get("ticker")
                             status = market.get("status")
-                            if ticker and status == "open":
+                            if ticker and status in ("open", "active"):
                                 self._tracked_tickers.add(ticker)
                 except Exception as e:
                     errors_by_prefix[prefix] = type(e).__name__
