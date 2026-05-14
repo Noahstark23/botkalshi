@@ -339,6 +339,37 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 - `TARGET_SERIES_PREFIXES` reducido a 2 (KXMLB, KXNBA) temporalmente.
 - Script `scripts/diagnose_kalshi.py` standalone para debug de conectividad.
 
+### Lección 7 (Mayo 13-14, 2026): asyncio.gather traga excepciones + websockets API change
+
+**Contexto:** WS jamás conectó por 11h. 226 intentos consecutivos con TypeError
+idéntico. last_error: null durante todo el episodio. Container "healthy"
+mientras orderbook_events permanecía en 0. REST capture funcionando en paralelo
+ocultaba la falla a nivel de operador.
+
+**Causa raíz técnica:** `extra_headers` kwarg renombrado a `additional_headers`
+en `websockets` 13.0+. pyproject.toml declaraba `websockets>=12.0` sin pin
+superior, pip instaló 14.x+ al rebuild de Docker, código quedó incompatible.
+
+**Causa raíz arquitectónica (más importante):** `data_capture.py:run()` usaba
+`asyncio.gather(ws.run(), snapshots(), return_exceptions=True)`. La excepción
+de ws.run() fue capturada como result y descartada. snapshots() siguió corriendo
+solo, dando la ilusión de "capture_running: true". TERCERA vez del mismo patrón
+(lecciones 4, 6, 7).
+
+**Decisión derivada:**
+- PROHIBIDO `asyncio.gather(..., return_exceptions=True)` para tareas críticas.
+  Usar supervisor pattern explícito que captura, reporta a BotState.record_error,
+  y re-leva.
+- Pin de dependencias críticas: `websockets>=13.0,<17.0`. Aplicar mismo patrón
+  a httpx, websockets, pydantic en próximos releases.
+- BotState.ws_connected refleja estado real de conexión, validado por heartbeat.
+- N fallos consecutivos (≥5) → Telegram alert obligatorio.
+- Tests de regresión específicos para versión de librerías críticas.
+
+**Anti-patrón confirmado por 3ra vez:** "el bot dice que está corriendo" ≠
+"el bot está corriendo". El monitor SIEMPRE valida contra estado real, nunca
+contra flag interna sin contraste empírico.
+
 ---
 
 ## 10. ROADMAP TÉCNICO
@@ -409,9 +440,12 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 | Item | Severidad | Fix esperado |
 |---|---|---|
 | `kalshi_python_sync` SDK no usado, hacemos requests manuales | Baja | Probablemente OK, evaluar después |
-| No hay retry exponencial en WS reconnect | Baja | Semana 4 |
+| ✅ RESUELTO 2026-05-14: No hay retry exponencial en WS reconnect | Resuelto | supervisor pattern + escalación tras 5 fallos consecutivos |
 | Tests cubren solo signer y config | Media | Agregar tests semana 2-3 |
 | Sin alerting si data capture muere silenciosamente | Resuelto 2026-05-09 | `/status` ahora expone `capture_running` y `ws_connected` |
+| ✅ RESUELTO 2026-05-14: websockets extra_headers API incompatibility + gather tragando TypeError | Resuelto | additional_headers + supervisor pattern + BotState.ws_connected + heartbeat staleness |
+| Snapshots silenciosamente paran de escribir a DB | Media | Investigar lock SQLite o except:pass en _take_snapshots |
+| Audit completo de TODOS los asyncio.gather(return_exceptions=True) en codebase | Alta | Antes de TRADING_ENABLED=true |
 | SQLite sin VACUUM scheduled | Baja | Agregar a cron mensual |
 | Sin metrics export (Prometheus, etc.) | Baja | No anticipado primer año |
 | Operando en `KALSHI_ENV=production` sin validación previa en demo | Media | Mitigado por `TRADING_ENABLED=false` + checklist sección 5 |

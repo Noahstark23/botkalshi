@@ -1,4 +1,4 @@
-# =====================================================
+﻿# =====================================================
 # Dockerfile multi-stage para Kalshi Bot
 # Imagen final ~150MB
 # =====================================================
@@ -23,7 +23,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/venv/bin/pip install --no-cache-dir \
         "httpx>=0.27.0" \
-        "websockets>=12.0" \
+        "websockets>=13.0,<17.0" \
         "pydantic>=2.6.0" \
         "pydantic-settings>=2.2.0" \
         "sqlmodel>=0.0.16" \

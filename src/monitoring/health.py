@@ -1,4 +1,4 @@
-"""
+﻿"""
 Health server FastAPI.
 
 Endpoints:
@@ -32,6 +32,7 @@ class BotState:
 
     started_at: datetime = datetime.now(UTC)
     last_ws_message: datetime | None = None
+    ws_connected: bool = False
     is_paused: bool = False
     pause_reason: str | None = None
     capture_running: bool = False
