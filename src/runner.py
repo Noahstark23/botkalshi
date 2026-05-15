@@ -30,6 +30,9 @@ from src.monitoring.health import BotState, app
 from src.monitoring.telegram_alerts import alert_shutdown, alert_startup
 from src.storage.models import BotRun, get_session, init_db
 from src.strategies.data_capture import DataCaptureService
+from src.clients.kalshi_rest import KalshiRestClient
+from src.risk.manager import RiskManager
+from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
 from src.utils.config import get_settings
 from src.utils.logging import setup_logging
 
@@ -149,10 +152,11 @@ class ProductionRunner:
             BotState.db_initialized = True
             logger.success("DB inicializada")
 
-            # TODO Fase 6 Motor 1: cuando se integre el ArbitrageExecutor al loop principal,
-            # llamar `await executor.initialize()` en este punto (después de init_db,
-            # antes de _run_data_capture). Esto ejecuta reconcile_pending_trades() para
-            # resolver estados huérfanos post-crash.
+            # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
+            async with KalshiRestClient() as rest_client:
+                risk_manager = RiskManager()
+                executor = ArbitrageExecutor(rest_client=rest_client, risk_manager=risk_manager)
+                await executor.initialize()
 
             self._record_run_start()
             await alert_startup()

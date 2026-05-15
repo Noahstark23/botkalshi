@@ -5,7 +5,7 @@ Motor de Gestión de Riesgo (Fase 2 Motor 1).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 
 from loguru import logger
 from sqlmodel import col, select
@@ -31,8 +31,6 @@ class RiskManager:
     Aplica controles de PnL, exposición máxima y sizing por trade.
 
     KNOWN TECHNICAL DEBT (Obligatorio antes de TRADING_ENABLED=true):
-    - Stop-Loss Semanal (-8%): No implementado. Requiere query rodante 7 días.
-    - Stop-Loss Mensual (-15%): No implementado. Requiere query mes calendario.
     - Exposición no descuenta arbitrajes ya fillados completos (sobrestima).
     - PnL realized-only: trades filled pero no settled no cuentan para stop-loss.
       Aceptable para Motor 1 (settlement rápido).
@@ -49,8 +47,8 @@ class RiskManager:
             reason = BotState.pause_reason or "Razón desconocida"
             return TradeDecision(False, f"BotState.is_paused activo: {reason}", 0)
 
-        if await self._is_daily_stop_loss_breached():
-            return TradeDecision(False, "Daily Stop-Loss (-3%) superado", 0)
+        if await self._check_timeframe_stop_losses():
+            return TradeDecision(False, "Stop-Loss (Diario/Semanal/Mensual) superado", 0)
 
         current_exposure_usd = self._get_current_exposure_usd()
         max_total_exposure_usd = self.settings.ACTIVE_CAPITAL_USD * (
@@ -98,36 +96,55 @@ class RiskManager:
         total_cents = sum(t.price_cents * t.count for t in active_trades)
         return total_cents / 100.0
 
-    async def _is_daily_stop_loss_breached(self) -> bool:
+    async def _check_timeframe_stop_losses(self) -> bool:
         """
-        Calcula PnL realizado del día (UTC) on-the-fly desde tabla Trade.
-
-        Solo cuenta trades con status='settled' y settled_at de hoy.
-        Trades fillados pero no settled NO cuentan (PnL no realizado).
+        Calcula PnL realizado (UTC) on-the-fly desde tabla Trade.
+        Revisa límites diario, semanal (desde el Lunes) y mensual (desde el día 1).
+        
+        Solo cuenta trades con status='settled'. Trades fillados pero 
+        no settled NO cuentan (PnL no realizado).
         """
-        today_start = datetime.combine(
-            datetime.now(UTC).date(),
-            time.min,
-        ).replace(tzinfo=UTC)
+        # SQLite retorna datetimes sin timezone info, usamos naive UTC para comparar
+        now = datetime.now(UTC).replace(tzinfo=None)
+        today_start = datetime.combine(now.date(), time.min)
+        
+        # Lunes de esta semana a las 00:00 UTC
+        days_since_monday = now.weekday()
+        week_start = datetime.combine(now.date() - timedelta(days=days_since_monday), time.min)
+        
+        # Día 1 de este mes a las 00:00 UTC
+        month_start = datetime.combine(now.date().replace(day=1), time.min)
 
         with get_session() as s:
+            # Traer todos los trades del mes actual (rango más amplio)
             stmt = select(Trade).where(
                 Trade.status == "settled",
-                col(Trade.settled_at) >= today_start,
+                col(Trade.settled_at) >= month_start,
             )
-            today_trades = list(s.exec(stmt))
+            monthly_trades = list(s.exec(stmt))
 
-        realized_pnl_cents = sum((t.pnl_cents or 0) for t in today_trades)
-        realized_pnl_usd = realized_pnl_cents / 100.0
+        # Filtrar trades para cada timeframe en memoria
+        weekly_trades = [t for t in monthly_trades if t.settled_at and t.settled_at >= week_start]
+        daily_trades = [t for t in weekly_trades if t.settled_at and t.settled_at >= today_start]
 
-        max_loss_usd = self.settings.ACTIVE_CAPITAL_USD * (self.settings.MAX_DAILY_LOSS_PCT / 100.0)
+        monthly_pnl_usd = sum((t.pnl_cents or 0) for t in monthly_trades) / 100.0
+        weekly_pnl_usd = sum((t.pnl_cents or 0) for t in weekly_trades) / 100.0
+        daily_pnl_usd = sum((t.pnl_cents or 0) for t in daily_trades) / 100.0
 
-        if realized_pnl_usd < 0 and abs(realized_pnl_usd) >= max_loss_usd:
-            await self._trigger_kill_switch(
-                f"Stop-Loss Diario superado: PnL=${realized_pnl_usd:.2f}, "
-                f"límite=${-max_loss_usd:.2f}"
-            )
-            return True
+        limits = [
+            ("Diario", daily_pnl_usd, self.settings.MAX_DAILY_LOSS_PCT),
+            ("Semanal", weekly_pnl_usd, self.settings.MAX_WEEKLY_LOSS_PCT),
+            ("Mensual", monthly_pnl_usd, self.settings.MAX_MONTHLY_LOSS_PCT),
+        ]
+
+        for period_name, pnl_usd, max_pct in limits:
+            max_loss_usd = self.settings.ACTIVE_CAPITAL_USD * (max_pct / 100.0)
+            if pnl_usd < 0 and abs(pnl_usd) >= max_loss_usd:
+                await self._trigger_kill_switch(
+                    f"Stop-Loss {period_name} superado: PnL=${pnl_usd:.2f}, "
+                    f"límite=${-max_loss_usd:.2f} ({max_pct}%)"
+                )
+                return True
 
         return False
 

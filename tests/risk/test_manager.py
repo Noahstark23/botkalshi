@@ -229,9 +229,9 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
             strategy="motor_1_arbitrage",
             status="settled",
             pnl_cents=-1000,  # -$10
-            placed_at=datetime.now(UTC) - timedelta(hours=2),
-            filled_at=datetime.now(UTC) - timedelta(hours=1),
-            settled_at=datetime.now(UTC) - timedelta(minutes=30),
+            placed_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2),
+            filled_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
+            settled_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=30),
         )
         s.add(losing_trade)
         s.commit()
@@ -240,7 +240,7 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
         decision = await risk_manager.check_pre_trade(sample_opp)
 
     assert decision.approved is False
-    assert "Daily Stop-Loss" in decision.reason
+    assert "Stop-Loss" in decision.reason
     assert BotState.is_paused is True
     assert BotState.pause_reason is not None
     assert "Stop-Loss" in BotState.pause_reason
@@ -273,8 +273,8 @@ async def test_daily_pnl_only_counts_settled_not_filled_e2e(
             strategy="motor_1_arbitrage",
             status="filled",
             pnl_cents=-1000,
-            placed_at=datetime.now(UTC),
-            filled_at=datetime.now(UTC),
+            placed_at=datetime.now(UTC).replace(tzinfo=None),
+            filled_at=datetime.now(UTC).replace(tzinfo=None),
         )
         s.add(filled_only)
         s.commit()
@@ -284,5 +284,5 @@ async def test_daily_pnl_only_counts_settled_not_filled_e2e(
     # Stop loss NO debe disparar (trade no settled)
     if not decision.approved:
         # Aceptable que rechace por exposure pero NO por stop loss
-        assert "Daily Stop-Loss" not in decision.reason
+        assert "Stop-Loss" not in decision.reason
     assert BotState.is_paused is False
