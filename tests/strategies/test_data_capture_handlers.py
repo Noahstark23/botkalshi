@@ -342,3 +342,91 @@ async def test_delta_shape_logged_only_once(mock_session, service):
     # Segunda llamada: flag ya true, no re-logea
     await service._on_orderbook_delta(msg)
     assert service._delta_shape_logged is True
+
+
+# =====================================================
+# Regression: payload REAL capturado de Kalshi prod
+# (via scripts/inspect_ws.py --verbose, 2026-05-16)
+# =====================================================
+
+# Payload literal capturado contra wss://api.elections.kalshi.com/trade-api/ws/v2
+REAL_DELTA_KALSHI_2026 = {
+    "type": "orderbook_delta",
+    "sid": 1,
+    "seq": 37,
+    "msg": {
+        "market_ticker": "KXNBA-26-NYK",
+        "market_id": "532ab8e8-d5dd-4139-9a1b-0f634d2d1d2e",
+        "price_dollars": "0.8500",
+        "delta_fp": "-2500.00",
+        "side": "no",
+        "ts": "2026-05-15T15:08:25.405575Z",
+        "ts_ms": 1778857705405,
+    },
+}
+
+REAL_DELTA_KALSHI_2026_YES = {
+    "type": "orderbook_delta",
+    "sid": 1,
+    "seq": 38,
+    "msg": {
+        "market_ticker": "KXNBA-26-NYK",
+        "market_id": "532ab8e8-d5dd-4139-9a1b-0f634d2d1d2e",
+        "price_dollars": "0.1200",
+        "delta_fp": "53.00",
+        "side": "yes",
+        "ts": "2026-05-16T17:14:32.925429Z",
+        "ts_ms": 1778951672925,
+    },
+}
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_real_kalshi_2026_no_side(mock_session, service):
+    """Payload literal capturado de produccion: side=no, price_dollars=0.8500, delta_fp=-2500."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    await service._on_orderbook_delta(REAL_DELTA_KALSHI_2026)
+
+    assert mock_db.add.called, "Debe persistir el evento — era el bug que causaba 0 rows"
+    added = mock_db.add.call_args[0][0]
+    assert added.ticker == "KXNBA-26-NYK"
+    assert added.side == "no"
+    assert added.price_cents == 85  # "0.8500" * 100 = 85
+    assert added.delta == -2500  # "-2500.00" -> -2500
+    assert BotState.last_error is None
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_real_kalshi_2026_yes_side(mock_session, service):
+    """Payload de produccion: side=yes, price_dollars=0.1200, delta_fp=53.00."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    await service._on_orderbook_delta(REAL_DELTA_KALSHI_2026_YES)
+
+    assert mock_db.add.called
+    added = mock_db.add.call_args[0][0]
+    assert added.ticker == "KXNBA-26-NYK"
+    assert added.side == "yes"
+    assert added.price_cents == 12  # "0.1200" * 100 = 12
+    assert added.delta == 53
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_real_2026_no_warning_emitted(mock_session, service):
+    """El fix no debe emitir WARNING para el shape real de Kalshi."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    await service._on_orderbook_delta(REAL_DELTA_KALSHI_2026)
+
+    # Si hubiera WARNING se registraria en BotState.last_error
+    assert BotState.last_error is None

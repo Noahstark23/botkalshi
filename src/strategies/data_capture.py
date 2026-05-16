@@ -133,10 +133,12 @@ class DataCaptureService:
             ticker = data.get("market_ticker")
             side = data.get("side")
 
-            # Shape 2026: fixed-point dollar strings ("0.2700", "-100.00")
-            # Shape viejo: integer cents (27, -100) — ambos manejados por helpers
-            price_cents = parse_price_to_cents(data.get("price"))
-            delta_size = parse_size(data.get("delta"))
+            # Shape 2026 (Kalshi actual): "price_dollars" + "delta_fp" como strings en dolares
+            # Shape legacy (defensivo): "price" + "delta" como ints en cents
+            price_raw = data.get("price_dollars", data.get("price"))
+            delta_raw = data.get("delta_fp", data.get("delta"))
+            price_cents = parse_price_to_cents(price_raw)
+            delta_size = parse_size(delta_raw)
 
             if not all([ticker, side, price_cents is not None, delta_size is not None]):
                 sample_keys = list(data.keys())
