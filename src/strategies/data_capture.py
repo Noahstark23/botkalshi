@@ -43,18 +43,64 @@ TARGET_SERIES_PREFIXES = [
 ]
 
 
-def parse_price_to_cents(value: object) -> int:
-    """Convierte precio de API (int, float, o string fixed-point) a centavos enteros."""
+def parse_price_to_cents(value: object) -> int | None:
+    """
+    Convierte precio a centavos enteros.
+    Acepta int directo (viejo: 27->27), str dollar fixed-point ("0.2700"->27),
+    o float (0.27->27). Retorna None para None o input invalido.
+    """
     if value is None:
-        return 0
-    if isinstance(value, (int, float)):
-        return int(value)
+        return None
+    if isinstance(value, int):
+        return value
     if isinstance(value, str):
         try:
             return int(round(float(value) * 100))
-        except ValueError:
-            return 0
-    return 0
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, float):
+        return int(round(value * 100))
+    return None
+
+
+def parse_size(value: object) -> int | None:
+    """Tamano de un delta o nivel. Acepta str, int, float. Retorna None si invalido."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (str, float)):
+        try:
+            return int(round(float(value)))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _top_bid(levels: list[Any]) -> tuple[int | None, int | None]:
+    """
+    Extrae el mejor bid (precio mas alto con size > 0) de una lista de levels.
+
+    Levels formato: [["0.2700", "100.00"], ...] o [[price_cents, size], ...]
+
+    Returns:
+        (price_cents, size) o (None, None) si lista vacia o malformada.
+    """
+    best_price_cents: int | None = None
+    best_size: int | None = None
+
+    for level in levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        price_cents = parse_price_to_cents(level[0])
+        size = parse_size(level[1])
+        if price_cents is None or size is None or size <= 0:
+            continue
+        if best_price_cents is None or price_cents > best_price_cents:
+            best_price_cents = price_cents
+            best_size = size
+
+    return best_price_cents, best_size
 
 
 class DataCaptureService:
@@ -68,6 +114,8 @@ class DataCaptureService:
         self.ws = KalshiWebSocket()
         self._stop_event = asyncio.Event()
         self._tracked_tickers: set[str] = set()
+        self._delta_shape_logged = False
+        self._snapshot_shape_logged = False
 
     # =====================================================
     # WS event handlers
@@ -77,20 +125,34 @@ class DataCaptureService:
         BotState.heartbeat()
         try:
             data = msg.get("msg", {})
+
+            if not self._delta_shape_logged:
+                logger.info(f"orderbook_delta shape detected: keys={list(data.keys())}")
+                self._delta_shape_logged = True
+
             ticker = data.get("market_ticker")
             side = data.get("side")
-            price = data.get("price")
-            delta = data.get("delta")
 
-            if not all([ticker, side, price is not None, delta is not None]):
+            # Shape 2026: fixed-point dollar strings ("0.2700", "-100.00")
+            # Shape viejo: integer cents (27, -100) — ambos manejados por helpers
+            price_cents = parse_price_to_cents(data.get("price"))
+            delta_size = parse_size(data.get("delta"))
+
+            if not all([ticker, side, price_cents is not None, delta_size is not None]):
+                sample_keys = list(data.keys())
+                logger.warning(
+                    f"orderbook_delta missing required fields. Keys present: {sample_keys}. "
+                    f"Sample: {str(data)[:300]}"
+                )
+                BotState.record_error(f"orderbook_delta unknown shape: keys={sample_keys}")
                 return
 
             with get_session() as s:
                 event = OrderbookEvent(
                     ticker=ticker,
                     side=side,
-                    price_cents=int(price),
-                    delta=int(delta),
+                    price_cents=price_cents,
+                    delta=delta_size,
                 )
                 s.add(event)
                 s.commit()
@@ -105,6 +167,57 @@ class DataCaptureService:
     async def _on_trade(self, msg: dict[str, Any]) -> None:
         BotState.heartbeat()
         # Trades publicos del market - utiles para CLV strategy futura
+
+    async def _on_orderbook_snapshot(self, msg: dict[str, Any]) -> None:
+        """
+        Snapshot inicial del orderbook. Extrae top-of-book y persiste a MarketSnapshot.
+
+        Kalshi envia un snapshot al suscribirse antes de empezar a mandar deltas.
+        Usar campos yes_dollars_fp / no_dollars_fp (shape 2026) con fallback
+        a yes / no (shape viejo de cents).
+        """
+        BotState.heartbeat()
+
+        if not self._snapshot_shape_logged:
+            data_check = msg.get("msg", {})
+            logger.info(f"orderbook_snapshot shape detected: keys={list(data_check.keys())}")
+            self._snapshot_shape_logged = True
+
+        try:
+            data = msg.get("msg", {})
+            ticker = data.get("market_ticker")
+            if not ticker:
+                return
+
+            # Shape 2026: yes_dollars_fp / no_dollars_fp
+            # Shape viejo: yes / no (lista de [price_cents, size])
+            yes_levels = data.get("yes_dollars_fp") or data.get("yes") or []
+            no_levels = data.get("no_dollars_fp") or data.get("no") or []
+
+            yes_bid_cents, _yes_size = _top_bid(yes_levels)
+            no_bid_cents, _no_size = _top_bid(no_levels)
+
+            # En Kalshi modelo reciproco: ask de yes = 100 - bid de no
+            yes_ask_cents = (100 - no_bid_cents) if no_bid_cents is not None else None
+            no_ask_cents = (100 - yes_bid_cents) if yes_bid_cents is not None else None
+
+            with get_session() as s:
+                snap = MarketSnapshot(
+                    ticker=ticker,
+                    event_ticker="",  # WS snapshot no incluye event_ticker
+                    yes_bid=yes_bid_cents or 0,
+                    yes_ask=yes_ask_cents or 0,
+                    no_bid=no_bid_cents or 0,
+                    no_ask=no_ask_cents or 0,
+                    last_price=None,
+                    volume=0,
+                    open_interest=0,
+                )
+                s.add(snap)
+                s.commit()
+        except Exception:
+            logger.exception("Error procesando orderbook_snapshot")
+            BotState.record_error("orderbook_snapshot processing error")
 
     # =====================================================
     # Discovery
@@ -202,16 +315,16 @@ class DataCaptureService:
                             # Fallback a campos enteros legacy para compatibilidad.
                             yes_bid=parse_price_to_cents(
                                 market.get("yes_bid_dollars") or market.get("yes_bid")
-                            ),
+                            ) or 0,
                             yes_ask=parse_price_to_cents(
                                 market.get("yes_ask_dollars") or market.get("yes_ask")
-                            ),
+                            ) or 0,
                             no_bid=parse_price_to_cents(
                                 market.get("no_bid_dollars") or market.get("no_bid")
-                            ),
+                            ) or 0,
                             no_ask=parse_price_to_cents(
                                 market.get("no_ask_dollars") or market.get("no_ask")
-                            ),
+                            ) or 0,
                             last_price=market.get("last_price"),
                             volume=market.get("volume", 0) or 0,
                             open_interest=market.get("open_interest", 0) or 0,
@@ -321,6 +434,7 @@ class DataCaptureService:
 
         # Registrar handlers
         self.ws.on("orderbook_delta", self._on_orderbook_delta)
+        self.ws.on("orderbook_snapshot", self._on_orderbook_snapshot)
         self.ws.on("ticker", self._on_ticker)
         self.ws.on("trade", self._on_trade)
 

@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "kalshi-bot"
 version = "0.1.0"
 description = "Algorithmic trading bot for Kalshi prediction markets"

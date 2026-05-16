@@ -1,0 +1,344 @@
+﻿"""Tests del handler de orderbook_delta y orderbook_snapshot con shape 2026 (fixed-point)."""
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.monitoring.health import BotState
+from src.strategies.data_capture import DataCaptureService, parse_price_to_cents, parse_size
+
+
+@pytest.fixture(autouse=True)
+def reset_botstate():
+    BotState.last_error = None
+    BotState.last_error_at = None
+    yield
+    BotState.last_error = None
+    BotState.last_error_at = None
+
+
+@pytest.fixture
+def service():
+    with patch("src.strategies.data_capture.get_settings"), patch(
+        "src.strategies.data_capture.KalshiWebSocket"
+    ):
+        svc = DataCaptureService()
+        return svc
+
+
+# =====================================================
+# parse_price_to_cents
+# =====================================================
+
+
+def test_parse_price_to_cents_dollar_string():
+    assert parse_price_to_cents("0.2700") == 27
+    assert parse_price_to_cents("0.5000") == 50
+    assert parse_price_to_cents("0.9900") == 99
+    assert parse_price_to_cents("0.0100") == 1
+
+
+def test_parse_price_to_cents_integer_backward_compat():
+    assert parse_price_to_cents(45) == 45
+    assert parse_price_to_cents(0) == 0
+    assert parse_price_to_cents(99) == 99
+
+
+def test_parse_price_to_cents_float():
+    assert parse_price_to_cents(0.27) == 27
+    assert parse_price_to_cents(0.50) == 50
+
+
+def test_parse_price_to_cents_invalid():
+    assert parse_price_to_cents(None) is None
+    assert parse_price_to_cents("not a number") is None
+    assert parse_price_to_cents("") is None
+
+
+# =====================================================
+# parse_size
+# =====================================================
+
+
+def test_parse_size_string():
+    assert parse_size("100.00") == 100
+    assert parse_size("-100.00") == -100
+    assert parse_size("502000.00") == 502000
+
+
+def test_parse_size_integer():
+    assert parse_size(10) == 10
+    assert parse_size(-50) == -50
+
+
+def test_parse_size_invalid():
+    assert parse_size(None) is None
+    assert parse_size("bad") is None
+
+
+# =====================================================
+# _on_orderbook_delta — shape 2026 (fixed-point dollar strings)
+# =====================================================
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_handler_processes_dollar_string_shape(mock_session, service):
+    """Shape 2026: price y delta como strings dollar fixed-point."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "sid": 1,
+        "seq": 100,
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "side": "yes",
+            "price": "0.2700",
+            "delta": "-100.00",
+        },
+    }
+
+    await service._on_orderbook_delta(msg)
+
+    assert mock_db.add.called
+    added = mock_db.add.call_args[0][0]
+    assert added.ticker == "KXMLB-26-LAD"
+    assert added.side == "yes"
+    assert added.price_cents == 27
+    assert added.delta == -100
+
+
+# =====================================================
+# _on_orderbook_delta — shape viejo (backward compat)
+# =====================================================
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_handler_processes_integer_shape_backward_compat(mock_session, service):
+    """Shape viejo con ints directos sigue funcionando."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {
+            "market_ticker": "KXNBA-26-LAL",
+            "side": "no",
+            "price": 45,
+            "delta": 10,
+        },
+    }
+
+    await service._on_orderbook_delta(msg)
+
+    assert mock_db.add.called
+    added = mock_db.add.call_args[0][0]
+    assert added.ticker == "KXNBA-26-LAL"
+    assert added.side == "no"
+    assert added.price_cents == 45
+    assert added.delta == 10
+
+
+# =====================================================
+# _on_orderbook_delta — shape desconocido → record_error
+# =====================================================
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_handler_unknown_shape_records_error(mock_session, service):
+    """Si Kalshi cambia el shape otra vez, el handler debe RECORD_ERROR visible."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            # falta side, price, delta — shape inesperado
+            "alien_field": "???",
+        },
+    }
+
+    await service._on_orderbook_delta(msg)
+
+    # No inserto nada
+    assert not mock_db.add.called
+    # Pero registro error visible
+    assert BotState.last_error is not None
+    assert "unknown shape" in BotState.last_error.lower() or "missing" in BotState.last_error.lower()
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_handler_missing_ticker_records_error(mock_session, service):
+    """Mensaje sin market_ticker tambien es shape desconocido."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {
+            "side": "yes",
+            "price": "0.2700",
+            "delta": "10.00",
+            # sin market_ticker
+        },
+    }
+
+    await service._on_orderbook_delta(msg)
+
+    assert not mock_db.add.called
+    assert BotState.last_error is not None
+
+
+# =====================================================
+# _on_orderbook_snapshot
+# =====================================================
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_snapshot_handler_extracts_top_of_book(mock_session, service):
+    """Snapshot debe extraer top-of-book correctamente y persistir."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "yes_dollars_fp": [
+                ["0.2700", "100.00"],
+                ["0.2600", "50.00"],
+                ["0.2500", "200.00"],
+            ],
+            "no_dollars_fp": [
+                ["0.7000", "75.00"],
+                ["0.6800", "120.00"],
+            ],
+        },
+    }
+
+    await service._on_orderbook_snapshot(msg)
+
+    assert mock_db.add.called
+    added = mock_db.add.call_args[0][0]
+    assert added.ticker == "KXMLB-26-LAD"
+    # Best yes bid: 27c (mayor precio de la lista)
+    assert added.yes_bid == 27
+    # Best no bid: 70c
+    assert added.no_bid == 70
+    # yes_ask = 100 - no_bid = 30
+    assert added.yes_ask == 30
+    # no_ask = 100 - yes_bid = 73
+    assert added.no_ask == 73
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_snapshot_handler_empty_levels_handled(mock_session, service):
+    """Snapshot con levels vacios no debe crashear."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": "KXMLB-26-ZERO",
+            "yes_dollars_fp": [],
+            "no_dollars_fp": [],
+        },
+    }
+
+    await service._on_orderbook_snapshot(msg)
+
+    # Inserto con zeros, no crasheo
+    assert mock_db.add.called
+    added = mock_db.add.call_args[0][0]
+    assert added.ticker == "KXMLB-26-ZERO"
+    assert added.yes_bid == 0
+    assert added.no_bid == 0
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_snapshot_handler_fallback_to_old_yes_no_fields(mock_session, service):
+    """Fallback a campos 'yes'/'no' si yes_dollars_fp no esta presente."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": "KXNBA-26-LAL",
+            "yes": [[45, 100], [40, 50]],  # shape viejo: [price_cents, size]
+            "no": [[55, 200]],
+        },
+    }
+
+    await service._on_orderbook_snapshot(msg)
+
+    assert mock_db.add.called
+    added = mock_db.add.call_args[0][0]
+    assert added.yes_bid == 45  # mayor precio viejo
+    assert added.no_bid == 55
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_snapshot_handler_no_ticker_skips_silently(mock_session, service):
+    """Snapshot sin ticker no crashea ni persiste."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            # sin market_ticker
+            "yes_dollars_fp": [["0.5000", "100.00"]],
+        },
+    }
+
+    await service._on_orderbook_snapshot(msg)
+
+    assert not mock_db.add.called
+    assert BotState.last_error is None
+
+
+# =====================================================
+# Shape logging (una sola vez por sesion)
+# =====================================================
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_delta_shape_logged_only_once(mock_session, service):
+    """El flag _delta_shape_logged previene logs repetidos."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {"market_ticker": "X", "side": "yes", "price": 50, "delta": 1},
+    }
+
+    assert service._delta_shape_logged is False
+    await service._on_orderbook_delta(msg)
+    assert service._delta_shape_logged is True
+    # Segunda llamada: flag ya true, no re-logea
+    await service._on_orderbook_delta(msg)
+    assert service._delta_shape_logged is True
