@@ -184,6 +184,43 @@ src/
 5. **Después de modificación de risk params**, mínimo 48h de monitoring antes
    de cambios adicionales.
 
+### Decisiones técnicas del Risk Manager (mayo 2026)
+
+1. **Stop-loss windows: calendario, no rolling.**
+   - Daily: desde 00:00 UTC del día actual
+   - Weekly: desde 00:00 UTC del lunes de la semana actual
+   - Monthly: desde 00:00 UTC del día 1 del mes actual
+
+   Razón: alinea con cómo Kalshi reporta PnL en su dashboard nativo.
+
+   Trade-off conocido: en las transiciones de periodo el contador resetea
+   (viernes 23:59 → sábado 00:01 → contador diario a cero). Mitigación:
+   los 3 timeframes operan juntos; un breach semanal o mensual sigue
+   disparando aunque el diario haya reseteado.
+
+2. **Naive UTC datetimes consistentes** en queries y writes de `Trade.settled_at`
+   y campos análogos.
+
+   Patrón obligatorio para todos los writes:
+   ```python
+   datetime.now(UTC).replace(tzinfo=None)
+   ```
+
+   NUNCA usar:
+   - `datetime.utcnow()` — deprecated en Python 3.12+
+   - `datetime.now()` sin argumento — usa local timezone
+   - `datetime.now(UTC)` directamente como write — produce aware datetime que
+     SQLite guarda como string ISO, retornado como naive en reads → mismatch
+
+   Razón: SQLite no preserva timezone info. Mezclar aware/naive produce
+   `TypeError: can't compare offset-naive and offset-aware datetimes` en runtime.
+
+3. **Reconcile en boot tolerante a fallas.**
+   El bloque de reconciliación de trades huérfanos (Fase 6) está envuelto en
+   try/except. Si Kalshi está caído al arranque, el bot sigue corriendo — la
+   captura de datos continúa funcionando y el error se registra en
+   `BotState.last_error` para visibilidad en `/status`.
+
 ---
 
 ## 6. KALSHI API SPECIFICS
@@ -454,13 +491,13 @@ contra flag interna sin contraste empírico.
 | Cliente REST parseaba `Retry-After` que Kalshi no envía | Resuelto 2026-05-12 | Eliminado; backoff exponencial puro max=60s |
 | Migración API V2 fixed-point (`yes_bid_dollars` string) | Resuelto 2026-05-12 | `parse_price_to_cents()` con fallback a legacy integers |
 | `TARGET_SERIES_PREFIXES` reducido a 2 temporalmente | Baja | Restaurar a 9 una vez discovery estable sin 429s |
-| Reconciliation post-crash en boot no integrada a runner.py todavía | Alta | Fase 6 (integración) |
+| ✅ RESUELTO 2026-05-16: Reconciliation post-crash integrada a runner.py con tolerancia a fallas | Resuelto | try/except + BotState.record_error; bot sigue arrancando si Kalshi flap |
 | Rollback parcial iterativo (vendiste 5 de 10, queda residual) | Alta | Después de Motor 1 v1 estable |
 | Timeout en asyncio.gather de órdenes concurrentes | Media | Después de Motor 1 v1 estable |
 | Slippage calculado contra depth=5, no representa fill real grande | Baja | Refactor cuando counts > 50 sean comunes |
 | get_orders en reconcile sin paginación (limit=100 hard cap) | Baja | Si > 100 trades pending al arranque |
-| Stop-Loss Semanal (-8%) no implementado en RiskManager | Alta | Antes de TRADING_ENABLED=true |
-| Stop-Loss Mensual (-15%) no implementado en RiskManager | Alta | Antes de TRADING_ENABLED=true |
+| ✅ RESUELTO 2026-05-16: Stop-Loss Semanal (-8%) implementado + tests E2E | Resuelto | _check_timeframe_stop_losses con calendar windows; tests en test_manager.py |
+| ✅ RESUELTO 2026-05-16: Stop-Loss Mensual (-15%) implementado + tests E2E | Resuelto | Ídem; convención naive UTC documentada en CONTEXT.md sección 5 |
 | `_get_current_exposure_usd` sobrestima exposición de arbitrajes ya fillados completos | Media | Cuando volumen de arbitrajes crezca |
 | PnL realized-only en daily stop loss (no cuenta filled-not-settled) | Baja | Aceptable para Motor 1, revisar para Motor 3 |
 | Race condition entre check_pre_trade concurrentes (single executor mitiga) | Baja | Cuando haya múltiples motores corriendo |

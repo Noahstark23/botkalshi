@@ -47,8 +47,13 @@ class RiskManager:
             reason = BotState.pause_reason or "Razón desconocida"
             return TradeDecision(False, f"BotState.is_paused activo: {reason}", 0)
 
-        if await self._check_timeframe_stop_losses():
-            return TradeDecision(False, "Stop-Loss (Diario/Semanal/Mensual) superado", 0)
+        breached_period = await self._check_timeframe_stop_losses()
+        if breached_period:
+            return TradeDecision(
+                approved=False,
+                reason=f"Stop-Loss {breached_period} superado",
+                max_allowed_count=0,
+            )
 
         current_exposure_usd = self._get_current_exposure_usd()
         max_total_exposure_usd = self.settings.ACTIVE_CAPITAL_USD * (
@@ -96,22 +101,45 @@ class RiskManager:
         total_cents = sum(t.price_cents * t.count for t in active_trades)
         return total_cents / 100.0
 
-    async def _check_timeframe_stop_losses(self) -> bool:
+    async def _check_timeframe_stop_losses(self) -> str | None:
         """
         Calcula PnL realizado (UTC) on-the-fly desde tabla Trade.
         Revisa límites diario, semanal (desde el Lunes) y mensual (desde el día 1).
-        
-        Solo cuenta trades con status='settled'. Trades fillados pero 
+
+        Returns:
+            Nombre del periodo que disparó ('Diario'/'Semanal'/'Mensual') o None si OK.
+
+        Solo cuenta trades con status='settled'. Trades fillados pero
         no settled NO cuentan (PnL no realizado).
+
+        DECISIONES ARQUITECTÓNICAS (mayo 2026):
+
+        1. CALENDAR WINDOWS (no rolling):
+           - Daily:   desde 00:00 UTC del día actual
+           - Weekly:  desde 00:00 UTC del lunes de esta semana
+           - Monthly: desde 00:00 UTC del día 1 del mes actual
+           Razón: alinea con cómo Kalshi reporta PnL en su dashboard.
+           Trade-off: en transición de periodo el contador resetea (ej: viernes
+           23:59 → sábado 00:01). Los 3 timeframes operan juntos como mitigación.
+
+        2. NAIVE UTC DATETIMES:
+           SQLite no preserva timezone info. Usamos naive UTC consistente para
+           evitar TypeError: can't compare offset-naive and offset-aware datetimes.
+           CONVENCIÓN para writes a Trade.settled_at y campos análogos:
+               datetime.now(UTC).replace(tzinfo=None)   # correcto
+           NUNCA:
+               datetime.utcnow()                         # deprecated Python 3.12+
+               datetime.now()                            # usa local timezone
+               datetime.now(UTC)                         # aware → SQLite lo guarda mal
         """
         # SQLite retorna datetimes sin timezone info, usamos naive UTC para comparar
         now = datetime.now(UTC).replace(tzinfo=None)
         today_start = datetime.combine(now.date(), time.min)
-        
+
         # Lunes de esta semana a las 00:00 UTC
         days_since_monday = now.weekday()
         week_start = datetime.combine(now.date() - timedelta(days=days_since_monday), time.min)
-        
+
         # Día 1 de este mes a las 00:00 UTC
         month_start = datetime.combine(now.date().replace(day=1), time.min)
 
@@ -144,9 +172,9 @@ class RiskManager:
                     f"Stop-Loss {period_name} superado: PnL=${pnl_usd:.2f}, "
                     f"límite=${-max_loss_usd:.2f} ({max_pct}%)"
                 )
-                return True
+                return period_name
 
-        return False
+        return None
 
     async def _trigger_kill_switch(self, reason: str) -> None:
         """Pausa el bot y notifica. Idempotente (no spamea si ya pausado)."""

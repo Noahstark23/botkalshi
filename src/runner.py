@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import signal
 import sys
 from datetime import UTC, datetime
@@ -26,12 +25,12 @@ from datetime import UTC, datetime
 import uvicorn
 from loguru import logger
 
+from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState, app
 from src.monitoring.telegram_alerts import alert_shutdown, alert_startup
+from src.risk.manager import RiskManager
 from src.storage.models import BotRun, get_session, init_db
 from src.strategies.data_capture import DataCaptureService
-from src.clients.kalshi_rest import KalshiRestClient
-from src.risk.manager import RiskManager
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
 from src.utils.config import get_settings
 from src.utils.logging import setup_logging
@@ -114,6 +113,29 @@ class ProductionRunner:
         self._capture = DataCaptureService()
         await self._capture.run()
 
+    async def _reconcile_on_boot(self) -> None:
+        """
+        Reconcilia trades huérfanos post-crash.
+
+        Tolerante a fallas: si Kalshi está caído al arranque, el bot SIGUE
+        corriendo — los trades pending quedan sin resolver en DB, pero el
+        operador ve el error en BotState.last_error y /status.
+        """
+        try:
+            async with KalshiRestClient() as rest_client:
+                risk_manager = RiskManager()
+                executor = ArbitrageExecutor(
+                    rest_client=rest_client,
+                    risk_manager=risk_manager,
+                )
+                await executor.initialize()
+                logger.success("Reconcile post-crash completado")
+        except Exception as e:
+            msg = f"Reconcile en boot falló: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+            # NO re-raise: el bot debe seguir arrancando
+
     # =====================================================
     # Lifecycle
     # =====================================================
@@ -153,10 +175,7 @@ class ProductionRunner:
             logger.success("DB inicializada")
 
             # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
-            async with KalshiRestClient() as rest_client:
-                risk_manager = RiskManager()
-                executor = ArbitrageExecutor(rest_client=rest_client, risk_manager=risk_manager)
-                await executor.initialize()
+            await self._reconcile_on_boot()
 
             self._record_run_start()
             await alert_startup()

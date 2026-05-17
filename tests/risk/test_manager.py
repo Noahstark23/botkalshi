@@ -9,7 +9,7 @@ Mezcla:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,6 +38,8 @@ def mock_settings():
         s.TRADING_ENABLED = True
         s.ACTIVE_CAPITAL_USD = 300.0
         s.MAX_DAILY_LOSS_PCT = 3.0
+        s.MAX_WEEKLY_LOSS_PCT = 8.0
+        s.MAX_MONTHLY_LOSS_PCT = 15.0
         s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0
         s.MAX_TRADE_SIZE_PCT = 5.0
         m.return_value = s
@@ -286,3 +288,193 @@ async def test_daily_pnl_only_counts_settled_not_filled_e2e(
         # Aceptable que rechace por exposure pero NO por stop loss
         assert "Stop-Loss" not in decision.reason
     assert BotState.is_paused is False
+
+
+@pytest.mark.asyncio
+async def test_weekly_pnl_breach_triggers_killswitch_e2e(
+    risk_manager, sample_opp, real_db_engine, monkeypatch
+):
+    """
+    Pérdida dentro de la ventana semanal (> 8% capital = $24) dispara kill switch.
+
+    El trade se inserta justo después del inicio de semana (lunes 00:01 UTC).
+    Si hoy ES lunes, settled_at cae en today_start → también cuenta para daily.
+    En ambos casos el resultado debe ser approved=False con "Stop-Loss" en reason.
+    Capital=$300, weekly cap=$24. Pérdida=$30 supera el límite.
+    """
+    import src.risk.manager as rm_module
+
+    def make_session():
+        return Session(real_db_engine)
+
+    monkeypatch.setattr(rm_module, "get_session", make_session)
+
+    now_naive = datetime.now(UTC).replace(tzinfo=None)
+    days_since_monday = now_naive.weekday()
+    week_start = datetime.combine(now_naive.date() - timedelta(days=days_since_monday), time.min)
+    settled_time = week_start + timedelta(hours=1)
+
+    with Session(real_db_engine) as s:
+        s.add(
+            Trade(
+                client_order_id="test-weekly-breach",
+                ticker="KX-TEST",
+                side="yes",
+                action="buy",
+                count=100,
+                price_cents=50,
+                strategy="motor_1_arbitrage",
+                status="settled",
+                pnl_cents=-3000,  # -$30 > weekly cap $24
+                placed_at=settled_time - timedelta(hours=1),
+                filled_at=settled_time - timedelta(hours=1),
+                settled_at=settled_time,
+            )
+        )
+        s.commit()
+
+    with patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock):
+        decision = await risk_manager.check_pre_trade(sample_opp)
+
+    assert decision.approved is False
+    assert "Stop-Loss" in decision.reason
+    assert BotState.is_paused is True
+
+
+@pytest.mark.asyncio
+async def test_weekly_pnl_old_trades_outside_window_dont_count(
+    risk_manager, sample_opp, real_db_engine, monkeypatch
+):
+    """
+    Trade de hace 10 días NO cuenta para la ventana semanal (siempre fuera del
+    calendario de lunes a hoy). Pérdida $15 < weekly cap $24 y < monthly cap $45.
+    """
+    import src.risk.manager as rm_module
+
+    def make_session():
+        return Session(real_db_engine)
+
+    monkeypatch.setattr(rm_module, "get_session", make_session)
+
+    now_naive = datetime.now(UTC).replace(tzinfo=None)
+
+    with Session(real_db_engine) as s:
+        s.add(
+            Trade(
+                client_order_id="test-old-trade",
+                ticker="KX-TEST",
+                side="yes",
+                action="buy",
+                count=100,
+                price_cents=50,
+                strategy="motor_1_arbitrage",
+                status="settled",
+                pnl_cents=-1500,  # -$15: < weekly $24, < monthly $45
+                placed_at=now_naive - timedelta(days=11),
+                filled_at=now_naive - timedelta(days=11),
+                settled_at=now_naive - timedelta(days=10),
+            )
+        )
+        s.commit()
+
+    # 10 días > 7 días → siempre fuera de la ventana semanal.
+    # -$15 < cap mensual $45 → sin breach mensual tampoco.
+    decision = await risk_manager.check_pre_trade(sample_opp)
+
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_monthly_pnl_breach_triggers_killswitch_e2e(
+    risk_manager, sample_opp, real_db_engine, monkeypatch
+):
+    """
+    Pérdida > 15% capital ($45) en el mes actual dispara kill switch.
+
+    Trade insertado al inicio del mes (mes actual, fuera de la semana actual
+    cuando el día del mes lo permite). Capital=$300, monthly cap=$45.
+    Pérdida=$50 supera el límite sin importar la ventana que lo atrape primero.
+    """
+    import src.risk.manager as rm_module
+
+    def make_session():
+        return Session(real_db_engine)
+
+    monkeypatch.setattr(rm_module, "get_session", make_session)
+
+    now_naive = datetime.now(UTC).replace(tzinfo=None)
+    month_start = datetime.combine(now_naive.date().replace(day=1), time.min)
+    settled_time = month_start + timedelta(hours=2)
+
+    with Session(real_db_engine) as s:
+        s.add(
+            Trade(
+                client_order_id="test-monthly-breach",
+                ticker="KX-TEST",
+                side="yes",
+                action="buy",
+                count=200,
+                price_cents=50,
+                strategy="motor_1_arbitrage",
+                status="settled",
+                pnl_cents=-5000,  # -$50 > monthly cap $45
+                placed_at=settled_time - timedelta(hours=1),
+                filled_at=settled_time - timedelta(hours=1),
+                settled_at=settled_time,
+            )
+        )
+        s.commit()
+
+    with patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock):
+        decision = await risk_manager.check_pre_trade(sample_opp)
+
+    assert decision.approved is False
+    assert "Stop-Loss" in decision.reason
+    assert BotState.is_paused is True
+
+
+@pytest.mark.asyncio
+async def test_daily_breach_priority_over_weekly_monthly(
+    risk_manager, sample_opp, real_db_engine, monkeypatch
+):
+    """
+    Cuando hay pérdida HOY, el reason debe decir 'Diario' (primer ítem del loop).
+
+    El loop de limits = [Diario, Semanal, Mensual] retorna el primero que dispara.
+    Un trade de hace 30 minutos cae en daily, weekly y monthly → 'Diario' gana.
+    Capital=$300, daily cap=$9 (3%). Pérdida=$15 supera.
+    """
+    import src.risk.manager as rm_module
+
+    def make_session():
+        return Session(real_db_engine)
+
+    monkeypatch.setattr(rm_module, "get_session", make_session)
+
+    now_naive = datetime.now(UTC).replace(tzinfo=None)
+
+    with Session(real_db_engine) as s:
+        s.add(
+            Trade(
+                client_order_id="test-daily-priority",
+                ticker="KX-TEST",
+                side="yes",
+                action="buy",
+                count=100,
+                price_cents=50,
+                strategy="motor_1_arbitrage",
+                status="settled",
+                pnl_cents=-1500,  # -$15 > daily $9, weekly $24 y monthly $45 → daily primero
+                placed_at=now_naive - timedelta(hours=2),
+                filled_at=now_naive - timedelta(hours=1),
+                settled_at=now_naive - timedelta(minutes=30),
+            )
+        )
+        s.commit()
+
+    with patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock):
+        decision = await risk_manager.check_pre_trade(sample_opp)
+
+    assert decision.approved is False
+    assert "Diario" in decision.reason
+    assert BotState.is_paused is True
