@@ -1,0 +1,8 @@
+{
+  "type": "subscribed",
+  "sid": 1,
+  "msg": {
+    "channel": "orderbook_delta",
+    "market_tickers": ["KXNBA-26-NYK"]
+  }
+}

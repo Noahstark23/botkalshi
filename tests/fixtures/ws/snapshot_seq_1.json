@@ -1,0 +1,10 @@
+{
+  "type": "orderbook_snapshot",
+  "sid": 1,
+  "seq": 1,
+  "msg": {
+    "market_ticker": "KXNBA-26-NYK",
+    "yes_dollars_fp": [["0.1200", "500.00"], ["0.1000", "200.00"]],
+    "no_dollars_fp": [["0.8500", "3000.00"], ["0.8000", "1500.00"]]
+  }
+}

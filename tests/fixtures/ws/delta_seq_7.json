@@ -1,0 +1,11 @@
+{
+  "type": "orderbook_delta",
+  "sid": 1,
+  "seq": 7,
+  "msg": {
+    "market_ticker": "KXNBA-26-NYK",
+    "price_dollars": "0.8500",
+    "delta_fp": "-100.00",
+    "side": "no"
+  }
+}
