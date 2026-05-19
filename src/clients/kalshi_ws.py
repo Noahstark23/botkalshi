@@ -228,6 +228,30 @@ class KalshiWebSocket:
             BotState.ws_connected = False
             self._ws = None
 
+    async def send_command(
+        self,
+        cmd: str,
+        *,
+        action: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        Send a JSON command and return the assigned request ID.
+
+        Raises RuntimeError if not connected.
+        """
+        if self._ws is None or self._ws.state != WsState.OPEN:
+            raise RuntimeError("WebSocket not connected")
+        cmd_id = self._next_id
+        self._next_id += 1
+        msg: dict[str, Any] = {"id": cmd_id, "cmd": cmd}
+        if action is not None:
+            msg["action"] = action
+        if params is not None:
+            msg["params"] = params
+        await self._ws.send(json.dumps(msg))
+        return cmd_id
+
     async def _send_subscribe(self, params: dict[str, Any]) -> None:
         """Envia un comando subscribe."""
         if self._ws is None:
@@ -250,11 +274,11 @@ class KalshiWebSocket:
 
         if msg_type == "error":
             logger.error(f"Server error: {msg}")
-            return
+            # Fall through — handlers (e.g. OrderbookManagerV2) may also process this
 
         if msg_type == "subscribed":
             logger.debug(f"Subscription confirmada: {msg}")
-            return
+            return  # No handlers registered for subscribed
 
         if not msg_type:
             logger.debug(f"Mensaje sin type: {msg}")
