@@ -3,29 +3,28 @@ OrderbookState: estado en memoria del orderbook de un market.
 
 Mantiene bids por side (yes/no), validados por sequence number.
 100% puro: sin IO, sin async, sin dependencias externas. La capa de red
-(Día 2) consume esta clase pero no la conoce internamente.
+(OrderbookManager) consume esta clase pero no la conoce internamente.
 
-Contexto Kalshi:
-    El orderbook expone BIDS por lado: cuánto paga alguien por YES y cuánto
-    por NO. Las "asks" implícitas se derivan (100 - mejor_bid_opuesto) — esa
-    conversión la hace el detector (Día 3), no este módulo.
+Contexto Kalshi — sequence numbers:
+    El seq en el WS de Kalshi es per-sid (subscription), NO per-ticker.
+    Es un contador monotónico global que se incrementa por cada mensaje
+    recibido en esa sid, intercalando entre todos los tickers suscritos.
+
+    Implicación para este módulo: OrderbookState SOLO garantiza monotonicidad
+    local (new_seq > self.sequence). La detección de gaps entre mensajes WS y
+    la recuperación coordinada por sid es responsabilidad de OrderbookManager.
 
     REST GET /markets/{ticker}/orderbook retorna solo bids:
-        {"orderbook": {"yes": [[price, size], ...], "no": [[price, size], ...]}}
-    sorted highest-bid first (ref: executor.py comments).
+        {"orderbook": {"yes": [[price_cents, size], ...], "no": [[price_cents, size], ...]}}
+    Precios ya en centavos enteros (no fixed-point). Sorted highest-bid first.
 
-    WS orderbook_delta afecta bids únicamente. La capa de red (Día 2) normaliza
-    los mensajes WS reales al formato dict que consume apply_delta(), incluyendo
-    seq y previous_seq explícitos.
-
-    Nota sobre sequence numbers: el _on_orderbook_delta actual (data_capture.py)
-    NO extrae campos seq ni previous_seq del WS — Día 2 deberá añadir esa
-    extracción del mensaje WS real para usar esta clase correctamente.
+    WS orderbook_delta afecta bids únicamente. OrderbookManager normaliza los
+    mensajes WS al formato dict que consume apply_delta().
 
 Diseño:
     - Levels como dict[price_cents, size] → lookup O(1) por precio.
     - Best bid/ask computados on-demand (rápido en libros <50 niveles típicos).
-    - Sequence number validado estrictamente en cada delta.
+    - Monotonicidad de seq validada en cada delta; gap detection en Manager.
     - Asks solo se populan si el WS snapshot los incluye explícitamente (raro).
 """
 from __future__ import annotations
@@ -40,34 +39,31 @@ class OrderbookError(Exception):
     """Error base de la lógica de orderbook."""
 
 
-class OrderbookDesyncError(OrderbookError):
-    """
-    Sequence number incorrecto: el orderbook local está desincronizado del server.
-
-    El handler de capa superior (Día 2) debe:
-    1. Loguear y record_error con el contexto del gap.
-    2. Vaciar el state local (call clear()).
-    3. Re-hacer snapshot via REST.
-    4. Re-aplicar deltas pendientes desde el buffer.
-
-    Attributes:
-        ticker: Market ticker desincronizado.
-        expected_seq: Sequence que esperábamos como previous_seq.
-        received_prev_seq: Sequence que llegó como previous_seq en el delta.
-    """
-
-    def __init__(self, ticker: str, expected_seq: int, received_prev_seq: int) -> None:
-        self.ticker = ticker
-        self.expected_seq = expected_seq
-        self.received_prev_seq = received_prev_seq
-        super().__init__(
-            f"Desync on {ticker}: expected previous_seq={expected_seq}, "
-            f"received previous_seq={received_prev_seq}"
-        )
-
-
 class OrderbookNotInitializedError(OrderbookError):
     """Se intentó aplicar delta antes de cargar snapshot inicial."""
+
+
+class OrderbookDesyncError(OrderbookError):
+    """
+    Raised by apply_delta when a delta produces new_qty < 0.
+
+    new_qty < 0 indicates feed-level corruption: the delta is inconsistent
+    with the current snapshot. Propagates to OrderbookManagerV2 which calls
+    mark_stale() and requests a WS recovery snapshot.
+
+    Attributes:
+        ticker: Market ticker where the corruption was detected.
+        price_cents: Price level that produced the negative qty.
+        new_qty: The negative quantity (current_qty + delta).
+    """
+
+    def __init__(self, ticker: str, price_cents: int, new_qty: int) -> None:
+        self.ticker = ticker
+        self.price_cents = price_cents
+        self.new_qty = new_qty
+        super().__init__(
+            f"{ticker} at {price_cents}c: delta produces qty={new_qty} < 0 (feed corruption)"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,14 +89,13 @@ class OrderbookState:
     Lifecycle:
         1. Crear con __init__(ticker).
         2. Cargar snapshot inicial con apply_snapshot(snapshot_data).
-        3. Aplicar deltas con apply_delta(delta_data) — valida sequence.
+        3. Aplicar deltas con apply_delta(delta_data) — valida monotonicidad.
         4. Leer top of book con top_of_book(side).
-        5. En caso de desync: clear() + repetir desde paso 2.
+        5. En caso de desync (detectado por OrderbookManager): clear() + paso 2.
 
     Thread-safety:
         NO thread-safe. Cada market debe tener un solo writer.
-        En el detector (Día 2) garantizamos esto procesando deltas
-        secuencialmente por ticker.
+        OrderbookManager garantiza esto procesando mensajes secuencialmente.
     """
 
     def __init__(self, ticker: str) -> None:
@@ -109,6 +104,8 @@ class OrderbookState:
         self.ticker = ticker
         self._sequence: int = 0
         self._initialized: bool = False
+        self._is_stale: bool = False
+        self._last_ts_ms: int | None = None
         # Kalshi REST/WS expone solo bids; asks derivados en detector (Día 3).
         self._yes_bids: dict[int, int] = {}
         self._yes_asks: dict[int, int] = {}
@@ -129,6 +126,11 @@ class OrderbookState:
         """True si ya se cargó snapshot inicial."""
         return self._initialized
 
+    @property
+    def is_stale(self) -> bool:
+        """True si mark_stale() fue llamado y el snapshot de recovery aún no llegó."""
+        return self._is_stale
+
     def is_empty(self) -> bool:
         """True si no hay levels en ningún lado."""
         return not (self._yes_bids or self._yes_asks or self._no_bids or self._no_asks)
@@ -136,6 +138,26 @@ class OrderbookState:
     # =====================================================
     # Mutations
     # =====================================================
+
+    def mark_stale(self) -> None:
+        """
+        Marca el state como stale: bloquea reads pero conserva datos.
+
+        Usar cuando se detecta un gap en el sid y se espera recovery snapshot.
+        El snapshot de recovery llama apply_snapshot() que limpia el flag.
+        Diferente de clear(): los datos siguen en memoria para debugging.
+
+        Example:
+            >>> state = OrderbookState("TICKER")
+            >>> state.apply_snapshot({"seq": 1, "yes": [[40, 100]], "no": []})
+            >>> state.mark_stale()
+            >>> state.is_initialized
+            False
+            >>> state.is_stale
+            True
+        """
+        self._initialized = False
+        self._is_stale = True
 
     def clear(self) -> None:
         """
@@ -154,6 +176,8 @@ class OrderbookState:
         """
         self._sequence = 0
         self._initialized = False
+        self._is_stale = False
+        self._last_ts_ms = None
         self._yes_bids.clear()
         self._yes_asks.clear()
         self._no_bids.clear()
@@ -227,37 +251,39 @@ class OrderbookState:
         self._yes_asks = new_yes_asks
         self._no_asks = new_no_asks
         self._sequence = seq
+        self._last_ts_ms = None
+        self._is_stale = False
         self._initialized = True
 
     def apply_delta(self, delta: dict) -> None:
         """
-        Aplica un delta del WebSocket validando sequence number.
+        Aplica un delta del WebSocket validando monotonicidad de sequence.
 
-        Kalshi WS orderbook_delta afecta BIDS únicamente. La capa de red (Día 2)
-        normaliza el mensaje WS real a este formato, incluyendo seq y previous_seq
-        (que el _on_orderbook_delta actual no extrae — requiere actualización en Día 2).
+        Kalshi WS orderbook_delta afecta BIDS únicamente. OrderbookManager
+        normaliza el mensaje WS al formato esperado aquí.
+
+        Garantía de este método: new_seq > self.sequence (monotonicidad local).
+        Garantía que NO ofrece: detección de gaps entre mensajes WS consecutivos.
+        Esa responsabilidad pertenece a OrderbookManager, que conoce el seq
+        global por sid y puede coordinar recovery entre todos los tickers.
 
         Args:
-            delta: dict normalizado por la capa de red:
+            delta: dict normalizado por OrderbookManager:
                 {
-                    "side":         "yes" | "no",
-                    "price":        int,   # cents, rango [0, 100]
-                    "delta":        int,   # cambio en size (puede ser negativo)
-                    "seq":          int,   # nuevo sequence number (> self.sequence)
-                    "previous_seq": int,   # debe coincidir con self.sequence exactamente
+                    "side":  "yes" | "no",
+                    "price": int,   # cents, rango [0, 100]
+                    "delta": int,   # cambio en size (puede ser negativo)
+                    "seq":   int,   # nuevo sequence number (> self.sequence)
                 }
 
         Raises:
             OrderbookNotInitializedError: si apply_delta se llama antes de snapshot.
-            OrderbookDesyncError: si delta["previous_seq"] != self.sequence.
             ValueError: si delta está malformado, price/side inválidos, o seq no avanza.
 
         Example:
             >>> state = OrderbookState("TICKER")
             >>> state.apply_snapshot({"seq": 100, "yes": [[40, 200]], "no": []})
-            >>> state.apply_delta(
-            ...     {"side": "yes", "price": 40, "delta": -50, "seq": 101, "previous_seq": 100}
-            ... )
+            >>> state.apply_delta({"side": "yes", "price": 40, "delta": -50, "seq": 101})
             >>> state.sequence
             101
             >>> state.top_of_book("yes").best_bid.size
@@ -268,23 +294,11 @@ class OrderbookState:
                 f"Cannot apply delta to {self.ticker}: no snapshot loaded"
             )
 
-        prev_seq = delta.get("previous_seq")
-        if prev_seq is None:
-            raise ValueError(f"delta missing 'previous_seq': {delta}")
-        if not isinstance(prev_seq, int):
-            raise ValueError(f"delta 'previous_seq' must be int, got: {prev_seq!r}")
-
-        if prev_seq != self._sequence:
-            raise OrderbookDesyncError(
-                ticker=self.ticker,
-                expected_seq=self._sequence,
-                received_prev_seq=prev_seq,
-            )
-
         side = delta.get("side")
         price = delta.get("price")
         delta_size = delta.get("delta")
         new_seq = delta.get("seq")
+        ts_ms = delta.get("ts_ms")
 
         if side not in ("yes", "no"):
             raise ValueError(f"Invalid side: {side!r}")
@@ -297,11 +311,27 @@ class OrderbookState:
                 f"Invalid new sequence: {new_seq!r} (must be > current {self._sequence})"
             )
 
+        if ts_ms is not None:
+            if not isinstance(ts_ms, (int, float)):
+                raise ValueError(f"Invalid ts_ms: {ts_ms!r}")
+            ts_ms_int = int(ts_ms)
+            if self._last_ts_ms is not None and ts_ms_int < self._last_ts_ms:
+                raise ValueError(
+                    f"ts_ms not monotonic: {ts_ms_int} < {self._last_ts_ms}"
+                )
+            self._last_ts_ms = ts_ms_int
+
         # Kalshi orderbook_delta always targets bids
         book = self._yes_bids if side == "yes" else self._no_bids
         new_size = book.get(price, 0) + delta_size
 
-        if new_size <= 0:
+        if new_size < 0:
+            raise OrderbookDesyncError(
+                ticker=self.ticker,
+                price_cents=price,
+                new_qty=new_size,
+            )
+        elif new_size == 0:
             book.pop(price, None)
         else:
             book[price] = new_size

@@ -2,9 +2,13 @@
 Tests para OrderbookState — Día 1 (puro en memoria, sin red).
 
 Cubre: construcción, apply_snapshot, apply_delta (happy path + validaciones),
-top_of_book, clear, desync recovery, snapshot_view, y edge cases.
+top_of_book, clear, recovery, snapshot_view, y edge cases.
 
-Todos los tests son sync — Día 1 no tiene async.
+Todos los tests son sync — OrderbookState no tiene async.
+
+Nota: previous_seq eliminado de apply_delta en refactor Día 2. El state
+garantiza monotonicidad local; gap detection es responsabilidad de
+OrderbookManager (ver test_orderbook_manager.py).
 """
 from __future__ import annotations
 
@@ -46,14 +50,12 @@ def make_delta(
     price: int = 40,
     delta: int = 10,
     seq: int = 101,
-    previous_seq: int = 100,
 ) -> dict:
     return {
         "side": side,
         "price": price,
         "delta": delta,
         "seq": seq,
-        "previous_seq": previous_seq,
     }
 
 
@@ -144,10 +146,8 @@ def test_snapshot_resets_previous_state() -> None:
     """Segundo apply_snapshot reemplaza el state del primero completamente."""
     state = OrderbookState("TICKER")
     state.apply_snapshot(make_snapshot(seq=100, yes=[[40, 200]]))
-    # Estado intermedio verificado
     assert state.top_of_book("yes").best_bid is not None
 
-    # Segundo snapshot sin levels YES
     state.apply_snapshot(make_snapshot(seq=200, yes=[], no=[[60, 100]]))
     assert state.sequence == 200
     assert state.top_of_book("yes").best_bid is None
@@ -210,49 +210,49 @@ def test_snapshot_zero_size_level_ignored() -> None:
 
 def test_delta_after_snapshot_updates_book() -> None:
     state = initialized_state(yes=[[40, 200]])
-    state.apply_delta(make_delta(side="yes", price=40, delta=50, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(side="yes", price=40, delta=50, seq=101))
     assert state.sequence == 101
     assert state.top_of_book("yes").best_bid == BookLevel(price_cents=40, size=250)
 
 
 def test_delta_positive_adds_size() -> None:
     state = initialized_state(yes=[[40, 50]])
-    state.apply_delta(make_delta(side="yes", price=40, delta=10, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(side="yes", price=40, delta=10, seq=101))
     assert state.top_of_book("yes").best_bid.size == 60  # type: ignore[union-attr]
 
 
 def test_delta_negative_reduces_size() -> None:
     state = initialized_state(yes=[[40, 50]])
-    state.apply_delta(make_delta(side="yes", price=40, delta=-10, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(side="yes", price=40, delta=-10, seq=101))
     assert state.top_of_book("yes").best_bid.size == 40  # type: ignore[union-attr]
 
 
 def test_delta_to_zero_removes_level() -> None:
     state = initialized_state(yes=[[40, 10]])
-    state.apply_delta(make_delta(side="yes", price=40, delta=-10, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(side="yes", price=40, delta=-10, seq=101))
     assert state.top_of_book("yes").best_bid is None
 
 
-def test_delta_to_negative_removes_level() -> None:
-    """Delta mayor al size existente: el level desaparece, no quedan sizes negativos."""
+def test_delta_to_negative_raises_orderbook_desync() -> None:
+    """Delta mayor al size existente: raises OrderbookDesyncError (feed corruption)."""
     state = initialized_state(yes=[[40, 10]])
-    state.apply_delta(make_delta(side="yes", price=40, delta=-15, seq=101, previous_seq=100))
-    assert state.top_of_book("yes").best_bid is None
-    # Verificar que el dict interno no tiene el price (no tamaños negativos)
-    view = state.snapshot_view()
-    assert 40 not in view["yes_bids"]
+    with pytest.raises(OrderbookDesyncError) as exc_info:
+        state.apply_delta(make_delta(side="yes", price=40, delta=-15, seq=101))
+    assert exc_info.value.ticker == "KXMLB-24"
+    assert exc_info.value.price_cents == 40
+    assert exc_info.value.new_qty == -5
 
 
 def test_delta_on_no_side_updates_no_bids() -> None:
     state = initialized_state(no=[[55, 80]])
-    state.apply_delta(make_delta(side="no", price=55, delta=20, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(side="no", price=55, delta=20, seq=101))
     assert state.top_of_book("no").best_bid.size == 100  # type: ignore[union-attr]
 
 
 def test_delta_new_price_level_created() -> None:
     """Delta en un precio que no existía crea el level."""
     state = initialized_state(yes=[[40, 100]])
-    state.apply_delta(make_delta(side="yes", price=38, delta=50, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(side="yes", price=38, delta=50, seq=101))
     top = state.top_of_book("yes")
     assert top.best_bid == BookLevel(price_cents=40, size=100)
     assert state.total_size("yes", "bid") == 150
@@ -269,28 +269,31 @@ def test_delta_before_snapshot_raises() -> None:
         state.apply_delta(make_delta())
 
 
-def test_delta_with_wrong_previous_seq_raises_desync() -> None:
-    state = initialized_state(seq=100)
-    with pytest.raises(OrderbookDesyncError) as exc_info:
-        state.apply_delta(make_delta(seq=101, previous_seq=99))
-    err = exc_info.value
-    assert err.expected_seq == 100
-    assert err.received_prev_seq == 99
-    assert err.ticker == "KXMLB-24"
-
-
 def test_delta_with_seq_not_advancing_raises() -> None:
     """seq == self.sequence (no avanza) → ValueError."""
     state = initialized_state(seq=100)
     with pytest.raises(ValueError, match="Invalid new sequence"):
-        state.apply_delta(make_delta(seq=100, previous_seq=100))
+        state.apply_delta(make_delta(seq=100))
 
 
 def test_delta_seq_less_than_current_raises() -> None:
     """seq < self.sequence → ValueError."""
     state = initialized_state(seq=100)
     with pytest.raises(ValueError, match="Invalid new sequence"):
-        state.apply_delta(make_delta(seq=99, previous_seq=100))
+        state.apply_delta(make_delta(seq=99))
+
+
+def test_delta_with_gap_is_applied_without_error() -> None:
+    """
+    Dos deltas con seq 100→102 (saltándose el 101) se aplican sin error.
+
+    OrderbookState NO detecta gaps; solo valida monotonicidad local.
+    La detección de gaps es responsabilidad de OrderbookManager.
+    """
+    state = initialized_state(seq=100, yes=[[40, 100]])
+    state.apply_delta(make_delta(side="yes", price=40, delta=10, seq=102))
+    assert state.sequence == 102
+    assert state.top_of_book("yes").best_bid.size == 110  # type: ignore[union-attr]
 
 
 def test_delta_invalid_side_raises() -> None:
@@ -317,21 +320,6 @@ def test_delta_float_price_raises() -> None:
         state.apply_delta(make_delta(price=40.5))  # type: ignore[arg-type]
 
 
-def test_delta_missing_previous_seq_raises() -> None:
-    state = initialized_state()
-    d = {"side": "yes", "price": 40, "delta": 10, "seq": 101}
-    with pytest.raises(ValueError, match="previous_seq"):
-        state.apply_delta(d)
-
-
-def test_delta_non_int_previous_seq_raises() -> None:
-    state = initialized_state()
-    d = make_delta()
-    d["previous_seq"] = "100"
-    with pytest.raises(ValueError, match="previous_seq.*int"):
-        state.apply_delta(d)
-
-
 def test_delta_float_delta_size_raises() -> None:
     state = initialized_state()
     with pytest.raises(ValueError, match="Invalid delta size"):
@@ -351,8 +339,6 @@ def test_top_of_book_empty_side_returns_none() -> None:
 
 def test_top_of_book_returns_max_bid_min_ask() -> None:
     state = OrderbookState("TICKER")
-    # Bids: 40 y 35. Best bid = max = 40.
-    # Asks explícitos: 42 y 45. Best ask = min = 42.
     state.apply_snapshot(
         make_snapshot(
             yes=[[40, 100], [35, 200]],
@@ -378,7 +364,7 @@ def test_top_of_book_invalid_side_raises() -> None:
 
 
 # =====================================================
-# clear y desync recovery
+# clear y recovery
 # =====================================================
 
 
@@ -396,31 +382,34 @@ def test_clear_resets_state() -> None:
 
 def test_clear_idempotent() -> None:
     state = OrderbookState("TICKER")
-    state.clear()  # No debe explotar en state vacío
+    state.clear()
     assert not state.is_initialized
     assert state.is_empty()
 
 
 def test_recovery_pattern() -> None:
-    """Ciclo completo de desync recovery: delta inválido → clear → nuevo snapshot."""
+    """
+    Ciclo completo de recovery: clear() + nuevo snapshot REST.
+
+    En el flujo real, OrderbookManager detecta el gap de seq,
+    llama clear() y luego aplica un snapshot REST (seq=0).
+    El delta WS siguiente tendrá seq > 0 (cumple monotonicidad).
+    """
     state = initialized_state(seq=100, yes=[[40, 200]])
-
-    # Delta con previous_seq incorrecto (gap en la secuencia)
-    with pytest.raises(OrderbookDesyncError):
-        state.apply_delta(make_delta(seq=103, previous_seq=102))
-
-    # State todavía tiene el snapshot anterior (delta no se aplicó)
-    assert state.sequence == 100
     assert state.is_initialized
 
-    # Recovery: clear + nuevo snapshot
+    # Recovery: clear + nuevo snapshot (simula lo que hace OrderbookManager)
     state.clear()
     assert not state.is_initialized
 
-    state.apply_snapshot(make_snapshot(seq=110, yes=[[42, 150]]))
+    state.apply_snapshot(make_snapshot(seq=0, yes=[[42, 150]]))
     assert state.is_initialized
-    assert state.sequence == 110
+    assert state.sequence == 0
     assert state.top_of_book("yes").best_bid == BookLevel(price_cents=42, size=150)
+
+    # Delta WS posterior (seq=110 > 0) se aplica sin error
+    state.apply_delta(make_delta(side="yes", price=42, delta=10, seq=110))
+    assert state.sequence == 110
 
 
 # =====================================================
@@ -435,11 +424,9 @@ def test_snapshot_view_returns_copy() -> None:
     view = state.snapshot_view()
     original_yes_bids = dict(view["yes_bids"])
 
-    # Mutar el dict retornado
     view["yes_bids"][40] = 9999
     view["yes_bids"][99] = 1
 
-    # State interno intacto
     assert state.top_of_book("yes").best_bid.size == 100  # type: ignore[union-attr]
     assert state.snapshot_view()["yes_bids"] == original_yes_bids
 
@@ -466,10 +453,10 @@ def test_delta_price_at_boundaries() -> None:
     """price=0 y price=100 son válidos aunque semánticamente raros en Kalshi."""
     state = initialized_state()
 
-    state.apply_delta(make_delta(price=0, delta=50, seq=101, previous_seq=100))
+    state.apply_delta(make_delta(price=0, delta=50, seq=101))
     assert state.snapshot_view()["yes_bids"].get(0) == 50
 
-    state.apply_delta(make_delta(price=100, delta=30, seq=102, previous_seq=101))
+    state.apply_delta(make_delta(price=100, delta=30, seq=102))
     assert state.snapshot_view()["yes_bids"].get(100) == 30
 
 
@@ -477,9 +464,9 @@ def test_multiple_levels_same_side() -> None:
     """Deltas en distintos precios del mismo side coexisten en el dict."""
     state = initialized_state(yes=[[40, 100]])
 
-    state.apply_delta(make_delta(price=40, delta=10, seq=101, previous_seq=100))
-    state.apply_delta(make_delta(price=35, delta=50, seq=102, previous_seq=101))
-    state.apply_delta(make_delta(price=45, delta=30, seq=103, previous_seq=102))
+    state.apply_delta(make_delta(price=40, delta=10, seq=101))
+    state.apply_delta(make_delta(price=35, delta=50, seq=102))
+    state.apply_delta(make_delta(price=45, delta=30, seq=103))
 
     bids = state.snapshot_view()["yes_bids"]
     assert bids == {40: 110, 35: 50, 45: 30}
@@ -488,17 +475,11 @@ def test_multiple_levels_same_side() -> None:
 
 def test_sequence_skipping_is_valid() -> None:
     """
-    Kalshi puede saltar sequence numbers (seq=105 tras seq=100 es válido).
-    Lo que importa para desync es que previous_seq == self.sequence exactamente.
-
-    Nota: la tarea original llama este test 'test_sequence_skipping_raises' pero
-    su descripción dice que es VÁLIDO (no raises). Renombrado para reflejar el
-    comportamiento real.
+    Seq salta de 100 a 105 (gap de 4) — válido desde la perspectiva del state.
+    OrderbookState solo valida monotonicidad; el gap lo detecta OrderbookManager.
     """
     state = initialized_state(seq=100, yes=[[40, 100]])
-
-    # seq salta de 100 a 105 (válido, Kalshi puede saltar seq)
-    state.apply_delta(make_delta(price=40, delta=10, seq=105, previous_seq=100))
+    state.apply_delta(make_delta(price=40, delta=10, seq=105))
     assert state.sequence == 105
 
 
@@ -529,13 +510,63 @@ def test_apply_snapshot_after_deltas() -> None:
     """Snapshot tras varios deltas resetea todo el state limpiamente."""
     state = initialized_state(yes=[[40, 100]], seq=100)
 
-    state.apply_delta(make_delta(price=40, delta=50, seq=101, previous_seq=100))
-    state.apply_delta(make_delta(price=38, delta=30, seq=102, previous_seq=101))
+    state.apply_delta(make_delta(price=40, delta=50, seq=101))
+    state.apply_delta(make_delta(price=38, delta=30, seq=102))
 
-    # Nuevo snapshot borra todo lo anterior
     state.apply_snapshot(make_snapshot(seq=200, yes=[[45, 75]], no=[[50, 60]]))
     assert state.sequence == 200
     assert state.snapshot_view()["yes_bids"] == {45: 75}
-    # El price 40 del state anterior ya no está
     assert 40 not in state.snapshot_view()["yes_bids"]
     assert 38 not in state.snapshot_view()["yes_bids"]
+
+
+# =====================================================
+# mark_stale / is_stale
+# =====================================================
+
+
+def test_mark_stale_blocks_reads() -> None:
+    """mark_stale() → is_initialized=False, is_stale=True; data preserved."""
+    state = initialized_state(yes=[[40, 100]], seq=50)
+    assert state.is_initialized
+
+    state.mark_stale()
+
+    assert not state.is_initialized
+    assert state.is_stale
+    # Data still present internally (useful for debugging)
+    assert state.snapshot_view()["yes_bids"] == {40: 100}
+    assert state.sequence == 50
+
+
+def test_apply_snapshot_clears_stale() -> None:
+    """apply_snapshot() after mark_stale() restores initialized=True, is_stale=False."""
+    state = initialized_state(yes=[[40, 100]], seq=50)
+    state.mark_stale()
+    assert state.is_stale
+
+    state.apply_snapshot(make_snapshot(seq=60, yes=[[42, 200]]))
+
+    assert state.is_initialized
+    assert not state.is_stale
+    assert state.sequence == 60
+    assert state.top_of_book("yes").best_bid == BookLevel(price_cents=42, size=200)  # type: ignore[union-attr]
+
+
+def test_clear_resets_stale_flag() -> None:
+    """clear() resets both is_initialized and is_stale."""
+    state = initialized_state()
+    state.mark_stale()
+    assert state.is_stale
+
+    state.clear()
+
+    assert not state.is_initialized
+    assert not state.is_stale
+
+
+def test_mark_stale_idempotent() -> None:
+    state = initialized_state()
+    state.mark_stale()
+    state.mark_stale()  # second call must not raise
+    assert state.is_stale
