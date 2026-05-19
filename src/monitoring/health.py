@@ -36,6 +36,7 @@ class BotState:
     is_paused: bool = False
     pause_reason: str | None = None
     capture_running: bool = False
+    last_capture_running_true_at: float = 0.0  # time.monotonic() when capture_running last set True
     db_initialized: bool = False
     tracked_markets_count: int = 0
     last_error: str | None = None

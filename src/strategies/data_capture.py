@@ -16,6 +16,7 @@ Esto corre 24/7. La data acumulada es input para los motores de trading.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
@@ -28,18 +29,18 @@ from src.monitoring.health import BotState
 from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
-# Series de Kalshi a trackear. Reducido temporalmente a 2 para diagnostico de 429s.
-# TODO: Restaurar lista completa una vez confirmado que discovery no genera burst.
 TARGET_SERIES_PREFIXES = [
-    "KXMLB",  # MLB
-    "KXNBA",  # NBA
-    # "KXNHL",   # NHL
-    # "KXNFL",   # NFL (en temporada)
-    # "KXEPL",   # Premier League
-    # "KXUCL",   # Champions League
-    # "KXUEL",   # Europa League
-    # "KXPRES",  # Politica
-    # "KXPOTUS", # Politica
+    # Deportes
+    "KXMLB",   # MLB
+    "KXNBA",   # NBA
+    "KXNHL",   # NHL
+    "KXNFL",   # NFL (en temporada)
+    "KXEPL",   # Premier League
+    "KXUCL",   # Champions League
+    "KXUEL",   # Europa League
+    # Política y eventos (donde menos competencia algorítmica)
+    "KXPRES",
+    "KXPOTUS",
 ]
 
 
@@ -440,6 +441,16 @@ class DataCaptureService:
         self.ws.on("ticker", self._on_ticker)
         self.ws.on("trade", self._on_trade)
 
+        # Orderbook manager — V2 if flag enabled, otherwise no manager (V1 must be wired separately)
+        if self.settings.USE_ORDERBOOK_MANAGER_V2:
+            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
+            _v2_manager = OrderbookManagerV2(self.ws)
+            self.ws.on("orderbook_delta", _v2_manager.handle_message)
+            self.ws.on("orderbook_snapshot", _v2_manager.handle_message)
+            self.ws.on("ok", _v2_manager.handle_message)
+            self.ws.on("error", _v2_manager.handle_message)
+            logger.info("OrderbookManagerV2 registered (USE_ORDERBOOK_MANAGER_V2=True)")
+
         # Encolar suscripciones (se aplicaran al conectar el WS)
         ticker_list = list(self._tracked_tickers)
         for i in range(0, len(ticker_list), 100):
@@ -450,6 +461,7 @@ class DataCaptureService:
             )
 
         BotState.capture_running = True
+        BotState.last_capture_running_true_at = time.monotonic()
 
         # Supervisor pattern: excepciones reportadas y re-levadas, nunca tragadas
         ws_task = asyncio.create_task(self._run_ws_supervised(), name="ws_supervisor")

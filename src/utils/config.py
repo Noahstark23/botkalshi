@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     MOTOR_1_ARBITRAGE_ENABLED: bool = False
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     MOTOR_3_CLV_ENABLED: bool = False
+    USE_ORDERBOOK_MANAGER_V2: bool = Field(default=False, description="Enable WS-based recovery (OrderbookManagerV2)")
 
     # === Optional ===
     SENTRY_DSN: str = ""
