@@ -31,6 +31,8 @@ from src.utils.config import get_settings
 
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
+STABLE_CONNECTION_THRESHOLD_SEC = 60
+
 
 class KalshiWebSocket:
     """
@@ -116,7 +118,9 @@ class KalshiWebSocket:
         alerted = False
 
         while self._running:
+            connected_at: datetime | None = None
             try:
+                connected_at = datetime.now(UTC)
                 await self._connect_and_listen()
                 consecutive_failures = 0
                 alerted = False
@@ -125,11 +129,29 @@ class KalshiWebSocket:
                 logger.info("WS run cancelled")
                 raise
             except websockets.ConnectionClosed as e:
+                stable_s = _stable_connection(connected_at)
+                if stable_s:
+                    logger.info(
+                        f"ws.failure_counter.reset reason=stable_connection "
+                        f"stable_seconds={int(stable_s)} previous_failures={consecutive_failures}"
+                    )
+                    consecutive_failures = 0
+                    backoff = 1.0
+                    alerted = False
                 consecutive_failures += 1
                 logger.warning(
                     f"WS closed: {e}. Consecutive failures: {consecutive_failures}"
                 )
             except Exception:
+                stable_s = _stable_connection(connected_at)
+                if stable_s:
+                    logger.info(
+                        f"ws.failure_counter.reset reason=stable_connection "
+                        f"stable_seconds={int(stable_s)} previous_failures={consecutive_failures}"
+                    )
+                    consecutive_failures = 0
+                    backoff = 1.0
+                    alerted = False
                 consecutive_failures += 1
                 logger.exception(
                     f"WS error inesperado. Consecutive failures: {consecutive_failures}"
@@ -296,3 +318,15 @@ class KalshiWebSocket:
         for r in results:
             if isinstance(r, Exception):
                 logger.exception(f"Handler exception en {msg_type}: {r}")
+
+
+def _stable_connection(connected_at: datetime | None) -> float:
+    """
+    Retorna segundos de conexión estable si superó el threshold, 0.0 si no.
+
+    Un único datetime.now() para evitar doble computo de "now" en el caller.
+    """
+    if connected_at is None:
+        return 0.0
+    secs = (datetime.now(UTC) - connected_at).total_seconds()
+    return secs if secs > STABLE_CONNECTION_THRESHOLD_SEC else 0.0
