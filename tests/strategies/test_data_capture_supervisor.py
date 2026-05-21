@@ -168,3 +168,27 @@ async def test_check_ws_health_sets_ws_connected_false_when_down(service):
     await service._check_ws_health()
 
     assert BotState.ws_connected is False
+
+
+@pytest.fixture
+def loguru_caplog(caplog):
+    """Redirect Loguru output to pytest's caplog handler."""
+    from loguru import logger
+    handler_id = logger.add(caplog.handler, format="{message}", level="DEBUG")
+    yield caplog
+    logger.remove(handler_id)
+
+
+@pytest.mark.asyncio
+async def test_zombie_detection_emits_warning_log(service, loguru_caplog):
+    """Cuando se detecta zombie, debe emitirse log WARNING con los tres campos esperados."""
+    service.ws.is_connected = True
+    service.ws.last_message_at = datetime.now(UTC) - timedelta(seconds=400)
+
+    await service._check_ws_health()
+
+    log_text = loguru_caplog.text
+    assert "ws.zombie.detected" in log_text
+    assert "silence_seconds=" in log_text
+    assert "ws_is_connected=" in log_text
+    assert "action_taken=record_error" in log_text
