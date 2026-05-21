@@ -138,6 +138,10 @@ class DataCaptureService:
             # Shape legacy (defensivo): "price" + "delta" como ints en cents
             price_raw = data.get("price_dollars", data.get("price"))
             delta_raw = data.get("delta_fp", data.get("delta"))
+            # WS payload usa fixed-point strings (price_dollars="0.4200", delta_fp="-2500.00").
+            # DB schema usa integers en cents (price_cents=42, delta=-2500). La conversión
+            # vive acá. Si futuro refactor toca persist layer, mantener esta semántica
+            # o migrar schema explícitamente. Documentado 2026-05-19.
             price_cents = parse_price_to_cents(price_raw)
             delta_size = parse_size(delta_raw)
 
@@ -371,6 +375,10 @@ class DataCaptureService:
 
         silence_seconds = (datetime.now(UTC) - last_msg).total_seconds()
         if silence_seconds > 300:
+            logger.warning(
+                f"ws.zombie.detected silence_seconds={int(silence_seconds)} "
+                f"ws_is_connected={self.ws.is_connected} action_taken=record_error"
+            )
             BotState.record_error(
                 f"WS zombie: connected but no messages for {silence_seconds:.0f}s"
             )
@@ -441,15 +449,16 @@ class DataCaptureService:
         self.ws.on("ticker", self._on_ticker)
         self.ws.on("trade", self._on_trade)
 
-        # Orderbook manager — V2 if flag enabled, otherwise no manager (V1 must be wired separately)
-        if self.settings.USE_ORDERBOOK_MANAGER_V2:
+        # Orderbook manager — V2 if flag enabled and Motor 1 is not already wiring it.
+        # When MOTOR_1_ARBITRAGE_ENABLED=True, runner.py owns the manager lifecycle.
+        if self.settings.USE_ORDERBOOK_MANAGER_V2 and not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
             _v2_manager = OrderbookManagerV2(self.ws)
             self.ws.on("orderbook_delta", _v2_manager.handle_message)
             self.ws.on("orderbook_snapshot", _v2_manager.handle_message)
             self.ws.on("ok", _v2_manager.handle_message)
             self.ws.on("error", _v2_manager.handle_message)
-            logger.info("OrderbookManagerV2 registered (USE_ORDERBOOK_MANAGER_V2=True)")
+            logger.info("OrderbookManagerV2 registered (data-capture only, no Motor 1)")
 
         # Encolar suscripciones (se aplicaran al conectar el WS)
         ticker_list = list(self._tracked_tickers)
