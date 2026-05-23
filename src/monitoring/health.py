@@ -41,6 +41,7 @@ class BotState:
     tracked_markets_count: int = 0
     last_error: str | None = None
     last_error_at: datetime | None = None
+    v2_manager: Any = None  # Set by DataCaptureService when USE_ORDERBOOK_MANAGER_V2=True
 
     @classmethod
     def heartbeat(cls) -> None:
@@ -168,6 +169,25 @@ async def status() -> dict[str, Any]:
             ).all()
         )
 
+    # V2 manager metrics
+    v2_enabled = settings.USE_ORDERBOOK_MANAGER_V2
+    v2_mgr = BotState.v2_manager
+    if not v2_enabled:
+        v2_info: dict[str, Any] = {"enabled": False}
+    elif v2_mgr is None:
+        BotState.record_error("v2 flag enabled but instance missing")
+        v2_info = {"enabled": True, "instance": "missing"}
+    else:
+        s = v2_mgr.stats()
+        v2_info = {
+            "enabled": True,
+            "books_initialized": s.get("initialized_tickers", 0),
+            "sids_tracked": len(v2_mgr._tickers_by_sid),
+            "sids_recovering": len(v2_mgr._recovering),
+            "gaps_last_60s": s.get("gaps_last_60s", 0),
+            "last_gap_at": s.get("last_gap_at"),
+        }
+
     return {
         "bot": {
             "started_at": BotState.started_at.isoformat(),
@@ -228,6 +248,7 @@ async def status() -> dict[str, Any]:
             }
             for r in recent_risks
         ],
+        "orderbook_manager_v2": v2_info,
     }
 
 

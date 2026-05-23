@@ -117,6 +117,7 @@ class DataCaptureService:
         self._tracked_tickers: set[str] = set()
         self._delta_shape_logged = False
         self._snapshot_shape_logged = False
+        self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
 
     # =====================================================
     # WS event handlers
@@ -453,11 +454,12 @@ class DataCaptureService:
         # When MOTOR_1_ARBITRAGE_ENABLED=True, runner.py owns the manager lifecycle.
         if self.settings.USE_ORDERBOOK_MANAGER_V2 and not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
-            _v2_manager = OrderbookManagerV2(self.ws)
-            self.ws.on("orderbook_delta", _v2_manager.handle_message)
-            self.ws.on("orderbook_snapshot", _v2_manager.handle_message)
-            self.ws.on("ok", _v2_manager.handle_message)
-            self.ws.on("error", _v2_manager.handle_message)
+            self._v2_manager = OrderbookManagerV2(self.ws)
+            BotState.v2_manager = self._v2_manager
+            self.ws.on("orderbook_delta", self._v2_manager.handle_message)
+            self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)
+            self.ws.on("ok", self._v2_manager.handle_message)
+            self.ws.on("error", self._v2_manager.handle_message)
             logger.info("OrderbookManagerV2 registered (data-capture only, no Motor 1)")
 
         # Encolar suscripciones (se aplicaran al conectar el WS)

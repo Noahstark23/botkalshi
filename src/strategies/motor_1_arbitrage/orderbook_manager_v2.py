@@ -23,6 +23,9 @@ Recovery flow on gap detection:
 """
 from __future__ import annotations
 
+import asyncio
+import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
@@ -87,6 +90,13 @@ class OrderbookManagerV2:
         self._pending_deltas: dict[int, list[dict]] = {}
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
+        # Gap rate tracking (monotonic timestamps within last 60s)
+        self._gap_timestamps: list[float] = []
+        self._consecutive_warning: int = 0
+        self._consecutive_critical: int = 0
+        self._last_warning_alert_at: float = 0.0
+        self._last_critical_alert_at: float = 0.0
+        self._last_gap_at: datetime | None = None
 
     # =====================================================
     # Public API
@@ -152,6 +162,9 @@ class OrderbookManagerV2:
             if new_seq != expected_seq:
                 await self._start_recovery(sid)
                 self._pending_deltas[sid].append(raw_msg)
+                alert_args = self._record_gap_and_should_alert()
+                if alert_args:
+                    asyncio.create_task(self._fire_alert(*alert_args))
                 raise SidGapError(sid=sid, expected_seq=expected_seq, received_seq=new_seq)
 
         self._last_seq_by_sid[sid] = new_seq
@@ -160,6 +173,11 @@ class OrderbookManagerV2:
             self._apply_snapshot_msg(raw_msg)
         else:
             self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
+
+    @property
+    def tracked_tickers(self) -> frozenset[str]:
+        """Snapshot of tickers with an active OrderbookState (may be stale/uninitialized)."""
+        return frozenset(self._books.keys())
 
     def get_top_of_book(self, ticker: str, side: Literal["yes", "no"]) -> BookTop | None:
         """Top of book. Returns None if ticker is unknown, stale, or uninitialized."""
@@ -170,6 +188,8 @@ class OrderbookManagerV2:
 
     def stats(self) -> dict:
         """Internal state for debugging via /status."""
+        now = time.monotonic()
+        gaps_last_60s = sum(1 for t in self._gap_timestamps if now - t < 60.0)
         return {
             "tracked_tickers": len(self._books),
             "initialized_tickers": sum(1 for b in self._books.values() if b.is_initialized),
@@ -177,7 +197,57 @@ class OrderbookManagerV2:
             "recovering_sids": list(self._recovering),
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
+            "gaps_last_60s": gaps_last_60s,
+            "last_gap_at": self._last_gap_at.isoformat() if self._last_gap_at else None,
         }
+
+    # =====================================================
+    # Gap rate tracking and alerting
+    # =====================================================
+
+    def _record_gap_and_should_alert(self) -> tuple[str, str] | None:
+        """
+        Record this gap occurrence and decide if an alert should fire.
+
+        Returns (kind, details) if an alert should be sent, None otherwise.
+        Called synchronously from handle_message before the SidGapError raise.
+        Caller (async) schedules _fire_alert via asyncio.create_task.
+        """
+        now = time.monotonic()
+        self._gap_timestamps.append(now)
+        self._gap_timestamps = [t for t in self._gap_timestamps if now - t < 60.0]
+        self._last_gap_at = datetime.now(UTC)
+        count = len(self._gap_timestamps)
+
+        if count >= 20:
+            self._consecutive_critical += 1
+            self._consecutive_warning += 1
+        elif count >= 5:
+            self._consecutive_critical = 0
+            self._consecutive_warning += 1
+        else:
+            self._consecutive_critical = 0
+            self._consecutive_warning = 0
+
+        details = f"gaps_last_60s={count}"
+
+        if self._consecutive_critical >= 3 and now - self._last_critical_alert_at > 120.0:
+            self._last_critical_alert_at = now
+            return "sid_gap_critical", details
+
+        if self._consecutive_warning >= 3 and now - self._last_warning_alert_at > 300.0:
+            self._last_warning_alert_at = now
+            return "sid_gap_warning", details
+
+        return None
+
+    async def _fire_alert(self, kind: str, details: str) -> None:
+        """Fire-and-forget alert. Catches all exceptions to protect the caller."""
+        try:
+            from src.monitoring.telegram_alerts import alert_orderbook_anomaly
+            await alert_orderbook_anomaly(kind, details)
+        except Exception as e:
+            logger.warning(f"v2.alert_send_failed kind={kind} error={e}")
 
     # =====================================================
     # Recovery

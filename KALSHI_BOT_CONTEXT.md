@@ -373,7 +373,7 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 - `wait_exponential(max=10)` → `wait_exponential(max=60)`.
 - `_record_api_error()` helper en `kalshi_rest.py` actualiza `BotState` al agotar retries.
 - `asyncio.sleep(2.0)` entre prefixes en `_discover_markets`.
-- `TARGET_SERIES_PREFIXES` reducido a 2 (KXMLB, KXNBA) temporalmente.
+- `TARGET_SERIES_PREFIXES` restaurado a 9 prefixes completos (2026-05-17).
 - Script `scripts/diagnose_kalshi.py` standalone para debug de conectividad.
 
 ### Lección 7 (Mayo 13-14, 2026): asyncio.gather traga excepciones + websockets API change
@@ -406,6 +406,31 @@ solo, dando la ilusión de "capture_running: true". TERCERA vez del mismo patró
 **Anti-patrón confirmado por 3ra vez:** "el bot dice que está corriendo" ≠
 "el bot está corriendo". El monitor SIEMPRE valida contra estado real, nunca
 contra flag interna sin contraste empírico.
+
+### Lección 8 (Mayo 22, 2026): Push masivo acumula deuda invisible de revisión
+
+**Contexto:** 14 commits locales acumulados sin push durante 5+ días de desarrollo. Descubierto al hacer
+el primer push real antes de activar V2. El CTO no había podido revisar 11 de los 14 commits.
+
+**Causa raíz:** Ningún push ocurría después de cada PR terminado — los commits vivían solo en local.
+El workflow de Claude Code no incluía `git push` explícito como paso del proceso.
+
+**Decisión derivada:** Push a origin/main después de cada PR o batch de commits cohesivo.
+Máximo 3–4 commits sin push. Si origin/main no tiene el código, nadie puede revisarlo.
+
+### Lección 9 ([FECHA DE ACTIVACIÓN]): Activación de OrderbookManagerV2
+
+*Completar después de la activación con observaciones reales.*
+
+**Contexto:** Primera activación de V2 con `USE_ORDERBOOK_MANAGER_V2=True` en producción.
+V2 diferencia clave vs V1: recovery por WS (no REST), buffer-and-drain, mark_stale sin clear.
+
+**Resultado:** [a completar]
+
+**Causa raíz de cualquier problema observado:** [a completar]
+
+**Decisión derivada:** [a completar — incluir: umbrales de alert correctos, frecuencia de gaps real,
+si mark_stale/drain funcionó bajo carga real, cualquier edge case no anticipado]
 
 ---
 
@@ -490,7 +515,7 @@ contra flag interna sin contraste empírico.
 | `data_capture` sin retry de discovery (bug arranque 2026-05-09) | Resuelto | Loop con backoff exponencial 5s→300s |
 | Cliente REST parseaba `Retry-After` que Kalshi no envía | Resuelto 2026-05-12 | Eliminado; backoff exponencial puro max=60s |
 | Migración API V2 fixed-point (`yes_bid_dollars` string) | Resuelto 2026-05-12 | `parse_price_to_cents()` con fallback a legacy integers |
-| `TARGET_SERIES_PREFIXES` reducido a 2 temporalmente | Baja | Restaurar a 9 una vez discovery estable sin 429s |
+| ✅ RESUELTO 2026-05-17: `TARGET_SERIES_PREFIXES` restaurado a 9 prefixes | Resuelto | WS estable, 130 deltas/min; discovery loop tiene sleep 2s entre prefixes |
 | ✅ RESUELTO 2026-05-16: Reconciliation post-crash integrada a runner.py con tolerancia a fallas | Resuelto | try/except + BotState.record_error; bot sigue arrancando si Kalshi flap |
 | Rollback parcial iterativo (vendiste 5 de 10, queda residual) | Alta | Después de Motor 1 v1 estable |
 | Timeout en asyncio.gather de órdenes concurrentes | Media | Después de Motor 1 v1 estable |
@@ -540,6 +565,86 @@ muertes silenciosas (lección Mayo 9, 2026).
 sizing de Motor 2/3 (Kelly), pero arbitraje requiere la fórmula real de
 Kalshi (`ceil(0.07 * count * price * (1-price))`). En profits chicos, la
 diferencia decide si hay edge o no.
+
+---
+
+## 12.5 RUNBOOK — Activación de OrderbookManagerV2
+
+### Pre-flight checklist (completar antes de cambiar el flag)
+
+- [ ] **Bot healthy:** `/health` retorna 200, uptime > 2h, `capture_running: true`, `tracked_markets >= 30`
+- [ ] **Sin errores recientes:** `last_error: null` en `/status` (o error > 30min atrás, no activo)
+- [ ] **278/278 tests pasan** en main (verificar con `python -m pytest -q`)
+- [ ] **DB backup manual:** snapshot del volumen Docker antes de deployar (Coolify > botkalshi > Volumes > backup ahora)
+
+### Pasos de activación
+
+1. En Coolify > botkalshi > Environment Variables:
+   - Cambiar `USE_ORDERBOOK_MANAGER_V2` de `false` a `true`
+   - Verificar que `TRADING_ENABLED=false` y `MOTOR_1_ARBITRAGE_ENABLED=false` (no tocar)
+2. Click **Deploy** (no Restart — Deploy fuerza rebuild desde GitHub con el nuevo env var)
+3. Esperar que el container healthcheck pase (30–60s)
+4. Verificar log de arranque: buscar `OrderbookManagerV2 registered (data-capture only, no Motor 1)`
+5. GET `/status` → confirmar que `orderbook_manager_v2.enabled = true` y `instance != "missing"`
+6. Monitorear logs durante 30 minutos mínimos
+
+### Criterios de éxito (los 3 deben cumplirse)
+
+1. **`/status`** muestra `orderbook_manager_v2.books_initialized >= 30` dentro de los primeros 5 minutos
+2. **`gaps_last_60s`** en `/status` es ≤ 5 sostenido (sin spike > 20 en primera hora)
+3. **Sin errores nuevos** relacionados con orderbook en logs (`grep "ERROR" logs | grep -i orderbook` = vacío)
+
+### Criterios de rollback inmediato (cualquiera de estos → revertir)
+
+1. `orderbook_manager_v2.instance = "missing"` en `/status` después del primer minuto
+2. `gaps_last_60s > 20` sostenido por más de 5 minutos consecutivos
+3. Telegram alert `sid_gap_critical` disparado más de 3 veces en la primera hora
+4. `books_initialized = 0` después de 10 minutos de uptime (books no se están llenando)
+5. `capture_running: false` o `ws_connected: false` (V2 rompió el WS handler)
+
+### Procedimiento de rollback step-by-step
+
+1. Coolify > botkalshi > Environment Variables: `USE_ORDERBOOK_MANAGER_V2=false`
+2. Click **Deploy** (rebuild completo, no Restart)
+3. Verificar que `/status` vuelve a mostrar `orderbook_manager_v2: {enabled: false}`
+4. Verificar que `capture_running: true` y `ws_connected: true` se restauran
+5. Documentar en este archivo qué criterio de rollback disparó y cuándo
+
+### Diagnóstico rápido en logs
+
+```bash
+# Ver todos los gaps detectados
+grep "SidGapError\|stream_gap\|sid.*gap" /var/log/bot/app.log
+
+# Ver estado del V2 al arranque
+grep "OrderbookManagerV2" /var/log/bot/app.log
+
+# Ver recoveries iniciados
+grep "recovery" /var/log/bot/app.log | grep -v test
+
+# Ver alertas de Telegram del orderbook
+grep "v2.alert_send\|sid_gap_warning\|sid_gap_critical" /var/log/bot/app.log
+
+# Ver errores de orderbook en general
+grep "ERROR\|CRITICAL" /var/log/bot/app.log | grep -i "orderbook\|manager"
+```
+
+En Coolify los logs se ven en: botkalshi > Logs (tab). Usar filtro de texto.
+
+### Baseline esperado en /status con V2 activo (condición nominal)
+
+```json
+"orderbook_manager_v2": {
+  "enabled": true,
+  "books_initialized": 38,      // ≈ tracked_markets
+  "sids_tracked": 1,             // normalmente 1 sid para data-capture
+  "sids_recovering": 0,          // 0 en condición nominal
+  "gaps_last_60s": 0,            // 0 en condición nominal; ≤5 es aceptable
+  "last_gap_at": null            // null si no hubo gaps; ISO si hubo
+}
+```
+
+Si `sids_recovering > 0` sostenido: el WS está con gaps frecuentes, investigar latencia de red.
 
 ---
 

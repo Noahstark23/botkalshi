@@ -78,3 +78,12 @@ async def alert_risk_event(event_type: str, message: str) -> None:
 async def alert_error(error: str) -> None:
     """Notifica error crítico."""
     await send_alert(f"*Error crítico*\n```\n{error[:500]}\n```", urgent=True)
+
+
+async def alert_orderbook_anomaly(
+    kind: str,  # "sid_gap_warning" | "sid_gap_critical" | "manager_zombie"
+    details: str,
+) -> None:
+    """Notifica anomalía del orderbook manager V2."""
+    urgent = kind == "sid_gap_critical"
+    await send_alert(f"*Orderbook {kind}*\n{details}", urgent=urgent)
