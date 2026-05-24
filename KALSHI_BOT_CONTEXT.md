@@ -1,16 +1,23 @@
 # KALSHI_BOT_CONTEXT.md
 
-**Versión:** 1.1
-**Última actualización:** Mayo 9, 2026
+**Versión:** 1.4
+**Última actualización:** Mayo 24, 2026
 **Owner:** Noel Pineda (sole founder)
-**Repo:** kalshi-bot (privado, GitHub)
+**Repo:** kalshi-bot (privado, GitHub — Noahstark23/botkalshi)
 
-**Cambios v1.0 → v1.1:**
-- Fase 1 ahora opera en `KALSHI_ENV=production` con `TRADING_ENABLED=false`
-  (decisión 2026-05-09: data sintética de demo insuficiente para entrenar Motor 1).
-- Checklist explícito para activación de `TRADING_ENABLED`.
-- Roadmap de Semana 1 actualizado con fixes de resilience aplicados.
-- Anti-patterns expandidos.
+**Cambios v1.3 → v1.4 (2026-05-24):**
+- Sección 4 actualizada: Motor 1 reflejando el estado real (matemática
+  arbitraje completa, RiskManager con tests E2E, OrderbookState Día 1
+  mergeado, OrderbookManagerV2 mergeado y dormant detrás de flag).
+- Sección 6 corregida: rate limit real (200 reads/sec en producción, no
+  100), eliminada referencia a `Retry-After` que Kalshi no envía.
+- Sección 9 consolidada: Lecciones 1-7 con fechas reales y referencias a
+  fixes mergeados.
+- Sección 10 actualizada: roadmap refleja lo realmente completado.
+- Sección 11 actualizada: deuda técnica viva (parse_price_to_cents float
+  vs Decimal; audit pendiente de `asyncio.gather` residuales).
+- **Sección 12.5 NUEVA:** Runbook de activación de OrderbookManagerV2.
+- **Sección 14 NUEVA:** Workflow operativo (modelo de roles 1+2).
 
 ---
 
@@ -32,10 +39,10 @@ Bot de trading algorítmico para **Kalshi prediction markets** (regulado por CFT
 ### Backend
 - **Lenguaje:** Python 3.12
 - **HTTP async:** httpx
-- **WebSocket:** websockets library
+- **WebSocket:** websockets library (pin `>=13.0,<17.0` — ver Lección 7)
 - **Crypto:** cryptography (RSA-PSS para Kalshi auth)
 - **Validación:** pydantic v2 + pydantic-settings
-- **ORM:** SQLModel
+- **ORM:** SQLModel (patrón `select() + s.exec()`, NUNCA `.query()`)
 - **API local:** FastAPI (health + admin endpoints en puerto 8080)
 - **Logging:** Loguru
 - **Scheduler:** APScheduler
@@ -54,7 +61,9 @@ Bot de trading algorítmico para **Kalshi prediction markets** (regulado por CFT
 
 ### Tests
 - pytest + pytest-asyncio
-- Coverage mínimo target: 60% en módulos críticos (auth, sizing, risk)
+- 264+ tests mergeados (mayo 2026). Coverage real en módulos críticos:
+  signer, fees, kelly, arbitrage, risk manager, orderbook, executor,
+  orderbook_manager_v2.
 
 ---
 
@@ -69,8 +78,10 @@ Bot de trading algorítmico para **Kalshi prediction markets** (regulado por CFT
 │            ├─ Production runner (asyncio)       │
 │            │   ├─ WebSocket → Kalshi feed       │
 │            │   ├─ REST client → Kalshi orders   │
-│            │   ├─ Strategy engines (3)          │
-│            │   ├─ Risk manager                  │
+│            │   ├─ DataCapture (snapshots+events)│
+│            │   ├─ OrderbookManagerV2 (dormant)  │
+│            │   ├─ Strategy engines (Motor 1)    │
+│            │   ├─ Risk manager (activo)         │
 │            │   └─ Telegram alerts               │
 │            └─ SQLite (volumen persistente)      │
 └─────────────────────────────────────────────────┘
@@ -86,9 +97,17 @@ src/
 ├── auth/         RSA-PSS signing
 ├── clients/      REST + WS clients de Kalshi
 ├── storage/      SQLModel models
-├── strategies/   Motores de trading (vacío hasta Semana 2)
-├── risk/         Risk manager (vacío hasta Semana 4)
-├── monitoring/   Health endpoints, Telegram
+├── strategies/
+│   ├── data_capture.py      ACTIVO: snapshots + persistencia
+│   └── motor_1_arbitrage/
+│       ├── orderbook.py            OrderbookState (Día 1, mergeado)
+│       ├── orderbook_manager_v2.py V2 (mergeado, dormant detrás de flag)
+│       ├── orderbook_manager.py    V1 (dormant, será eliminado en sprint Motor 1)
+│       ├── detector.py             Matemática de arbitraje (mergeado)
+│       └── executor.py             Rollback automático (mergeado)
+├── math/         fees, kelly, arbitrage (completo y testeado)
+├── risk/         Risk manager (completo, tests E2E)
+├── monitoring/   Health endpoints, Telegram, BotState
 └── utils/        Config, logging
 ```
 
@@ -99,11 +118,22 @@ src/
 ### Motor 1: Arbitraje Intra-Kalshi
 **Tesis:** En cada evento con N outcomes, sus precios deberían sumar ≥100¢. Si suman <100¢ después de comisión, arbitraje matemático garantizado.
 
+**Estado actual (mayo 24, 2026):**
+- ✅ `src/math/arbitrage.py`: `detect_binary_arb` + `detect_multi_outcome_arb` mergeados con tests completos.
+- ✅ `src/math/fees.py`: fórmula real Kalshi `ceil(7 * count * price * (100-price) / 1_000_000)` mergeada y testeada.
+- ✅ `src/math/kelly.py`: Quarter Kelly con cap 5%.
+- ✅ `src/risk/manager.py`: stop-loss daily/weekly/monthly (calendario UTC), tests E2E completos.
+- ✅ `src/strategies/motor_1_arbitrage/orderbook.py`: OrderbookState puro (Día 1).
+- ✅ `src/strategies/motor_1_arbitrage/orderbook_manager_v2.py`: gap detection por sid + books por ticker, recovery, alerts Telegram con throttle. 15/15 tests pasan. **DORMANT** detrás de `USE_ORDERBOOK_MANAGER_V2=False`.
+- ✅ `src/strategies/motor_1_arbitrage/executor.py`: FOK paralelo + rollback sell-to-1¢, circuit breaker tras 3 rollbacks/hora.
+- 🔜 **Pendiente:** activar V2 en producción (ventana agendada mayo 25 PM).
+- 🔜 **Pendiente:** wirear detector con V2 para que detecte oportunidades reales (Día 3 del sprint).
+
 **Frecuencia esperada 2026:** 1-3 oportunidades/semana en mercados nicho (políticos, weather, eventos culturales). En MLB/NBA mainstream casi cero — los HFT institucionales los matan en milisegundos.
 
 **Sizing:** Máximo de liquidez disponible, hasta 100 contratos por outcome.
 
-**Riesgo:** 0% si se ejecuta correctamente (riesgo real es ejecución parcial — necesita rollback).
+**Riesgo:** 0% si se ejecuta correctamente (riesgo real es ejecución parcial — rollback automático mitiga).
 
 **ROI esperado por trade:** 0.5-2%
 **ROI mensual del motor:** 0.3-0.8%
@@ -130,57 +160,29 @@ src/
 
 **Sizing:** Más conservador, 2-3% capital por trade.
 
-**ROI mensual del motor:** 0.3-0.7%
-
-### Combinado: 1.5-3% mensual realista
-
 ---
 
-## 5. RISK MANAGEMENT (HARDCODED - NO TOCAR SIN APROBACIÓN EXPLÍCITA)
+## 5. GUARDRAILS Y POLÍTICAS DE OPERACIÓN
 
-### Stop-loss escalonado
-| Nivel | Umbral | Acción |
-|---|---|---|
-| Diario | -3% capital activo | Pausa automática 24h |
-| Semanal | -8% capital activo | Pausa 7 días + Telegram alert |
-| Mensual | -15% capital activo | Kill-switch total + revisión código |
+1. **`TRADING_ENABLED=false` por defecto.** El bot opera en producción
+   contra la API real solo para captura de datos. Trading desactivado.
 
-### Caps de exposición
-- **Sizing máximo por trade:** 5% capital activo (cap absoluto independiente de Kelly)
-- **Exposure simultáneo total:** 25% capital activo
-- **Posiciones simultáneas máximas:** 10
-- **Kelly fraction:** 0.25 (¼ Kelly, NO full Kelly)
+2. **Fase actual: Fase 1 (data capture).** Acumulando snapshots reales de
+   40+ markets sin tradear. Toda activación posterior requiere checklist.
 
-### Capital management
-- **Capital activo en Kalshi:** escalado según validación
-  - **Fase 1 (días 1-30):** `KALSHI_ENV=production` con `TRADING_ENABLED=false`.
-    Captura de data REAL con orderbooks reales de producción. Sin trading.
-    Capital activo $0. Razón: demo de Kalshi tiene data sintética insuficiente
-    para entrenar Motor 1 (arbitraje requiere ineficiencias reales, no simuladas).
-  - **Fase 2 (días 31-60):** `TRADING_ENABLED=true` tras 7+ días de captura
-    estable y detección de oportunidades funcionando. Capital $300.
-  - **Fase 3 (días 61-90):** $800 si Fase 2 cierra positivo.
-  - **Fase 4 (día 91+):** hasta $2,000 si Fase 3 cierra positivo.
-- **Reserva en cuenta bancaria:** siempre $500 mínimo.
-- **Riesgo aceptado en Fase 1:** activar `TRADING_ENABLED=true` por error
-  mientras estamos sobre API production tradearía dinero real sin validación
-  previa. Mitigación: cambio de la flag requiere checklist explícito (abajo).
-
-### Reglas de operación
-1. **NO trades automáticos** hasta Semana 2 del roadmap.
-2. **`TRADING_ENABLED=true`** solo después de validación explícita. El bot
-   opera sobre API production desde Fase 1, pero la flag bloquea ejecución
-   real hasta cumplir el checklist.
 3. **Activación de `TRADING_ENABLED` requiere TODO lo siguiente:**
    - [ ] Mínimo 7 días corriendo sin crashes ni reinicios anómalos.
    - [ ] `tracked_markets > 50` estable durante esos 7 días.
    - [ ] DB con `market_snapshots` y `orderbook_events` poblados continuamente.
    - [ ] Logs muestran arbitrajes detectados (aunque no se ejecuten).
-   - [ ] RiskManager validado con tests de integración (no solo unitarios).
+   - [ ] `OrderbookManagerV2` activo y sin gaps anómalos por 72h+.
+   - [ ] RiskManager validado con tests de integración (✅ completo).
    - [ ] Capital activo confirmado a $300 (no más en Fase 2).
    - [ ] Decisión documentada en commit message del cambio de la flag.
+
 4. **Cualquier cambio a parámetros de risk** (stop-loss, exposure, sizing,
    Kelly fraction) requiere aprobación explícita de Noel.
+
 5. **Después de modificación de risk params**, mínimo 48h de monitoring antes
    de cambios adicionales.
 
@@ -212,11 +214,8 @@ src/
    - `datetime.now(UTC)` directamente como write — produce aware datetime que
      SQLite guarda como string ISO, retornado como naive en reads → mismatch
 
-   Razón: SQLite no preserva timezone info. Mezclar aware/naive produce
-   `TypeError: can't compare offset-naive and offset-aware datetimes` en runtime.
-
 3. **Reconcile en boot tolerante a fallas.**
-   El bloque de reconciliación de trades huérfanos (Fase 6) está envuelto en
+   El bloque de reconciliación de trades huérfanos está envuelto en
    try/except. Si Kalshi está caído al arranque, el bot sigue corriendo — la
    captura de datos continúa funcionando y el error se registra en
    `BotState.last_error` para visibilidad en `/status`.
@@ -233,33 +232,33 @@ src/
 - Llaves diferentes para demo y producción (en Fase 1 usamos las de producción)
 
 ### Endpoints clave
-- **REST base:** `https://demo-api.kalshi.co/trade-api/v2` (demo, NO usado en Fase 1)
 - **REST base:** `https://api.elections.kalshi.com/trade-api/v2` (producción, ACTIVO)
 - **WS prod:** `wss://api.elections.kalshi.com/trade-api/ws/v2`
+- **Demo:** `https://demo-api.kalshi.co/trade-api/v2` (NO usado en Fase 1)
 
 ### Rate limits
-- 100 req/sec REST en producción
+- **200 reads/sec** REST en producción
 - WS sin límite específico pero respeta backpressure
-- **Importante:** al arranque del container puede topar 429 si hay rate limit
-  acumulado de despliegues previos.
-- **Kalshi NO envía header `Retry-After`** (confirmado docs mayo 2026).
-  El cliente usa backoff exponencial puro (1s, 2s, 4s… cap 60s).
-  No existe ningún header `X-RateLimit-*` tampoco.
-- **Endpoint de diagnóstico:** `GET /account/limits` retorna los límites
-  configurados para la API key actual.
-- **API V2 fixed-point (marzo 2026):** Los campos `yes_bid`, `yes_ask`,
-  `no_bid`, `no_ask` como integers fueron deprecados. Ahora vienen como
-  strings `"0.4500"` en campos `yes_bid_dollars` etc. El cliente tiene
-  helper `parse_price_to_cents()` con fallback a campos legacy.
+- **Importante:** Kalshi NO envía header `Retry-After` (confirmado empírica-
+  mente, Lección 5). El cliente usa exponential backoff con cap=60s sin
+  parsear ese header.
 
 ### Comisiones (CRÍTICO para cálculo de edge)
 - **~7% sobre profit aproximación high-level** (para Kelly sizing rough).
 - **Fórmula real (USAR para Motor 1 / arbitraje):**
-  `fee_cents = ceil(0.07 * count * price_yes_cents * (100 - price_yes_cents) / 10000)`
+  `fee_cents = ceil(7 * count * price_yes_cents * (100 - price_yes_cents) / 1_000_000)`
+  (Integer arithmetic. Mergeado en `src/math/fees.py`.)
 - Aplica solo a trades rentables.
 - **Cualquier cálculo de edge en arbitraje debe usar la fórmula real, no la
   aproximación.** En arbitrajes con profit gross de pocos centavos, la
   diferencia decide si hay edge o no.
+
+### Shape de mensajes WebSocket (2026)
+- **orderbook_snapshot:** `{"market_ticker": str, "msg": {...}}`. El payload
+  expone `yes_dollars_fp` / `no_dollars_fp` como primary (legacy `yes` / `no`
+  como fallback).
+- **orderbook_delta:** incluye `seq` y `previous_seq` para validación de
+  secuencia. Validación estricta — gap → `SidGapError` → recovery.
 
 ### Demo vs Producción
 - Demo da $10,000 virtuales pero data SINTÉTICA (insuficiente para entrenar
@@ -299,8 +298,6 @@ src/
 
 ## 8. DECISIONES TÉCNICAS DEFERIDAS
 
-### Decisiones que tomaremos cuando aplique (no ahora)
-
 | Decisión | Trigger | Notas |
 |---|---|---|
 | Migrar SQLite → Postgres | >100k trades/mes | No anticipado en primer año |
@@ -310,7 +307,7 @@ src/
 | ML/AI offline para análisis | Tener >1000 trades de data | NUNCA en hot path de decisiones |
 | Co-locación cerca de Kalshi servers | >$1000/mes profit | Solo si latencia <5ms paga |
 | Migración a aiosqlite + WAL | Si lag de DB pasa de 30ms | Refactor mayor, posponer |
-| Multi-outcome arbitrage en Motor 1 | Después de v1 binario validada | Más complejo de ejecutar |
+| Eliminar `orderbook_manager.py` (V1) | Sprint de activación Motor 1 | Aún referenciado por runner/detector |
 
 ---
 
@@ -351,7 +348,6 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 **Decisión derivada:**
 - Toda llamada externa al arranque debe tener retry con backoff exponencial.
 - Excepciones en discovery van a nivel `warning`, no `debug`.
-- Cliente REST respeta `Retry-After` header de Kalshi.
 - `/status` endpoint expone `capture_running`, `ws_connected`, `last_ws_message`
   para detectar muertes silenciosas.
 
@@ -373,8 +369,32 @@ Mercados de Kalshi son competidos por institucionales (Susquehanna, etc.) y bots
 - `wait_exponential(max=10)` → `wait_exponential(max=60)`.
 - `_record_api_error()` helper en `kalshi_rest.py` actualiza `BotState` al agotar retries.
 - `asyncio.sleep(2.0)` entre prefixes en `_discover_markets`.
-- `TARGET_SERIES_PREFIXES` restaurado a 9 prefixes completos (2026-05-17).
+- `TARGET_SERIES_PREFIXES` reducido a 2 (KXMLB, KXNBA) temporalmente.
 - Script `scripts/diagnose_kalshi.py` standalone para debug de conectividad.
+
+### Lección 6 (Mayo 16-17, 2026): Misclasificación de 401 como 429 + diagnóstico contra host equivocado
+**Contexto:** Bloqueo productivo de 48h con loop de "429s" interminables y
+`/status` sin errores visibles. El bot reportaba healthy mientras estaba
+incapaz de hacer ningún request real.
+
+**Causa raíz:** Combo de tres bugs:
+1. `_classify_error` en `kalshi_rest.py` mapeaba 401 de proxy-migration de
+   Kalshi como 429 (rate limit), entrando en retry loop infinito sin avanzar.
+2. `KalshiAuthError` no llamaba `BotState.record_error()`, por lo que el
+   401 mal-clasificado nunca aparecía en `/status` — falla invisible al
+   operador.
+3. `scripts/diagnose_kalshi.py` tenía hardcoded un host deprecated, por lo
+   que el diagnóstico salía limpio contra un servidor que no era el real,
+   confirmando falsamente que "Kalshi está bien".
+
+**Decisión derivada:**
+- `_classify_error` siempre verifica el status code antes de mapear.
+- Toda excepción de Kalshi (auth, rate, server, client) registra a
+  `BotState.record_error()`. No hay path silencioso.
+- Script de diagnóstico lee el host del `.env`, nunca hardcoded.
+- **Patrón confirmado:** "el diagnóstico está limpio" ≠ "el sistema está
+  sano" — siempre verificar que el diagnóstico esté apuntando al sistema
+  real, no a un fantasma.
 
 ### Lección 7 (Mayo 13-14, 2026): asyncio.gather traga excepciones + websockets API change
 
@@ -390,8 +410,8 @@ superior, pip instaló 14.x+ al rebuild de Docker, código quedó incompatible.
 **Causa raíz arquitectónica (más importante):** `data_capture.py:run()` usaba
 `asyncio.gather(ws.run(), snapshots(), return_exceptions=True)`. La excepción
 de ws.run() fue capturada como result y descartada. snapshots() siguió corriendo
-solo, dando la ilusión de "capture_running: true". TERCERA vez del mismo patrón
-(lecciones 4, 6, 7).
+solo, dando la ilusión de "capture_running: true". **TERCERA vez del mismo
+patrón (lecciones 4, 6, 7).**
 
 **Decisión derivada:**
 - PROHIBIDO `asyncio.gather(..., return_exceptions=True)` para tareas críticas.
@@ -407,72 +427,62 @@ solo, dando la ilusión de "capture_running: true". TERCERA vez del mismo patró
 "el bot está corriendo". El monitor SIEMPRE valida contra estado real, nunca
 contra flag interna sin contraste empírico.
 
-### Lección 8 (Mayo 22, 2026): Push masivo acumula deuda invisible de revisión
+### Lección 8 (Mayo 24, 2026): Discovery primero, planning después
+**Contexto:** Sprint de "Día 2 OrderbookFeed" planeado y briefed a Gemini.
+Después de 3 rondas de revisión adversarial, Claude Code descubrió que
+`OrderbookManagerV2` ya existía en el repo, mergeado, dormant detrás de un
+flag, cubriendo 90% del scope que Día 2 prometía construir. Tres semanas
+de planning sobre código que ya existía.
 
-**Contexto:** 14 commits locales acumulados sin push durante 5+ días de desarrollo. Descubierto al hacer
-el primer push real antes de activar V2. El CTO no había podido revisar 11 de los 14 commits.
+**Causa raíz:** Capa de planning (Claude Project) escribió briefs detallados
+asumiendo el estado del repo basándose en docstrings desactualizados de
+módulos vecinos, sin pedir a Claude Code un dump empírico del estado real.
 
-**Causa raíz:** Ningún push ocurría después de cada PR terminado — los commits vivían solo en local.
-El workflow de Claude Code no incluía `git push` explícito como paso del proceso.
+**Decisión derivada:**
+- Antes de escribir cualquier brief de implementación, Claude Project pide
+  a Claude Code 5 min de discovery: listar archivos, dump de signatures,
+  grep de importadores. El brief sale DESPUÉS de ver el estado real.
+- Los docstrings de módulos pueden quedar como fósiles cuando el código
+  alrededor evoluciona. No son fuente de verdad para planning. El código
+  real lo es.
 
-**Decisión derivada:** Push a origin/main después de cada PR o batch de commits cohesivo.
-Máximo 3–4 commits sin push. Si origin/main no tiene el código, nadie puede revisarlo.
-
-### Lección 9 ([FECHA DE ACTIVACIÓN]): Activación de OrderbookManagerV2
-
-*Completar después de la activación con observaciones reales.*
-
-**Contexto:** Primera activación de V2 con `USE_ORDERBOOK_MANAGER_V2=True` en producción.
-V2 diferencia clave vs V1: recovery por WS (no REST), buffer-and-drain, mark_stale sin clear.
-
-**Resultado:** [a completar]
-
-**Causa raíz de cualquier problema observado:** [a completar]
-
-**Decisión derivada:** [a completar — incluir: umbrales de alert correctos, frecuencia de gaps real,
-si mark_stale/drain funcionó bajo carga real, cualquier edge case no anticipado]
+**Anti-patrón confirmado:** "según el docstring..." ≠ "según el código actual..."
 
 ---
 
 ## 10. ROADMAP TÉCNICO
 
 ### Semana 1 — Infrastructure ✅ COMPLETADO
-- [x] Auth RSA-PSS (3/3 tests pasan)
+- [x] Auth RSA-PSS
 - [x] Cliente REST async con retries
-- [x] Cliente WebSocket con reconexión
-- [x] SQLite schema (5 tablas)
-- [x] Health server FastAPI
+- [x] Cliente WebSocket con reconexión + pin de versión
+- [x] SQLite schema
+- [x] Health server FastAPI con `/status` rico
 - [x] Dockerfile multi-stage
 - [x] docker-compose.yml para Coolify
-- [x] Documentación de deploy
 - [x] Deploy en Coolify VPS
-- [x] Fixes de resilience aplicados (data_capture retry, 429 handling, /status visibility)
+- [x] Fixes de resilience (lecciones 4, 5, 6, 7 aplicadas)
 
-**Pendiente Noel antes de Semana 2:**
-- [ ] Verificar `/health` retorna 200 después de fixes
-- [ ] Verificar `/status` muestra `capture_running: true`, `tracked_markets > 50`
-- [ ] Confirmar DB tiene rows en `market_snapshots` y `orderbook_events` (>0 después de 10 min)
-- [ ] 24h+ de captura estable antes de retomar Motor 1
-- [ ] Telegram chat_id corregido y `alert_startup` funciona
-- [ ] Coolify healthcheck apunta a puerto 8080 (no 8000)
+### Semana 2 — Motor 1: Arbitraje Intra-Kalshi
+**Estado actual (mayo 24, 2026):**
+- [x] Fase 1: `src/math/fees.py` + `src/math/kelly.py`
+- [x] Fase 2: `src/risk/manager.py` con stop-loss daily/weekly/monthly +
+      tests E2E
+- [x] Fase 3: Cliente REST con API V2 fixed-point support
+- [x] Fase 4a: `src/strategies/motor_1_arbitrage/detector.py` (matemática:
+      detect_binary_arb + detect_multi_outcome_arb con tests)
+- [x] Fase 4b: `OrderbookState` (Día 1) puro en memoria con tests completos
+- [x] Fase 4c: `OrderbookManagerV2` mergeado con 15/15 tests + alerts +
+      visibilidad en /status (Mayo 24)
+- [x] Fase 5: `src/strategies/motor_1_arbitrage/executor.py` con rollback
+- [ ] Fase 6a: **Activar `USE_ORDERBOOK_MANAGER_V2=True`** (agendado:
+      mayo 25 PM, ver Runbook 12.5)
+- [ ] Fase 6b: Wirear detector con V2 (Día 3 del sprint, después de
+      activación validada)
+- [ ] Fase 7: Demo testing 7 días → checklist de activación
+      `TRADING_ENABLED`
 
-### Semana 2 — Motor 1: Arbitraje Intra-Kalshi (binario + multi-outcome)
-
-**Decisiones tomadas (2026-05-09):**
-- Scope v1: arbitraje binario (YES+NO) + multi-outcome (N markets en 1 event).
-- Ejecución: FOK paralelo con `asyncio.gather` + rollback automático
-  sell-to-market en partial fills.
-
-**Fases internas (orden bloqueante):**
-- [ ] Fase 1: `src/math/fees.py` (fee real Kalshi) + `src/math/kelly.py`
-- [ ] Fase 2: `src/risk/manager.py` con persistencia SQLite (tabla `RiskState`)
-- [ ] Fase 3: Migración `kalshi_rest.py` a API V2 fixed-point format
-- [ ] Fase 4: `src/strategies/motor_1_arbitrage/detector.py` (binario + multi)
-- [ ] Fase 5: `src/strategies/motor_1_arbitrage/executor.py` con rollback
-- [ ] Fase 6: Integración con runner + WS subscription a `orderbook_delta`
-- [ ] Fase 7: Demo testing 7 días con `TRADING_ENABLED=false` → activación
-
-### Semana 3 — Motor 2: Kalshi vs Sportsbooks
+### Semana 3 — Motor 2: Kalshi vs Sportsbooks (NO INICIADO)
 - [ ] Cliente The Odds API
 - [ ] Algoritmo no-vig
 - [ ] Matcher de eventos cross-platform
@@ -480,10 +490,9 @@ si mark_stale/drain funcionó bajo carga real, cualquier edge case no anticipado
 - [ ] Caps de risk manager integrados
 - [ ] Live testing en demo con bankroll completo
 
-### Semana 4 — Motor 3 + Hardening
+### Semana 4 — Motor 3 + Hardening (NO INICIADO)
 - [ ] CLV strategy (open vs close pricing)
-- [ ] Risk manager activo con kill-switches
-- [ ] Telegram alerts (trades, P&L, errors)
+- [ ] Telegram alerts ampliados (trades, P&L)
 - [ ] Dashboard local FastAPI
 - [ ] Runbook de operación
 - [ ] Backup automatizado SQLite
@@ -502,30 +511,18 @@ si mark_stale/drain funcionó bajo carga real, cualquier edge case no anticipado
 | Item | Severidad | Fix esperado |
 |---|---|---|
 | `kalshi_python_sync` SDK no usado, hacemos requests manuales | Baja | Probablemente OK, evaluar después |
-| ✅ RESUELTO 2026-05-14: No hay retry exponencial en WS reconnect | Resuelto | supervisor pattern + escalación tras 5 fallos consecutivos |
-| Tests cubren solo signer y config | Media | Agregar tests semana 2-3 |
-| Sin alerting si data capture muere silenciosamente | Resuelto 2026-05-09 | `/status` ahora expone `capture_running` y `ws_connected` |
-| ✅ RESUELTO 2026-05-14: websockets extra_headers API incompatibility + gather tragando TypeError | Resuelto | additional_headers + supervisor pattern + BotState.ws_connected + heartbeat staleness |
-| Snapshots silenciosamente paran de escribir a DB | Media | Investigar lock SQLite o except:pass en _take_snapshots |
-| Audit completo de TODOS los asyncio.gather(return_exceptions=True) en codebase | Alta | Antes de TRADING_ENABLED=true |
+| ✅ RESUELTO 2026-05-14: WS reconnect sin retry exponencial | Resuelto | supervisor + escalación tras 5 fallos |
+| ✅ RESUELTO 2026-05-14: websockets API incompatibility + gather tragando TypeError | Resuelto | additional_headers + supervisor pattern + heartbeat |
+| ✅ RESUELTO 2026-05-17: `_classify_error` mapea 401 como 429 (Lección 6) | Resuelto | Fix mergeado, todas las excepciones loguean a BotState |
+| ✅ RESUELTO 2026-05-24: `manager.py` + `manager_normalize.py` zombi en `motor_1_arbitrage/` | Resuelto | Eliminados (commit d7ce624) |
+| `orderbook_manager.py` (V1) aún referenciado en `runner.py`, `detector.py`, `__init__.py` | Media | Eliminar en sprint de activación Motor 1 (cuando se migren los call-sites a V2) |
+| Audit completo de TODOS los `asyncio.gather(return_exceptions=True)` residuales en codebase | Alta | Antes de `TRADING_ENABLED=true` |
+| `parse_price_to_cents` en `data_capture.py` usa `round(float(v) * 100)` vs `Decimal` en `manager_normalize.py` (legacy) | Baja | Unificar a Decimal cuando se simplifique normalización post-V2 |
+| Patrón `or` en normalizadores (`payload.get("seq") or payload.get("...") or msg.get("seq")`) enmascara valores `0` legítimos | Baja | Refactor a helper `_coalesce` que filtre por `is not None` |
 | SQLite sin VACUUM scheduled | Baja | Agregar a cron mensual |
 | Sin metrics export (Prometheus, etc.) | Baja | No anticipado primer año |
+| Snapshots silenciosamente paran de escribir a DB (observado intermitente) | Media | Investigar lock SQLite o except:pass en `_take_snapshots` |
 | Operando en `KALSHI_ENV=production` sin validación previa en demo | Media | Mitigado por `TRADING_ENABLED=false` + checklist sección 5 |
-| Telegram chat_id no validado en arranque | Baja | Validar al boot que `send_alert` funciona, sino warning |
-| `data_capture` sin retry de discovery (bug arranque 2026-05-09) | Resuelto | Loop con backoff exponencial 5s→300s |
-| Cliente REST parseaba `Retry-After` que Kalshi no envía | Resuelto 2026-05-12 | Eliminado; backoff exponencial puro max=60s |
-| Migración API V2 fixed-point (`yes_bid_dollars` string) | Resuelto 2026-05-12 | `parse_price_to_cents()` con fallback a legacy integers |
-| ✅ RESUELTO 2026-05-17: `TARGET_SERIES_PREFIXES` restaurado a 9 prefixes | Resuelto | WS estable, 130 deltas/min; discovery loop tiene sleep 2s entre prefixes |
-| ✅ RESUELTO 2026-05-16: Reconciliation post-crash integrada a runner.py con tolerancia a fallas | Resuelto | try/except + BotState.record_error; bot sigue arrancando si Kalshi flap |
-| Rollback parcial iterativo (vendiste 5 de 10, queda residual) | Alta | Después de Motor 1 v1 estable |
-| Timeout en asyncio.gather de órdenes concurrentes | Media | Después de Motor 1 v1 estable |
-| Slippage calculado contra depth=5, no representa fill real grande | Baja | Refactor cuando counts > 50 sean comunes |
-| get_orders en reconcile sin paginación (limit=100 hard cap) | Baja | Si > 100 trades pending al arranque |
-| ✅ RESUELTO 2026-05-16: Stop-Loss Semanal (-8%) implementado + tests E2E | Resuelto | _check_timeframe_stop_losses con calendar windows; tests en test_manager.py |
-| ✅ RESUELTO 2026-05-16: Stop-Loss Mensual (-15%) implementado + tests E2E | Resuelto | Ídem; convención naive UTC documentada en CONTEXT.md sección 5 |
-| `_get_current_exposure_usd` sobrestima exposición de arbitrajes ya fillados completos | Media | Cuando volumen de arbitrajes crezca |
-| PnL realized-only en daily stop loss (no cuenta filled-not-settled) | Baja | Aceptable para Motor 1, revisar para Motor 3 |
-| Race condition entre check_pre_trade concurrentes (single executor mitiga) | Baja | Cuando haya múltiples motores corriendo |
 
 ---
 
@@ -559,102 +556,221 @@ en production desde Fase 1 (con `TRADING_ENABLED=false` como guardia).
 
 ❌ **Tragar excepciones a nivel `debug`:** Si una llamada externa falla al
 arranque, debe verse en logs INFO o WARNING. Capturar en `debug` esconde
-muertes silenciosas (lección Mayo 9, 2026).
+muertes silenciosas (lección 4).
+
+❌ **`asyncio.gather(..., return_exceptions=True)` en tareas críticas:** Las
+excepciones se vuelven `results` y se descartan. Usar supervisor pattern
+con try/except explícito (lección 7, confirmada 3 veces).
 
 ❌ **Aproximación de fee 7% flat en Motor 1:** La aproximación sirve para
 sizing de Motor 2/3 (Kelly), pero arbitraje requiere la fórmula real de
-Kalshi (`ceil(0.07 * count * price * (1-price))`). En profits chicos, la
-diferencia decide si hay edge o no.
+Kalshi (`ceil(7 * count * price * (100-price) / 1_000_000)`). En profits
+chicos, la diferencia decide si hay edge o no.
+
+❌ **`datetime.utcnow()` o `datetime.now()` sin argumento:** SQLite no preserva
+tz info. Usar `datetime.now(UTC).replace(tzinfo=None)` para todos los writes
+(decisión Risk Manager).
+
+❌ **SQLAlchemy `.query()`:** Usar `select() + s.exec()` (patrón SQLModel).
+Recurring bug de Gemini en outputs.
+
+❌ **`asyncio.create_task()` desde funciones sync:** Solo desde contexto async.
+Recurring bug de Gemini.
+
+❌ **Planificar sin discovery:** Asumir el estado del repo desde docstrings o
+memoria. Lección 8: siempre pedir dump real antes de escribir briefs.
+
+❌ **Diagnóstico contra host equivocado:** Verificar que el script de diagnóstico
+apunta al sistema productivo real, no a fantasmas. Lección 6.
 
 ---
 
 ## 12.5 RUNBOOK — Activación de OrderbookManagerV2
 
-### Pre-flight checklist (completar antes de cambiar el flag)
+**Ventana de activación:** Mayo 25, 2026 (tarde). Requiere ventana de
+2-3h continuas de supervisión activa de Noel.
 
-- [ ] **Bot healthy:** `/health` retorna 200, uptime > 2h, `capture_running: true`, `tracked_markets >= 30`
-- [ ] **Sin errores recientes:** `last_error: null` en `/status` (o error > 30min atrás, no activo)
-- [ ] **278/278 tests pasan** en main (verificar con `python -m pytest -q`)
-- [ ] **DB backup manual:** snapshot del volumen Docker antes de deployar (Coolify > botkalshi > Volumes > backup ahora)
+### Pre-flight checklist (obligatorio antes de tocar el flag)
 
-### Pasos de activación
+- [ ] Bot healthy en `/status` por mínimo 1h consecutiva: `capture_running=true`,
+      `ws_connected=true`, `tracked_markets>=40`, `last_error=null`.
+- [ ] Ventana de 2-3h continuas confirmadas para supervisión activa.
+- [ ] Telegram receiver verificado: enviar mensaje de test manual y confirmar
+      recepción ANTES de tocar el flag.
+- [ ] Backup DB manual ejecutado en los últimos 30 min (snapshot del volumen
+      Docker, no esperar al cron de 6h).
 
-1. En Coolify > botkalshi > Environment Variables:
-   - Cambiar `USE_ORDERBOOK_MANAGER_V2` de `false` a `true`
-   - Verificar que `TRADING_ENABLED=false` y `MOTOR_1_ARBITRAGE_ENABLED=false` (no tocar)
-2. Click **Deploy** (no Restart — Deploy fuerza rebuild desde GitHub con el nuevo env var)
-3. Esperar que el container healthcheck pase (30–60s)
-4. Verificar log de arranque: buscar `OrderbookManagerV2 registered (data-capture only, no Motor 1)`
-5. GET `/status` → confirmar que `orderbook_manager_v2.enabled = true` y `instance != "missing"`
-6. Monitorear logs durante 30 minutos mínimos
+### Activación
 
-### Criterios de éxito (los 3 deben cumplirse)
+1. Coolify → Configuration → Environment Variables → settear
+   `USE_ORDERBOOK_MANAGER_V2=true`.
+2. Mantener `MOTOR_1_ARBITRAGE_ENABLED=false` y `TRADING_ENABLED=false`.
+3. Redeploy (toma ~2 min).
+4. Confirmar en logs de arranque: `OrderbookManagerV2 registered (data-capture only, no Motor 1)`.
 
-1. **`/status`** muestra `orderbook_manager_v2.books_initialized >= 30` dentro de los primeros 5 minutos
-2. **`gaps_last_60s`** en `/status` es ≤ 5 sostenido (sin spike > 20 en primera hora)
-3. **Sin errores nuevos** relacionados con orderbook en logs (`grep "ERROR" logs | grep -i orderbook` = vacío)
+### Criterios de ÉXITO (todos deben cumplirse en T+2h)
 
-### Criterios de rollback inmediato (cualquiera de estos → revertir)
+1. Cero `ERROR` nuevos en logs relacionados con orderbook/manager/V2.
+2. `SidGapError` rate sostenido **< 5/min** (picos puntuales OK; lo que
+   importa es la mediana).
+3. `data_capture._take_snapshots` sigue completando 40/40 cada ~5 min
+   (no regresión del path existente).
 
-1. `orderbook_manager_v2.instance = "missing"` en `/status` después del primer minuto
-2. `gaps_last_60s > 20` sostenido por más de 5 minutos consecutivos
-3. Telegram alert `sid_gap_critical` disparado más de 3 veces en la primera hora
-4. `books_initialized = 0` después de 10 minutos de uptime (books no se están llenando)
-5. `capture_running: false` o `ws_connected: false` (V2 rompió el WS handler)
+### Criterios de ROLLBACK INMEDIATO (cualquiera dispara rollback sin discusión)
 
-### Procedimiento de rollback step-by-step
+1. Más de 3 errores no relacionados a `SidGapError` en 10 min.
+2. `SidGapError` rate sostenido **> 20/min** por más de 5 min.
+3. `tracked_markets` cae por debajo de 35 (regresión del path estable).
+4. `/status` devuelve `capture_running=false` o `ws_connected=false` por
+   más de 60s.
+5. Cualquier `CRITICAL` o cualquier excepción que no estaba en producción
+   antes.
 
-1. Coolify > botkalshi > Environment Variables: `USE_ORDERBOOK_MANAGER_V2=false`
-2. Click **Deploy** (rebuild completo, no Restart)
-3. Verificar que `/status` vuelve a mostrar `orderbook_manager_v2: {enabled: false}`
-4. Verificar que `capture_running: true` y `ws_connected: true` se restauran
-5. Documentar en este archivo qué criterio de rollback disparó y cuándo
+### Procedimiento de rollback
 
-### Diagnóstico rápido en logs
+1. Coolify → env var → `USE_ORDERBOOK_MANAGER_V2=false`.
+2. Redeploy.
+3. Verificar en logs ausencia del mensaje de registro de V2.
+4. Confirmar `/status` vuelve al baseline anterior (`orderbook_manager_v2:
+   {enabled: false}`).
+5. **Tiempo objetivo end-to-end: < 5 min** desde detección a baseline
+   restaurado.
+
+### Grep patterns para diagnóstico rápido
 
 ```bash
-# Ver todos los gaps detectados
-grep "SidGapError\|stream_gap\|sid.*gap" /var/log/bot/app.log
-
-# Ver estado del V2 al arranque
-grep "OrderbookManagerV2" /var/log/bot/app.log
-
-# Ver recoveries iniciados
-grep "recovery" /var/log/bot/app.log | grep -v test
-
-# Ver alertas de Telegram del orderbook
-grep "v2.alert_send\|sid_gap_warning\|sid_gap_critical" /var/log/bot/app.log
-
-# Ver errores de orderbook en general
-grep "ERROR\|CRITICAL" /var/log/bot/app.log | grep -i "orderbook\|manager"
+# En Coolify logs del contenedor:
+grep "SidGapError" 
+grep "OrderbookManagerV2"
+grep "recovery"
+grep -i "error\|critical\|exception"
+grep "Snapshots:"          # debe mostrar 40/40 cada ~5min
 ```
 
-En Coolify los logs se ven en: botkalshi > Logs (tab). Usar filtro de texto.
-
-### Baseline esperado en /status con V2 activo (condición nominal)
+### Métricas en `/status` para baseline vs degradación
 
 ```json
 "orderbook_manager_v2": {
   "enabled": true,
-  "books_initialized": 38,      // ≈ tracked_markets
-  "sids_tracked": 1,             // normalmente 1 sid para data-capture
-  "sids_recovering": 0,          // 0 en condición nominal
-  "gaps_last_60s": 0,            // 0 en condición nominal; ≤5 es aceptable
-  "last_gap_at": null            // null si no hubo gaps; ISO si hubo
+  "books_initialized": int,    // esperado: crece a 40 en T+1min
+  "sids_tracked": int,         // esperado: 1-5 sids
+  "sids_recovering": int,      // esperado: 0 en steady state
+  "gaps_last_60s": int,        // esperado: 0-5 picos OK
+  "last_gap_at": str | null    // ISO timestamp del último gap
 }
 ```
 
-Si `sids_recovering > 0` sostenido: el WS está con gaps frecuentes, investigar latencia de red.
+### Post-activación
+
+Si T+2h pasa limpio:
+- Declarar éxito y dejar corriendo.
+- Documentar observaciones reales (gap rate típico, books_initialized
+  steady-state, etc.) en una sub-lección o ticket.
+- Avanzar a Día 3 (wirear detector con V2 para detección real de
+  oportunidades de arbitraje).
+
+Si rollback ocurre:
+- NO reintentar inmediatamente. Capturar logs completos.
+- Analizar root cause con Claude Project antes de segundo intento.
 
 ---
 
 ## 13. CONTACTO Y OWNERSHIP
 
 - **Sole operator:** Noel Pineda
-- **Repos:** GitHub privado
+- **Repos:** GitHub privado (Noahstark23/botkalshi)
 - **Hosting:** DigitalOcean VPS (compartido con Nortex stack)
 - **Capital:** Personal, segregado en cuenta Kalshi separada
 - **Tax filing:** US individual (1099 from Kalshi)
+
+---
+
+## 14. WORKFLOW OPERATIVO
+
+**Vigente desde mayo 24, 2026.** Reemplaza el workflow de 3 capas
+homogéneo anterior. Calibrado por bucket de riesgo de la tarea.
+
+### Roles
+
+**Gemini** → CTO de visión estratégica. Conversaciones cada 2-4 semanas
+para decisiones de high-level: activación de motores, agregar plataformas
+(Polymarket), cambios al bankroll target, market making. Le pasamos el
+contexto actualizado, opina, Claude Project cuestiona, Noel decide.
+
+**Claude Project** → Planning táctico + decisión arquitectónica + revisión
+adversarial cuando aplique. Escribe briefs para Claude Code en ~95% de
+los casos. Reviews calibradas por bucket de severidad: **bloqueante** (no
+mergea) vs **deuda** (ticket separado, mergea igual). No invento críticas
+para justificar la capa.
+
+**Claude Code** → Ejecución sobre la máquina local + Coolify. Implementa,
+testea, deploya. NO hace recomendaciones operacionales sobre cuándo
+activar features — esa decisión es de Noel.
+
+**Noel** → Decisor final + revisor humano de cada PR antes de merge +
+operador de Coolify + único con autoridad sobre activación de flags
+críticos.
+
+### Buckets de tareas
+
+🟢 **Rutinaria** → Noel → Claude Code directo. Sin pasar por Claude Project.
+- Limpieza de código zombi
+- Agregar logs / alertas / métricas
+- Configurar env vars
+- Refactor de un archivo aislado bajo 100 LOC
+- Documentación
+- Bumps de dependencias menores
+
+🟡 **Implementación táctica** → Noel → Claude Project (planning) → Claude
+Code (ejecución) → Noel (revisión PR) → merge. Sin Gemini en el medio.
+- Módulos nuevos aislados
+- Endpoints nuevos
+- Integraciones con clientes externos no-críticos
+- Tests de cobertura
+- Detector de arbitraje (Día 3)
+
+🔴 **Crítica** → workflow completo de 3 capas (Gemini → Claude Project →
+Claude Code → Noel).
+- Cualquier cosa que toque `risk/manager.py`
+- Cualquier cosa que toque `auth/`
+- Lógica de sizing, Kelly, stop-loss
+- Ejecutores de trades / rollback / partial fills
+- Cambios al checklist de `TRADING_ENABLED`
+- Activación de capital real
+
+### Reglas mías que cambian
+
+1. **Discovery primero, planning después.** Antes de escribir un brief de
+   implementación, Claude Project pide a Claude Code 5 min de discovery del
+   repo. Nunca asumir que un módulo no existe sin verificarlo. (Origen:
+   Lección 8.)
+
+2. **Reviews calibradas por bucket de severidad.** En tareas 🔴, mi review
+   devuelve solo dos categorías: **bloqueante** (no mergea) y **deuda**
+   (ticket separado, mergea igual). Cero "13 issues mezclados".
+
+3. **No invento críticas para justificar la capa.** Si el código está bien,
+   digo "está bien, mergeamos".
+
+### Reglas de Noel para que el workflow funcione
+
+1. **Noel decide el bucket al inicio de cada tarea.** "Esto es 🟢/🟡/🔴".
+   Si no especifica, Claude Project asume 🟡 y arranca planning.
+
+2. **No reabrir buckets a mitad de tarea.** Si arrancamos como 🟢 y a mitad
+   descubrimos que toca algo crítico, paramos y reclasificamos a 🔴. Pero
+   no oscilamos cada 3 mensajes.
+
+3. **Si el workflow se siente lento, decirlo.** La calibración es un
+   proceso, no un set-and-forget.
+
+### Lo que NO cambia
+
+- `TRADING_ENABLED` sigue en False hasta cumplir el checklist completo.
+- Todos los anti-patterns de sección 12 siguen vigentes.
+- Decisiones críticas siempre con human gate (Noel).
+- Lecciones aprendidas se siguen documentando con causa raíz + decisión
+  derivada + anti-patrón confirmado.
 
 ---
 
