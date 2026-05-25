@@ -74,21 +74,23 @@ Poll every 5 min via: `curl http://<host>:18080/status | python3 -m json.tool | 
 
 ## DB Backup (execute in Coolify terminal BEFORE touching flag)
 
-```bash
-# Option A — in-container copy (fastest, ~instant for <100MB DB)
-cp /app/data/trades.db /app/data/trades_backup_$(date +%Y%m%d_%H%M%S).db
+> **Why not `cp`:** `cp` on a live SQLite file with concurrent writers (~26 rows/sec from
+> snapshot REST path) can produce a torn, unrecoverable copy. Use SQLite's online backup
+> API instead — it is atomic and safe with active writers.
 
-# Option B — full volume snapshot from VPS host
-docker run --rm \
-  -v kalshi_data:/data:ro \
-  -v /tmp:/backup \
-  alpine tar czf /backup/kalshi_data_$(date +%Y%m%d_%H%M%S).tar.gz -C /data .
+```bash
+# Step 1 — atomic backup via SQLite online backup API
+docker exec kalshi-bot sqlite3 /app/data/trades.db \
+  ".backup /app/data/trades_backup_$(date +%Y%m%d_%H%M%S).db"
+
+# Step 2 — verify file exists
+docker exec kalshi-bot ls -lh /app/data/trades_backup_*.db
+
+# Step 3 — integrity check (must return "ok" before proceeding)
+docker exec kalshi-bot sqlite3 /app/data/trades_backup_*.db "PRAGMA integrity_check;"
 ```
 
-Verify backup exists before proceeding:
-```bash
-ls -lh /app/data/trades_backup_*.db
-```
+If Step 3 does not return `ok`: repeat Steps 1–3 before touching the flag.
 
 ---
 
