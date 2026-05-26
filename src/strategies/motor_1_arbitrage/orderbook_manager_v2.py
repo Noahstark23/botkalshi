@@ -167,12 +167,11 @@ class OrderbookManagerV2:
                     asyncio.create_task(self._fire_alert(*alert_args))
                 raise SidGapError(sid=sid, expected_seq=expected_seq, received_seq=new_seq)
 
-        self._last_seq_by_sid[sid] = new_seq
-
         if msg_type == "orderbook_snapshot":
             self._apply_snapshot_msg(raw_msg)
         else:
             self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
+        self._last_seq_by_sid[sid] = new_seq  # Only reached if apply succeeded
 
     @property
     def tracked_tickers(self) -> frozenset[str]:
@@ -341,6 +340,13 @@ class OrderbookManagerV2:
         yes_raw = msg.get("yes_dollars_fp") or msg.get("yes") or []
         no_raw = msg.get("no_dollars_fp") or msg.get("no") or []
 
+        logger.info(
+            f"snapshot ticker={ticker} seq={seq} "
+            f"num_yes_levels={len(yes_raw)} num_no_levels={len(no_raw)} "
+            f"sample_yes={yes_raw[:3]!r} sample_no={no_raw[:3]!r}"
+        )
+        logger.debug(f"snapshot raw payload: {raw_msg!r}")
+
         yes_levels = _parse_fp_levels(yes_raw, ticker, "yes")
         no_levels = _parse_fp_levels(no_raw, ticker, "no")
 
@@ -408,6 +414,8 @@ def _parse_fp_levels(
             logger.warning(
                 f"OrderbookManagerV2: unparseable level for {ticker}/{side}: {lvl!r}"
             )
+            continue
+        if size == 0:
             continue
         result.append([price_cents, size])
     return result

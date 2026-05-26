@@ -317,7 +317,7 @@ class KalshiWebSocket:
         )
         for r in results:
             if isinstance(r, Exception):
-                logger.exception(f"Handler exception en {msg_type}: {r}")
+                logger.opt(exception=r).error(f"Handler exception en {msg_type}: {r}")
 
 
 def _stable_connection(connected_at: datetime | None) -> float:
