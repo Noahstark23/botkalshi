@@ -341,11 +341,11 @@ class OrderbookManagerV2:
         no_raw = msg.get("no_dollars_fp") or msg.get("no") or []
 
         logger.info(
-            f"snapshot ticker={ticker} seq={seq} "
-            f"num_yes_levels={len(yes_raw)} num_no_levels={len(no_raw)} "
-            f"sample_yes={yes_raw[:3]!r} sample_no={no_raw[:3]!r}"
+            f"V2 snapshot: ticker={ticker} seq={seq} "
+            f"num_yes={len(yes_raw)} num_no={len(no_raw)} "
+            f"sample_yes={yes_raw[:3]} sample_no={no_raw[:3]}"
         )
-        logger.debug(f"snapshot raw payload: {raw_msg!r}")
+        logger.debug(f"V2 snapshot raw: ticker={ticker} payload={msg!r}")
 
         yes_levels = _parse_fp_levels(yes_raw, ticker, "yes")
         no_levels = _parse_fp_levels(no_raw, ticker, "no")

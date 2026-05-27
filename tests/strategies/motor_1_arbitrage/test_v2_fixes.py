@@ -3,7 +3,7 @@ Regression tests for three V2 bugs fixed in fix(v2): resolve orderbook size=0 de
 
 Test 1: _parse_fp_levels drops size=0 levels (size=0 convention discrepancy fix)
 Test 2: seq counter NOT advanced when apply_delta raises (seq ordering fix, normal delta)
-Test 3: seq counter NOT advanced when apply_delta raises (seq ordering fix, delta=-6247)
+Test 3: seq counter NOT advanced when apply_delta raises (seq ordering fix, delta=-6247, production magnitudes)
 Test 4: _dispatch logs full traceback via logger.opt(exception=r).error (not NoneType: None)
 """
 from __future__ import annotations
@@ -31,15 +31,14 @@ def make_v2() -> OrderbookManagerV2:
 # =====================================================
 
 
-def test_parse_fp_levels_drops_size_zero():
-    """Level [price=50, size=0] must not appear in the result."""
-    raw = [["0.50", "0"], ["0.45", "100"]]
-    result = _parse_fp_levels(raw, "TICKER-A", "yes")
+def test_parse_fp_levels_filters_size_zero():
+    """Snapshot con [price, 0] entre levels válidos: size=0 se filtra antes de apply_snapshot."""
+    raw_levels = [["0.4500", "100"], ["0.5000", "0"], ["0.5500", "50"]]
+    result = _parse_fp_levels(raw_levels, "KXTEST", "yes")
     prices = [lvl[0] for lvl in result]
-    assert 50 not in prices, f"price=50 (size=0) must be dropped, got {result}"
-    assert len(result) == 1
-    assert result[0][0] == 45
-    assert result[0][1] == 100
+    assert 50 not in prices, f"price=50¢ (size=0) debe ser filtrado, got {result}"
+    assert 45 in prices
+    assert 55 in prices
 
 
 # =====================================================
@@ -75,55 +74,54 @@ def _delta_msg(ticker: str, sid: int, seq: int, side: str, price: str, delta: st
 
 
 @pytest.mark.asyncio
-async def test_seq_not_advanced_after_desync_delta_minus_100():
-    """
-    Snapshot seq=1 at price=50 absent (size=0, dropped) → delta seq=2 price=50 delta=-100
-    → OrderbookDesyncError raised, _last_seq_by_sid[sid] must still be 1 (not 2).
-    """
+async def test_delta_negative_on_absent_price_preserves_seq():
+    """Después del filter, delta=-X sobre price ausente lanza error y NO avanza last_seq."""
     mgr = make_v2()
     sid = 1
-    ticker = "TICKER-A"
+    ticker = "KXTEST"
     mgr._tickers_by_sid[sid] = {ticker}
 
-    # Snapshot: price=50 has size=0 → dropped by fix. Book has no level at price=50.
-    snap = _snapshot_msg(ticker, sid, seq=1, yes_levels=[["0.50", "0"], ["0.45", "200"]])
+    # Snapshot: price=50¢ has size=0 → dropped. Book has no level at price=50.
+    snap = _snapshot_msg(ticker, sid, seq=100, yes_levels=[["0.4500", "100"], ["0.5000", "0"]])
     await mgr.handle_message(snap)
-    assert mgr._last_seq_by_sid[sid] == 1
+    assert mgr._last_seq_by_sid[sid] == 100
 
-    # Delta: seq=2, price=50, delta=-100 → qty = 0 + (-100) < 0 → OrderbookDesyncError
-    delta = _delta_msg(ticker, sid, seq=2, side="yes", price="0.50", delta="-100")
+    # Delta sobre price=50¢ (ausente del book): delta=-200
+    delta = _delta_msg(ticker, sid, seq=101, side="yes", price="0.5000", delta="-200")
     from src.strategies.motor_1_arbitrage.orderbook import OrderbookDesyncError
     with pytest.raises(OrderbookDesyncError):
         await mgr.handle_message(delta)
 
-    # Seq counter must NOT have advanced to 2
-    assert mgr._last_seq_by_sid[sid] == 1, (
+    # CRÍTICO: last_seq NO avanzó
+    assert mgr._last_seq_by_sid[sid] == 100, (
         f"_last_seq_by_sid advanced to {mgr._last_seq_by_sid[sid]} despite apply raising"
     )
 
 
 @pytest.mark.asyncio
-async def test_seq_not_advanced_after_desync_delta_minus_6247():
-    """
-    Same as test above with delta=-6247 (magnitude seen in production logs).
-    """
+async def test_regression_production_magnitudes():
+    """Reproduce las magnitudes observadas durante el incidente del 25-mayo."""
     mgr = make_v2()
     sid = 1
-    ticker = "TICKER-B"
+    ticker = "KXMLB-26-ATH"
     mgr._tickers_by_sid[sid] = {ticker}
 
-    snap = _snapshot_msg(ticker, sid, seq=1, yes_levels=[["0.50", "0"]])
+    snap = _snapshot_msg(ticker, sid, seq=1000, yes_levels=[["0.0100", "0"]])
     await mgr.handle_message(snap)
-    assert mgr._last_seq_by_sid[sid] == 1
+    assert mgr._last_seq_by_sid[sid] == 1000
 
-    delta = _delta_msg(ticker, sid, seq=2, side="yes", price="0.50", delta="-6247")
+    # Delta con magnitud real observada: -6247 sobre price=1¢
+    delta = _delta_msg(ticker, sid, seq=1001, side="yes", price="0.0100", delta="-6247")
     from src.strategies.motor_1_arbitrage.orderbook import OrderbookDesyncError
-    with pytest.raises(OrderbookDesyncError):
+    with pytest.raises(OrderbookDesyncError) as exc_info:
         await mgr.handle_message(delta)
 
-    assert mgr._last_seq_by_sid[sid] == 1, (
-        f"_last_seq_by_sid advanced to {mgr._last_seq_by_sid[sid]} despite apply raising"
-    )
+    assert "qty" in str(exc_info.value).lower() or "desync" in str(exc_info.value).lower()
+    assert mgr._last_seq_by_sid[sid] == 1000  # seq intacto
+
+    # State del book intacto (no corrupto)
+    state = mgr._books[ticker]
+    assert state.sequence == 1000
 
 
 # =====================================================
@@ -132,10 +130,12 @@ async def test_seq_not_advanced_after_desync_delta_minus_6247():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_logs_full_traceback_not_nonetype():
-    """
-    When a handler raises, _dispatch must log via logger.opt(exception=r).error.
-    The log record must contain the exception type, not 'NoneType: None'.
+async def test_dispatcher_logs_full_stack_trace():
+    """Excepción en handler debe loggear con stack trace completo, no NoneType: None.
+
+    loguru does not support exc_info= as a kwarg on .error(); the correct pattern is
+    logger.opt(exception=r).error(...). We verify that opt(exception=r) is called with
+    the actual exception object — this is what causes loguru to emit the full traceback.
     """
     from src.clients.kalshi_ws import KalshiWebSocket
 
@@ -149,7 +149,6 @@ async def test_dispatch_logs_full_traceback_not_nonetype():
         def error(self, msg):
             captured_calls.append((self._exc, msg))
 
-        # Stub out other logger methods used during client init
         def info(self, *a, **kw): pass
         def debug(self, *a, **kw): pass
         def warning(self, *a, **kw): pass
@@ -160,18 +159,22 @@ async def test_dispatch_logs_full_traceback_not_nonetype():
     ws_client._failure_count = 0
     ws_client._last_connected_at = None
 
-    error = ValueError("boom")
-    async def bad_handler(msg):
+    error = ValueError("test error")
+
+    async def failing_handler(msg):
         raise error
 
-    ws_client._handlers["orderbook_delta"] = [bad_handler]
+    ws_client._handlers["test_msg"] = [failing_handler]
 
-    msg = {"type": "orderbook_delta", "sid": 1, "seq": 1, "msg": {}}
+    msg = {"type": "test_msg", "data": "x"}
 
     with patch("src.clients.kalshi_ws.logger", FakeLogger()):
         await ws_client._dispatch(msg)
 
     assert len(captured_calls) == 1, "Expected exactly one error log call"
     exc_arg, log_msg = captured_calls[0]
-    assert exc_arg is error, "opt(exception=...) must receive the actual exception object"
-    assert "orderbook_delta" in log_msg
+    # opt(exception=r) must receive the real exception — loguru uses this to emit the traceback
+    assert exc_arg is error, (
+        f"opt(exception=...) must receive the actual exception object, got {exc_arg!r}"
+    )
+    assert "test_msg" in log_msg
