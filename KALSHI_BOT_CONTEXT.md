@@ -602,6 +602,8 @@ es responder la pregunta abierta: ¿el bug está en el parsing del snapshot
 La evidencia nueva (stack traces + raw snapshot logging) es suficiente para
 responderlo de forma definitiva esta vez.
 
+Update (29-may, tercer discovery): Auditoría forense lado a lado del pipeline Snapshot vs Delta. Resultado: el parsing (conversión a cents, rounding, side-handling) es idéntico y correcto en ambos paths. Se refuta H1 (filtro size=0) y se descarta round-off y side-confusion como causas del error -3108. V2 NO está exculpado: el parser está limpio, pero la aplicación de deltas y la sincronización del snapshot inicial siguen bajo sospecha. Hipótesis residuales vivas: (A) feed corruption real, (B) snapshot inicial parcial — el bucket real en el exchange difería del que V2 cargó, (C) bug de V2 en la ventana de ~2.7s entre snapshot y crash. Decisión: instrumentar raw_msg en ambos paths (delta en nivel ERROR para que persista con LOG_LEVEL=INFO; snapshot completo en DEBUG) antes de la próxima activación. La desambiguación A/B/C requiere capturar el evento en vivo, no más discovery sobre logs actuales. Fase de activación (tercera ventana) desacoplada, pendiente de decisión de gestión.
+
 ---
 
 ## 10. ROADMAP TÉCNICO
