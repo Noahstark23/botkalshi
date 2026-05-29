@@ -14,7 +14,7 @@
 - Sección 11: deuda técnica viva — V2 sigue no apto para producción, causa
   raíz abierta.
 - Sección 12.5 sin cambios (runbook validado empíricamente 2 veces).
-- **Lección 10 PENDIENTE:** WS zombie / degradación escalonada 28-may. Discovery completado (event loop compartido, SQLite singleton, writes síncronos); fix propuesto pendiente de implementación.
+- **Lección 10 AÑADIDA:** WS zombie / degradación escalonada 28-may. Watchdog activo en producción con threshold provisional de 300s.
 
 **Cambios v1.3 → v1.4 (2026-05-24):**
 - Sección 4 actualizada: Motor 1 reflejando el estado real (matemática
@@ -612,7 +612,7 @@ Update (29-may, tercer discovery): Auditoría forense lado a lado del pipeline S
 1. **Never trust `ws_connected`:** La conectividad TCP no garantiza la recepción de datos. La salud del feed se mide por *heartbeat de aplicación* (tiempo desde el último mensaje recibido).
 2. **Defensive Reconnect:** Si el feed silencia por >60-90s, el bot está en estado inconsistente. La reconexión debe ser forzada, no opcional.
 3. **Thresholds:** Los detectores de inactividad deben ser más agresivos que el intervalo de trading. 300s es una eternidad; 60s es el estándar.
-**Status:** Fix implementado (Detector de silencio activo + reconexión forzada).
+**Status:** Fix implementado (Detector de silencio activo + reconexión forzada calibrado provisionalmente a 300s en producción; objetivo de diseño a 60s diferido a Fase 2).
 
 ---
 
