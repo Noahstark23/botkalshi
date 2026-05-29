@@ -34,6 +34,7 @@ from src.monitoring.health import BotState
 from src.strategies.data_capture import parse_price_to_cents, parse_size
 from src.strategies.motor_1_arbitrage.orderbook import (
     BookTop,
+    OrderbookDesyncError,
     OrderbookError,
     OrderbookState,
 )
@@ -346,6 +347,8 @@ class OrderbookManagerV2:
             f"sample_yes={yes_raw[:3]} sample_no={no_raw[:3]}"
         )
         logger.debug(f"V2 snapshot raw: ticker={ticker} payload={msg!r}")
+        # Observabilidad: envelope completo (incluye sid/seq/type/id) antes de procesar.
+        logger.debug(f"V2 snapshot raw_msg (full envelope): ticker={ticker} raw_msg={raw_msg!r}")
 
         yes_levels = _parse_fp_levels(yes_raw, ticker, "yes")
         no_levels = _parse_fp_levels(no_raw, ticker, "no")
@@ -386,8 +389,33 @@ class OrderbookManagerV2:
                 f"price_raw={price_raw!r}, delta_raw={delta_raw!r}"
             )
 
-        # May raise OrderbookDesyncError (new_qty < 0) — intentionally not caught
-        state.apply_delta({"side": side, "price": price_cents, "delta": delta_size, "seq": seq})
+        # May raise OrderbookDesyncError (new_qty < 0). Capturamos SOLO para emitir
+        # logging diagnostico defensivo y re-lanzamos la excepcion intacta: no se
+        # altera la logica ni el control flow (la misma excepcion propaga igual).
+        try:
+            state.apply_delta(
+                {"side": side, "price": price_cents, "delta": delta_size, "seq": seq}
+            )
+        except OrderbookDesyncError:
+            # El bloque de logging va envuelto en su propio try/except para que
+            # ningun fallo del diagnostico introduzca un path de excepcion nuevo.
+            # apply_delta hace raise ANTES de mutar el book, asi que snapshot_view()
+            # refleja el estado PRE-delta del bucket (el punto ciego que buscabamos).
+            try:
+                view = state.snapshot_view()
+                bids = view.get("yes_bids" if side == "yes" else "no_bids", {})
+                logger.error(
+                    "V2 desync diagnostic: "
+                    f"ticker={ticker} sid={raw_msg.get('sid')} msg_seq={seq} "
+                    f"state_seq={view.get('sequence')} side={side} "
+                    f"price_cents={price_cents} delta_size={delta_size} "
+                    f"bucket_qty_pre_delta={bids.get(price_cents)} "
+                    f"raw_msg={raw_msg!r}"
+                )
+            except Exception:
+                pass
+            # Re-lanzar la OrderbookDesyncError original intacta (fuera del try de logging).
+            raise
 
 
 # =====================================================

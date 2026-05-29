@@ -14,7 +14,7 @@
 - Sección 11: deuda técnica viva — V2 sigue no apto para producción, causa
   raíz abierta.
 - Sección 12.5 sin cambios (runbook validado empíricamente 2 veces).
-- **Lección 10 PENDIENTE:** WS zombie / degradación escalonada 28-may. Discovery completado (event loop compartido, SQLite singleton, writes síncronos); fix propuesto pendiente de implementación.
+- **Lección 10 AÑADIDA:** WS zombie / degradación escalonada 28-may. Watchdog activo en producción con threshold provisional de 300s.
 
 **Cambios v1.3 → v1.4 (2026-05-24):**
 - Sección 4 actualizada: Motor 1 reflejando el estado real (matemática
@@ -601,6 +601,18 @@ es responder la pregunta abierta: ¿el bug está en el parsing del snapshot
 (H1 parcial) o en la aplicación de deltas sobre estado válido (H nueva)?
 La evidencia nueva (stack traces + raw snapshot logging) es suficiente para
 responderlo de forma definitiva esta vez.
+
+Update (29-may, tercer discovery): Auditoría forense lado a lado del pipeline Snapshot vs Delta. Resultado: el parsing (conversión a cents, rounding, side-handling) es idéntico y correcto en ambos paths. Se refuta H1 (filtro size=0) y se descarta round-off y side-confusion como causas del error -3108. V2 NO está exculpado: el parser está limpio, pero la aplicación de deltas y la sincronización del snapshot inicial siguen bajo sospecha. Hipótesis residuales vivas: (A) feed corruption real, (B) snapshot inicial parcial — el bucket real en el exchange difería del que V2 cargó, (C) bug de V2 en la ventana de ~2.7s entre snapshot y crash. Decisión: instrumentar raw_msg en ambos paths (delta en nivel ERROR para que persista con LOG_LEVEL=INFO; snapshot completo en DEBUG) antes de la próxima activación. La desambiguación A/B/C requiere capturar el evento en vivo, no más discovery sobre logs actuales. Fase de activación (tercera ventana) desacoplada, pendiente de decisión de gestión.
+
+### Lección 10 (Mayo 28, 2026): WS Zombie / Degradación Escalonada
+**Problema:** Degradación progresiva del feed (`orderbook_events`) durante ~3h con `ws_connected=True` (TCP/Keepalive intacto).
+**Diagnóstico:** El bot dependía de `ws_connected` (señal de transporte) para determinar la salud del feed. Fallo absoluto de observabilidad a nivel de aplicación: silencio de mensajes durante 1475s sin ser detectado como incidente. El detector de "zombie" preexistente estaba mal calibrado (timeout de 300s) y era puramente informativo (no escalaba a reconexión).
+**Causa Raíz:** Confianza ciega en el estado del socket (TCP) ignorando el flujo de datos (aplicación). El bot estaba "zombie": vivo en red, muerto en lógica.
+**Lección Aprendida:**
+1. **Never trust `ws_connected`:** La conectividad TCP no garantiza la recepción de datos. La salud del feed se mide por *heartbeat de aplicación* (tiempo desde el último mensaje recibido).
+2. **Defensive Reconnect:** Si el feed silencia por >60-90s, el bot está en estado inconsistente. La reconexión debe ser forzada, no opcional.
+3. **Thresholds:** Los detectores de inactividad deben ser más agresivos que el intervalo de trading. 300s es una eternidad; 60s es el estándar.
+**Status:** Fix implementado (Detector de silencio activo + reconexión forzada calibrado provisionalmente a 300s en producción; objetivo de diseño a 60s diferido a Fase 2).
 
 ---
 
