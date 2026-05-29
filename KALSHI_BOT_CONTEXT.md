@@ -1,19 +1,20 @@
 # KALSHI_BOT_CONTEXT.md
 
 **Versión:** 1.5
-**Última actualización:** Mayo 27, 2026
+**Última actualización:** Mayo 28, 2026
 **Owner:** Noel Pineda (sole founder)
 **Repo:** kalshi-bot (privado, GitHub — Noahstark23/botkalshi)
 
-**Cambios v1.4 → v1.5 (2026-05-27):**
+**Cambios v1.4 → v1.5 (2026-05-28):**
 - **Lección 9 NUEVA:** Dos activaciones fallidas de V2 (25-may, 27-may), dos
   diagnósticos prematuros, contención disciplinada en ambas. Causa raíz NO
   resuelta — pendiente tercer discovery con stack traces del attempt #2.
 - Fixes ed7b7ac + b9abaa0 mergeados: size=0 filter, seq order swap, dispatcher
-  logging. Solo el logging fix validado como efectivo en producción.
+  logging. Solo el logging fix validado como efectivo en producción.h
 - Sección 11: deuda técnica viva — V2 sigue no apto para producción, causa
   raíz abierta.
 - Sección 12.5 sin cambios (runbook validado empíricamente 2 veces).
+- **Lección 10 PENDIENTE:** WS zombie / degradación escalonada 28-may. Discovery completado (event loop compartido, SQLite singleton, writes síncronos); fix propuesto pendiente de implementación.
 
 **Cambios v1.3 → v1.4 (2026-05-24):**
 - Sección 4 actualizada: Motor 1 reflejando el estado real (matemática
