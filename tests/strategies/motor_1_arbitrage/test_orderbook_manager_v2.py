@@ -289,6 +289,65 @@ async def test_ac3_negative_qty_raises_orderbook_desync(manager: OrderbookManage
     assert exc_info.value.new_qty == -5
 
 
+@pytest.mark.asyncio
+async def test_desync_emits_error_diagnostic_and_reraises(manager: OrderbookManagerV2) -> None:
+    """En desync: log ERROR con el estado PRE-delta + raw_msg, y la excepcion se re-lanza intacta."""
+    from loguru import logger
+
+    ticker = "KXNBA-26-NYK"
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1, yes_fp=[["0.4000", "10.00"]])
+    )
+
+    records: list = []
+    sink_id = logger.add(records.append, level="ERROR", format="{message}")
+    try:
+        with pytest.raises(OrderbookDesyncError) as exc_info:
+            await manager.handle_message(
+                make_ws_delta(
+                    ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00", side="yes"
+                )
+            )
+    finally:
+        logger.remove(sink_id)
+
+    # La excepcion original propaga intacta (mismo control flow que antes).
+    assert exc_info.value.new_qty == -5
+    assert exc_info.value.price_cents == 40
+
+    # Se emitio el diagnostico a nivel ERROR (persiste con LOG_LEVEL=INFO) con los campos clave.
+    captured = "\n".join(str(r) for r in records)
+    assert "V2 desync diagnostic" in captured
+    assert "bucket_qty_pre_delta=10" in captured  # estado PRE-delta (book aun no mutado)
+    assert "delta_size=-15" in captured
+    assert "msg_seq=2" in captured
+    assert "raw_msg=" in captured
+
+
+@pytest.mark.asyncio
+async def test_desync_logging_failure_is_silenced(
+    manager: OrderbookManagerV2, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Si el logging diagnostico falla, se silencia: se re-lanza la OrderbookDesyncError, no otra."""
+    ticker = "KXNBA-26-NYK"
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1, yes_fp=[["0.4000", "10.00"]])
+    )
+
+    def boom() -> dict:
+        raise RuntimeError("diagnostic logging path broken")
+
+    monkeypatch.setattr(manager._books[ticker], "snapshot_view", boom)
+
+    # Aun con el diagnostico roto, propaga la OrderbookDesyncError original (no el RuntimeError).
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(
+            make_ws_delta(
+                ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00", side="yes"
+            )
+        )
+
+
 # =====================================================
 # AC4: subscribed (no seq) → no SidGapError
 # =====================================================
