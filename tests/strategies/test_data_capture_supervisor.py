@@ -23,6 +23,7 @@ def service():
         svc = DataCaptureService()
         svc._tracked_tickers = set()
         svc.ws = MagicMock()
+        svc.ws.force_reconnect = AsyncMock()
         return svc
 
 
@@ -191,4 +192,66 @@ async def test_zombie_detection_emits_warning_log(service, loguru_caplog):
     assert "ws.zombie.detected" in log_text
     assert "silence_seconds=" in log_text
     assert "ws_is_connected=" in log_text
-    assert "action_taken=record_error" in log_text
+    assert "action_taken=force_reconnect" in log_text
+
+
+@pytest.mark.asyncio
+async def test_zombie_detection_forces_reconnect(service):
+    """Ante WS zombie, el watchdog debe llamar ws.force_reconnect() (no stop)."""
+    service.ws.is_connected = True
+    service.ws.last_message_at = datetime.now(UTC) - timedelta(seconds=400)
+
+    await service._check_ws_health()
+
+    service.ws.force_reconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_zombie_alert_gated_by_threshold(service):
+    """Telegram solo se alerta tras WS_ZOMBIE_ALERT_THRESHOLD detecciones consecutivas."""
+    service.ws.is_connected = True
+    service.ws.last_message_at = datetime.now(UTC) - timedelta(seconds=400)
+
+    with patch("src.monitoring.telegram_alerts.alert_error", new=AsyncMock()) as alert:
+        # 1ra deteccion: fuerza reconexion pero NO alerta (count=1 < threshold=2)
+        await service._check_ws_health()
+        assert service._ws_zombie_count == 1
+        alert.assert_not_awaited()
+
+        # 2da deteccion consecutiva: alcanza threshold → alerta
+        await service._check_ws_health()
+        assert service._ws_zombie_count == 2
+        alert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_zombie_count_resets_on_recovery(service):
+    """Tras recuperar trafico, el contador de zombie vuelve a 0."""
+    service.ws.is_connected = True
+    service.ws.last_message_at = datetime.now(UTC) - timedelta(seconds=400)
+    await service._check_ws_health()
+    assert service._ws_zombie_count == 1
+
+    # Feed recuperado: mensaje reciente
+    service.ws.last_message_at = datetime.now(UTC) - timedelta(seconds=10)
+    await service._check_ws_health()
+    assert service._ws_zombie_count == 0
+
+
+def test_current_error_ttl_expires_stale_error():
+    """current_error() devuelve None y limpia un error mas viejo que el TTL."""
+    BotState.record_error("error viejo")
+    # Forzar timestamp por encima del TTL
+    BotState.last_error_at = datetime.now(UTC) - timedelta(
+        seconds=BotState.LAST_ERROR_TTL_SEC + 60
+    )
+
+    assert BotState.current_error() is None
+    assert BotState.last_error is None
+    assert BotState.last_error_at is None
+
+
+def test_current_error_returns_fresh_error():
+    """current_error() devuelve el error si esta dentro del TTL."""
+    BotState.record_error("error fresco")
+    assert BotState.current_error() == "error fresco"

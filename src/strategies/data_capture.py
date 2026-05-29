@@ -109,6 +109,8 @@ class DataCaptureService:
 
     SNAPSHOT_INTERVAL_SEC = 300  # 5 min
     MAX_TICKERS_PER_SNAPSHOT_CYCLE = 50
+    WS_SILENCE_THRESHOLD_SEC = 300  # silencio del WS que dispara reconexion forzada
+    WS_ZOMBIE_ALERT_THRESHOLD = 2  # detecciones consecutivas antes de alertar a Telegram
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -118,6 +120,7 @@ class DataCaptureService:
         self._delta_shape_logged = False
         self._snapshot_shape_logged = False
         self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
+        self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
 
     # =====================================================
     # WS event handlers
@@ -355,11 +358,15 @@ class DataCaptureService:
     async def _check_ws_health(self) -> None:
         """
         Detecta WS zombie (conectado pero sin trafico) o sin conexion tras periodo de gracia.
+
+        Ante un WS zombie fuerza la reconexion via ws.force_reconnect() (cierra el socket
+        sin detener el loop, que reconecta con su backoff) y, si el zombie persiste
+        WS_ZOMBIE_ALERT_THRESHOLD ciclos consecutivos, alerta a Telegram.
         """
         if not self.ws.is_connected:
             BotState.ws_connected = False
             uptime = (datetime.now(UTC) - BotState.started_at).total_seconds()
-            if uptime > 120 and not BotState.last_error:
+            if uptime > 120 and not BotState.current_error():
                 BotState.record_error("WS not connected after 2min of uptime")
             return
 
@@ -375,14 +382,38 @@ class DataCaptureService:
             return
 
         silence_seconds = (datetime.now(UTC) - last_msg).total_seconds()
-        if silence_seconds > 300:
-            logger.warning(
-                f"ws.zombie.detected silence_seconds={int(silence_seconds)} "
-                f"ws_is_connected={self.ws.is_connected} action_taken=record_error"
-            )
-            BotState.record_error(
-                f"WS zombie: connected but no messages for {silence_seconds:.0f}s"
-            )
+        if silence_seconds <= self.WS_SILENCE_THRESHOLD_SEC:
+            self._ws_zombie_count = 0
+            return
+
+        # WS zombie: conectado pero sin trafico. Forzar reconexion.
+        self._ws_zombie_count += 1
+        logger.warning(
+            f"ws.zombie.detected silence_seconds={int(silence_seconds)} "
+            f"ws_is_connected={self.ws.is_connected} "
+            f"zombie_count={self._ws_zombie_count} action_taken=force_reconnect"
+        )
+        BotState.record_error(
+            f"WS zombie: connected but no messages for {silence_seconds:.0f}s "
+            f"(detection #{self._ws_zombie_count}, forcing reconnect)"
+        )
+
+        try:
+            await self.ws.force_reconnect()
+        except Exception:
+            logger.exception("ws.force_reconnect fallo")
+
+        if self._ws_zombie_count >= self.WS_ZOMBIE_ALERT_THRESHOLD:
+            try:
+                from src.monitoring.telegram_alerts import alert_error
+
+                await alert_error(
+                    f"WS zombie persistente: sin mensajes por {silence_seconds:.0f}s "
+                    f"tras {self._ws_zombie_count} detecciones consecutivas. "
+                    f"Reconexion forzada; revisar si el feed se recupera."
+                )
+            except Exception:
+                logger.exception("Telegram alert (ws zombie) fallo")
 
     # =====================================================
     # Supervisors

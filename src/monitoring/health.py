@@ -43,6 +43,10 @@ class BotState:
     last_error_at: datetime | None = None
     v2_manager: Any = None  # Set by DataCaptureService when USE_ORDERBOOK_MANAGER_V2=True
 
+    # TTL del last_error: un error mas viejo que esto se considera rancio y se limpia,
+    # para que el dashboard no quede mostrando un error ya superado tras la recuperacion.
+    LAST_ERROR_TTL_SEC: float = 900.0  # 15 min
+
     @classmethod
     def heartbeat(cls) -> None:
         cls.last_ws_message = datetime.now(UTC)
@@ -51,6 +55,21 @@ class BotState:
     def record_error(cls, message: str) -> None:
         cls.last_error = message[:500]
         cls.last_error_at = datetime.now(UTC)
+
+    @classmethod
+    def current_error(cls) -> str | None:
+        """
+        last_error con TTL. Devuelve el error solo si es mas reciente que
+        LAST_ERROR_TTL_SEC; si expiro, lo limpia y devuelve None.
+        """
+        if cls.last_error is None or cls.last_error_at is None:
+            return None
+        age = (datetime.now(UTC) - cls.last_error_at).total_seconds()
+        if age > cls.LAST_ERROR_TTL_SEC:
+            cls.last_error = None
+            cls.last_error_at = None
+            return None
+        return cls.last_error
 
 
 @asynccontextmanager
@@ -203,7 +222,7 @@ async def status() -> dict[str, Any]:
                 BotState.last_ws_message.isoformat() if BotState.last_ws_message else None
             ),
             "tracked_markets": BotState.tracked_markets_count,
-            "last_error": BotState.last_error,
+            "last_error": BotState.current_error(),
             "last_error_at": (
                 BotState.last_error_at.isoformat() if BotState.last_error_at else None
             ),

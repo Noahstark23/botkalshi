@@ -185,6 +185,20 @@ class KalshiWebSocket:
         if self._ws and self._ws.state == WsState.OPEN:
             await self._ws.close()
 
+    async def force_reconnect(self) -> None:
+        """
+        Cierra la conexion actual SIN detener el loop principal, forzando reconexion.
+
+        A diferencia de stop() (que pone _running=False y hace que run() termine en
+        el break de la linea ~175), esto solo cierra el socket: el `async for` de
+        _connect_and_listen termina, run() lo trata como un cierre de conexion normal
+        y reconecta con su backoff. Pensado para el watchdog cuando detecta un WS
+        zombie (conectado pero sin trafico). Idempotente si no hay conexion abierta.
+        """
+        if self._ws is not None and self._ws.state == WsState.OPEN:
+            logger.warning("ws.force_reconnect cerrando socket para forzar reconexion")
+            await self._ws.close()
+
     # =====================================================
     # Internal
     # =====================================================
