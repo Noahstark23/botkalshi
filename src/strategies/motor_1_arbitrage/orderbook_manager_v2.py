@@ -89,6 +89,10 @@ class OrderbookManagerV2:
         self._tickers_by_sid: dict[int, set[str]] = {}
         self._recovering: set[int] = set()
         self._pending_deltas: dict[int, list[dict]] = {}
+        # Deltas que llegan antes del snapshot inicial de un ticker (bootstrap).
+        # Se encolan por ticker y se drenan en _drain_bootstrap_buffer al llegar
+        # el snapshot, en vez de descartarse (causa del desync de attempt #3).
+        self._bootstrap_buffer: dict[str, list[dict]] = {}
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
         # Gap rate tracking (monotonic timestamps within last 60s)
@@ -170,9 +174,14 @@ class OrderbookManagerV2:
 
         if msg_type == "orderbook_snapshot":
             self._apply_snapshot_msg(raw_msg)
+            applied = True
         else:
-            self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
-        self._last_seq_by_sid[sid] = new_seq  # Only reached if apply succeeded
+            # Devuelve False si encoló el delta (ticker sin snapshot inicial):
+            # en ese caso NO se avanza el baseline del sid, para que el snapshot
+            # posterior no se interprete como gap.
+            applied = self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
+        if applied:
+            self._last_seq_by_sid[sid] = max(self._last_seq_by_sid.get(sid, 0), new_seq)
 
     @property
     def tracked_tickers(self) -> frozenset[str]:
@@ -358,12 +367,36 @@ class OrderbookManagerV2:
 
         self._books[ticker].apply_snapshot({"seq": seq, "yes": yes_levels, "no": no_levels})
 
-    def _apply_delta_msg(self, raw_msg: dict) -> None:
+        # Drenar deltas pre-snapshot encolados para este ticker (bootstrap reordenado).
+        self._drain_bootstrap_buffer(raw_msg["sid"], ticker, seq)
+
+    def _drain_bootstrap_buffer(self, sid: int, ticker: str, snapshot_seq: int) -> None:
+        """
+        Aplica los deltas encolados antes del snapshot inicial de un ticker.
+
+        Descarta los ya contenidos en el snapshot (seq <= snapshot_seq) y aplica
+        el resto en orden de seq. Avanza el baseline del sid al mayor seq aplicado
+        para no generar un falso gap en el próximo delta en vivo.
+        """
+        buffered = self._bootstrap_buffer.pop(ticker, [])
+        if not buffered:
+            return
+
+        buffered.sort(key=lambda m: m["seq"])
+        for m in buffered:
+            if m["seq"] <= snapshot_seq:
+                continue  # ya incluido en el snapshot
+            self._apply_delta_msg(m)
+            if m["seq"] > self._last_seq_by_sid.get(sid, 0):
+                self._last_seq_by_sid[sid] = m["seq"]
+
+    def _apply_delta_msg(self, raw_msg: dict) -> bool:
         """
         Apply WS orderbook_delta to state.
 
-        If state is not initialized (e.g. stale pending recovery), logs and skips.
-        Raises OrderbookDesyncError if delta produces new_qty < 0.
+        Returns True si el delta se aplicó; False si se encoló en el bootstrap
+        buffer porque el ticker aún no tiene snapshot inicial (se drenará al
+        llegar el snapshot). Raises OrderbookDesyncError si produce new_qty < 0.
         """
         msg = raw_msg["msg"]
         ticker: str = msg["market_ticker"]
@@ -371,10 +404,11 @@ class OrderbookManagerV2:
 
         state = self._books.get(ticker)
         if state is None or not state.is_initialized:
-            logger.warning(
-                f"Delta for uninitialized/stale ticker {ticker} seq={seq} — skipping"
-            )
-            return
+            # Encolar (no descartar): el snapshot inicial del ticker aún no se
+            # aplicó. Un delta con seq > snapshot_seq es una actualización real que
+            # se perdería si se descartara, dejando el book sub-construido.
+            self._bootstrap_buffer.setdefault(ticker, []).append(raw_msg)
+            return False
 
         price_raw = msg.get("price_dollars") or msg.get("price")
         delta_raw = msg.get("delta_fp") or msg.get("delta")
@@ -416,6 +450,8 @@ class OrderbookManagerV2:
                 pass
             # Re-lanzar la OrderbookDesyncError original intacta (fuera del try de logging).
             raise
+
+        return True
 
 
 # =====================================================

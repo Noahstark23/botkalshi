@@ -349,6 +349,72 @@ async def test_desync_logging_failure_is_silenced(
 
 
 # =====================================================
+# Bootstrap buffer (Parte A — fix desync bootstrap)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_reordered_delta_before_snapshot(manager: OrderbookManagerV2) -> None:
+    """Delta que llega antes del snapshot inicial se encola y aplica (no se descarta).
+
+    Reproduce el patrón del attempt #3: un add pre-snapshot que, si se descartara,
+    dejaría el book sub-construido y un delta posterior lo llevaría a qty<0.
+    """
+    ticker = "KXMLB-26-PHI"
+
+    # Delta seq=2 (add +13 a 3c) llega ANTES del snapshot seq=1 → debe encolarse.
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=1, seq=2, price_dollars="0.0300", delta_fp="13.00", side="yes")
+    )
+    assert manager._bootstrap_buffer.get(ticker), "el delta pre-snapshot debió encolarse"
+    assert 1 not in manager._last_seq_by_sid, "encolar no debe avanzar el baseline del sid"
+
+    # Snapshot seq=1: bucket 3c = 2.
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1, yes_fp=[["0.0300", "2.00"]])
+    )
+
+    # El delta encolado (seq 2 > 1) se drenó: 2 + 13 = 15.
+    top = manager.get_top_of_book(ticker, "yes")
+    assert top is not None and top.best_bid is not None
+    assert top.best_bid.price_cents == 3
+    assert top.best_bid.size == 15
+    assert ticker not in manager._bootstrap_buffer
+    assert manager._last_seq_by_sid[1] == 2
+
+    # Y el delta -13 posterior (seq 3) ya NO produce desync: 15 - 13 = 2.
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=1, seq=3, price_dollars="0.0300", delta_fp="-13.00", side="yes")
+    )
+    top = manager.get_top_of_book(ticker, "yes")
+    assert top.best_bid.size == 2
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_buffer_discards_redundant_delta(manager: OrderbookManagerV2) -> None:
+    """Un delta encolado con seq <= snapshot_seq ya está contenido en el snapshot: se descarta."""
+    ticker = "KXMLB-26-PHI"
+
+    # Delta seq=5 llega antes del snapshot → encolado.
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=1, seq=5, price_dollars="0.0300", delta_fp="100.00", side="yes")
+    )
+    assert manager._bootstrap_buffer.get(ticker)
+
+    # Snapshot seq=10 (más nuevo que el delta encolado seq=5) con bucket 3c = 2.
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=10, yes_fp=[["0.0300", "2.00"]])
+    )
+
+    # seq 5 <= 10 → descartado (ya en el snapshot). El bucket queda en 2, no 102.
+    top = manager.get_top_of_book(ticker, "yes")
+    assert top is not None and top.best_bid is not None
+    assert top.best_bid.size == 2
+    assert ticker not in manager._bootstrap_buffer
+    assert manager._last_seq_by_sid[1] == 10
+
+
+# =====================================================
 # AC4: subscribed (no seq) → no SidGapError
 # =====================================================
 
