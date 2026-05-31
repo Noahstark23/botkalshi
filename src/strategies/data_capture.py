@@ -19,6 +19,7 @@ import asyncio
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from loguru import logger
@@ -49,18 +50,27 @@ def parse_price_to_cents(value: object) -> int | None:
     Convierte precio a centavos enteros.
     Acepta int directo (viejo: 27->27), str dollar fixed-point ("0.2700"->27),
     o float (0.27->27). Retorna None para None o input invalido.
+
+    Usa Decimal (no float + round) para evitar descalces de coma flotante en el
+    hot-path: con float, "0.29"*100 = 28.999999... y round() puede caer al lado
+    equivocado en valores límite. Decimal + ROUND_HALF_UP da el centavo exacto.
     """
     if value is None:
         return None
+    if isinstance(value, bool):
+        # bool es subclase de int; un True/False no es un precio válido.
+        return None
     if isinstance(value, int):
         return value
-    if isinstance(value, str):
+    if isinstance(value, (str, float)):
         try:
-            return int(round(float(value) * 100))
-        except (ValueError, TypeError):
+            # float -> str primero: Decimal(float) arrastraría el ruido binario;
+            # Decimal(str(float)) toma la representación decimal corta esperada.
+            dec = Decimal(value) if isinstance(value, str) else Decimal(str(value))
+            cents = (dec * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+            return int(cents)
+        except (InvalidOperation, ValueError, TypeError):
             return None
-    if isinstance(value, float):
-        return int(round(value * 100))
     return None
 
 
