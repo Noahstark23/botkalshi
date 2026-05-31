@@ -13,6 +13,7 @@ También incluye: fixture loading, multi-ticker recovery, stats().
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -24,7 +25,6 @@ from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import (
     OrderbookManagerV2,
     SidGapError,
 )
-
 
 # =====================================================
 # Helpers
@@ -555,3 +555,117 @@ async def test_delta_from_fixture_after_snapshot(manager: OrderbookManagerV2) ->
     assert top_no.best_bid is not None
     assert top_no.best_bid.price_cents == 85
     assert top_no.best_bid.size == 2900  # 3000 - 100
+
+
+# =====================================================
+# Part B — supervisor de recovery (convergencia)
+# =====================================================
+
+
+async def _init_ticker(manager: OrderbookManagerV2, ticker: str, sid: int, seq: int) -> None:
+    """Inicializa un ticker con un snapshot para poder dispararle un gap."""
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=sid, seq=seq, yes_fp=[["0.4000", "10.00"]])
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_timeout_triggers_retry(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """Un recovery snapshot que excede 10s → el supervisor incrementa retry y re-emite."""
+    # send_command devuelve req_ids distintos por llamada (recovery inicial + retry).
+    mock_ws.send_command.side_effect = [100, 101, 102, 103]
+    ticker = "KXNBA-26-NYK"
+    await _init_ticker(manager, ticker, sid=1, seq=1)
+
+    # Gap → dispara recovery (req_id=100), registra deadline.
+    with pytest.raises(SidGapError):
+        await manager.handle_message(make_ws_delta(ticker, sid=1, seq=5))
+    assert 100 in manager._recovery_deadlines
+    assert manager._recovery_retries.get(1, 0) == 0
+
+    # Forzar vencimiento del deadline y correr un tick del supervisor.
+    manager._recovery_deadlines[100] = time.monotonic() - 1.0
+    await manager._check_recovery_timeouts()
+
+    # El recovery original venció → retry incrementado y nuevo get_snapshot emitido.
+    assert manager._recovery_retries[1] == 1
+    assert 100 not in manager._pending_snapshot_requests
+    assert 101 in manager._pending_snapshot_requests  # re-emitido
+    assert 101 in manager._recovery_deadlines
+    assert 1 in manager._recovering  # sigue en recovery, no evictado
+
+
+@pytest.mark.asyncio
+async def test_recovery_exhausts_retries_then_evicts(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """Tras RECOVERY_MAX_RETRIES timeouts, los tickers pendientes se evictan a V1 pasivo."""
+    mock_ws.send_command.side_effect = list(range(200, 220))
+    ticker = "KXNBA-26-NYK"
+    await _init_ticker(manager, ticker, sid=1, seq=1)
+
+    with pytest.raises(SidGapError):
+        await manager.handle_message(make_ws_delta(ticker, sid=1, seq=5))
+
+    # Vencer el deadline y tickear MAX_RETRIES+1 veces.
+    for _ in range(manager.RECOVERY_MAX_RETRIES + 1):
+        for rid in list(manager._recovery_deadlines):
+            manager._recovery_deadlines[rid] = time.monotonic() - 1.0
+        await manager._check_recovery_timeouts()
+
+    # Tras agotar reintentos → ticker evictado, book=None, sid fuera de recovery.
+    assert ticker in manager._evicted
+    assert manager._books[ticker] is None
+    assert 1 not in manager._recovering
+    assert not manager._pending_snapshot_requests
+
+    # Guarda de evicción: un delta posterior del ticker se descarta sin error.
+    await manager.handle_message(make_ws_delta(ticker, sid=1, seq=99))
+    assert manager._books[ticker] is None
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_buffer_overflow_evicts_immediately(
+    manager: OrderbookManagerV2,
+) -> None:
+    """Un ticker que supera BOOTSTRAP_BUFFER_CAP mensajes pre-snapshot se evicta de inmediato."""
+    ticker = "KXNBA-26-NYK"
+    cap = manager.BOOTSTRAP_BUFFER_CAP
+
+    # Encolar cap+1 deltas pre-snapshot (sin snapshot inicial → van al bootstrap_buffer).
+    for i in range(cap + 1):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=1, seq=i + 1, delta_fp="1.00")
+        )
+
+    # Al superar el cap → evicción inmediata.
+    assert ticker in manager._evicted
+    assert manager._books[ticker] is None
+    assert ticker not in manager._bootstrap_buffer  # buffer liberado
+
+
+@pytest.mark.asyncio
+async def test_code15_aborts_recovery_and_forces_reconnect(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """code 15 → aborta recoveries en curso y fuerza la desconexión del socket."""
+    mock_ws.send_command.side_effect = [300, 301]
+    ticker = "KXNBA-26-NYK"
+    await _init_ticker(manager, ticker, sid=1, seq=1)
+
+    with pytest.raises(SidGapError):
+        await manager.handle_message(make_ws_delta(ticker, sid=1, seq=5))
+    assert manager._recovering  # hay recovery en curso
+    assert manager._recovery_deadlines
+
+    # Llega el code 15 por el WS.
+    await manager.handle_message({"type": "error", "code": 15, "msg": "Action required"})
+
+    # Recoveries abortados y socket forzado a reconectar.
+    assert not manager._recovering
+    assert not manager._pending_snapshot_requests
+    assert not manager._recovery_deadlines
+    assert not manager._recovery_retries
+    mock_ws.force_reconnect.assert_awaited_once()

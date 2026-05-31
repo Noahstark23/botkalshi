@@ -82,9 +82,15 @@ class OrderbookManagerV2:
         # Then start ws.run()
     """
 
+    # Part B — supervisor de recovery (convergencia)
+    RECOVERY_TIMEOUT_SEC: float = 10.0   # deadline por req_id de recovery
+    RECOVERY_MAX_RETRIES: int = 3        # reintentos antes de evictar a V1 pasivo
+    BOOTSTRAP_BUFFER_CAP: int = 1000     # cap del buffer pre-snapshot por ticker (RAM guard)
+    SUPERVISOR_TICK_SEC: float = 1.0     # periodo del loop supervisor
+
     def __init__(self, ws: KalshiWebSocket) -> None:
         self._ws = ws
-        self._books: dict[str, OrderbookState] = {}
+        self._books: dict[str, OrderbookState | None] = {}
         self._last_seq_by_sid: dict[int, int] = {}
         self._tickers_by_sid: dict[int, set[str]] = {}
         self._recovering: set[int] = set()
@@ -95,6 +101,14 @@ class OrderbookManagerV2:
         self._bootstrap_buffer: dict[str, list[dict]] = {}
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
+        # Part B: supervisor de recovery (convergencia).
+        # req_id → monotonic deadline (timeout de RECOVERY_TIMEOUT_SEC).
+        self._recovery_deadlines: dict[int, float] = {}
+        # sid → cantidad de reintentos de recovery consumidos.
+        self._recovery_retries: dict[int, int] = {}
+        # Tickers evictados a modo pasivo V1 (book=None). Distingue "evictado a
+        # proposito" de "nunca visto": handle_message descarta deltas de estos.
+        self._evicted: set[str] = set()
         # Gap rate tracking (monotonic timestamps within last 60s)
         self._gap_timestamps: list[float] = []
         self._consecutive_warning: int = 0
@@ -129,6 +143,11 @@ class OrderbookManagerV2:
             err_text = raw_msg.get("msg", "")
             logger.error(f"WS error code={code}: {err_text}")
             BotState.record_error(f"WS error code={code}: {err_text}")
+            # Part B (a): code 15 "Action required" es un fallo de canal, no de un
+            # ticker. Abortar recoveries locales y forzar la caida del socket: el
+            # supervisor de run() reconecta y re-firma RSA-PSS por construccion.
+            if code == 15:
+                await self._handle_code15()
             return
 
         if msg_type == "subscribed":
@@ -145,6 +164,12 @@ class OrderbookManagerV2:
             raise ValueError(
                 f"Malformed WS message missing field {e}: {raw_msg}"
             ) from e
+
+        # Part B (b): guarda de evicción. Un ticker evictado a V1 pasivo tiene
+        # book=None; descartamos sus deltas en V2 (data_capture REST sigue
+        # persistiendo en SQLite). Distingue evictado de "nunca visto".
+        if ticker in self._evicted:
+            return
 
         # Register ticker in its sid (always, before buffering or gap check)
         self._tickers_by_sid.setdefault(sid, set()).add(ticker)
@@ -201,8 +226,13 @@ class OrderbookManagerV2:
         gaps_last_60s = sum(1 for t in self._gap_timestamps if now - t < 60.0)
         return {
             "tracked_tickers": len(self._books),
-            "initialized_tickers": sum(1 for b in self._books.values() if b.is_initialized),
-            "stale_tickers": sum(1 for b in self._books.values() if b.is_stale),
+            "initialized_tickers": sum(
+                1 for b in self._books.values() if b is not None and b.is_initialized
+            ),
+            "stale_tickers": sum(
+                1 for b in self._books.values() if b is not None and b.is_stale
+            ),
+            "evicted_tickers": len(self._evicted),
             "recovering_sids": list(self._recovering),
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
@@ -274,8 +304,9 @@ class OrderbookManagerV2:
         self._pending_deltas[sid] = []
 
         for ticker in tickers:
-            if ticker in self._books:
-                self._books[ticker].mark_stale()
+            book = self._books.get(ticker)
+            if book is not None:
+                book.mark_stale()
 
         if not tickers:
             return
@@ -286,6 +317,8 @@ class OrderbookManagerV2:
             params={"market_tickers": tickers, "sids": [sid]},
         )
         self._pending_snapshot_requests[req_id] = (sid, set(tickers))
+        # Part B: registrar deadline para que el supervisor detecte no-convergencia.
+        self._recovery_deadlines[req_id] = time.monotonic() + self.RECOVERY_TIMEOUT_SEC
 
     async def _handle_recovery_snapshot(self, raw_msg: dict, req_id: int) -> None:
         """Apply a recovery snapshot. Drain buffer when all tickers in the sid recovered."""
@@ -297,8 +330,109 @@ class OrderbookManagerV2:
 
         if not tickers_pending:
             del self._pending_snapshot_requests[req_id]
+            self._recovery_deadlines.pop(req_id, None)
             self._recovering.discard(sid)
+            self._recovery_retries.pop(sid, None)  # recovery convergió → reset retries
             self._drain_buffer(sid)
+
+    # =====================================================
+    # Part B — supervisor de recovery (convergencia)
+    # =====================================================
+
+    def _evict_ticker(self, ticker: str) -> None:
+        """
+        Degrada un ticker a modo pasivo V1: book=None + marca evictado.
+
+        Deltas posteriores se descartan en V2 (guarda en handle_message);
+        data_capture (REST) sigue persistiendo en SQLite. El discovery diario
+        (00:00 UTC) limpia _evicted y re-inicializa.
+        """
+        self._books[ticker] = None
+        self._evicted.add(ticker)
+        self._bootstrap_buffer.pop(ticker, None)
+        logger.critical(f"v2.ticker.evicted ticker={ticker} mode=passive_v1")
+
+    async def _handle_code15(self) -> None:
+        """
+        code 15 "Action required": fallo de canal WS, no de un ticker.
+
+        Aborta todos los recoveries en curso (sin tratar como falla de snapshot,
+        que rompería el aislamiento) y fuerza la caída del socket. El supervisor
+        de run() reconecta y re-firma RSA-PSS por construcción.
+        """
+        logger.critical("v2.code15.intercepted action=abort_recoveries+force_reconnect")
+        self._recovering.clear()
+        self._pending_snapshot_requests.clear()
+        self._recovery_deadlines.clear()
+        self._recovery_retries.clear()
+        try:
+            await self._ws.force_reconnect()
+        except Exception:
+            logger.exception("v2.code15.force_reconnect_failed")
+
+    async def _check_recovery_timeouts(self) -> None:
+        """
+        Un tick del supervisor: re-emite o evicta los recoveries vencidos.
+
+        Factorizado fuera del loop para poder testearse sin el bucle infinito.
+        """
+        now = time.monotonic()
+        expired = [rid for rid, deadline in self._recovery_deadlines.items() if now >= deadline]
+        for req_id in expired:
+            pending = self._pending_snapshot_requests.get(req_id)
+            self._recovery_deadlines.pop(req_id, None)
+            if pending is None:
+                continue
+            sid, tickers_pending = pending
+            del self._pending_snapshot_requests[req_id]
+
+            retries = self._recovery_retries.get(sid, 0) + 1
+            if retries <= self.RECOVERY_MAX_RETRIES:
+                self._recovery_retries[sid] = retries
+                logger.warning(
+                    f"v2.recovery.timeout sid={sid} req_id={req_id} "
+                    f"retry={retries}/{self.RECOVERY_MAX_RETRIES} "
+                    f"pending_tickers={len(tickers_pending)}"
+                )
+                tickers = list(tickers_pending)
+                try:
+                    new_req_id = await self._ws.send_command(
+                        "update_subscription",
+                        action="get_snapshot",
+                        params={"market_tickers": tickers, "sids": [sid]},
+                    )
+                    self._pending_snapshot_requests[new_req_id] = (sid, set(tickers))
+                    self._recovery_deadlines[new_req_id] = (
+                        time.monotonic() + self.RECOVERY_TIMEOUT_SEC
+                    )
+                except Exception:
+                    logger.exception(f"v2.recovery.retry_send_failed sid={sid}")
+            else:
+                # Agotó reintentos: evictar los tickers pendientes a V1 pasivo.
+                logger.critical(
+                    f"v2.recovery.exhausted sid={sid} req_id={req_id} "
+                    f"retries={retries - 1} action=evict pending={len(tickers_pending)}"
+                )
+                for ticker in tickers_pending:
+                    self._evict_ticker(ticker)
+                self._recovering.discard(sid)
+                self._recovery_retries.pop(sid, None)
+                self._pending_deltas.pop(sid, None)
+
+    async def _recovery_supervisor(self) -> None:
+        """
+        Loop de fondo: chequea timeouts de recovery cada SUPERVISOR_TICK_SEC.
+
+        Se lanza junto con el wiring de V2 (solo cuando V2 está activo).
+        """
+        while True:
+            try:
+                await self._check_recovery_timeouts()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("v2.recovery_supervisor.tick_error")
+            await asyncio.sleep(self.SUPERVISOR_TICK_SEC)
 
     def _drain_buffer(self, sid: int) -> None:
         """Apply buffered messages after recovery. Messages at/below snapshot seq discarded."""
@@ -311,9 +445,9 @@ class OrderbookManagerV2:
         # Update sid baseline to the max snapshot seq across all recovered tickers
         max_seq = max(
             (
-                self._books[t].sequence
+                self._books[t].sequence  # type: ignore[union-attr]
                 for t in self._tickers_by_sid.get(sid, set())
-                if t in self._books
+                if self._books.get(t) is not None
             ),
             default=self._last_seq_by_sid.get(sid, 0),
         )
@@ -362,10 +496,12 @@ class OrderbookManagerV2:
         yes_levels = _parse_fp_levels(yes_raw, ticker, "yes")
         no_levels = _parse_fp_levels(no_raw, ticker, "no")
 
-        if ticker not in self._books:
-            self._books[ticker] = OrderbookState(ticker)
+        book = self._books.get(ticker)
+        if book is None:
+            book = OrderbookState(ticker)
+            self._books[ticker] = book
 
-        self._books[ticker].apply_snapshot({"seq": seq, "yes": yes_levels, "no": no_levels})
+        book.apply_snapshot({"seq": seq, "yes": yes_levels, "no": no_levels})
 
         # Drenar deltas pre-snapshot encolados para este ticker (bootstrap reordenado).
         self._drain_bootstrap_buffer(raw_msg["sid"], ticker, seq)
@@ -407,7 +543,17 @@ class OrderbookManagerV2:
             # Encolar (no descartar): el snapshot inicial del ticker aún no se
             # aplicó. Un delta con seq > snapshot_seq es una actualización real que
             # se perdería si se descartara, dejando el book sub-construido.
-            self._bootstrap_buffer.setdefault(ticker, []).append(raw_msg)
+            buf = self._bootstrap_buffer.setdefault(ticker, [])
+            buf.append(raw_msg)
+            # Part B (c): circuit breaker por volumen. Si el snapshot inicial nunca
+            # llega, el buffer crece sin techo. Al superar el cap, evictar a V1
+            # pasivo para blindar la RAM del droplet.
+            if len(buf) > self.BOOTSTRAP_BUFFER_CAP:
+                logger.critical(
+                    f"v2.bootstrap_buffer.overflow ticker={ticker} "
+                    f"size={len(buf)} cap={self.BOOTSTRAP_BUFFER_CAP} action=evict"
+                )
+                self._evict_ticker(ticker)
             return False
 
         price_raw = msg.get("price_dollars") or msg.get("price")
