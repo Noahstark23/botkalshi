@@ -56,25 +56,61 @@
 
 ---
 
-## Diseño read-only — Cooldown / reintegración de evicción (Gap c)
+## Diseño read-only — Cooldown de Evicción determinista (Gap c)
 
-> ⚠️ La directiva del CTO definió esta tarea como "DISEÑO TÉCNICO READ-ONLY DEL COOLDOWN DE EVICCIÓN (GAP C)" pero **el texto llegó truncado** (cortado tras el encabezado). El siguiente diseño se infiere del nombre y del docstring de `_evict_ticker`. **Pendiente de confirmación de requisitos.**
+**Decisión de diseño (aprobada por CTO):** se descarta el "00:00 UTC" del docstring original y el "backoff" del borrador inferido. El mecanismo es un **cooldown determinista de 3600s por ticker**, controlado por `time.monotonic()`, gestionado dentro del tick de 1s del supervisor (`_check_recovery_timeouts`). **Sin cron ni scheduler externo.**
 
-**Objetivo:** que un ticker evictado se reintegre automáticamente, sin reinicio manual. Dos enfoques, no excluyentes:
+**Por qué es superior al "00:00 UTC":**
+- El horario fijo dejaría un ticker evictado a las 00:01 inutilizado ~24h. El cooldown reintegra cada ticker **1h después de SU propia evicción**, no en un horario global arbitrario.
+- Reusa el supervisor loop que Gap b ya pondría a correr (mismo tick de 1s que detecta timeouts de recovery) → cero infraestructura nueva, menos superficie de fallo.
+- Es exactamente el patrón del **TTL de `last_error`** ya validado en el watchdog (PR #1): timestamp + expiración por diferencia de tiempo. Patrón conocido, no inventado.
 
-**Opción A — Reintegración diaria 00:00 UTC (lo que prometía el docstring):**
-- Una tarea periódica (en el bloque cooperativo de `data_capture.py`, o un scheduler) que al cruzar 00:00 UTC:
-  1. `self._v2_manager` limpia `_evicted` (método público nuevo a diseñar, p.ej. `reset_evictions()` — pero esto tocaría el manager, hoy prohibido → queda para cuando se levante la prohibición).
-  2. Re-suscribe / fuerza snapshot fresco de los tickers reintegrados para reconstruir sus books.
-- Ventaja: alineado con el ciclo de discovery diario ya mencionado. Desventaja: hasta 24h de inutilización en V2 para un ticker evictado a las 00:01.
+### Flujo de 4 pasos
 
-**Opción B — Cooldown por ticker (reintegración más ágil):**
-- Al evictar, registrar `_evicted_at[ticker] = monotonic()`. El supervisor (ya existente, una vez wireado por Gap b) chequea por tick: si `monotonic() - _evicted_at[ticker] > EVICTION_COOLDOWN_SEC` (p.ej. 300s, calibrable), saca el ticker de `_evicted`, lo borra de `_books`, y dispara un snapshot fresco → se rebootea por el flujo normal de bootstrap (ya robusto por Part A).
-- Ventaja: recuperación en minutos, no horas; reusa el supervisor que Gap b ya pondría a correr. Desventaja: un ticker que falla de forma persistente entraría en ciclos evict→cooldown→evict (mitigable con backoff exponencial del cooldown o un cap de reintegraciones/día).
+**(1) Estructura del dict.** Reemplazar `self._evicted: set[str]` por:
+```
+self._evicted_cooldowns: dict[str, float]   # ticker → monotonic deadline de reintegración
+```
+La key presente = ticker actualmente evictado; el value = instante (`time.monotonic()`) a partir del cual puede reintegrarse. Migrar de `set` a `dict` mantiene la semántica de membresía (`ticker in self._evicted_cooldowns`) y agrega el timestamp en la misma estructura.
 
-**Recomendación (a validar):** **Opción B con backoff**, porque (i) recupera sin esperar al cambio de día, (ii) se apoya en el supervisor que de todos modos hay que wirear para Gap b, y (iii) el bootstrap post-Part-A ya maneja la reconstrucción de un book desde cero de forma segura. La Opción A puede coexistir como "reset duro" diario de respaldo.
+**(2) Penalización de 3600s en `_evict_ticker`.** Al evictar, registrar el deadline:
+```
+EVICTION_COOLDOWN_SEC = 3600.0   # constante de clase
+...
+def _evict_ticker(self, ticker):
+    self._books[ticker] = None
+    self._evicted_cooldowns[ticker] = time.monotonic() + self.EVICTION_COOLDOWN_SEC
+    self._bootstrap_buffer.pop(ticker, None)
+    logger.critical(...)
+```
+`monotonic()` (no `time()`/`datetime`) porque es inmune a saltos del reloj del sistema (NTP, DST) — la penalización es una duración relativa, no un instante de calendario.
 
-**Ambas opciones requieren tocar `orderbook_manager_v2.py`** (método de reintegración + tracking de `_evicted_at`), hoy **prohibido**. Por lo tanto: diseño documentado, implementación diferida hasta que se autorice modificar el manager.
+**(3) Guarda en `handle_message` que protege a los tickers nuevos.** La guarda de descarte cambia de `if ticker in self._evicted` a:
+```
+if ticker in self._evicted_cooldowns:
+    return   # ticker en penalización → descartar delta (data_capture REST sigue en SQLite)
+```
+**Crítico:** la guarda chequea **membresía explícita en el dict**, NO `_books.get(ticker) is None`. Un ticker **nuevo** (nunca visto) no está en `_evicted_cooldowns` → pasa y sigue el flujo normal de bootstrap. Esto preserva la corrección de Part B: solo los evictados a propósito se descartan; los nuevos arrancan normal. (Es el mismo bug que ya se evitó al elegir un contenedor explícito sobre `book is None`.)
+
+**(4) Limpieza en el tick de 1s del supervisor.** Dentro de `_check_recovery_timeouts` (que ya corre cada `SUPERVISOR_TICK_SEC=1s`), agregar una pasada de reintegración:
+```
+now = time.monotonic()
+ready = [t for t, deadline in self._evicted_cooldowns.items() if now >= deadline]
+for ticker in ready:
+    del self._evicted_cooldowns[ticker]   # sale de penalización
+    self._books.pop(ticker, None)         # borra el book None → vuelve a "nunca visto"
+    # el próximo delta del ticker entra por bootstrap normal (encola hasta snapshot);
+    # opcional: forzar get_snapshot del ticker para acelerar la reconstrucción.
+```
+Tras la limpieza, el ticker queda como "nunca visto": su próximo mensaje sigue el bootstrap robusto de Part A (encola pre-snapshot, drena al llegar el snapshot). No hay reconstrucción especial que diseñar — se reusa el camino ya probado.
+
+### Propiedades
+
+- **Determinista:** exactamente 3600s desde cada evicción, sin backoff ni estado acumulado. Predecible para operar y testear.
+- **Sin scheduler:** vive en el tick del supervisor existente (Gap b). Si el supervisor no corre (Gap b sin cerrar), la reintegración tampoco → **Gap c depende de Gap b**. Ambos deben cerrarse juntos.
+- **Ciclo evict→reintegra→evict acotado:** un ticker que falla de forma persistente se reintegra cada hora, falla, y se vuelve a evictar 1h. Es 1 ciclo/hora por ticker — tolerable. (Si se observa flapping en prod, se puede agregar un cap de reintegraciones/día como mejora futura; no es necesario para el diseño base.)
+
+**Requiere tocar `orderbook_manager_v2.py`** (`_evicted` → `_evicted_cooldowns`, constante, guarda, pasada de limpieza), hoy **prohibido**. Implementación **diferida** hasta que se autorice modificar el manager, en turno separado, tras revisión adversarial de este diseño.
 
 ---
 
@@ -83,6 +119,6 @@
 | Gap | Estado | Toca manager? | Bloquea V2? |
 |---|---|---|---|
 | (b) supervisor no vivo + sin anti-zombie | diseñado, no implementado | wiring en `data_capture.py` (no el manager) | **Sí** |
-| (c) reintegración 00:00 UTC inexistente | diseñado (Opc. A/B), no implementado | **Sí** (prohibido hoy) | **Sí** |
+| (c) reintegración de evictados inexistente | diseñado (cooldown determinista 3600s vía `_evicted_cooldowns`), no implementado | **Sí** (prohibido hoy) | **Sí** |
 
 Mientras estos dos gaps no se cierren, **PR #11 no debe mergearse para activar V2**. El flag permanece `False`.
