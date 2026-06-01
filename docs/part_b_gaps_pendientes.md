@@ -122,3 +122,27 @@ Tras la limpieza, el ticker queda como "nunca visto": su próximo mensaje sigue 
 | (c) reintegración de evictados inexistente | diseñado (cooldown determinista 3600s vía `_evicted_cooldowns`), no implementado | **Sí** (prohibido hoy) | **Sí** |
 
 Mientras estos dos gaps no se cierren, **PR #11 no debe mergearse para activar V2**. El flag permanece `False`.
+
+---
+
+## Anexo — Cierre de diseño de Gap (b): aislamiento del supervisor (APROBADO, sin implementar)
+
+La auditoría del cableado anti-zombie destapó un 4º punto bloqueante: con `restart: unless-stopped` (confirmado en `docker-compose.yml:14`, **sin cap**), hacer fail-loud-hasta-matar-proceso ante la muerte del supervisor produce un **crash-loop de contenedor infinito** (supervisor muere → proceso sale → Coolify reinicia → re-bootstrap frágil de 38 tickers → si vuelve a fallar, loop). El "anti-zombie" produciría otro zombie.
+
+**Decisión aprobada (sin implementar): B1 + A2.**
+
+- **B1 — Aislar el supervisor (in-process).** Su muerte NO mata el proceso. El wrapper, ante crash del loop: loggea + `BotState.record_error` + Telegram + espera backoff (1s→2s→4s…) + **relanza el supervisor**. Mantiene un contador de fallos con ventana temporal (mismo patrón que el gap-rate alerting del manager); solo tras N fallos en M min escala a **deshabilitar V2 in-process** (V1 sigue intacto) y alerta. Respeta Lección 7 (nada se traga: se reporta y escala visiblemente) sin sobre-aplicarla a un componente auxiliar de V2-dormant. Vive en el wiring (`data_capture.py`), no en el manager.
+- **A2 — Backstop en `runner.py`.** Contador de arranques persistido en el volumen (`/app/data`): si hubo ≥N arranques en M min → arranca en "modo seguro" (V1 normal, V2 inhibido ignorando el flag) hasta intervención. Cubre el caso de que algo *fuera* del supervisor (p.ej. el WS crítico) entre en loop. Toca `runner.py`, no el manager.
+
+**Por qué B1 sobre A1/solo-cap:** aislar el fallo de un auxiliar preserva V1 (productivo) y evita el re-bootstrap repetido. El cap a nivel Docker (A1) cortaría el loop pero dejaría el bot entero caído por un fallo de V2-dormant — inaceptable. A2 queda como defensa en profundidad de segundo nivel.
+
+**Pendiente para implementación (cuando se autorice):** definir N/M concretos (fallos del supervisor en B1; arranques en A2) — calibrables, punto de partida sugerido: B1 = 5 fallos/5min → V2-off; A2 = 5 arranques/10min → modo seguro.
+
+### Correcciones consolidadas al diseño de (b) y (c) — aplicar al implementar
+
+1. **(b) wording:** el "reinicio limpio" es **restart de contenedor por Coolify** (`unless-stopped`), NO relanzamiento de task por `runner.py` (`runner.run()` es lineal: loggea, `return`, el proceso sale). Corregir la frase "el supervisor de runner.py lo reinicia".
+2. **(b↔c) no persistir cooldowns:** el restart de contenedor reconstruye `_evicted_cooldowns` vacío → reintegración masiva post-restart. **Aceptable** (reset duro tras anomalía; flapping acotado a 1 ciclo/restart). No persistir.
+3. **(c) reintegración ACTIVA obligatoria** (no "opcional"): el paso 4 debe emitir `get_snapshot` para el ticker reintegrado (reusando `_start_recovery` + deadline). La pasiva degenera en flapping (Kalshi no manda snapshots espontáneos).
+4. **(b) aislamiento B1+A2** (este anexo).
+
+**Orden de implementación obligatorio:** (b) antes que (c) — (c) depende de que el supervisor corra. Turnos separados, PR + review, flag `False` durante todo.
