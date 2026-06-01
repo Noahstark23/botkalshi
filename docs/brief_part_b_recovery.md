@@ -1,6 +1,16 @@
 # Brief de Arquitectura — Part B: convergencia de recovery en V2 (Q3)
 
-**ESTADO: APROBADO (revisión adversarial CTO + Noel).** Autoriza escritura de código en la máquina de estados de recovery. `USE_ORDERBOOK_MANAGER_V2` permanece `False` en main hasta la ventana de validación en vivo.
+**ESTADO: DOCUMENTACIÓN POST-HOC del código implementado (PR #11), alineada para revisión adversarial en frío.** El código de Part B ya existe en `feat/v2-recovery-supervisor` (PR #11, draft). Este brief documenta **lo que el código hace**, no una propuesta a futuro. `USE_ORDERBOOK_MANAGER_V2` permanece `False`; el supervisor solo corre cuando se active V2 (ventana de validación en vivo, pendiente).
+
+## 0. Correcciones respecto al brief-borrador original
+
+El borrador previo de esta directiva contenía 3 valores que eran **bugs del brief, no del código**. El código de PR #11 implementa la versión correcta; este documento queda alineado a él:
+
+| Punto | Brief-borrador (incorrecto) | Código PR #11 (correcto) | Por qué |
+|---|---|---|---|
+| Cap de RAM | `len(_pending_deltas[ticker]) > 1000` | `len(_bootstrap_buffer[ticker]) > 1000` | `_pending_deltas` se indexa por **sid** (int), no por ticker → índice inexistente. Y la cola que crece sin techo en bootstrap es `_bootstrap_buffer[ticker]`, no la de recovery. |
+| Guarda None-safe | `if _books.get(ticker) is None: return` | `if ticker in self._evicted: return` | `.get()` da `None` también para tickers **nuevos** (key ausente) → la guarda literal descartaría el primer delta de todo ticker nuevo y rompería el bootstrap. El set `_evicted` distingue "evictado" de "nunca visto". `book=None` se conserva para None-safety. |
+| Tick supervisor | 5s | 1s (`SUPERVISOR_TICK_SEC`) | Con timeout de recovery de 10s, tick 1s detecta el vencimiento con ≤1s de slop vs hasta 5s. Calibrable. |
 
 ## 1. Problema (Q3)
 
