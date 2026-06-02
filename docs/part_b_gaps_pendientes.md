@@ -142,6 +142,17 @@ Mientras estos dos gaps no se cierren, **PR #11 no debe mergearse para activar V
 - ~~**B1** — supervisor del supervisor con backoff y ventanas temporales de conteo de fallos.~~ Eliminado.
 - ~~**A2** — modo seguro en `runner.py` con estado durable en disco (contador de arranques persistido).~~ Eliminado.
 
-**El freno al crash-loop se delega a un cap de restart de Docker** (ver más abajo), no a estado durable en código. Cero código nuevo para esto: una línea de config.
+**El freno al crash-loop NO se delega a un cap de restart de Docker** — ese cap resultó no-soportado en este entorno (ver nota abajo). Se mitiga por otra vía (Telegram + healthcheck + intervención manual).
 
 > Nota histórica: el anexo previo "Cierre de diseño de Gap (b): aislamiento del supervisor (B1+A2)" queda **derogado** por esta poda. Se conserva el registro de las 4 correcciones de wording de (b)/(c) que siguen vigentes (restart = contenedor por Coolify; no persistir cooldowns; reintegración activa obligatoria), pero B1 y A2 ya **no forman parte del diseño**.
+
+### Cap de restart de Docker: NO soportado en este entorno (cerrado)
+
+**Cap de restart de Docker: NO soportado en Coolify** (hardcodea `unless-stopped`, ref. discusión Coolify #10259; no Swarm → `deploy.restart_policy` ignorado). **Decisión: NO implementar wrapper de entrypoint** (= A2 reintroducido, descartado por sobre-ingeniería). A escala de 4-8 mercados NBA, el riesgo de crash-loop es bajo; se mitiga con la alerta de Telegram existente (PR #1) + healthcheck + intervención manual (apagar el flag). El cap automático era nice-to-have, no bloqueante.
+
+Detalle técnico que confirma el cierre (sin necesidad de probar en el entorno):
+- El campo `restart:` de Compose solo acepta `no|always|on-failure|unless-stopped` (sin contador) → `on-failure:5` sería sintaxis inválida.
+- `deploy.restart_policy.max_attempts` solo lo respeta Docker Swarm; este deploy no es Swarm → se ignora silenciosamente.
+- Coolify re-inyecta `unless-stopped` en cada deploy y no expone setting nativo de max-attempts.
+
+`docker-compose.yml` **no se modifica**. No hay wrapper de entrypoint. No hay redeploy.
