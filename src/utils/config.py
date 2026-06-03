@@ -69,6 +69,18 @@ class Settings(BaseSettings):
     MOTOR_3_CLV_ENABLED: bool = False
     USE_ORDERBOOK_MANAGER_V2: bool = Field(default=False, description="Enable WS-based recovery (OrderbookManagerV2)")
 
+    # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
+    # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,
+    # graba EdgeWindow). Default False. Para shadow mode = True + TRADING_ENABLED=False.
+    MOTOR_REST_ENABLED: bool = Field(default=False, description="Run Motor REST (shadow/live)")
+    # Umbrales calibrables con data real del shadow (NO hardcodear en el motor).
+    MOTOR_REST_MIN_EDGE_CENTS: int = Field(
+        default=1, ge=0, description="Edge neto post-comisión mínimo para disparar (cents)"
+    )
+    MOTOR_REST_MIN_DEPTH: int = Field(
+        default=2, ge=1, description="Profundidad mínima (contratos) en la pata limitante"
+    )
+
     # === Optional ===
     SENTRY_DSN: str = ""
 

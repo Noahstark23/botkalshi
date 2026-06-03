@@ -163,7 +163,8 @@ class EdgeWindow(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     market_ticker: str = Field(index=True, max_length=100)
     duration_ms: int | None = None
-    magnitude_cents: int  # spread crudo detectado
+    magnitude_cents: int  # edge NETO post-comisión (lo que decide)
+    gross_spread_cents: int | None = None  # spread BRUTO pre-comisión (para analizar cuánto come el fee)
     leg_states: str | None = Field(default=None, max_length=50)  # "FILL/KILL", "FILL/ERROR_RED", etc.
     reconciled: bool = False
     kill_switch_fired: bool = False
