@@ -72,30 +72,67 @@ Reusar el path ya validado en `bench_rest_arb_path.py`:
 - `TRIGGER_SPREAD_THRESHOLD` (grueso, paso 2): decide cuándo *mirar*. Laxo.
 - `EXECUTION_EDGE_THRESHOLD` (fino, paso 4): decide cuándo *ejecutar*. Estricto, sobre el edge real post-fees de `ArbOpportunity`.
 
-### 4.1 — Ejecución de dos patas (BLOQUEANTE 1, cerrado) — EL riesgo financiero del motor
+### 4.1 — Ejecución de dos patas — EL riesgo financiero del motor (refinado, 2 verificaciones cerradas)
 
-Un arb binario requiere **ambas** patas (comprar YES y NO). Si se llena una sola, el bot queda **apostador direccional con capital real**. El diseño debe especificar qué pasa ante fallo de la 2ª pata.
+Un arb binario requiere **ambas** patas. Si se llena una sola, el bot queda **apostador direccional con capital real**. Dos verificaciones cerradas refinan el diseño:
 
-**Análisis de `executor.py` existente (leído, `execute()` líneas 147-214):**
-- Coloca **ambas patas en paralelo** (`asyncio.gather` de `_place_leg`), **simultáneas**, no secuenciales.
-- Cada pata es una **orden `limit`** al `price_cents` de la `ArbLeg` (`_place_leg`, `order_type="limit"`), NO una FOK real de Kalshi.
-- Si una pata lanza excepción (reject/red) → `failed=True` → `_execute_iterative_rollback`: vende las patas que SÍ se llenaron a `price=1` (agresivo, consume cualquier bid>0), con `max_rollback_retries=3`, slippage cap, y **circuit breaker** tras 3 rollbacks/hora (pausa el bot).
+**VERIFICACIÓN 1 — FOK existe (Gate 0.5):** Kalshi soporta `time_in_force="fill_or_kill"` nativo (`docs/gate_0_5_fok_support.md`). → ejecución primaria por FOK.
 
-**El gap que el executor actual NO cubre (hay que decirlo):** el rollback se dispara solo ante **excepción** de una pata. Pero una orden `limit` puede **no fallar y tampoco llenarse** (queda resting/parcial si el precio se movió en los ~100ms del RTT). En ese caso `_place_leg` retorna OK (la orden se *aceptó*), `failed=False`, y el executor cree "all legs filled" **cuando en realidad una quedó sin ejecutar** → exposición direccional silenciosa. El executor confía en "orden aceptada = pata llena", lo cual con `limit` **no es cierto**.
+**VERIFICACIÓN 2 — Kalshi NO tiene órdenes market** ([changelog oficial](https://docs.kalshi.com/changelog): `type=market` fue removido; solo `type="limit"`). → **cualquier rollback es limit, y un rollback limit PUEDE NO LLENARSE.** Esto cambia el diseño del rollback (ver §4.3).
 
-**Las 3 estrategias y su trade-off:**
+#### 4.2 — Máquina de estados de ejecución por pata (4 estados, NO 3)
 
-| Estrategia | Exposición direccional | Captura | Complejidad |
-|---|---|---|---|
-| **(A) FOK en ambas** (fill-or-kill nativo Kalshi) | **Cero** — si una no se llena completa, ambas se cancelan, nada queda abierto | Menor (pierde ventanas donde una pata se llena parcial) | Baja — requiere que Kalshi soporte FOK y cambiar `order_type` |
-| **(B) Limit paralelo + rollback** (lo que hace executor.py hoy) | **Real** — ventana entre fill de pata 1 y rollback; el rollback puede perder plata (vende a 1¢ / slippage) | Mayor | Media — ya implementado, pero con el gap del partial no-detectado |
-| **(C) Patas simultáneas IOC + verificación de fill** | Baja si se verifica fill real y se hace rollback solo del lado llenado | Media | Alta — requiere polling de fill status post-orden |
+El error a evitar (recrea Issue #14 / viola el principio de Lección 7 "no tragar excepciones de tareas críticas"): un `asyncio.gather(return_exceptions=True)` sobre las dos patas colapsa **éxito y fallo-de-red en lo mismo** — si una pata lanza excepción de red, el bot **no sabe si la orden llegó a Kalshi y se llenó** mientras él cree que falló. Eso es exposición direccional silenciosa.
 
-**Recomendación: (A) FOK en ambas patas, si Kalshi lo soporta.** Razón: para un motor que arranca y se valida en vivo, **cero exposición direccional > maximizar captura**. Un arb es ganancia garantizada *solo si se capturan ambas patas*; media pata es especulación con el capital de $300. FOK convierte el peor caso de "pata huérfana + rollback con pérdida" en "no pasó nada, esperamos la próxima ventana". Se sacrifica algo de captura (ventanas donde una pata se llena y la otra no) — pero esas son justo las ventanas peligrosas. El 73% de captura perfecta no sirve si el 27% restante sangra capital en rollbacks.
+Por eso cada pata resuelve **explícitamente** a uno de **4 estados** (no 3):
 
-**Pendiente de verificación pre-implementación `[verificar contra API Kalshi]`:** ¿Kalshi soporta `order_type="fill_or_kill"` (o `time_in_force` equivalente) en `place_order`? El `_place_leg` actual usa `"limit"`. Si FOK no existe en la API, el fallback es **(C)** (IOC + verificación de fill, con rollback solo del lado ejecutado), NO (B) — porque (B) tiene el gap del partial silencioso. **Esto se confirma antes de escribir el ejecutor del Motor REST.**
+| Estado | Significado | Cómo se determina |
+|---|---|---|
+| **FILL** | la pata se ejecutó completa | respuesta FOK confirma fill total |
+| **KILL** | la pata NO se ejecutó, se canceló limpia | respuesta FOK confirma cancelación (FOK no llenó) |
+| **ERROR_RED** | **estado DESCONOCIDO** — excepción de red/timeout: la orden **pudo haber llegado a Kalshi y llenado, o no** | excepción en el `place_order` (timeout, conn reset, 5xx sin body) |
+| (resuelto vía reconciliación) | — | ver abajo |
 
-**Decisión de reuso:** el Motor REST tendrá su **propio ejecutor** (o un `executor.py` parametrizado por `order_type`), NO reusa el de Motor 1 tal cual — porque el de Motor 1 asume `limit`+rollback (estrategia B, con el gap). El rollback/circuit-breaker de `executor.py` sí se reusa como **fallback** si se va por (C).
+**El 4º estado (ERROR_RED) es el más peligroso y NUNCA se asume como KILL.** Asumir "excepción = no se ejecutó" es precisamente el bug de Issue #14. Tratamiento explícito:
+
+```
+ejecutar ambas patas con manejo de excepción POR PATA (no gather que colapsa):
+  cada pata → FILL | KILL | ERROR_RED
+
+evaluar la combinación:
+  (FILL, FILL)         → arb capturado completo. outcome=captured_full. ✓
+  (KILL, KILL)         → ninguna se ejecutó (ventana se cerró). Cero exposición. outcome=missed_kill. ✓
+  (FILL, KILL)         → UNA pata abierta → rollback de la pata FILL (§4.3).
+  (*, ERROR_RED) o     → ESTADO DESCONOCIDO. NO decidir a ciegas.
+  (ERROR_RED, *)          → RECONCILIAR: consultar la posición REAL vía API antes de rollback.
+```
+
+**Reconciliación del estado ERROR_RED (clave):** ante un `ERROR_RED`, el bot **no asume nada**. Consulta el estado real:
+- `get_positions()` (existe: `kalshi_rest.py:199`) y/o `get_orders()` por `client_order_id` (existe: `kalshi_rest.py:314`) para saber si esa orden **realmente** se llenó en Kalshi.
+- El `client_order_id` (UUID idempotente, ya lo usa el executor) permite localizar la orden aunque la respuesta original se haya perdido.
+- Con la posición real confirmada → recién ahí decidir: si la pata huérfana se llenó → rollback; si no → cerrar el ciclo sin exposición.
+- Si la consulta de reconciliación **también** falla (red sigue caída) → **kill-switch + alerta** (no operar a ciegas; ver §4.3).
+
+Esto convierte FOK de "3 casos limpios" en "4 casos donde el 4º se resuelve por reconciliación, no por suposición". FOK reduce la *frecuencia* de patas huérfanas (KILL es limpio), pero **no elimina** el ERROR_RED — la red puede fallar después de que Kalshi llenó. Por eso la reconciliación es obligatoria aunque se use FOK.
+
+#### 4.3 — Rollback robusto (el rollback limit PUEDE fallar — Kalshi no tiene market)
+
+Como Kalshi **no tiene órdenes market** (Verif. 2), el rollback de una pata huérfana es una **orden limit de venta**, que puede **no llenarse** si el mercado que causó el desbalance se sigue moviendo. "Fallback = ejecución manual" es **inaceptable** para operación desatendida durante el Mundial. Diseño del rollback:
+
+1. **Intento 1 — limit agresivo:** vender la pata huérfana a un precio que cruce el bid actual (consume liquidez disponible). Reusa la lógica de `_execute_iterative_rollback` de `executor.py` (sell agresivo, slippage cap, `max_rollback_retries`).
+2. **Si no se llena → reintento acotado:** N reintentos con re-pricing al bid vigente (el bid se mueve; re-cotizar). Backoff corto.
+3. **Si agota reintentos → KILL-SWITCH automático, no "esperar a Noel":**
+   - Marcar la posición huérfana como **exposición abierta conocida** (persistir en DB, no perderla).
+   - **Pausar el motor** (`MOTOR_REST_ENABLED` efectivo a False en runtime / `BotState.is_paused`) — deja de abrir nuevas posiciones.
+   - **Alerta Telegram CRÍTICA** con el detalle (ticker, lado, size, intentos de rollback).
+   - El circuit-breaker existente de `executor.py` (3 rollbacks/hora → pausa) se reusa como segunda capa.
+   - La posición queda abierta y **señalizada** hasta intervención, pero el bot **no sigue operando a ciegas** ni acumula más exposición. La pérdida máxima queda acotada a esa única posición, no a un sangrado continuo.
+
+**Principio:** el bot desatendido nunca debe quedar en un estado donde *necesita* que el operador esté despierto para no perder más. Ante lo irresoluble automáticamente: **acotar, pausar, alertar** — no seguir.
+
+#### 4.4 — Decisión de reuso de `executor.py`
+
+El Motor REST tiene **ejecutor propio** (`motor_rest_arb/executor.py`), porque el de Motor 1: (a) usa `gather` que colapsa estados (no tiene el ERROR_RED explícito), (b) asume `limit`+rollback sin FOK, (c) tiene el bug de Issue #14. Se **reusa** de `executor.py`: la lógica de `_execute_iterative_rollback` (sell agresivo + slippage cap) y el circuit-breaker, como componentes del §4.3 — pero la orquestación de las patas es nueva (FOK + máquina de 4 estados + reconciliación).
 
 ## 5. Instrumentación OBLIGATORIA desde día 1 — medición de captura neta
 
@@ -111,7 +148,10 @@ Cada vez que el trigger dispara, loguear un **registro estructurado de la ventan
 | `rest_rtt_ms` | RTT del GET aislado (para correlacionar con el bench) |
 | `leg_yes_filled`, `leg_no_filled` | **fill real de CADA pata** (no "orden aceptada"): count llenado por lado |
 | `both_legs_filled` | bool — **la métrica que importa**: ¿se capturó el arb COMPLETO? |
-| `rollback_triggered`, `rollback_pnl_cents` | si hubo rollback y cuánto costó |
+| `rollback_triggered`, `rollback_pnl_cents`, `rollback_filled` | si hubo rollback, cuánto costó, y **si el rollback limit realmente se llenó** (§4.3) |
+| `leg_states` | estado por pata: `FILL`/`KILL`/`ERROR_RED` (§4.2) |
+| `reconciled` | bool — si hubo `ERROR_RED` que requirió consulta de posición real |
+| `kill_switch_fired` | bool — rollback no convergió → motor pausado + alerta (§4.3) |
 | `order_ids` | ids de las órdenes colocadas |
 
 **El número que importa es `both_legs_filled`, NO `edge detectado` (MEJORA 2, cerrada).** Detectar un edge no es capturarlo; capturar una pata no es capturar el arb. La instrumentación debe registrar el **fill confirmado de ambas patas** (vía respuesta de la orden FOK o polling de fill status), porque la pregunta de negocio es *"¿ejecuté el arb completo y neto?"*, no *"¿vi el edge?"*. Sin `both_legs_filled` + `rollback_pnl_cents`, el PnL neto real es invisible.
@@ -131,19 +171,22 @@ Cada vez que el trigger dispara, loguear un **registro estructurado de la ventan
 
 ## 7. Estado de los puntos de revisión
 
-**Bloqueantes cerrados en esta revisión:**
-1. ✅ **Ejecución de 2 patas (era bloqueante 1)** — cerrado en §4.1. Recomendación FOK-ambas (cero exposición direccional), con `[verificar API Kalshi soporta FOK]`; fallback IOC+verificación de fill (C), NO limit+rollback (B, tiene gap de partial silencioso). Ejecutor propio del Motor REST.
-2. ✅ **Shape del `ticker` (era bloqueante 2)** — cerrado en §1.1. Gate 0: captura en shadow puro antes de diseñar la fórmula del trigger; condicionado a que el ticker traiga BBO.
+**Bloqueantes cerrados:**
+1. ✅ **Ejecución de 2 patas** — §4.1/4.2/4.3/4.4. FOK-ambas (Verif. 1: FOK existe) + **máquina de 4 estados** (FILL/KILL/ERROR_RED + reconciliación de posición real ante red incierta — NO se asume ERROR=KILL, eso era Issue #14) + **rollback robusto** (Verif. 2: Kalshi sin market → rollback limit que puede no llenarse → reintento acotado → kill-switch+alerta, NO "ejecución manual").
+2. ✅ **Shape del `ticker`** — Gate 0 PASA (trae BBO, `docs/gate_0_ticker_shape.md`).
+3. ✅ **Throttle global + estrategia 429** — §2.1.
+4. ✅ **Instrumentación de FILL de ambas patas + estados + reconciliación** — §5. `both_legs_filled` métrica central; `leg_states`, `reconciled`, `kill_switch_fired` registrados.
+5. ✅ **FOK existe** — Gate 0.5 (`docs/gate_0_5_fok_support.md`).
+6. ✅ **Kalshi NO tiene órdenes market** — verificado ([changelog](https://docs.kalshi.com/changelog)); rollback rediseñado en §4.3.
 
-**Mejoras cerradas:**
-3. ✅ **Throttle global + estrategia 429** — §2.1. Por-ticker + global (token-bucket), priorización por mayor `trigger_spread` ante saturación, budget que baja ante 429.
-4. ✅ **Instrumentación de FILL de ambas patas** — §5. `both_legs_filled` es la métrica central, no "edge detectado".
+> **Nota de principio:** el riesgo de `gather` que colapsa estados corresponde a **Lección 7** ("PROHIBIDO `asyncio.gather(..., return_exceptions=True)` para tareas críticas"), KALSHI_BOT_CONTEXT.md línea 410 — NO Lección 3 (que es "el edge es marginal"). El principio que aplica es el de Lección 7; el número en la directiva estaba corrido.
 
-**Riesgos residuales que siguen abiertos (para la próxima revisión / a medir en shadow):**
-5. **Race trigger→REST:** entre el ticker y el retorno del GET (~RTT) el book pudo moverse. El edge se evalúa sobre datos frescos del GET, pero la ventana pudo cerrarse. **Empírico:** lo mide `cycle_latency_ms` + `outcome=missed_latency` en vivo.
-6. **Calibración de umbrales sin datos aún:** `TRIGGER_SPREAD_THRESHOLD` y `EXECUTION_EDGE_THRESHOLD` arrancan como estimación; se calibran en shadow antes de `TRADING_ENABLED`.
-7. **Reuso de `RiskManager`:** confirmar que `check_pre_trade` (escrito para Motor 1) no asume nada que no aplique al caso soccer/REST.
-8. **`[verificar API Kalshi]` FOK existe** (de §4.1) — determina si la ejecución va por (A) o (C). Confirmar antes de implementar el ejecutor.
+**Riesgos residuales abiertos (a medir en shadow / próxima revisión):**
+7. **Race trigger→REST:** ~RTT de latencia; el book pudo moverse. Empírico: `cycle_latency_ms` + `outcome=missed_latency`.
+8. **Calibración de umbrales** `TRIGGER_SPREAD_THRESHOLD`/`EXECUTION_EDGE_THRESHOLD` — en shadow antes de `TRADING_ENABLED`.
+9. **Reuso de `RiskManager`** — confirmar que `check_pre_trade` no asume nada de Motor 1 inaplicable.
+10. **`[verificar en demo]`** el envío FOK real + el comportamiento de la reconciliación `get_positions`/`get_orders` contra cuenta demo, antes de capital real.
+11. **Cadencia del ticker** (de Gate 0): cada cuánto Kalshi empuja un ticker nuevo al moverse el BBO — define si la detección reacciona a tiempo. Se mide con el RTT bajo carga.
 
 ## 8. Gobernanza
 - V2 (PR #11, `orderbook_manager_v2.py`) **archivado, intacto, recuperable**. No se borra.
