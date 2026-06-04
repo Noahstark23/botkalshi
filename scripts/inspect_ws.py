@@ -8,7 +8,12 @@ Uso tipico (dentro del container o local con .env):
     python scripts/inspect_ws.py
     python scripts/inspect_ws.py --tickers KXMLB-26-LAD,KXMLB-26-NYY --verbose
     python scripts/inspect_ws.py --channels orderbook_delta --max-messages 50 --duration 30
-    python scripts/inspect_ws.py --channels orderbook_snapshot,ticker,trade
+    python scripts/inspect_ws.py --channels ticker,trade
+
+CANALES VÁLIDOS de Kalshi WS v2: orderbook_delta, ticker, trade, fill, market_lifecycle.
+NOTA: "orderbook_snapshot" NO es un canal — es un TIPO DE MENSAJE que Kalshi envía
+al suscribirse a `orderbook_delta` (el snapshot inicial). Suscribirse a él devuelve
+code 8 "Unknown channel name". El script valida esto y rechaza canales desconocidos.
 """
 from __future__ import annotations
 
@@ -48,7 +53,7 @@ def _load_private_key(path: str):
 
 def _sign(private_key, method: str, path: str, api_key_id: str) -> dict[str, str]:
     timestamp_ms = str(int(time.time() * 1000))
-    msg = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
+    msg = f"{timestamp_ms}{method.upper()}{path}".encode()
     sig = private_key.sign(
         msg,
         padding.PSS(
@@ -187,7 +192,7 @@ async def inspect_ws(
                     break
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 30.0))
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
 
                 msg_counter += 1
@@ -263,12 +268,12 @@ async def inspect_ws(
         print("     The subscription IS working. Bug is in _on_orderbook_delta handler or DB write.")
         print("     Check: msg.get('msg') structure, OrderbookEvent fields, get_session() commits.")
     elif snapshot_count > 0 and delta_count == 0:
-        print(f"  ⚠️  orderbook_snapshot received ({snapshot_count}), but ZERO orderbook_delta.")
+        print(f"  ⚠️  orderbook_snapshot messages received ({snapshot_count}), but ZERO orderbook_delta.")
+        print("     (orderbook_snapshot es el snapshot inicial que llega al suscribir a")
+        print("      orderbook_delta — recibirlo confirma que la suscripción al canal funciona.)")
         print("     Possible causes:")
         print("       - Markets are open but truly inactive (no trades = no deltas)")
-        print("       - Delta channel may use a different name")
-        print("     Try: --channels orderbook_snapshot,book_update,market_data,orderbook")
-        print("     Also try: --duration 300 to wait longer for activity")
+        print("     Try: --duration 300 to wait longer for activity")
     elif subscribed_count > 0 and msg_counter <= subscribed_count:
         print(f"  ⚠️  Subscription confirmed but NO market data after {duration_actual:.0f}s.")
         print("     Markets may be truly inactive right now.")
@@ -282,7 +287,7 @@ async def inspect_ws(
     else:
         print(f"  ⚠️  {msg_counter} messages received but no orderbook traffic.")
         print(f"     Channels tried: {channels}")
-        print("     Try: --channels orderbook_snapshot,ticker,trade,market_data")
+        print("     Try: --channels orderbook_delta,ticker,trade --duration 300")
 
 
 # =====================================================
@@ -336,7 +341,7 @@ async def main() -> int:
         print("ERROR: missing KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH env vars")
         return 1
 
-    if not Path(private_key_path).exists():
+    if not Path(private_key_path).exists():  # noqa: ASYNC240 — script de diagnóstico, check puntual al inicio
         print(f"ERROR: private key not found: {private_key_path}")
         return 1
 
@@ -355,6 +360,19 @@ async def main() -> int:
         return 1
 
     channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+
+    # Validar canales contra los nombres reales de Kalshi WS v2 ANTES de suscribir,
+    # para no generar code 8 "Unknown channel name" (falso positivo del diagnóstico).
+    # "orderbook_snapshot" es un TIPO DE MENSAJE, NO un canal → se rechaza explícito.
+    valid_channels = {"orderbook_delta", "ticker", "trade", "fill", "market_lifecycle"}
+    invalid = [c for c in channels if c not in valid_channels]
+    if invalid:
+        print(f"ERROR: canal(es) inválido(s): {invalid}")
+        if "orderbook_snapshot" in invalid:
+            print("  'orderbook_snapshot' NO es un canal — es el snapshot inicial que llega")
+            print("  al suscribir a 'orderbook_delta'. Usá --channels orderbook_delta.")
+        print(f"  Canales válidos: {sorted(valid_channels)}")
+        return 1
 
     if args.tickers:
         tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
