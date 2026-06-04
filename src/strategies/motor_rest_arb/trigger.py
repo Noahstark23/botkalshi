@@ -13,12 +13,10 @@ Reusa:
 Profundidad: si el size de la pata limitante no se puede leer del payload, se
 trata como INSUFICIENTE (fallo seguro → no dispara), nunca como suficiente.
 
-⚠️ [verificar contra captura real] Los nombres de los campos de size del ticker
-NO fueron registrados con exactitud en Gate 0 (solo se confirmó "sizes asociados
-al BBO"). El parser prueba varios nombres candidatos; al correr el PRIMER shadow
-contra mercado real, lo PRIMERO a confirmar es que _parse_size_fp lee un size de
-verdad (loguear un par de sizes parseados) — si devuelve None en silencio, el
-filtro de profundidad es decorativo y la data del shadow no sirve.
+Shape de size confirmado en producción: yes_bid_size_fp / yes_ask_size_fp, valores
+como strings ("8.73"). _parse_size_float castea a float con fallo seguro a 0.0
+(llave ausente / None / casteo inválido → 0.0 → no alcanza min_depth → no dispara,
+sin interrumpir el feed).
 """
 from __future__ import annotations
 
@@ -26,11 +24,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.math.arbitrage import ArbOpportunity, detect_binary_arb
-from src.strategies.data_capture import parse_price_to_cents, parse_size
+from src.strategies.data_capture import parse_price_to_cents
 
 # Nombres candidatos para el size de cada nivel del BBO en el payload `ticker`.
-# Gate 0 no fijó el nombre exacto → se prueban variantes en orden. Si ninguno
-# aparece, _parse_size_fp devuelve None → profundidad insuficiente (fallo seguro).
+# Shape real confirmado en producción: yes_bid_size_fp / yes_ask_size_fp, valores
+# como strings ("8.73"). Se prueban variantes por robustez; el primero es el real.
 _YES_BID_SIZE_KEYS = ("yes_bid_size_fp", "yes_bid_size", "yes_bid_qty")
 _YES_ASK_SIZE_KEYS = ("yes_ask_size_fp", "yes_ask_size", "yes_ask_qty")
 
@@ -43,20 +41,25 @@ class TriggerSignal:
     opportunity: ArbOpportunity
     net_edge_cents: int      # net_profit_cents de la opp
     gross_spread_cents: int  # gross_profit_cents (pre-comisión)
-    limiting_depth: int      # contratos en la pata limitante
+    limiting_depth: int      # contratos enteros disponibles en la pata limitante
 
 
-def _parse_size_fp(data: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+def _parse_size_float(data: dict[str, Any], keys: tuple[str, ...]) -> float:
     """
-    Lee el size de un nivel probando varios nombres candidatos.
+    Lee el size de un nivel probando varios nombres candidatos, casteado a float.
 
-    Devuelve None si ninguno aparece (→ el caller trata la profundidad como
-    insuficiente: fallo seguro hacia 'no disparo').
+    Los sizes del ticker vienen como strings fraccionarios ("8.73"). FALLO SEGURO:
+    si ninguna llave existe, el valor es None, o el casteo falla (ValueError/
+    TypeError), devuelve 0.0 — nunca interrumpe el feed y nunca se interpreta como
+    profundidad suficiente (0.0 < min_depth → no dispara).
     """
     for k in keys:
         if k in data:
-            return parse_size(data[k])
-    return None
+            try:
+                return float(data[k])
+            except (ValueError, TypeError):
+                return 0.0
+    return 0.0
 
 
 def evaluate_ticker(
@@ -69,8 +72,9 @@ def evaluate_ticker(
     Evalúa un mensaje `ticker` y devuelve una TriggerSignal si hay arbitraje
     rentable post-comisión con profundidad suficiente; None en caso contrario.
 
-    Shape esperado (Gate 0): payload con yes_bid_dollars/yes_ask_dollars
-    (fixed-point strings) + sizes. La pata NO se deriva (Kalshi binario).
+    Shape esperado (confirmado en prod): yes_bid_dollars/yes_ask_dollars
+    (fixed-point strings) + yes_bid_size_fp/yes_ask_size_fp (strings, ej "8.73").
+    La pata NO se deriva (Kalshi binario).
     """
     data = raw_msg.get("msg", raw_msg)
     ticker = data.get("market_ticker")
@@ -90,18 +94,23 @@ def evaluate_ticker(
     if not (1 <= no_ask <= 99):
         return None
 
-    # Profundidad: sizes de la pata limitante. Para el arb se ejecuta contra
-    # el yes_ask (size del ask YES) y el no_ask = vender-YES-bid (size del bid YES).
-    yes_ask_size = _parse_size_fp(data, _YES_ASK_SIZE_KEYS)
-    yes_bid_size = _parse_size_fp(data, _YES_BID_SIZE_KEYS)
-    # Fallo seguro: si no se puede leer algún size → profundidad insuficiente.
-    if yes_ask_size is None or yes_bid_size is None:
-        return None
+    # Profundidad: sizes de la pata limitante (float, fallo seguro a 0.0). Para el
+    # arb se ejecuta contra el yes_ask (size del ask YES) y el no_ask = vender-YES-bid
+    # (size del bid YES).
+    yes_ask_size = _parse_size_float(data, _YES_ASK_SIZE_KEYS)
+    yes_bid_size = _parse_size_float(data, _YES_BID_SIZE_KEYS)
     # La pata NO sintética se ejecuta contra el bid YES; su size disponible es el del bid.
     no_ask_size = yes_bid_size
-    limiting_depth = min(yes_ask_size, no_ask_size)
-    if limiting_depth < min_depth:
+    limiting_depth_float = min(yes_ask_size, no_ask_size)
+    # Fallo seguro: size ausente/inválido → 0.0 → no alcanza min_depth → no dispara.
+    if limiting_depth_float < min_depth:
         return None
+
+    # detect_binary_arb opera en contratos enteros: floor del size (conservador —
+    # 8.73 contratos disponibles → 8 ejecutables).
+    yes_ask_int = int(yes_ask_size)
+    no_ask_int = int(no_ask_size)
+    limiting_depth = min(yes_ask_int, no_ask_int)
 
     # Matemática oficial (reuso): detect_binary_arb descuenta la comisión de ambas
     # patas y devuelve net_profit_cents. Resuelve "cruce bruto que no sobrevive
@@ -109,9 +118,9 @@ def evaluate_ticker(
     opp = detect_binary_arb(
         ticker,
         yes_ask_cents=yes_ask,
-        yes_available_size=yes_ask_size,
+        yes_available_size=yes_ask_int,
         no_ask_cents=no_ask,
-        no_available_size=no_ask_size,
+        no_available_size=no_ask_int,
     )
     if opp is None:
         return None

@@ -19,11 +19,11 @@ def make_ticker(
     ticker: str = "KXWC-26-ARG",
     yes_bid: str,
     yes_ask: str,
-    yes_bid_size: int = 100,
-    yes_ask_size: int = 100,
+    yes_bid_size: float = 100,
+    yes_ask_size: float = 100,
     include_sizes: bool = True,
 ) -> dict:
-    """Mensaje `ticker` mock con shape Gate 0 (fixed-point dollar strings)."""
+    """Mensaje `ticker` mock con shape de prod (dollars + *_size_fp strings)."""
     msg: dict = {
         "type": "ticker",
         "msg": {
@@ -80,5 +80,30 @@ def test_d_no_cross_no_trigger():
 def test_e_missing_size_fails_safe_no_trigger():
     """Size ausente del payload → profundidad insuficiente (fallo seguro), NO trigger."""
     msg = make_ticker(yes_bid="0.5800", yes_ask="0.4000", include_sizes=False)
+    sig = evaluate_ticker(msg, min_edge_cents=1, min_depth=2)
+    assert sig is None
+
+
+def test_f_fractional_size_string_parsed_as_float():
+    """Size fraccionario ('8.73') se castea a float; floor a int para ejecución."""
+    # yes_bid=0.58 → no_ask=42; yes_ask=0.40 → arb rentable. sizes 8.73 ≥ min_depth 2.
+    msg = make_ticker(yes_bid="0.5800", yes_ask="0.4000", yes_bid_size=8.73, yes_ask_size=8.73)
+    sig = evaluate_ticker(msg, min_edge_cents=1, min_depth=2)
+    assert sig is not None
+    assert sig.limiting_depth == 8  # floor(8.73)
+
+
+def test_g_invalid_size_string_fails_safe_no_trigger():
+    """Size con casteo inválido → fallo seguro a 0.0 → no alcanza min_depth → NO trigger."""
+    msg = make_ticker(yes_bid="0.5800", yes_ask="0.4000")
+    msg["msg"]["yes_bid_size_fp"] = "not-a-number"
+    msg["msg"]["yes_ask_size_fp"] = "not-a-number"
+    sig = evaluate_ticker(msg, min_edge_cents=1, min_depth=2)
+    assert sig is None
+
+
+def test_h_fractional_below_one_fails_min_depth():
+    """Size fraccionario < min_depth (0.5 < 2) → NO trigger (no se redondea hacia arriba)."""
+    msg = make_ticker(yes_bid="0.5800", yes_ask="0.4000", yes_bid_size=0.5, yes_ask_size=0.5)
     sig = evaluate_ticker(msg, min_edge_cents=1, min_depth=2)
     assert sig is None
