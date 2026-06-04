@@ -278,6 +278,7 @@ class KalshiRestClient:
         yes_price: int | None = None,
         no_price: int | None = None,
         client_order_id: str | None = None,
+        time_in_force: str = "gtc",
     ) -> dict:
         """
         Coloca una orden.
@@ -286,6 +287,18 @@ class KalshiRestClient:
         1. Verifica TRADING_ENABLED=true
         2. Valida con risk manager
         3. Considera idempotency con client_order_id
+
+        time_in_force:
+            Default "gtc" (good-till-canceled) — replica el comportamiento histórico
+            de Kalshi (que asume gtc si se omite), por lo que NO cambia el
+            comportamiento de ningún caller existente.
+
+            ⚠️ ADVERTENCIA: "gtc" deja la orden RESTING viva si no cruza — es el
+            modo asociado al bug del Issue #14 (pata que queda abierta sin
+            detectarse → exposición direccional silenciosa). Para arbitraje el
+            caller DEBE pasar explícitamente time_in_force="fill_or_kill"
+            (FOK: se ejecuta completa o se cancela, cero resting). NUNCA confiar
+            en el default para órdenes de arbitraje.
         """
         body: dict[str, Any] = {
             "ticker": ticker,
@@ -293,6 +306,7 @@ class KalshiRestClient:
             "action": action,
             "count": count,
             "type": order_type,
+            "time_in_force": time_in_force,
         }
         if yes_price is not None:
             body["yes_price"] = yes_price

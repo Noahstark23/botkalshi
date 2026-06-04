@@ -148,9 +148,30 @@ class BotRun(SQLModel, table=True):
     crash_reason: str | None = Field(default=None, max_length=500)
 
 
-# =====================================================
-# Engine y session
-# =====================================================
+class EdgeWindow(SQLModel, table=True):
+    """
+    Ventana de edge detectada por el Motor REST (shadow + live).
+
+    Mide la captura NETA real: cada vez que el trigger del Motor REST dispara,
+    se registra la ventana — spread detectado, latencias, estados de las patas y
+    resultado de la ejecución/rollback. Es solo un registro de datos; no dispara
+    lógica de trading. Ver docs/motor_rest_design.md §5.
+    """
+
+    __tablename__ = "edge_windows"
+
+    id: int | None = Field(default=None, primary_key=True)
+    market_ticker: str = Field(index=True, max_length=100)
+    duration_ms: int | None = None
+    magnitude_cents: int  # edge NETO post-comisión (lo que decide)
+    gross_spread_cents: int | None = None  # spread BRUTO pre-comisión (para analizar cuánto come el fee)
+    leg_states: str | None = Field(default=None, max_length=50)  # "FILL/KILL", "FILL/ERROR_RED", etc.
+    reconciled: bool = False
+    kill_switch_fired: bool = False
+    rollback_filled: bool = False
+    cycle_latency_ms: int | None = None
+    rest_rtt_ms: int | None = None
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 _engine: Any = None
 

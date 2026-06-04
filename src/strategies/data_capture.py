@@ -120,6 +120,7 @@ class DataCaptureService:
         self._delta_shape_logged = False
         self._snapshot_shape_logged = False
         self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
+        self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
         self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
 
     # =====================================================
@@ -447,6 +448,45 @@ class DataCaptureService:
     # Lifecycle
     # =====================================================
 
+    def _register_ws_handlers(self) -> None:
+        """
+        Registra los handlers del WS. Separado de run() para testear el wiring.
+
+        - Handlers base de captura (siempre).
+        - OrderbookManagerV2 si USE_ORDERBOOK_MANAGER_V2 y no Motor 1.
+        - Motor REST (shadow) si MOTOR_REST_ENABLED.
+        """
+        # Handlers base de captura
+        self.ws.on("orderbook_delta", self._on_orderbook_delta)
+        self.ws.on("orderbook_snapshot", self._on_orderbook_snapshot)
+        self.ws.on("ticker", self._on_ticker)
+        self.ws.on("trade", self._on_trade)
+
+        # Orderbook manager — V2 if flag enabled and Motor 1 is not already wiring it.
+        # When MOTOR_1_ARBITRAGE_ENABLED=True, runner.py owns the manager lifecycle.
+        if self.settings.USE_ORDERBOOK_MANAGER_V2 and not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
+            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
+            self._v2_manager = OrderbookManagerV2(self.ws)
+            BotState.v2_manager = self._v2_manager
+            self.ws.on("orderbook_delta", self._v2_manager.handle_message)
+            self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)
+            self.ws.on("ok", self._v2_manager.handle_message)
+            self.ws.on("error", self._v2_manager.handle_message)
+            logger.info("OrderbookManagerV2 registered (data-capture only, no Motor 1)")
+
+        # Motor REST — shadow mode. Estrictamente condicionado por MOTOR_REST_ENABLED.
+        # SHADOW: detecta arbitraje sobre el canal `ticker` y graba EdgeWindow; NUNCA
+        # ejecuta órdenes (TRADING_ENABLED es el muro; el engine no instancia ejecución).
+        # El canal `ticker` ya se suscribe, así que solo se agrega el handler.
+        if self.settings.MOTOR_REST_ENABLED:
+            from src.strategies.motor_rest_arb.engine import RestArbEngine
+            self._rest_engine = RestArbEngine()
+            self.ws.on("ticker", self._rest_engine.on_ticker)
+            logger.info(
+                "Motor REST registered (SHADOW: detecta y graba EdgeWindow, "
+                f"trading_enabled={self.settings.TRADING_ENABLED})"
+            )
+
     async def run(self) -> None:
         """Loop principal del servicio."""
         # Discovery con retry: la primera llamada al arranque suele topar 429
@@ -475,23 +515,7 @@ class DataCaptureService:
             BotState.record_error("Discovery returned 0 markets after retries")
             return
 
-        # Registrar handlers
-        self.ws.on("orderbook_delta", self._on_orderbook_delta)
-        self.ws.on("orderbook_snapshot", self._on_orderbook_snapshot)
-        self.ws.on("ticker", self._on_ticker)
-        self.ws.on("trade", self._on_trade)
-
-        # Orderbook manager — V2 if flag enabled and Motor 1 is not already wiring it.
-        # When MOTOR_1_ARBITRAGE_ENABLED=True, runner.py owns the manager lifecycle.
-        if self.settings.USE_ORDERBOOK_MANAGER_V2 and not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
-            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
-            self._v2_manager = OrderbookManagerV2(self.ws)
-            BotState.v2_manager = self._v2_manager
-            self.ws.on("orderbook_delta", self._v2_manager.handle_message)
-            self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)
-            self.ws.on("ok", self._v2_manager.handle_message)
-            self.ws.on("error", self._v2_manager.handle_message)
-            logger.info("OrderbookManagerV2 registered (data-capture only, no Motor 1)")
+        self._register_ws_handlers()
 
         # Encolar suscripciones (se aplicaran al conectar el WS)
         ticker_list = list(self._tracked_tickers)
