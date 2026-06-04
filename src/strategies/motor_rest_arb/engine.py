@@ -36,12 +36,26 @@ class RestArbEngine:
     Wiring (cuando MOTOR_REST_ENABLED=True): ws.on("ticker", self.on_ticker).
     """
 
+    # Cada cuántos tickers evaluados se emite un heartbeat INFO (evidencia de vida).
+    HEARTBEAT_EVERY = 200
+
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._signals_seen = 0
+        self._signals_seen = 0       # cruces de arbitraje detectados (EdgeWindows grabadas)
+        self._tickers_evaluated = 0  # tickers procesados (para el heartbeat)
 
     async def on_ticker(self, raw_msg: dict[str, Any]) -> None:
         """Handler del canal `ticker`: evaluar trigger y, si hay señal, grabar shadow."""
+        self._tickers_evaluated += 1
+        # Heartbeat de observabilidad: evidencia VIVA de que el motor procesa.
+        # 0 edges es normal en mercado eficiente; el heartbeat distingue "sin cruces"
+        # de "motor zombi". Loguea cada HEARTBEAT_EVERY tickers a nivel INFO.
+        if self._tickers_evaluated % self.HEARTBEAT_EVERY == 0:
+            logger.info(
+                f"REST Engine Heartbeat: {self._tickers_evaluated} tickers evaluados, "
+                f"{self._signals_seen} cruces detectados"
+            )
+
         try:
             signal = evaluate_ticker(
                 raw_msg,
