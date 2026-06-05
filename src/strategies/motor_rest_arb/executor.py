@@ -30,6 +30,20 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 
 
+def _as_int(value: object) -> int | None:
+    """Castea a int un campo que puede venir int o fixed-point string. None si inválido."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (str, float)):
+        try:
+            return int(round(float(value)))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 class LegState(StrEnum):
     """Estado resuelto de una pata tras intentar ejecutarla."""
 
@@ -63,6 +77,12 @@ class RestExecutor:
     """
     Ejecutor FOK del Motor REST. Una instancia por motor; mantiene el estado del
     circuit breaker en memoria.
+
+    NO ES RE-ENTRANTE: `execute()` no debe llamarse concurrentemente sobre la misma
+    instancia. `_paused` y `_rollback_timestamps` no tienen lock; en asyncio
+    single-thread con llamadas SECUENCIALES (el uso previsto) es seguro, pero
+    invocaciones solapadas tendrían carrera en el circuit breaker. El caller debe
+    serializar las ejecuciones. [validar/ajustar en demo si el motor paraleliza]
     """
 
     ROLLBACK_WINDOW_SEC = 3600.0       # ventana del circuit breaker
@@ -147,24 +167,54 @@ class RestExecutor:
             logger.warning(f"rest_exec.leg.error_red ticker={leg.market_ticker} side={leg.side}: {exc}")
             return LegResult(leg=leg, state=LegState.ERROR_RED, client_order_id=coid)
 
-        order = resp.get("order", {}) if isinstance(resp, dict) else {}
+        order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = str(order.get("order_id", "")) or None
-        if self._order_is_filled(order, leg):
+        if self._create_order_filled(order, leg):
             return LegResult(leg=leg, state=LegState.FILL, client_order_id=coid, order_id=order_id)
-        # FOK que no llenó → cancelado limpio.
+        # FOK que no llenó (remaining_count > 0 / fill_count < count) → cancelado limpio.
         return LegResult(leg=leg, state=LegState.KILL, client_order_id=coid, order_id=order_id)
 
     @staticmethod
-    def _order_is_filled(order: dict, leg: ArbLeg) -> bool:
-        """True si la respuesta de la orden indica fill completo de la pata."""
-        status = str(order.get("status", "")).lower()
-        if status in ("filled", "executed"):
-            return True
-        # Algunos shapes reportan count llenado; fill completo = count solicitado.
-        filled = order.get("filled_count", order.get("count_filled"))
-        if isinstance(filled, int):
-            return filled >= leg.count
-        return False
+    def _create_order_filled(order: dict, leg: ArbLeg) -> bool:
+        """
+        True si la respuesta de CreateOrder indica fill COMPLETO de la pata.
+
+        Shape real de Kalshi CreateOrder (V2), verificado contra la doc:
+        https://docs.kalshi.com/api-reference/orders/create-order
+          - fill_count: contratos llenados inmediatamente al colocar.
+          - remaining_count: contratos restantes; para FOK/IOC es el estado final
+            tras cancelar lo no llenado.
+        NO existe un campo `status` en CreateOrder; tampoco `filled`/`count_filled`.
+
+        FALLO CONSERVADOR HACIA KILL: si los campos esperados no están presentes o
+        no son enteros, se devuelve False (KILL). Mejor un rollback innecesario que
+        leer un KILL como FILL → exposición direccional silenciosa (Issue #14).
+
+        ⚠️ [verificar en demo] El nombre exacto puede venir como fixed-point
+        (`fill_count_fp`/`remaining_count_fp`, strings) según endpoint/versión. Se
+        prueban ambos; lo que no se confirme aquí se valida mandando una FOK real
+        en cuenta demo y observando la respuesta cruda antes de operar capital.
+        """
+        fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp")))
+        remaining = _as_int(order.get("remaining_count", order.get("remaining_count_fp")))
+        if fill_count is None:
+            return False  # sin señal de fill confiable → KILL conservador
+        # Fill completo: se llenó al menos lo pedido y no quedó nada pendiente.
+        if remaining is not None:
+            return fill_count >= leg.count and remaining == 0
+        return fill_count >= leg.count
+
+    @staticmethod
+    def _get_orders_filled(order: dict, leg: ArbLeg) -> bool:
+        """
+        True si una orden de GetOrders/GetOrder está ejecutada (para reconciliación).
+
+        Shape real de Kalshi GetOrders, verificado:
+        https://docs.kalshi.com/api-reference/orders/get-orders
+          - status ∈ {"resting", "canceled", "executed"}.
+        FILL = status == "executed". Fallo conservador: cualquier otro → no llena.
+        """
+        return str(order.get("status", "")).lower() == "executed"
 
     # =====================================================
     # Reconciliación de ERROR_RED (estado desconocido)
@@ -196,24 +246,60 @@ class RestExecutor:
 
     async def _reconcile_leg(self, r: LegResult) -> bool:
         """
-        Consulta el estado REAL de una pata ERROR_RED. True si está llena en Kalshi.
+        Consulta el estado REAL de una pata ERROR_RED con DOS fuentes independientes.
 
-        Si la consulta de reconciliación también falla (red sigue caída) → tratar
-        como exposición (fail-safe: rollbackear es más seguro que ignorar) y marcar
-        para kill-switch si el rollback no converge.
+        Es la decisión más cara del sistema, así que no descansa en una sola fuente
+        (que además comparte el shape de parsing dudoso):
+          1) PRIMARIA: get_orders, match por client_order_id → status=="executed".
+          2) SECUNDARIA: get_positions, ¿hay posición abierta en el ticker?
+
+        Reglas (fail-safe hacia exposición = rollback, la opción segura):
+          - Si CUALQUIERA de las dos consultas falla (red sigue caída) → exposición.
+          - Si DISCREPAN (una dice llena, la otra no) → exposición (no confiar en
+            la fuente optimista).
+          - Solo si AMBAS coinciden en "no llena" → no llena (no rollback).
         """
+        # Fuente 1: get_orders por client_order_id.
         try:
             resp = await self.client.get_orders(ticker=r.leg.market_ticker)
             orders = resp.get("orders", []) if isinstance(resp, dict) else []
-            for o in orders:
-                if str(o.get("client_order_id", "")) == r.client_order_id:
-                    return self._order_is_filled(o, r.leg)
-            # No apareció la orden: probablemente no llegó a Kalshi → no llena.
-            return False
+            matched = next(
+                (o for o in orders if str(o.get("client_order_id", "")) == r.client_order_id),
+                None,
+            )
+            # No apareció la orden → probablemente no llegó a Kalshi (no llena por esta fuente).
+            orders_says_filled = self._get_orders_filled(matched, r.leg) if matched else False
         except Exception as exc:
-            # Reconciliación falló: asumir exposición (fail-safe hacia rollback).
-            logger.critical(f"rest_exec.reconcile.failed ticker={r.leg.market_ticker}: {exc} → assume exposed")
+            logger.critical(f"rest_exec.reconcile.get_orders_failed ticker={r.leg.market_ticker}: {exc} → assume exposed")
             return True
+
+        # Fuente 2: get_positions, independiente del parsing de órdenes.
+        try:
+            has_position = await self._has_open_position(r.leg.market_ticker)
+        except Exception as exc:
+            logger.critical(f"rest_exec.reconcile.get_positions_failed ticker={r.leg.market_ticker}: {exc} → assume exposed")
+            return True
+
+        if orders_says_filled == has_position:
+            return orders_says_filled  # ambas coinciden
+        # Discrepancia entre fuentes → tratar como exposición (rollback, lo seguro).
+        logger.critical(
+            f"rest_exec.reconcile.discrepancy ticker={r.leg.market_ticker} "
+            f"get_orders={orders_says_filled} get_positions={has_position} → assume exposed"
+        )
+        return True
+
+    async def _has_open_position(self, ticker: str) -> bool:
+        """True si hay una posición abierta (no-cero) en el ticker, vía get_positions."""
+        resp = await self.client.get_positions()
+        positions = resp.get("market_positions", resp.get("positions", [])) if isinstance(resp, dict) else []
+        for p in positions:
+            if str(p.get("ticker", "")) == ticker:
+                # 'position' (contratos netos) != 0 → posición abierta.
+                pos = _as_int(p.get("position"))
+                if pos is not None and pos != 0:
+                    return True
+        return False
 
     # =====================================================
     # Rollback + circuit breaker
@@ -258,8 +344,8 @@ class RestExecutor:
                     client_order_id=str(uuid.uuid4()),
                     time_in_force="immediate_or_cancel",
                 )
-                order = resp.get("order", {}) if isinstance(resp, dict) else {}
-                if self._order_is_filled(order, leg):
+                order = resp.get("order", resp) if isinstance(resp, dict) else {}
+                if self._create_order_filled(order, leg):
                     logger.info(f"rest_exec.rollback.filled ticker={leg.market_ticker} attempt={attempt + 1}")
                     return True
                 logger.warning(
