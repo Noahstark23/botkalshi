@@ -8,25 +8,30 @@ esté mergeado.
 
 ---
 
-## 🔴 GATE IRREDUCIBLE — Validación del sensor de fill en demo (BLOQUEANTE)
+## ✅ GATE DEL SENSOR DE FILL — CERRADO (validado contra API viva, 2026-06-05)
 
-El sensor `_create_order_filled` (`src/strategies/motor_rest_arb/executor.py`) está verificado
-**solo contra la doc de Kalshi**, NO contra la API viva. Es el sensor primario de toda la
-máquina de estados (FILL/KILL/ERROR_RED se ramifican de "¿llenó sí o no?"). Antes de capital:
+El sensor de fill (`src/strategies/motor_rest_arb/`) fue validado mandando una orden
+`fill_or_kill` REAL en cuenta demo y capturando las respuestas crudas. Las 3 rutas de la
+máquina de estados están confirmadas contra la API viva de Kalshi:
 
-- [ ] Mandar una orden **`fill_or_kill` REAL en cuenta demo**.
-- [ ] Capturar la **respuesta cruda** (JSON completo de CreateOrder).
-- [ ] Confirmar que `_create_order_filled` la lee correctamente:
-  - [ ] caso **FILL → FILL** (orden que se llena completa).
-  - [ ] caso **KILL → KILL** (orden FOK que no cruza y se cancela).
-- [ ] **Confirmar el sufijo `_fp`** de los campos numéricos: ¿la API devuelve `fill_count`/
-  `remaining_count` (int) o `fill_count_fp`/`remaining_count_fp` (fixed-point string)? El
-  código prueba ambos, pero hay que confirmar cuál es el real y que se parsea bien.
+- [x] **FILL → FILL** — HTTP 200 + `fill_count_fp="1.00"`, `remaining_count_fp="0.00"`,
+  `status="executed"`. `_create_order_filled` lo lee correctamente (incluido el sufijo `_fp`:
+  los campos vienen como fixed-point strings; el parser castea bien).
+- [x] **KILL → KILL** — HTTP **409** + `error.code="fill_or_kill_insufficient_resting_volume"`.
+  Hallazgo de la prueba: Kalshi modela el KILL como 409, NO como order object. El sensor ahora
+  lo detecta con match estricto (`status_code==409 AND error_code conocido`) y devuelve KILL
+  determinístico — sin reconciliar. (PR #22.)
+- [x] **ERROR_RED → reconcilia** — excepción de red/timeout o cualquier OTRO 409/code → estado
+  desconocido → reconciliación de doble fuente (`get_orders` + `get_positions`).
 
-**Hasta que esta validación en demo pase, el executor NO opera, aunque esté en main.**
-(Recordatorio del modo de fallo evitado: el sensor original adivinaba campos inexistentes
-—`status`/`filled_count`— que habrían leído todo FILL como KILL → rollback en cada fill.
-Ahora falla conservador hacia KILL, pero el shape real debe confirmarse en vivo.)
+**Validado en la máquina de estados, no solo en el sensor aislado:** el caso FILL/KILL-409 →
+rollback INMEDIATO de la pata llena, sin reconciliación demorada (test
+`test_fill_plus_kill409_rolls_back_immediately_no_reconcile`).
+
+> **`[verificar]` residual menor:** `fill_or_kill_insufficient_resting_volume` es el único
+> error code de "FOK no llenó" observado. Si en producción aparece otro 409 relacionado a FOK,
+> se suma a `_FOK_KILL_ERROR_CODES`. Fallo conservador hasta entonces (code desconocido →
+> ERROR_RED → reconcilia, nunca exposición silenciosa).
 
 ---
 
@@ -58,5 +63,5 @@ Ahora falla conservador hacia KILL, pero el shape real debe confirmarse en vivo.
 |---|---|
 | Detección (shadow, `RestArbEngine`) | ✅ en main, **corriendo** (graba EdgeWindow, riesgo cero) |
 | Ejecución (`RestExecutor`) | ✅ en main, **DORMANT** (sin wiring, sin validar en demo) |
-| Sensor de fill validado en API viva | ❌ **pendiente — gate irreducible** |
+| Sensor de fill validado en API viva (FILL/KILL/ERROR_RED) | ✅ **cerrado** (demo, PR #22) |
 | Wiring `execute()` detrás de `TRADING_ENABLED` | ❌ pendiente (paso aparte) |
