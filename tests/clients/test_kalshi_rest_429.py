@@ -135,3 +135,28 @@ async def test_no_retry_after_header_no_crash(mock_settings, mock_signer):
         result = await client._request("GET", "/events")
 
     assert result == {"result": "ok"}
+
+
+# =====================================================
+# error.code parsing (para distinguir KILL de FOK del resto)
+# =====================================================
+
+def test_classify_error_extracts_fok_kill_code():
+    """Un 409 con body {'error':{'code':...}} → KalshiClientError con error_code poblado."""
+    from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
+
+    body = '{"error":{"code":"fill_or_kill_insufficient_resting_volume","message":"no volume"}}'
+    err = KalshiRestClient._classify_error(409, body)
+    assert isinstance(err, KalshiClientError)
+    assert err.status_code == 409
+    assert err.error_code == "fill_or_kill_insufficient_resting_volume"
+
+
+def test_classify_error_code_none_when_unparseable():
+    """Body no-JSON o sin code → error_code None (best-effort, no crashea)."""
+    from src.clients.kalshi_rest import KalshiRestClient
+
+    assert KalshiRestClient._classify_error(409, "not json").error_code is None
+    assert KalshiRestClient._classify_error(400, '{"foo":"bar"}').error_code is None
+    # code en la raíz también se acepta.
+    assert KalshiRestClient._classify_error(409, '{"code":"x"}').error_code == "x"

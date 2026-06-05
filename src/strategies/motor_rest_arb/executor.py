@@ -26,8 +26,16 @@ from enum import StrEnum
 
 from loguru import logger
 
-from src.clients.kalshi_rest import KalshiRestClient
+from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
 from src.math.arbitrage import ArbLeg, ArbOpportunity
+
+# error.code que Kalshi devuelve (HTTP 409) cuando una orden fill_or_kill NO encuentra
+# volumen para llenarse → es un KILL DETERMINÍSTICO (la orden llegó y se rechazó limpio),
+# NO un ERROR_RED. Verificado contra la API viva (demo, 2026-06-05).
+# [verificar] ¿Es el ÚNICO code que significa "FOK no llenó"? Con este se cubre el caso
+# probado; si en prod aparece otro 409 relacionado a FOK, se suma acá. Fallo conservador:
+# cualquier code distinto → se repropaga → ERROR_RED → reconcilia.
+_FOK_KILL_ERROR_CODES = frozenset({"fill_or_kill_insufficient_resting_volume"})
 
 
 def _as_int(value: object) -> int | None:
@@ -146,9 +154,9 @@ class RestExecutor:
         """
         Coloca una pata con FOK. Resuelve a FILL / KILL / ERROR_RED.
 
-        - FILL  : la respuesta indica la orden llena (status filled / count llenado).
-        - KILL  : la respuesta indica que el FOK no llenó y se canceló.
-        - ERROR_RED: excepción de red/timeout → estado DESCONOCIDO (no asumir KILL).
+        - FILL  : HTTP 200, fill_count completo y remaining 0.
+        - KILL  : HTTP 409 con error.code de "FOK sin volumen" → rechazo determinístico.
+        - ERROR_RED: excepción de red/timeout o cualquier otro error → DESCONOCIDO.
         """
         try:
             resp = await self.client.place_order(
@@ -162,8 +170,27 @@ class RestExecutor:
                 client_order_id=coid,
                 time_in_force="fill_or_kill",
             )
+        except KalshiClientError as exc:
+            # Kalshi modela el KILL de un FOK como HTTP 409 + error.code específico, NO como
+            # un order object con status canceled. Es un rechazo DETERMINÍSTICO: la orden
+            # llegó y no había volumen → KILL limpio, nada que reconciliar.
+            # Match ESTRICTO: solo 409 + code conocido es KILL. Cualquier otro 409 (orden
+            # malformada, mercado cerrado, etc.) o cualquier otro code → ERROR_RED (se
+            # reconcilia). Fallo conservador hacia "estado desconocido".
+            if exc.status_code == 409 and exc.error_code in _FOK_KILL_ERROR_CODES:
+                logger.info(
+                    f"rest_exec.leg.kill ticker={leg.market_ticker} side={leg.side} "
+                    f"code={exc.error_code} (FOK sin volumen, KILL determinístico)"
+                )
+                return LegResult(leg=leg, state=LegState.KILL, client_order_id=coid)
+            # Otro error de cliente (4xx) → desconocido, no asumir KILL.
+            logger.warning(
+                f"rest_exec.leg.error_red ticker={leg.market_ticker} side={leg.side} "
+                f"status={exc.status_code} code={exc.error_code}: {exc}"
+            )
+            return LegResult(leg=leg, state=LegState.ERROR_RED, client_order_id=coid)
         except Exception as exc:
-            # NO asumir KILL: la orden pudo llegar a Kalshi y llenarse.
+            # Excepción de red/timeout: la orden pudo llegar a Kalshi y llenarse → DESCONOCIDO.
             logger.warning(f"rest_exec.leg.error_red ticker={leg.market_ticker} side={leg.side}: {exc}")
             return LegResult(leg=leg, state=LegState.ERROR_RED, client_order_id=coid)
 

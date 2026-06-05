@@ -11,6 +11,7 @@ Features:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from urllib.parse import urlencode
 
@@ -30,11 +31,17 @@ from src.utils.config import get_settings
 class KalshiAPIError(Exception):
     """Error genérico de Kalshi API."""
 
-    def __init__(self, status_code: int, message: str, response_body: str = ""):
+    def __init__(
+        self, status_code: int, message: str, response_body: str = "", error_code: str | None = None
+    ):
         self.status_code = status_code
         self.message = message
         self.response_body = response_body
-        super().__init__(f"[{status_code}] {message}")
+        # error.code del body JSON de Kalshi (p.ej. "fill_or_kill_insufficient_resting_volume").
+        # None si el body no traía un code parseable. Lo usan los callers para distinguir
+        # causas determinísticas (KILL de FOK) de errores genéricos.
+        self.error_code = error_code
+        super().__init__(f"[{status_code}] {message}" + (f" code={error_code}" if error_code else ""))
 
 
 class KalshiAuthError(KalshiAPIError):
@@ -72,6 +79,31 @@ def _record_api_error(method: str, path: str, exc: Exception) -> None:
         )
     except Exception:
         pass  # best-effort; never let logging crash a request
+
+
+def _extract_error_code(response_text: str) -> str | None:
+    """
+    Extrae error.code del body JSON de un error de Kalshi.
+
+    Shape esperado: {"error": {"code": "...", "message": "..."}}. Algunos errores
+    traen "code" en la raíz. Devuelve None si el body no es JSON o no trae code
+    (best-effort: nunca lanza).
+    """
+    try:
+        body = json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error")
+    if isinstance(err, dict):
+        code = err.get("code")
+        if isinstance(code, str):
+            return code
+    root_code = body.get("code")
+    if isinstance(root_code, str):
+        return root_code
+    return None
 
 
 class KalshiRestClient:
@@ -119,14 +151,15 @@ class KalshiRestClient:
 
     @staticmethod
     def _classify_error(status_code: int, response_text: str) -> KalshiAPIError:
-        """Mapea status code → excepción específica."""
+        """Mapea status code → excepción específica, con error.code del body si lo hay."""
+        error_code = _extract_error_code(response_text)
         if status_code in (401, 403):
-            return KalshiAuthError(status_code, "Auth failed", response_text)
+            return KalshiAuthError(status_code, "Auth failed", response_text, error_code)
         if status_code == 429:
-            return KalshiRateLimitError(status_code, "Rate limited", response_text)
+            return KalshiRateLimitError(status_code, "Rate limited", response_text, error_code)
         if 500 <= status_code < 600:
-            return KalshiServerError(status_code, "Server error", response_text)
-        return KalshiClientError(status_code, "Client error", response_text)
+            return KalshiServerError(status_code, "Server error", response_text, error_code)
+        return KalshiClientError(status_code, "Client error", response_text, error_code)
 
     async def _request(
         self,
