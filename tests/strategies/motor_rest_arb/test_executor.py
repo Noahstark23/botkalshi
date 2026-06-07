@@ -205,3 +205,80 @@ def test_get_orders_filled_status():
     assert g({"status": "resting"}, leg) is False
     assert g({"status": "canceled"}, leg) is False
     assert g({}, leg) is False  # conservador
+
+
+@pytest.mark.asyncio
+async def test_fok_kill_409_read_as_kill_not_error_red():
+    """HTTP 409 + code de FOK-sin-volumen → KILL determinístico (NO ERROR_RED, no reconcilia)."""
+    from src.clients.kalshi_rest import KalshiClientError
+
+    client = AsyncMock()
+    kill_409 = KalshiClientError(
+        409, "Client error", "", error_code="fill_or_kill_insufficient_resting_volume"
+    )
+    # Ambas patas devuelven el 409-KILL → ambas KILL → cero exposición, sin reconciliar.
+    client.place_order = AsyncMock(side_effect=[kill_409, kill_409])
+    ex = RestExecutor(client)
+
+    out = await ex.execute(_opp())
+
+    assert out.leg_states == [LegState.KILL, LegState.KILL]
+    assert out.filled is False
+    assert out.rollback_triggered is False
+    assert out.reconciled is False          # KILL determinístico: nada que reconciliar
+    client.get_orders.assert_not_called()   # no se consultó nada
+    client.get_positions.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_other_409_is_error_red_not_kill():
+    """Un 409 con OTRO error code (no FOK) → ERROR_RED (se reconcilia), NUNCA KILL."""
+    from src.clients.kalshi_rest import KalshiClientError
+
+    client = AsyncMock()
+    other_409 = KalshiClientError(409, "Client error", "", error_code="market_closed")
+    # yes FILL, no → 409 de otra causa → ERROR_RED → reconcilia.
+    client.place_order = AsyncMock(side_effect=[_filled_resp(), other_409, _filled_resp()])
+    client.get_orders = AsyncMock(return_value={"orders": []})
+    client.get_positions = AsyncMock(return_value={"market_positions": []})
+    ex = RestExecutor(client)
+
+    out = await ex.execute(_opp())
+
+    assert LegState.ERROR_RED in out.leg_states  # NO se trató como KILL
+    assert out.reconciled is True                # se reconcilió (es lo correcto para 'desconocido')
+
+
+@pytest.mark.asyncio
+async def test_fill_plus_kill409_rolls_back_immediately_no_reconcile():
+    """
+    EL CASO PELIGROSO (a nivel máquina de estados, no solo sensor):
+    pata 1 FILL (200) + pata 2 KILL-409 determinístico → resultado FILL/KILL →
+    rollback INMEDIATO de la pata 1, SIN reconciliación de la pata 2.
+
+    Si el KILL-409 se tratara como ERROR_RED, el executor reconciliaría la pata 2
+    (get_orders/get_positions) antes de rollbackear la pata 1 expuesta — demora que
+    cuesta plata mientras el mercado se mueve. Este test garantiza que NO pasa.
+    """
+    from src.clients.kalshi_rest import KalshiClientError
+
+    client = AsyncMock()
+    kill_409 = KalshiClientError(
+        409, "Client error", "", error_code="fill_or_kill_insufficient_resting_volume"
+    )
+    # pata 1 (yes) FILL, pata 2 (no) KILL-409; luego el rollback (sell) de la pata 1 llena.
+    client.place_order = AsyncMock(side_effect=[_filled_resp(), kill_409, _filled_resp()])
+    ex = RestExecutor(client)
+
+    out = await ex.execute(_opp())
+
+    assert out.leg_states == [LegState.FILL, LegState.KILL]
+    assert out.rollback_triggered is True       # rollback de la pata 1 (FILL)
+    assert out.rollback_filled is True
+    assert out.reconciled is False              # ← clave: NO se reconcilió la pata 2
+    client.get_orders.assert_not_called()       # KILL-409 es determinístico, no se consulta
+    client.get_positions.assert_not_called()
+    # El rollback fue un sell a 1¢ de la pata YES (la única llena).
+    sell_call = client.place_order.await_args_list[2]
+    assert sell_call.kwargs["action"] == "sell"
+    assert sell_call.kwargs["yes_price"] == 1
