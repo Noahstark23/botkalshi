@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import event
 from sqlmodel import Field, Session, SQLModel, create_engine
 
 from src.utils.config import get_settings
@@ -176,19 +177,46 @@ class EdgeWindow(SQLModel, table=True):
 _engine: Any = None
 
 
+def _apply_sqlite_pragmas(dbapi_conn: Any, _connection_record: Any) -> None:
+    """
+    PRAGMAs por-conexión para SQLite, aplicados en cada connect del pool.
+
+    - journal_mode=WAL: permite lectores concurrentes + 1 escritor sin el lock
+      EXCLUSIVO del modo 'delete' (default). Necesario porque V1 (data_capture) y
+      el Motor REST shadow escriben en la MISMA DB; con 'delete' los escritores se
+      serializan duro y, bajo carga (soccer en vivo), aparece 'database is locked'.
+      WAL es persistente (la primera conexión convierte la DB), pero re-aplicarlo
+      es idempotente y barato.
+    - busy_timeout=5000: ante lock, esperar hasta 5s en vez de fallar al instante
+      (el default es 0 → fallo inmediato). Cubre el residual de contención.
+    """
+    cur = dbapi_conn.cursor()
+    try:
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.execute("PRAGMA synchronous=NORMAL")  # seguro con WAL; menos fsync por commit
+    finally:
+        cur.close()
+
+
 def get_engine() -> Any:
     """Singleton del engine."""
     global _engine
     if _engine is None:
         settings = get_settings()
         connect_args = {}
-        if "sqlite" in settings.DATABASE_URL:
+        is_sqlite = "sqlite" in settings.DATABASE_URL
+        if is_sqlite:
             connect_args["check_same_thread"] = False
         _engine = create_engine(
             settings.DATABASE_URL,
             echo=False,
             connect_args=connect_args,
         )
+        if is_sqlite:
+            # WAL + busy_timeout en cada conexión (evita 'database is locked' con
+            # múltiples escritores: V1 captura + Motor REST shadow).
+            event.listen(_engine, "connect", _apply_sqlite_pragmas)
     return _engine
 
 
