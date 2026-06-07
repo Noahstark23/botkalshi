@@ -25,8 +25,27 @@ from typing import Any
 from loguru import logger
 
 from src.storage.models import EdgeWindow, get_session
-from src.strategies.motor_rest_arb.trigger import TriggerSignal, evaluate_ticker
+from src.strategies.motor_rest_arb.trigger import (
+    _YES_ASK_SIZE_KEYS,
+    _YES_BID_SIZE_KEYS,
+    TriggerSignal,
+    _parse_size_float,
+    evaluate_ticker,
+)
 from src.utils.config import get_settings
+
+
+def _raw_size_value(data: dict[str, Any], keys: tuple[str, ...]) -> tuple[str, Any]:
+    """
+    Diagnóstico: devuelve (key_encontrada, valor_crudo) del primer candidate presente.
+
+    Si ninguna llave existe, devuelve ("<absent>", None). Permite distinguir en el log
+    'campo ausente' de 'campo presente pero None' de 'campo con valor real ("8.73")'.
+    """
+    for k in keys:
+        if k in data:
+            return k, data[k]
+    return "<absent>", None
 
 
 class RestArbEngine:
@@ -43,18 +62,41 @@ class RestArbEngine:
         self.settings = get_settings()
         self._signals_seen = 0       # cruces de arbitraje detectados (EdgeWindows grabadas)
         self._tickers_evaluated = 0  # tickers procesados (para el heartbeat)
+        # Diagnóstico de profundidad (instrumentación, NO afecta la lógica del trigger):
+        # cuántos tickers de la ventana actual tuvieron size REAL (bid>0 Y ask>0).
+        # Resuelve la ambigüedad de "0 cruces": mercado eficiente (size_real alto) vs
+        # parser lee None → size 0.0 → el filtro de profundidad descarta TODO (size_real=0).
+        self._ticks_with_real_size = 0
 
     async def on_ticker(self, raw_msg: dict[str, Any]) -> None:
         """Handler del canal `ticker`: evaluar trigger y, si hay señal, grabar shadow."""
         self._tickers_evaluated += 1
+
+        # Muestreo de size para diagnóstico (instrumentación pura: NO altera detección).
+        # Reusa el parser y las keys del trigger (única fuente de verdad). Mide si el
+        # size llega real o None — sin esto, "0 cruces" no es interpretable.
+        data = raw_msg.get("msg", raw_msg)
+        bid_key, bid_raw = _raw_size_value(data, _YES_BID_SIZE_KEYS)
+        ask_key, ask_raw = _raw_size_value(data, _YES_ASK_SIZE_KEYS)
+        bid_size = _parse_size_float(data, _YES_BID_SIZE_KEYS)
+        ask_size = _parse_size_float(data, _YES_ASK_SIZE_KEYS)
+        if bid_size > 0 and ask_size > 0:
+            self._ticks_with_real_size += 1
+
         # Heartbeat de observabilidad: evidencia VIVA de que el motor procesa.
         # 0 edges es normal en mercado eficiente; el heartbeat distingue "sin cruces"
-        # de "motor zombi". Loguea cada HEARTBEAT_EVERY tickers a nivel INFO.
+        # de "motor zombi". Ahora también reporta si el size llega real (size_real_en
+        # X/N) + una muestra cruda del último tick (key=raw->parsed) para confirmar en
+        # 30s que el parser NO lee None. Loguea cada HEARTBEAT_EVERY tickers a INFO.
         if self._tickers_evaluated % self.HEARTBEAT_EVERY == 0:
             logger.info(
                 f"REST Engine Heartbeat: {self._tickers_evaluated} tickers evaluados, "
-                f"{self._signals_seen} cruces detectados"
+                f"{self._signals_seen} cruces detectados | "
+                f"size_real_en {self._ticks_with_real_size}/{self.HEARTBEAT_EVERY} ticks | "
+                f"ultimo_tick: {bid_key}={bid_raw!r}->{bid_size:.2f} "
+                f"{ask_key}={ask_raw!r}->{ask_size:.2f}"
             )
+            self._ticks_with_real_size = 0  # reset por ventana
 
         try:
             signal = evaluate_ticker(
