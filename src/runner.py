@@ -110,8 +110,17 @@ class ProductionRunner:
         # Pequeño delay para que health server esté listo primero
         await asyncio.sleep(2)
 
-        self._capture = DataCaptureService()
-        await self._capture.run()
+        # Cliente REST PERSISTENTE para el path de ejecución del Motor REST (live):
+        # se instancia UNA vez, pool abierto toda la vida del servicio, inyectado al
+        # servicio (y de ahí al executor en la Capa 2). Solo se abre con
+        # TRADING_ENABLED=true; en shadow NO se crea → la ruta es idéntica a la actual.
+        if self.settings.TRADING_ENABLED:
+            async with KalshiRestClient() as rest_client:
+                self._capture = DataCaptureService(rest_client=rest_client)
+                await self._capture.run()
+        else:
+            self._capture = DataCaptureService()
+            await self._capture.run()
 
     async def _reconcile_on_boot(self) -> None:
         """

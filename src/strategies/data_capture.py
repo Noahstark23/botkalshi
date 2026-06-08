@@ -112,7 +112,7 @@ class DataCaptureService:
     WS_SILENCE_THRESHOLD_SEC = 300  # silencio del WS que dispara reconexion forzada
     WS_ZOMBIE_ALERT_THRESHOLD = 2  # detecciones consecutivas antes de alertar a Telegram
 
-    def __init__(self) -> None:
+    def __init__(self, rest_client: KalshiRestClient | None = None) -> None:
         self.settings = get_settings()
         self.ws = KalshiWebSocket()
         self._stop_event = asyncio.Event()
@@ -121,6 +121,9 @@ class DataCaptureService:
         self._snapshot_shape_logged = False
         self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
         self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
+        # Cliente REST persistente inyectado por el runner SOLO con TRADING_ENABLED=true.
+        # None en shadow. La Capa 2 lo pasará al RestExecutor del Motor REST.
+        self._rest_client = rest_client
         self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
 
     # =====================================================
