@@ -483,10 +483,29 @@ class DataCaptureService:
         # El canal `ticker` ya se suscribe, así que solo se agrega el handler.
         if self.settings.MOTOR_REST_ENABLED:
             from src.strategies.motor_rest_arb.engine import RestArbEngine
-            self._rest_engine = RestArbEngine()
+
+            # ── Capa A del muro (gatear la construcción del path de ejecución) ──────
+            # El executor + risk manager SOLO se construyen con TRADING_ENABLED=true Y
+            # un cliente REST persistente presente. Si falta cualquiera, el engine queda
+            # en SHADOW (executor=None) → estructuralmente incapaz de ejecutar.
+            executor = None
+            risk_manager = None
+            if self.settings.TRADING_ENABLED and self._rest_client is not None:
+                from src.risk.manager import RiskManager
+                from src.strategies.motor_rest_arb.executor import RestExecutor
+                executor = RestExecutor(self._rest_client)
+                risk_manager = RiskManager()
+            elif self.settings.TRADING_ENABLED and self._rest_client is None:
+                logger.error(
+                    "Motor REST: TRADING_ENABLED=true pero SIN cliente REST persistente "
+                    "→ se queda en SHADOW (no se construye el executor)."
+                )
+
+            self._rest_engine = RestArbEngine(executor=executor, risk_manager=risk_manager)
             self.ws.on("ticker", self._rest_engine.on_ticker)
+            mode = "LIVE: ejecuta" if executor is not None else "SHADOW: detecta y graba EdgeWindow"
             logger.info(
-                "Motor REST registered (SHADOW: detecta y graba EdgeWindow, "
+                f"Motor REST registered ({mode}, "
                 f"trading_enabled={self.settings.TRADING_ENABLED})"
             )
 
