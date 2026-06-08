@@ -12,17 +12,23 @@ from unittest.mock import MagicMock, patch
 from src.strategies.data_capture import DataCaptureService
 
 
-def _service_with_flags(*, motor_rest: bool, trading: bool = False) -> DataCaptureService:
+def _service_with_flags(
+    *, motor_rest: bool, trading: bool = False, with_client: bool = False
+) -> DataCaptureService:
     settings = MagicMock()
     settings.USE_ORDERBOOK_MANAGER_V2 = False
     settings.MOTOR_1_ARBITRAGE_ENABLED = False
     settings.MOTOR_REST_ENABLED = motor_rest
     settings.TRADING_ENABLED = trading
+    rest_client = MagicMock() if with_client else None
     # Mockear get_settings en ambos módulos: data_capture y el engine (que lo llama en su __init__).
+    # RiskManager también llama get_settings en su __init__ (path live) → mockearlo ahí.
     with patch("src.strategies.data_capture.get_settings", return_value=settings), patch(
         "src.strategies.data_capture.KalshiWebSocket"
-    ), patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
-        svc = DataCaptureService()
+    ), patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings), patch(
+        "src.risk.manager.get_settings", return_value=settings
+    ):
+        svc = DataCaptureService(rest_client=rest_client)
         svc.ws = MagicMock()
         # _register_ws_handlers se llama dentro del with para que el engine vea el mock.
         svc._register_ws_handlers()
@@ -53,11 +59,32 @@ def test_motor_rest_not_wired_when_flag_disabled():
 
 
 def test_motor_rest_does_not_touch_execution_in_shadow():
-    """Shadow (MOTOR_REST_ENABLED=True, TRADING_ENABLED=False): el engine no referencia ejecución."""
+    """Shadow (MOTOR_REST_ENABLED=True, TRADING_ENABLED=False): el engine NO puede ejecutar."""
     svc = _service_with_flags(motor_rest=True, trading=False)
 
-    # El engine existe pero no tiene ningún atributo de ejecución (no FOKExecutor, no client de órdenes).
+    # Capa A: el engine existe pero su path de ejecución no se construyó.
     engine = svc._rest_engine
     assert engine is not None
-    assert not hasattr(engine, "executor")
+    assert engine._executor is None
+    assert engine._risk_manager is None
     assert not hasattr(engine, "place_order")
+
+
+def test_motor_rest_builds_executor_when_live_with_client():
+    """Capa A: TRADING_ENABLED=true + cliente presente → executor + risk_manager construidos."""
+    svc = _service_with_flags(motor_rest=True, trading=True, with_client=True)
+
+    engine = svc._rest_engine
+    assert engine is not None
+    assert engine._executor is not None
+    assert engine._risk_manager is not None
+
+
+def test_motor_rest_stays_shadow_when_live_but_no_client():
+    """Capa A (guard): TRADING_ENABLED=true pero SIN cliente → se queda en shadow (executor=None)."""
+    svc = _service_with_flags(motor_rest=True, trading=True, with_client=False)
+
+    engine = svc._rest_engine
+    assert engine is not None
+    assert engine._executor is None
+    assert engine._risk_manager is None

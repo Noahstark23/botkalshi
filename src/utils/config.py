@@ -80,6 +80,14 @@ class Settings(BaseSettings):
     MOTOR_REST_MIN_DEPTH: int = Field(
         default=2, ge=1, description="Profundidad mínima (contratos) en la pata limitante"
     )
+    # Umbral FINO de EJECUCIÓN, distinto del trigger grueso de arriba: se DETECTA/graba
+    # con el grueso (MOTOR_REST_MIN_EDGE_CENTS) pero se EJECUTA solo si el edge neto
+    # post-comisión supera este % del capital comprometido (= opp.edge_pct, una fuente
+    # de verdad). Default ALTO/conservador; se calibra con data del shadow.
+    MOTOR_REST_EXECUTION_EDGE_PCT: float = Field(
+        default=1.5, ge=0.0,
+        description="Edge neto post-fee mínimo (% del capital comprometido) para EJECUTAR",
+    )
 
     # === Optional ===
     SENTRY_DSN: str = ""
