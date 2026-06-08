@@ -60,6 +60,15 @@ class KalshiClientError(KalshiAPIError):
     """4xx (excepto 401/403/429) - no retry, bug nuestro."""
 
 
+class TradingDisabledError(RuntimeError):
+    """
+    Capa C del muro: se intentó colocar una orden de ENTRADA con TRADING_ENABLED=false.
+
+    Defensa final de bajo nivel — independiente de cualquier guard aguas arriba.
+    NO es un error de la API de Kalshi (no tiene status_code): la orden nunca salió.
+    """
+
+
 # Excepciones retryables
 _RETRYABLE_EXCEPTIONS = (
     httpx.TimeoutException,
@@ -333,6 +342,21 @@ class KalshiRestClient:
             (FOK: se ejecuta completa o se cancela, cero resting). NUNCA confiar
             en el default para órdenes de arbitraje.
         """
+        # ── Capa C del muro (defensa final de bajo nivel) ──────────────────────
+        # Con TRADING_ENABLED=false NINGUNA orden de ENTRADA puede salir, sin
+        # importar bugs aguas arriba. Default-deny: se bloquea todo SALVO
+        # action="sell", que es una SALIDA PROTECTORA (rollback cerrando una pata
+        # expuesta). Si el flag se apagara a mitad de una ejecución, bloquear el
+        # sell dejaría exposición abierta sin poder cerrarla — peor que no tener
+        # guard. Invariante de Kalshi (verificado en todo el codebase, no hay
+        # short): buy = abrir posición, sell = cerrar. Reconcile usa get_orders/
+        # get_positions, no place_order, así que no se ve afectado.
+        if action != "sell" and not self.settings.TRADING_ENABLED:
+            raise TradingDisabledError(
+                f"place_order bloqueado: TRADING_ENABLED=false "
+                f"(action={action} ticker={ticker} count={count})"
+            )
+
         body: dict[str, Any] = {
             "ticker": ticker,
             "side": side,

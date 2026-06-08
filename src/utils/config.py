@@ -116,6 +116,7 @@ class Settings(BaseSettings):
                 self.MOTOR_1_ARBITRAGE_ENABLED,
                 self.MOTOR_2_SPORTSBOOK_ENABLED,
                 self.MOTOR_3_CLV_ENABLED,
+                self.MOTOR_REST_ENABLED,
             ]):
                 raise ValueError(
                     "TRADING_ENABLED=true pero ningún motor está habilitado. "
