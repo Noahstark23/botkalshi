@@ -16,16 +16,21 @@ EL MURO DE TRADING_ENABLED (defensa en profundidad):
     - Objetivo: que sea estructuralmente IMPOSIBLE que salga una orden en shadow,
       no que dependa de un único `if`.
 
-Este módulo, hoy, NO importa ni referencia ningún ejecutor ni `place_order`.
+El muro completo (3 capas, cable Capas 1-3): Capa A = data_capture solo construye el
+RestExecutor con TRADING_ENABLED=true + cliente presente; Capa B = guard en on_ticker
+(executor None o flag false → return); Capa C = place_order bloquea ENTRADAS con el
+flag en false (kalshi_rest.TradingDisabledError).
 """
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from src.math.arbitrage import ArbOpportunity, detect_binary_arb
+from src.monitoring.telegram_alerts import alert_trade
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_rest_arb.trigger import (
     _YES_ASK_SIZE_KEYS,
@@ -38,7 +43,7 @@ from src.utils.config import get_settings
 
 if TYPE_CHECKING:
     from src.risk.manager import RiskManager
-    from src.strategies.motor_rest_arb.executor import RestExecutor
+    from src.strategies.motor_rest_arb.executor import ExecutionOutcome, RestExecutor
 
 
 def _raw_size_value(data: dict[str, Any], keys: tuple[str, ...]) -> tuple[str, Any]:
@@ -189,11 +194,12 @@ class RestArbEngine:
                 # Gatekeeper de riesgo: caps + stop-loss + is_paused (sizing por caps, cero Kelly).
                 decision = await risk_manager.check_pre_trade(opp)
                 if not decision.approved:
+                    # El rechazo queda registrado en este log (EdgeWindow no tiene campo
+                    # "rejected"; la fila de detección ya está grabada con sus defaults).
                     logger.info(
                         f"motor_rest.exec.rejected ticker={opp.legs[0].market_ticker} "
                         f"reason={decision.reason} edge_id={edge_id}"
                     )
-                    # TODO Capa 3: _update_edge_window_outcome(edge_id, rejected)
                     return
 
                 # Resize al count autorizado REUSANDO detect_binary_arb (recomputa
@@ -207,21 +213,63 @@ class RestArbEngine:
                     )
                     return
 
+                t0 = time.monotonic()
                 outcome = await executor.execute(opp_sized)
-                # Capa 2: loguear el outcome para VERIFICAR execute() en demo.
+                cycle_latency_ms = int((time.monotonic() - t0) * 1000)
+                # Loguear el outcome (verificación en demo, independiente de Telegram/DB).
                 logger.info(
                     f"motor_rest.exec.outcome edge_id={edge_id} filled={outcome.filled} "
                     f"leg_states={[s.value for s in outcome.leg_states]} "
                     f"reconciled={outcome.reconciled} rollback_filled={outcome.rollback_filled} "
                     f"kill_switch={outcome.kill_switch_fired} "
-                    f"rejected_paused={outcome.rejected_paused}"
+                    f"rejected_paused={outcome.rejected_paused} "
+                    f"latency_ms={cycle_latency_ms}"
                 )
-                # TODO Capa 3: alert_trade(outcome, opp_sized) + _update_edge_window_outcome(edge_id, outcome)
+                # Capa 3 — registro y notificación, AMBOS best-effort: el trade ya pasó;
+                # un fallo acá jamás debe afectar el resultado ni tirar el task.
+                try:
+                    await alert_trade(outcome, opp_sized)
+                except Exception:
+                    logger.exception("motor_rest.exec.alert_error")
+                self._update_edge_window_outcome(edge_id, outcome, cycle_latency_ms)
         except Exception:
             logger.exception("motor_rest.exec.error")
         finally:
             self._executing = False
             self._exec_task = None
+
+    def _update_edge_window_outcome(
+        self,
+        edge_id: int | None,
+        outcome: ExecutionOutcome,
+        cycle_latency_ms: int,
+    ) -> None:
+        """
+        Pobla la fila de EdgeWindow (grabada en la detección) con el resultado real.
+
+        BEST-EFFORT: corre DESPUÉS de que execute() retornó — es registro, no decisión.
+        Si falla (o edge_id es None porque la detección no se grabó), la fila queda con
+        defaults y el outcome ya está en el log; NUNCA propaga al flujo de ejecución.
+        rest_rtt_ms queda en default (no medible desde el engine; mejora futura:
+        sumarlo al ExecutionOutcome del executor).
+        """
+        if edge_id is None:
+            return
+        try:
+            with get_session() as session:
+                row = session.get(EdgeWindow, edge_id)
+                if row is None:
+                    logger.warning(f"motor_rest.edge.update_missing edge_id={edge_id}")
+                    return
+                row.leg_states = "/".join(s.value for s in outcome.leg_states)
+                row.reconciled = outcome.reconciled
+                row.kill_switch_fired = outcome.kill_switch_fired
+                row.rollback_filled = outcome.rollback_filled
+                row.cycle_latency_ms = cycle_latency_ms
+                session.add(row)
+                session.commit()
+        except Exception:
+            logger.exception(f"motor_rest.edge.update_error edge_id={edge_id}")
 
     def _resize_opportunity(self, opp: ArbOpportunity, max_count: int) -> ArbOpportunity | None:
         """

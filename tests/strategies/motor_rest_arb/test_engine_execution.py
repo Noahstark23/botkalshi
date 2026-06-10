@@ -82,10 +82,12 @@ async def test_shadow_never_executes():
 
 @pytest.mark.asyncio
 async def test_live_executes_full_flow():
-    """flag=true + executor: detección → check_pre_trade → resize → execute() llamado."""
+    """flag=true + executor: detección → check_pre_trade → resize → execute → alert + update."""
     ex, rm = _mock_executor(), _mock_risk(max_count=50)
     eng = _engine(_settings(trading=True), executor=ex, risk_manager=rm)
-    with patch.object(eng, "_record_edge_window", return_value=7):
+    with patch.object(eng, "_record_edge_window", return_value=7), patch(
+        "src.strategies.motor_rest_arb.engine.alert_trade", new=AsyncMock()
+    ) as mock_alert, patch.object(eng, "_update_edge_window_outcome") as mock_update:
         await eng.on_ticker(_arb_ticker())
         await _drain(eng)
 
@@ -94,6 +96,15 @@ async def test_live_executes_full_flow():
     # El opp ejecutado fue redimensionado al count autorizado (50), no el detectado (100).
     executed_opp = ex.execute.call_args.args[0]
     assert executed_opp.count == 50
+    # Capa 3: Telegram + update de EdgeWindow corren tras el outcome, con el edge_id
+    # de la detección y la latencia medida alrededor de execute().
+    mock_alert.assert_awaited_once()
+    assert mock_alert.call_args.args[0] is ex.execute.return_value  # el outcome real
+    mock_update.assert_called_once()
+    upd_args = mock_update.call_args.args
+    assert upd_args[0] == 7                        # edge_id de la detección
+    assert upd_args[1] is ex.execute.return_value  # el outcome
+    assert isinstance(upd_args[2], int) and upd_args[2] >= 0  # cycle_latency_ms medido
     assert eng._executing is False     # limpiado en finally
     assert eng._exec_task is None
 

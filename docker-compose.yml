@@ -56,6 +56,8 @@ services:
       MOTOR_REST_ENABLED: ${MOTOR_REST_ENABLED:-false}
       MOTOR_REST_MIN_EDGE_CENTS: ${MOTOR_REST_MIN_EDGE_CENTS:-1}
       MOTOR_REST_MIN_DEPTH: ${MOTOR_REST_MIN_DEPTH:-2}
+      # Umbral FINO de ejecución (% del capital comprometido); calibrable desde Coolify.
+      MOTOR_REST_EXECUTION_EDGE_PCT: ${MOTOR_REST_EXECUTION_EDGE_PCT:-1.5}
 
       # Optional
       SENTRY_DSN: ${SENTRY_DSN:-}
