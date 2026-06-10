@@ -1,10 +1,10 @@
 # Checklist de activación con capital — Motor REST
 
-**Estado:** el `RestExecutor` está en `main` (PR #20, `1e4fe28`) pero **DORMANT** — nadie llama
-`execute()`. **NO toca capital** hasta que TODOS los gates de abajo pasen, aunque el código
-esté mergeado.
-
-`TRADING_ENABLED=False` y `MOTOR_REST_ENABLED=True` (shadow) es el estado operativo actual.
+**Estado (2026-06-10):** el **cable está COMPLETO en `main`** (Capas 1+2+3, PRs #26/#27/#28):
+detección → umbral fino → `check_pre_trade` → resize → `execute()` → Telegram → EdgeWindow,
+detrás del muro de 3 capas (A: construcción gateada; B: guard en el path; C: `place_order`
+bloquea entradas). **NO toca capital**: `TRADING_ENABLED=False` y el cable nunca corrió en
+vivo — producción sigue en shadow. Próximo paso: **demo en ventana muerta** (Opción B).
 
 ---
 
@@ -35,13 +35,42 @@ rollback INMEDIATO de la pata llena, sin reconciliación demorada (test
 
 ---
 
+## 🔴 BLOQUEANTE pre-plata real: RiskManager CIEGO al Motor REST (verificado 2026-06-10)
+
+Rastreo contra el código real (read-only):
+
+- El RiskManager lee **SOLO la tabla `Trade`**: exposición = `Trade` con
+  `status in ('pending','filled')` (manager.py:95); stop-losses −3/−8/−15% = `Trade` con
+  `status='settled'` + `pnl_cents` (manager.py:148-150).
+- El cable del Motor REST **NO escribe `Trade`**: `execute()` → `ExecutionOutcome` → solo
+  EdgeWindow. Único escritor de `Trade` en el codebase: Motor 1 (`_persist_intents`).
+- Consecuencias: (a) pérdidas del Motor REST (p.ej. rollbacks) **jamás disparan stop-loss**;
+  (b) `check_pre_trade` ve **$0 de exposición** del propio motor → el cap de exposición
+  simultánea (25%) no acumula sus posiciones; (c) el kill-switch del Motor REST pausa solo
+  el `RestExecutor` **en memoria** (no `BotState.is_paused`) → un restart borra la pausa.
+
+**Fix (tarea aparte, diseño → review → código):** el cable persiste `Trade` rows
+(`strategy="motor_rest_arb"`, intents pre-red + status post-outcome, patrón Motor 1) →
+alimenta exposición y stop-losses sin tocar `manager.py`. Resolver además settlement
+(`settled_at`/`pnl_cents`). **NO bloquea la demo** (capital ficticio); **SÍ bloquea**
+`TRADING_ENABLED=true` real.
+
+---
+
 ## Resto del checklist (gates estándar de trading)
 
-- [ ] **7 días sin crashes** en producción (uptime continuo, sin reinicios por excepción).
-- [ ] **RiskManager sin excepciones** en ese período (`check_pre_trade` corriendo limpio).
-- [ ] **Cap de 5% por trade / ¼ Kelly** confirmado activo en la config efectiva.
-- [ ] **Wiring de `execute()`** detrás de `TRADING_ENABLED` — paso aparte, con su propio gate
-  de código (diseño → review → código → review). Hoy NO está wireado.
+- [ ] **7 días sin crashes** en producción — **EN CERO**: el cable nunca corrió; el reloj
+  arranca con el deploy post-demo.
+- [ ] **Arbitrajes detectados en logs** — **NO cumplido** (`edge_windows=0` a la fecha); lo
+  llena la data del Mundial en shadow.
+- [ ] **RiskManager apto para Motor REST** — NO cumplido: deuda documentada (manager.py:33-39:
+  sobrestima exposición, PnL realized-only, race en check concurrente) + tests de integración
+  pendientes + **veredicto CIEGO de arriba (🔴)**.
+- [ ] **Cap de 5% por trade** confirmado activo (`MAX_TRADE_SIZE_PCT=5.0`); sizing por caps,
+  **cero Kelly** (decisión 2026-06: en arb p≈1, Kelly diría 100% del bankroll).
+- [ ] **Smoke test de `place_order` contra producción** — pendiente, post-demo.
+- [x] **Wiring de `execute()`** detrás de `TRADING_ENABLED` — ✅ HECHO (cable Capas 1+2+3,
+  PRs #26/#27/#28, con muro de 3 capas y review por capa). Falta validarlo en demo.
 
 ---
 
@@ -61,7 +90,10 @@ rollback INMEDIATO de la pata llena, sin reconciliación demorada (test
 
 | Componente | Estado |
 |---|---|
-| Detección (shadow, `RestArbEngine`) | ✅ en main, **corriendo** (graba EdgeWindow, riesgo cero) |
-| Ejecución (`RestExecutor`) | ✅ en main, **DORMANT** (sin wiring, sin validar en demo) |
+| Detección (shadow, `RestArbEngine`) | ✅ en main (graba EdgeWindow + heartbeat con diag de size) |
+| Ejecución (`RestExecutor`) | ✅ en main, sensor validado en API viva |
 | Sensor de fill validado en API viva (FILL/KILL/ERROR_RED) | ✅ **cerrado** (demo, PR #22) |
-| Wiring `execute()` detrás de `TRADING_ENABLED` | ❌ pendiente (paso aparte) |
+| Wiring `execute()` (cable Capas 1+2+3, muro A/B/C) | ✅ en main (PRs #26/#27/#28) — **sin validar en demo** |
+| Demo end-to-end (Telegram suena + EdgeWindow poblado) | ❌ pendiente (ventana muerta, Opción B) |
+| RiskManager VE al Motor REST (Trade rows) | 🔴 **CIEGO** — bloqueante pre-plata real |
+| Runbook kill-switch manual | ✅ `docs/runbook_kill_switch.md` |
