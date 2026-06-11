@@ -152,6 +152,11 @@ def test_update_populates_edge_window_row(sqlite_engine):
     edge_id = eng._record_edge_window(_signal())
     assert edge_id is not None  # _record_edge_window devuelve el id (Capa 2)
 
+    # Pieza 4: la detección graba count/fees_cents/edge_pct del opp (reconstrucción del gate).
+    with Session(sqlite_engine) as s:
+        det = s.get(models.EdgeWindow, edge_id)
+        assert (det.count, det.fees_cents, det.edge_pct) == (10, 10, 4.2)
+
     outcome = ExecutionOutcome(
         filled=False,
         leg_states=[LegState.FILL, LegState.KILL],

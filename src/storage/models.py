@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from loguru import logger
 from sqlalchemy import event
 from sqlmodel import Field, Session, SQLModel, create_engine
 
@@ -166,6 +167,10 @@ class EdgeWindow(SQLModel, table=True):
     duration_ms: int | None = None
     magnitude_cents: int  # edge NETO post-comisión (lo que decide)
     gross_spread_cents: int | None = None  # spread BRUTO pre-comisión (para analizar cuánto come el fee)
+    # Reconstrucción EXACTA del gate (agregadas 2026-06; NULL en ventanas pre-deploy).
+    count: int | None = None       # contratos del opp detectado
+    fees_cents: int | None = None  # comisión total estimada (ambas patas)
+    edge_pct: float | None = None  # edge neto post-fee como % del capital comprometido
     leg_states: str | None = Field(default=None, max_length=50)  # "FILL/KILL", "FILL/ERROR_RED", etc.
     reconciled: bool = False
     kill_switch_fired: bool = False
@@ -220,13 +225,47 @@ def get_engine() -> Any:
     return _engine
 
 
+# Migraciones de ADD COLUMN. SQLite no tiene historia de migración y create_all NO altera
+# tablas existentes → estas cubren columnas agregadas a tablas que ya existen en la DB
+# productiva. ADD COLUMN nullable es metadata-only en SQLite (instantáneo aun en DBs grandes).
+# Cada entrada: (tabla, columna, tipo SQL). Idempotente: solo agrega si falta.
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("edge_windows", "count", "INTEGER"),
+    ("edge_windows", "fees_cents", "INTEGER"),
+    ("edge_windows", "edge_pct", "FLOAT"),
+]
+
+
+def _existing_columns(conn: Any, table: str) -> set[str]:
+    """Nombres de columna actuales de una tabla SQLite (vía PRAGMA table_info)."""
+    rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+    return {r[1] for r in rows}  # r = (cid, name, type, notnull, dflt, pk)
+
+
+def apply_migrations(engine: Any) -> None:
+    """
+    Aplica los ADD COLUMN pendientes, idempotente. Convive con create_all: este último
+    crea tablas/columnas en DBs NUEVAS (donde no hace falta migrar); esto cubre las
+    columnas nuevas en tablas EXISTENTES (donde create_all no hace nada). Solo SQLite;
+    en otro engine sería Alembic.
+    """
+    if "sqlite" not in get_settings().DATABASE_URL:
+        return
+    with engine.begin() as conn:
+        for table, column, col_type in _MIGRATIONS:
+            if column not in _existing_columns(conn, table):
+                conn.exec_driver_sql(f'ALTER TABLE {table} ADD COLUMN "{column}" {col_type}')
+                logger.info(f"migration: ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+
 def init_db() -> None:
     """
-    Crea tablas si no existen.
+    Crea tablas si no existen + aplica migraciones de ADD COLUMN.
     Idempotente - safe llamar múltiples veces.
     """
     engine = get_engine()
-    SQLModel.metadata.create_all(engine)
+    SQLModel.metadata.create_all(engine)  # tablas/columnas nuevas en DBs nuevas
+    apply_migrations(engine)              # columnas nuevas en tablas existentes
 
 
 def get_session() -> Session:
