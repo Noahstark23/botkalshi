@@ -318,10 +318,14 @@ class RestArbEngine:
         )
         try:
             with get_session() as s:
+                opp = signal.opportunity
                 window = EdgeWindow(
                     market_ticker=signal.market_ticker,
                     magnitude_cents=signal.net_edge_cents,       # edge NETO post-comisión
                     gross_spread_cents=signal.gross_spread_cents,  # spread BRUTO pre-comisión
+                    count=opp.count,            # reconstrucción exacta del gate
+                    fees_cents=opp.fees_cents,
+                    edge_pct=opp.edge_pct,
                 )
                 s.add(window)
                 s.commit()
