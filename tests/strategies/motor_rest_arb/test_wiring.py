@@ -13,7 +13,7 @@ from src.strategies.data_capture import DataCaptureService
 
 
 def _service_with_flags(
-    *, motor_rest: bool, trading: bool = False, with_client: bool = False
+    *, motor_rest: bool, trading: bool = False, with_client: bool = False, ks_engaged: bool = False
 ) -> DataCaptureService:
     settings = MagicMock()
     settings.USE_ORDERBOOK_MANAGER_V2 = False
@@ -21,13 +21,15 @@ def _service_with_flags(
     settings.MOTOR_REST_ENABLED = motor_rest
     settings.TRADING_ENABLED = trading
     rest_client = MagicMock() if with_client else None
+    ks_value = (True, "test kill-switch") if ks_engaged else (False, None)
     # Mockear get_settings en ambos módulos: data_capture y el engine (que lo llama en su __init__).
     # RiskManager también llama get_settings en su __init__ (path live) → mockearlo ahí.
+    # kill_switch_engaged (lectura de DB en la Capa A) → mockeada para no tocar DB real.
     with patch("src.strategies.data_capture.get_settings", return_value=settings), patch(
         "src.strategies.data_capture.KalshiWebSocket"
     ), patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings), patch(
         "src.risk.manager.get_settings", return_value=settings
-    ):
+    ), patch("src.storage.models.kill_switch_engaged", return_value=ks_value):
         svc = DataCaptureService(rest_client=rest_client)
         svc.ws = MagicMock()
         # _register_ws_handlers se llama dentro del with para que el engine vea el mock.
@@ -87,4 +89,14 @@ def test_motor_rest_stays_shadow_when_live_but_no_client():
     engine = svc._rest_engine
     assert engine is not None
     assert engine._executor is None
+    assert engine._risk_manager is None
+
+
+def test_motor_rest_stays_shadow_when_kill_switch_engaged():
+    """Capa A (guard): kill-switch persistente ENGAGED → shadow forzado aun con trading+cliente."""
+    svc = _service_with_flags(motor_rest=True, trading=True, with_client=True, ks_engaged=True)
+
+    engine = svc._rest_engine
+    assert engine is not None
+    assert engine._executor is None      # no se construye con el kill-switch engaged
     assert engine._risk_manager is None

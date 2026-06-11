@@ -498,19 +498,32 @@ class DataCaptureService:
         # ejecuta órdenes (TRADING_ENABLED es el muro; el engine no instancia ejecución).
         # El canal `ticker` ya se suscribe, así que solo se agrega el handler.
         if self.settings.MOTOR_REST_ENABLED:
-            from src.strategies.motor_rest_arb.engine import RestArbEngine
-
             # ── Capa A del muro (gatear la construcción del path de ejecución) ──────
             # El executor + risk manager SOLO se construyen con TRADING_ENABLED=true Y
-            # un cliente REST persistente presente. Si falta cualquiera, el engine queda
-            # en SHADOW (executor=None) → estructuralmente incapaz de ejecutar.
+            # cliente REST persistente presente Y kill-switch persistente NO engaged. Si
+            # falta cualquiera, el engine queda en SHADOW (executor=None) → incapaz de ejecutar.
+            # Kill-switch: fail-safe-hacia-shadow — si la lectura falla, se asume engaged
+            # (no construir). Cubre el restart de Coolify tras un kill-switch a las 3am.
+            from src.storage.models import kill_switch_engaged
+            from src.strategies.motor_rest_arb.engine import RestArbEngine
+            try:
+                ks_engaged, ks_reason = kill_switch_engaged()
+            except Exception:
+                ks_engaged, ks_reason = True, "lectura del kill-switch falló (fail-safe)"
+                logger.exception("Motor REST: no se pudo leer el kill-switch persistente")
+
             executor = None
             risk_manager = None
-            if self.settings.TRADING_ENABLED and self._rest_client is not None:
+            if self.settings.TRADING_ENABLED and self._rest_client is not None and not ks_engaged:
                 from src.risk.manager import RiskManager
                 from src.strategies.motor_rest_arb.executor import RestExecutor
                 executor = RestExecutor(self._rest_client)
                 risk_manager = RiskManager()
+            elif self.settings.TRADING_ENABLED and ks_engaged:
+                logger.critical(
+                    f"Motor REST: kill-switch persistente ENGAGED ({ks_reason}) → SHADOW "
+                    "forzado. Resolver con scripts/clear_kill_switch.py + redeploy."
+                )
             elif self.settings.TRADING_ENABLED and self._rest_client is None:
                 logger.error(
                     "Motor REST: TRADING_ENABLED=true pero SIN cliente REST persistente "

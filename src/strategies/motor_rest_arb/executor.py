@@ -399,10 +399,24 @@ class RestExecutor:
             )
 
     async def _fire_kill_switch(self, filled_legs: list[LegResult]) -> None:
-        """Pausa ya seteada por el caller; loggea CRITICAL (dispara alerta Telegram)."""
+        """
+        Pausa del executor ya seteada por el caller (_paused). Acá se eleva a pausa
+        GLOBAL y PERSISTENTE: BotState.is_paused (corta check_pre_trade) + DB
+        (sobrevive el restart de Coolify — sin esto, un reinicio des-pausaría el bot
+        con la pata todavía expuesta). Best-effort: nada de esto debe impedir la alerta.
+        """
         tickers = [r.leg.market_ticker for r in filled_legs]
         msg = f"rest_exec.kill_switch posiciones_expuestas={tickers} rollback_no_convergió"
         logger.critical(msg)
+        try:
+            from src.monitoring.health import BotState
+            from src.storage.models import engage_kill_switch
+
+            BotState.is_paused = True
+            BotState.pause_reason = msg
+            engage_kill_switch(msg)
+        except Exception:
+            logger.exception("rest_exec.kill_switch.persist_failed")
         try:
             from src.monitoring.telegram_alerts import alert_error
 
