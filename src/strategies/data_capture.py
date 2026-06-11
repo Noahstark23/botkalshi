@@ -30,6 +30,9 @@ from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
 TARGET_SERIES_PREFIXES = [
+    # ⚠️ NO son prefijos: el discovery pasa cada string como series_ticker EXACTO a
+    # list_events() — "KXWC" NO cubre "KXWCGROUPWIN". Cada serie va enumerada.
+    # (El nombre histórico de la variable es engañoso; se mantiene por compat.)
     # Deportes
     "KXMLB",   # MLB
     "KXNBA",   # NBA
@@ -38,6 +41,17 @@ TARGET_SERIES_PREFIXES = [
     "KXEPL",   # Premier League
     "KXUCL",   # Champions League
     "KXUEL",   # Europa League
+    # Mundial 2026 — series confirmadas contra la API pública (2026-06-11)
+    "KXMENWORLDCUP",  # ganador del torneo (selecciones masculinas)
+    "KXMWORLDCUP",
+    "KXFIFAGAME",     # partidos (match markets — el corazón para el shadow)
+    "KXFIFAADVANCE",  # clasificación a siguiente ronda
+    "KXFIFATOTAL",    # totales de goles
+    "KXFIFASPREAD",   # hándicaps
+    "KXWCGROUPWIN",   # ganador de grupo
+    "KXWCSTAGE",      # alcance de ronda por equipo
+    "KXWCTEAMGOALS",  # goles por equipo
+    "KXWCGOALIEPEN",  # props (arqueros/penales)
     # Política y eventos (donde menos competencia algorítmica)
     "KXPRES",
     "KXPOTUS",
@@ -249,7 +263,9 @@ class DataCaptureService:
         async with KalshiRestClient() as client:
             for prefix in TARGET_SERIES_PREFIXES:
                 try:
-                    events_resp = await client.list_events(series_ticker=prefix, limit=100)
+                    # limit=200 (máx de Kalshi): el Mundial tiene 104 partidos — una serie
+                    # como KXFIFAGAME clipea con limit=100 y perderíamos eventos.
+                    events_resp = await client.list_events(series_ticker=prefix, limit=200)
                     events = events_resp.get("events", [])
                     for event in events:
                         event_ticker = event.get("event_ticker")
