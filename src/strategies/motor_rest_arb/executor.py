@@ -22,12 +22,21 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from loguru import logger
+from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
 from src.math.arbitrage import ArbLeg, ArbOpportunity
+from src.math.fees import kalshi_fee_cents
+from src.storage.models import Trade, engage_kill_switch, get_session
+
+
+def _naive_utc_now() -> datetime:
+    """Convención del proyecto para writes a Trade (ver manager.py): naive UTC."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 # error.code que Kalshi devuelve (HTTP 409) cuando una orden fill_or_kill NO encuentra
 # volumen para llenarse → es un KILL DETERMINÍSTICO (la orden llegó y se rechazó limpio),
@@ -118,7 +127,20 @@ class RestExecutor:
             logger.critical("rest_exec.rejected reason=circuit_breaker_paused")
             return ExecutionOutcome(filled=False, rejected_paused=True)
 
-        coids = {leg: str(uuid.uuid4()) for leg in opp.legs}
+        # A.1 — arb_id compartido por ambas patas, embebido como PREFIJO del coid
+        # (recuperable con rsplit("-", 1)). PR-B (settlement) agrupa por este prefijo.
+        # [verificar en smoke] que Kalshi acepte el coid de 40 chars con sufijo -yes/-no
+        # (hoy usa uuid4 puro de 36 y funciona; el campo es string ≤100).
+        arb_id = str(uuid.uuid4())
+        coids = {leg: f"{arb_id}-{leg.side}" for leg in opp.legs}
+
+        # A.1 — INTENTS PRE-RED: la fila Trade por pata se escribe ANTES de tocar la
+        # red. Es lo que permite que reconcile_pending_trades (boot) recupere un crash
+        # a mitad de ejecución, y lo que alimenta exposición/stop-loss del RiskManager.
+        # Si el persist falla → ABORT sin colocar órdenes (sin fila, el RiskManager
+        # quedaría ciego a un fill real — fail-safe hacia no-operar).
+        if not self._persist_intents(arb_id, opp, coids):
+            return ExecutionOutcome(filled=False)
 
         # Lanzar ambas patas en paralelo con manejo EXPLÍCITO por pata (no gather
         # que colapsa estados). Cada tarea resuelve a LegResult con su estado.
@@ -127,6 +149,25 @@ class RestExecutor:
 
         states = [r.state for r in results]
         outcome = ExecutionOutcome(filled=False, leg_states=states)
+
+        # A.1 — actualizar cada fila al estado resuelto de su pata. FILL es CRÍTICO
+        # (posición real abierta: si la DB falla acá, el RiskManager queda ciego →
+        # pausa preventiva). KILL es best-effort (sin posición; la fila pending residual
+        # la marca el reconcile de boot con alerta conservadora).
+        for r in results:
+            if r.state is LegState.FILL:
+                self._update_trade(
+                    r.client_order_id, critical=True,
+                    status="filled", filled_at=_naive_utc_now(),
+                    fill_price_cents=r.leg.price_cents,
+                    fees_cents=kalshi_fee_cents(r.leg.count, r.leg.price_cents),
+                    kalshi_order_id=r.order_id,
+                )
+            elif r.state is LegState.KILL:
+                self._update_trade(
+                    r.client_order_id, critical=False,
+                    status="cancelled", notes_append="fok_kill",
+                )
 
         # Caso 1: ambas FILL → arb capturado completo.
         if all(s is LegState.FILL for s in states):
@@ -266,9 +307,22 @@ class RestExecutor:
                 really_filled = await self._reconcile_leg(r)
                 if really_filled:
                     logger.warning(f"rest_exec.reconcile ticker={r.leg.market_ticker} → FILLED (rollback)")
+                    # A.1 — la pata desconocida resultó LLENA: posición real → crítico.
+                    self._update_trade(
+                        r.client_order_id, critical=True,
+                        status="filled", filled_at=_naive_utc_now(),
+                        fill_price_cents=r.leg.price_cents,
+                        fees_cents=kalshi_fee_cents(r.leg.count, r.leg.price_cents),
+                        notes_append="error_red_reconciled_filled",
+                    )
                     exposed.append(r)
                 else:
                     logger.info(f"rest_exec.reconcile ticker={r.leg.market_ticker} → not filled")
+                    # A.1 — confirmada no-llena por doble fuente → cerrar la fila.
+                    self._update_trade(
+                        r.client_order_id, critical=False,
+                        status="cancelled", notes_append="error_red_reconciled",
+                    )
         return exposed
 
     async def _reconcile_leg(self, r: LegResult) -> bool:
@@ -346,6 +400,30 @@ class RestExecutor:
         for r in filled_legs:
             closed = await self._sell_to_exit(r.leg)
             all_closed = all_closed and closed
+            if closed:
+                # A.1 — la pérdida del rollback se REALIZA al instante: settled +
+                # pnl_cents NEGATIVO a PRECIOS LÍMITE (venta a ROLLBACK_PRICE_CENTS=1¢).
+                # SESGO CONSERVADOR documentado: el sell IOC pudo llenar a mejor precio
+                # (al bid); registrar 1¢ sobrestima la pérdida → seguro para el stop-loss.
+                # [verificar en smoke] leer el precio real vía get_fills y reemplazar.
+                pnl = (
+                    (self.ROLLBACK_PRICE_CENTS - r.leg.price_cents) * r.leg.count
+                    - kalshi_fee_cents(r.leg.count, r.leg.price_cents)
+                    - kalshi_fee_cents(r.leg.count, self.ROLLBACK_PRICE_CENTS)
+                )
+                self._update_trade(
+                    r.client_order_id, critical=True,
+                    status="settled", settled_at=_naive_utc_now(),
+                    pnl_cents=pnl, notes_append="rollback_closed",
+                )
+            else:
+                # A.1 — la pata queda EXPUESTA (kill-switch a continuación): se mantiene
+                # status="filled" para que el cap de exposición del 25% LA VEA, con
+                # marca de auditoría para el runbook.
+                self._update_trade(
+                    r.client_order_id, critical=True,
+                    notes_append="exposed_killswitch",
+                )
 
         outcome.rollback_filled = all_closed
         if not all_closed:
@@ -382,6 +460,96 @@ class RestExecutor:
             except Exception as exc:
                 logger.warning(f"rest_exec.rollback.error ticker={leg.market_ticker} attempt={attempt + 1}: {exc}")
         return False
+
+    # =====================================================
+    # A.1 — Persistencia de Trade (los ojos del RiskManager)
+    # =====================================================
+
+    def _persist_intents(self, arb_id: str, opp: ArbOpportunity, coids: dict[ArbLeg, str]) -> bool:
+        """
+        Escribe una fila Trade por PATA (status='pending') ANTES de tocar la red.
+
+        Patrón Motor 1 (_persist_intents): el intent pre-red es lo que el reconcile de
+        boot usa para recuperar crashes a mitad de ejecución, y lo que la query de
+        exposición del RiskManager lee (pending/filled). El arb_id viaja en notes y
+        como prefijo del coid. False si la DB falla → el caller ABORTA sin operar.
+        """
+        try:
+            with get_session() as s:
+                for leg in opp.legs:
+                    s.add(Trade(
+                        client_order_id=coids[leg],
+                        ticker=leg.market_ticker,
+                        side=leg.side,
+                        action="buy",
+                        count=leg.count,
+                        price_cents=leg.price_cents,
+                        strategy="motor_rest_arb",
+                        estimated_edge_pct=opp.edge_pct,
+                        status="pending",
+                        notes=f"arb_id={arb_id}",
+                    ))
+                s.commit()
+            return True
+        except Exception:
+            logger.critical(
+                f"rest_exec.persist_intents_failed arb_id={arb_id} → ABORT "
+                "(no se colocan órdenes: sin fila, el RiskManager quedaría ciego)"
+            )
+            return False
+
+    def _update_trade(
+        self,
+        coid: str,
+        *,
+        critical: bool,
+        notes_append: str | None = None,
+        **fields: object,
+    ) -> None:
+        """
+        Actualiza la fila Trade de una pata.
+
+        critical=True → la fila representa una POSICIÓN REAL (fill/settled/expuesta):
+        si el update falla, el RiskManager queda ciego a capital vivo → PAUSA
+        PREVENTIVA (decisión (ii) del diseño A.1): kill-switch persistente + BotState.
+        critical=False → best-effort (KILL/cancelled, sin posición): solo se loguea;
+        la fila pending residual la levanta el reconcile de boot con alerta conservadora.
+        """
+        try:
+            with get_session() as s:
+                t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
+                if t is None:
+                    logger.warning(f"rest_exec.update_trade.missing coid={coid}")
+                    return
+                for k, v in fields.items():
+                    setattr(t, k, v)
+                if notes_append:
+                    t.notes = f"{t.notes or ''} {notes_append}".strip()[:500]
+                s.add(t)
+                s.commit()
+        except Exception:
+            logger.exception(f"rest_exec.update_trade_failed coid={coid} critical={critical}")
+            if critical:
+                self._engage_preventive_pause(coid)
+
+    def _engage_preventive_pause(self, coid: str) -> None:
+        """
+        Pausa preventiva (diseño A.1, opción (ii)): un fill REAL no pudo registrarse →
+        el RiskManager está ciego a esa posición → detener nuevas operaciones hasta
+        revisión humana. Usa el kill-switch persistente (#32): sobrevive restarts y
+        la Capa A no reconstruye el executor. Best-effort: nunca lanza.
+        """
+        msg = f"persist de Trade falló post-fill (coid={coid}) — RiskManager ciego a posición viva"
+        logger.critical(f"rest_exec.preventive_pause {msg}")
+        self._paused = True
+        try:
+            from src.monitoring.health import BotState
+
+            BotState.is_paused = True
+            BotState.pause_reason = msg
+            engage_kill_switch(msg)
+        except Exception:
+            logger.exception("rest_exec.preventive_pause.persist_failed")
 
     def _record_rollback(self) -> None:
         now = time.monotonic()
