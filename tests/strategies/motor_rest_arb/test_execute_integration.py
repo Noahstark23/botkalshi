@@ -16,17 +16,9 @@ está cubierto en tests/clients/test_kalshi_rest_429.py. Acá el fake devuelve l
 REALES y se ejercita el parsing del EXECUTOR (_create_order_filled lee fill_count_fp,
 _get_orders_filled lee status=="executed", _has_open_position lee market_positions).
 
-═══════════════════════════════════════════════════════════════════════════════════
-PUNTO DE EXTENSIÓN PARA A.1 (persistencia de Trade rows + pausa persistente)
-───────────────────────────────────────────────────────────────────────────────────
-Cuando A.1 exista, NO hay que reescribir estas rutas: ya corren execute() de punta a
-punta. Solo se agrega, en cada test, donde dice `# === A.1 EXTENSION POINT ===`:
-  - un fixture de DB temporal (patrón de test_capa3_outcome.sqlite_engine),
-  - asserts sobre las filas Trade (status por pata según la ruta), y
-  - en la ruta 4, assert de la pausa persistente (models.kill_switch_engaged()).
-El `HarnessClient` ya registra cada place_order con su client_order_id (.calls) para
-verificar el arb_id-prefijo y el mapeo coid→Trade.
-═══════════════════════════════════════════════════════════════════════════════════
+A.1 INTEGRADO: cada ruta verifica además las Trade rows que execute() persiste
+(intents pre-red + estado final por pata) y, en la ruta 4, la pausa persistente.
+La DB temporal la monta el conftest del paquete (autouse).
 """
 from __future__ import annotations
 
@@ -34,12 +26,32 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlmodel import select
 
+import src.storage.models as models
 from src.clients.kalshi_rest import KalshiClientError
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.strategies.motor_rest_arb.executor import LegState, RestExecutor
 
 _FOK_KILL_CODE = "fill_or_kill_insufficient_resting_volume"
+
+
+def _trades() -> dict[str, models.Trade]:
+    """Filas Trade persistidas por A.1, indexadas por side (una por pata)."""
+    with models.get_session() as s:
+        rows = list(s.exec(select(models.Trade)).all())
+    return {t.side: t for t in rows}
+
+
+def _shared_arb_id(trades: dict[str, models.Trade]) -> str:
+    """El arb_id (prefijo del coid + notes) debe ser EL MISMO en ambas patas."""
+    ids = {t.client_order_id.rsplit("-", 1)[0] for t in trades.values()}
+    assert len(ids) == 1, f"arb_id no compartido: {ids}"
+    arb_id = ids.pop()
+    for t in trades.values():
+        assert f"arb_id={arb_id}" in (t.notes or "")
+        assert t.strategy == "motor_rest_arb"
+    return arb_id
 
 
 def _opp(count: int = 5) -> ArbOpportunity:
@@ -140,7 +152,11 @@ async def test_route_fill_fill():
     assert outcome.leg_states == [LegState.FILL, LegState.FILL]
     assert outcome.rollback_triggered is False
     assert len(client.buys()) == 2 and len(client.sells()) == 0
-    # === A.1 EXTENSION POINT === ambas Trade rows → status="filled" (exposición).
+    # A.1: ambas patas filled (exposición que el RiskManager VE), mismo arb_id.
+    trades = _trades()
+    assert {t.status for t in trades.values()} == {"filled"}
+    assert all(t.filled_at is not None and t.fees_cents is not None for t in trades.values())
+    _shared_arb_id(trades)
 
 
 @pytest.mark.asyncio
@@ -155,7 +171,11 @@ async def test_route_kill_kill():
     assert outcome.rollback_triggered is False
     assert outcome.reconciled is False
     assert len(client.sells()) == 0
-    # === A.1 EXTENSION POINT === ambas Trade rows → status="cancelled" (audit trail).
+    # A.1: ambas canceladas con audit trail (sin exposición fantasma).
+    trades = _trades()
+    assert {t.status for t in trades.values()} == {"cancelled"}
+    assert all("fok_kill" in (t.notes or "") for t in trades.values())
+    _shared_arb_id(trades)
 
 
 @pytest.mark.asyncio
@@ -172,7 +192,15 @@ async def test_route_fill_plus_rollback_ok():
     assert outcome.rollback_filled is True
     assert outcome.kill_switch_fired is False
     assert len(client.sells()) == 1  # se vendió la pata yes expuesta
-    # === A.1 EXTENSION POINT === yes → settled, pnl_cents<0 (pérdida realizada); no → cancelled.
+    # A.1 — EL CASO POR EL QUE EXISTE LA TAREA: la pérdida del rollback se REALIZA
+    # al instante (settled + pnl<0 a precios límite) → el stop-loss del RiskManager
+    # la ve HOY, sin esperar la resolución del evento.
+    trades = _trades()
+    assert trades["yes"].status == "settled"
+    assert trades["yes"].pnl_cents is not None and trades["yes"].pnl_cents < 0
+    assert trades["yes"].settled_at is not None
+    assert "rollback_closed" in (trades["yes"].notes or "")
+    assert trades["no"].status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -191,8 +219,13 @@ async def test_route_fill_plus_rollback_fails_kill_switch():
     assert executor.is_paused is True                       # circuit/kill-switch pausó
     assert len(client.sells()) == executor.ROLLBACK_MAX_RETRIES  # reintentó el máximo
     mock_alert.assert_awaited()                             # sonó la alerta de kill-switch
-    # === A.1 EXTENSION POINT === yes → filled + notes="exposed_killswitch" (el 25% la ve);
-    #                             y models.kill_switch_engaged() == (True, ...) (pausa persistente A.3).
+    # A.1: la pata expuesta QUEDA filled (el cap del 25% la ve) con marca de auditoría,
+    # y la pausa es PERSISTENTE (#32: sobrevive el restart de Coolify).
+    trades = _trades()
+    assert trades["yes"].status == "filled"
+    assert "exposed_killswitch" in (trades["yes"].notes or "")
+    engaged, _reason = models.kill_switch_engaged()
+    assert engaged is True
 
 
 @pytest.mark.asyncio
@@ -212,7 +245,12 @@ async def test_route_error_red_reconciles_to_filled():
     assert any(m == "get_orders" for m, _ in client.calls)
     assert any(m == "get_positions" for m, _ in client.calls)
     assert outcome.rollback_triggered is True  # ambas expuestas (yes reconciliada llena + no FILL)
-    # === A.1 EXTENSION POINT === las patas reconciliadas-llenas → settled/cancelled según rollback.
+    # A.1: la reconciliada-llena quedó marcada y, como el rollback cerró, ambas
+    # terminan settled con pérdida realizada.
+    trades = _trades()
+    assert "error_red_reconciled_filled" in (trades["yes"].notes or "")
+    assert trades["yes"].status == "settled" and trades["no"].status == "settled"
+    assert all((t.pnl_cents or 0) < 0 for t in trades.values())
 
 
 @pytest.mark.asyncio
@@ -228,4 +266,47 @@ async def test_route_error_red_reconciles_to_not_filled():
     assert outcome.reconciled is True
     assert outcome.rollback_triggered is False  # nada expuesto → no rollback
     assert len(client.sells()) == 0
-    # === A.1 EXTENSION POINT === yes → cancelled notes="error_red_reconciled".
+    # A.1: la ERROR_RED confirmada no-llena se cierra como cancelled con su motivo.
+    trades = _trades()
+    assert trades["yes"].status == "cancelled"
+    assert "error_red_reconciled" in (trades["yes"].notes or "")
+
+
+# =====================================================
+# A.1 — fallos de persistencia (los dos casos de seguridad)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_persist_intents_failure_aborts_without_placing_orders():
+    """Si el intent pre-red NO se puede escribir → ABORT: ninguna orden sale a la red."""
+    client = HarnessClient()
+    client.buy = {"yes": _create_order_fill(), "no": _create_order_fill()}
+    executor = RestExecutor(client)
+    with patch(
+        "src.strategies.motor_rest_arb.executor.get_session",
+        side_effect=RuntimeError("db down"),
+    ):
+        outcome = await executor.execute(_opp())
+
+    assert outcome.filled is False
+    assert client.calls == []  # CERO llamadas a Kalshi: sin fila no se opera
+
+
+@pytest.mark.asyncio
+async def test_update_failure_post_fill_engages_preventive_pause():
+    """Fallo del update DESPUÉS de un fill real → pausa preventiva (ii): kill-switch persistente."""
+    client = HarnessClient()
+    client.buy = {"yes": _create_order_fill(), "no": _create_order_fill()}
+    executor = RestExecutor(client)
+    # Los intents (solo add) pasan; los updates (usan select) fallan → crítico post-fill.
+    with patch(
+        "src.strategies.motor_rest_arb.executor.select",
+        side_effect=RuntimeError("db down post-fill"),
+    ):
+        outcome = await executor.execute(_opp())
+
+    assert outcome.filled is True          # el trade real ocurrió
+    assert executor.is_paused is True      # pero el motor se PAUSÓ preventivamente
+    engaged, reason = models.kill_switch_engaged()
+    assert engaged is True and "RiskManager ciego" in (reason or "")
