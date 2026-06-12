@@ -338,6 +338,9 @@ class DataCaptureService:
                             market_tickers=batch_list[i : i + 100],
                         )
                     logger.success(f"Re-discovery: {len(new_tickers)} markets nuevos suscriptos")
+                    # P3: refrescar el universo multi-outcome con los markets nuevos.
+                    if self._rest_engine is not None:
+                        self._rest_engine.update_universe(self._tracked_tickers)
             except Exception as e:
                 msg = f"Re-discovery fallo: {type(e).__name__}: {e}"
                 logger.warning(msg)
@@ -576,6 +579,9 @@ class DataCaptureService:
                 )
 
             self._rest_engine = RestArbEngine(executor=executor, risk_manager=risk_manager)
+            # P3: universo de eventos multi-outcome (1X2/winner) — el discovery del boot
+            # ya corrió cuando se registran los handlers; el re-discovery lo refresca.
+            self._rest_engine.update_universe(self._tracked_tickers)
             self.ws.on("ticker", self._rest_engine.on_ticker)
             mode = "LIVE: ejecuta" if executor is not None else "SHADOW: detecta y graba EdgeWindow"
             logger.info(
