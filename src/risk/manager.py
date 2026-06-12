@@ -4,6 +4,7 @@ Motor de Gestión de Riesgo (Fase 2 Motor 1).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 
@@ -14,6 +15,7 @@ from src.math.arbitrage import ArbOpportunity
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event
 from src.storage.models import Trade, engage_kill_switch, get_session
+from src.strategies.motor_rest_arb.settlement import arb_group_key
 from src.utils.config import get_settings
 
 
@@ -30,19 +32,43 @@ class RiskManager:
 
     Aplica controles de PnL, exposición máxima y sizing por trade.
 
-    KNOWN TECHNICAL DEBT (Obligatorio antes de TRADING_ENABLED=true):
-    - Exposición no descuenta arbitrajes ya fillados completos (sobrestima).
-    - PnL realized-only: trades filled pero no settled no cuentan para stop-loss.
-      Aceptable para Motor 1 (settlement rápido).
-    - Race condition entre check_pre_trade concurrentes: aceptable para
-      single-executor Motor 1 v1.
+    DEUDA RESUELTA (FASE 0.3, 2026-06):
+    - Sobrestima de exposición: los arbs COMPLETOS fillados (ambas patas yes+no del
+      mismo ticker, identificadas por arb_id de A.1) se descuentan — son posiciones
+      HEDGED (payout 100¢ garantizado), no riesgo direccional.
+    - Race entre check_pre_trade concurrentes: serializado con lock de CLASE
+      (cross-instancia: cada motor crea su RiskManager pero comparten el lock).
+
+    DEUDA VIGENTE (documentada, NO redefinida):
+    - PnL realized-only: trades filled-no-settled no cuentan para stop-loss. Es una
+      DECISIÓN de semántica financiera del owner, no un bug — el settlement (PR-B)
+      la vuelve operativa (settled ahora existe), no la cambia.
+    - Residual del lock: la ventana check→persist-intents sigue abierta (el lock
+      cubre el CHECK, los intents los escribe el executor después). Peor caso con
+      N motores en el timing exacto: overshoot de N×MAX_TRADE_SIZE_PCT sobre el cap
+      de exposición (hoy N=1 motor con single-flight → residual teórico). Cierre
+      total = reserva transaccional en el check; anotado como mejora si N crece.
     """
+
+    # Lock de CLASE: serializa check_pre_trade entre TODAS las instancias (un
+    # RiskManager por motor). En asyncio single-process esto elimina la carrera
+    # leer-exposición→aprobar de dos checks simultáneos.
+    _check_lock: asyncio.Lock = asyncio.Lock()
 
     def __init__(self) -> None:
         self.settings = get_settings()
 
     async def check_pre_trade(self, opp: ArbOpportunity) -> TradeDecision:
-        """Gatekeeper crítico. Debe llamarse con await desde el executor."""
+        """Gatekeeper crítico. Debe llamarse con await desde el executor.
+
+        Serializado con _check_lock (ver docstring de clase): dos motores no pueden
+        evaluar exposición simultáneamente y aprobarse mutuamente por encima del cap.
+        """
+        async with RiskManager._check_lock:
+            return await self._check_pre_trade_locked(opp)
+
+    async def _check_pre_trade_locked(self, opp: ArbOpportunity) -> TradeDecision:
+        """Cuerpo del check (bajo lock). Lógica idéntica a la versión histórica."""
         if BotState.is_paused:
             reason = BotState.pause_reason or "Razón desconocida"
             return TradeDecision(False, f"BotState.is_paused activo: {reason}", 0)
@@ -90,7 +116,17 @@ class RiskManager:
         return TradeDecision(True, "Aprobado", allowed_count)
 
     def _get_current_exposure_usd(self) -> float:
-        """Dinero bloqueado actualmente en posiciones abiertas."""
+        """
+        Capital EN RIESGO en posiciones abiertas (pending/filled, todos los motores).
+
+        FIX sobrestima (FASE 0.3): un arb COMPLETO fillado (ambas patas yes+no del
+        MISMO ticker, mismo grupo arb_id) es una posición HEDGED — pase lo que pase
+        paga 100¢/contrato → riesgo direccional CERO. Se descuenta el costo de los
+        contratos EMPAREJADOS (min de counts por lado); el excedente sin pareja sigue
+        contando entero. Solo se descuenta lo identificable con CERTEZA (grupos con
+        arb_id de A.1, status='filled'); pending y patas sueltas cuentan completo —
+        ante la duda, sobrestimar (frena antes, nunca después).
+        """
         with get_session() as s:
             stmt = select(Trade).where(col(Trade.status).in_(["pending", "filled"]))
             active_trades = list(s.exec(stmt))
@@ -99,7 +135,33 @@ class RiskManager:
             return 0.0
 
         total_cents = sum(t.price_cents * t.count for t in active_trades)
-        return total_cents / 100.0
+
+        # Descuento de arbs hedged: agrupar las FILLED con arb_id identificable.
+        groups: dict[str, list[Trade]] = {}
+        for t in active_trades:
+            if t.status == "filled" and "arb_id=" in (t.notes or ""):
+                groups.setdefault(arb_group_key(t), []).append(t)
+
+        for legs in groups.values():
+            yes_legs = [t for t in legs if t.side == "yes"]
+            no_legs = [t for t in legs if t.side == "no"]
+            if not yes_legs or not no_legs:
+                continue  # pata suelta → riesgo direccional real, cuenta entera
+            tickers = {t.ticker for t in legs}
+            if len(tickers) != 1:
+                continue  # patas en mercados distintos: NO es el arb binario hedged
+            # Emparejar contratos: el hedge cubre min(count_yes, count_no) por lado.
+            cnt_yes = sum(t.count for t in yes_legs)
+            cnt_no = sum(t.count for t in no_legs)
+            paired = min(cnt_yes, cnt_no)
+            if paired <= 0:
+                continue
+            # Costo promedio ponderado por lado × contratos emparejados.
+            cost_yes = sum(t.price_cents * t.count for t in yes_legs) / cnt_yes
+            cost_no = sum(t.price_cents * t.count for t in no_legs) / cnt_no
+            total_cents -= int(paired * (cost_yes + cost_no))
+
+        return max(total_cents, 0) / 100.0
 
     async def _check_timeframe_stop_losses(self) -> str | None:
         """

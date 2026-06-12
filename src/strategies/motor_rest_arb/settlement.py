@@ -80,7 +80,7 @@ class KalshiSettlementSource:
         )
 
 
-def _arb_group_key(trade: Trade) -> str:
+def arb_group_key(trade: Trade) -> str:
     """
     Clave de grupo del arb: arb_id desde notes ('arb_id=<uuid>'), con fallback al
     prefijo del client_order_id ('<uuid>-yes'). Si nada matchea, el trade es su
@@ -168,7 +168,7 @@ class SettlementPoller:
 
         groups: dict[str, list[Trade]] = {}
         for t in filled:
-            groups.setdefault(_arb_group_key(t), []).append(t)
+            groups.setdefault(arb_group_key(t), []).append(t)
 
         settled_count = 0
         for arb_id, legs in groups.items():
