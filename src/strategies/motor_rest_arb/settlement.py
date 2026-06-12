@@ -60,24 +60,30 @@ class SettlementSource(Protocol):
 
 class KalshiSettlementSource:
     """
-    Adaptador REAL contra Kalshi — STUB hasta verificar shapes contra producción.
+    Adaptador REAL contra Kalshi vía get_market(ticker).result.
 
-    [shapes a verificar, read-only, sin riesgo]:
-      Opción 1 (preferida): GET /portfolio/settlements (revenue oficial por mercado;
-        requiere agregar get_settlements() al cliente).
-      Opción 2: get_market(ticker) → campo result cuando status es settled/finalized.
-    Se llena en una sesión una vez confirmado el shape. Hasta entonces, el poller NO
-    debe cablearse a runtime con esta fuente.
+    Un mercado de Kalshi expone `result` ∈ {"yes","no"} cuando RESOLVIÓ; vacío/ausente
+    mientras sigue abierto. Read-only (no toca capital). FAIL-SAFE: cualquier valor que
+    NO sea exactamente "yes"/"no" → None (aún no resuelto) → el poller atómico SALTEA el
+    grupo (nunca settlea de más). [verificar en smoke] el shape exacto del campo result
+    contra un mercado del Mundial ya resuelto; si el nombre difiere, se ajusta acá sin
+    tocar el poller.
+
+    (Opción 2 del diseño: usa get_market —ya en el cliente— sin endpoint nuevo. La
+    opción 1, GET /portfolio/settlements, queda como mejora si se necesita revenue
+    oficial agregado.)
     """
 
     def __init__(self, client: object) -> None:
         self.client = client
 
     async def get_resolution(self, ticker: str) -> MarketResolution | None:
-        raise NotImplementedError(
-            "KalshiSettlementSource: shapes pendientes de verificar contra producción "
-            "(GET /portfolio/settlements o get_market.result). Ver docstring."
-        )
+        resp = await self.client.get_market(ticker)  # type: ignore[attr-defined]
+        market = resp.get("market", resp) if isinstance(resp, dict) else {}
+        result = str(market.get("result", "")).strip().lower()
+        if result in ("yes", "no"):
+            return MarketResolution(ticker=ticker, result=result)
+        return None  # aún no resolvió (open / result vacío) → el grupo espera
 
 
 def arb_group_key(trade: Trade) -> str:

@@ -32,6 +32,7 @@ from src.risk.manager import RiskManager
 from src.storage.models import BotRun, get_session, init_db, kill_switch_engaged
 from src.strategies.data_capture import DataCaptureService
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from src.strategies.motor_rest_arb.settlement import KalshiSettlementSource, SettlementPoller
 from src.utils.config import get_settings
 from src.utils.logging import setup_logging
 
@@ -149,6 +150,29 @@ class ProductionRunner:
         except Exception:
             logger.exception("alerta de boot-paused falló")
 
+    async def _run_settlement(self) -> None:
+        """
+        Poller de settlement (PR-B) — corre SIEMPRE, NO gateado por TRADING_ENABLED.
+
+        Razón: si apago el flag para investigar un incidente, el settlement de lo YA
+        tradeado debe seguir corriendo (las posiciones abiertas tienen que liquidarse
+        igual). Es no-op barato cuando no hay Trade 'filled' pendientes (la query del
+        poller no devuelve nada). Atómico por arb_id (heredado de SettlementPoller:
+        ambas patas en una transacción o ninguna; huérfana imposible).
+
+        Read-only contra Kalshi (get_market.result). Si el cliente/poller cae, se
+        registra y la task termina — NO tira el bot (el resto sigue capturando).
+        """
+        await asyncio.sleep(5)  # dejar que init_db / boot terminen
+        try:
+            async with KalshiRestClient() as client:
+                source = KalshiSettlementSource(client)
+                await SettlementPoller(source).run(self._stop_event)
+        except Exception as e:
+            msg = f"settlement runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -226,6 +250,7 @@ class ProductionRunner:
             tasks = [
                 asyncio.create_task(self._run_health_server(), name="health"),
                 asyncio.create_task(self._run_data_capture(), name="capture"),
+                asyncio.create_task(self._run_settlement(), name="settlement"),
             ]
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
