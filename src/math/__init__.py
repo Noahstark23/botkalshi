@@ -5,6 +5,12 @@ from __future__ import annotations
 from src.math.arbitrage import ArbLeg, ArbOpportunity, detect_binary_arb, detect_multi_outcome_arb
 from src.math.fees import kalshi_fee_cents
 from src.math.kelly import quarter_kelly_size
+from src.math.no_vig import (
+    implied_prob,
+    overround,
+    remove_vig_additive,
+    remove_vig_multiplicative,
+)
 
 __all__ = [
     "kalshi_fee_cents",
@@ -13,4 +19,8 @@ __all__ = [
     "ArbOpportunity",
     "detect_binary_arb",
     "detect_multi_outcome_arb",
+    "implied_prob",
+    "overround",
+    "remove_vig_multiplicative",
+    "remove_vig_additive",
 ]
