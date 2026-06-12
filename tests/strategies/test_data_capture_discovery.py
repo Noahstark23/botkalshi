@@ -1,12 +1,11 @@
 """
-Tests de DataCaptureService._discover_markets (P2: por prefijo) + re-discovery.
+Tests de DataCaptureService._discover_markets (HOTFIX: series exactas, flujo #30)
++ re-discovery periódico (#41, conservado).
 
-Verifica:
-- filtro por PREFIJO real (familias enteras KXWC*/KXFIFA*; series ajenas afuera);
-- paginación con cursor + pacing entre páginas;
-- corte de seguridad DISCOVERY_MAX_PAGES;
-- devuelve SOLO los tickers nuevos (re-discovery delta);
-- _run_rediscovery suscribe los nuevos EN CALIENTE y sobrevive fallos (best-effort).
+El listado amplio por paginación (#41) falló en producción (>40k markets abiertos,
+los deportivos fuera del alcance del cap) → el discovery interno volvió al flujo
+conocido-bueno: list_events(series_ticker=X) + get_event por evento. La firma DELTA
+(set de tickers nuevos) se conserva: el re-discovery la usa para suscribir en caliente.
 """
 
 from __future__ import annotations
@@ -29,104 +28,87 @@ def service():
         return svc
 
 
-def _markets_page(tickers: list[str], cursor: str | None = None) -> dict:
-    return {"markets": [{"ticker": t} for t in tickers], "cursor": cursor}
+def _events_resp(prefix: str, n_events: int = 1) -> dict:
+    return {"events": [{"event_ticker": f"{prefix}-E{i}"} for i in range(n_events)]}
 
 
-def _mock_client(pages: list[dict]) -> AsyncMock:
-    client = AsyncMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
-    client.list_markets = AsyncMock(side_effect=pages)
-    return client
+def _event_detail(event_ticker: str, n_markets: int = 2, status: str = "active") -> dict:
+    markets = [{"ticker": f"{event_ticker}-T{i}", "status": status} for i in range(n_markets)]
+    return {"event": {"event_ticker": event_ticker}, "markets": markets}
+
+
+def _client(list_events_side: list, get_event_side) -> AsyncMock:
+    c = AsyncMock()
+    c.__aenter__ = AsyncMock(return_value=c)
+    c.__aexit__ = AsyncMock(return_value=False)
+    c.list_events = AsyncMock(side_effect=list_events_side)
+    if isinstance(get_event_side, list):
+        c.get_event = AsyncMock(side_effect=get_event_side)
+    else:
+        c.get_event = AsyncMock(return_value=get_event_side)
+    return c
 
 
 @pytest.mark.asyncio
-async def test_discovery_filters_by_prefix_covering_families(service):
-    """KXWC*/KXFIFA* enteras entran por prefijo; series ajenas (KXBTC) quedan afuera."""
-    page = _markets_page([
-        "KXFIFAGAME-26JUN12-ARG-MEX",   # el match market que el listado exacto perdía
-        "KXWCGROUPWIN-26-A",
-        "KXWCNEWSERIES-26-X",            # serie NUEVA de la familia → entra sola
-        "KXNBA-26-LAL",
-        "KXBTC-26DEC31",                 # ajena → afuera
-    ])
-    client = _mock_client([page])
-
+async def test_discovery_exact_series_collects_open_markets(service):
+    """Flujo #30: por serie exacta → eventos → get_event → markets open/active; delta correcto."""
+    client = _client(
+        [_events_resp("KXMLB"), _events_resp("KXFIFAGAME")],
+        [_event_detail("KXMLB-E0", 2), _event_detail("KXFIFAGAME-E0", 3)],
+    )
     with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXWC", "KXFIFA", "KXNBA"]
-    ):
-        new = await service._discover_markets()
-
-    assert new == {
-        "KXFIFAGAME-26JUN12-ARG-MEX",
-        "KXWCGROUPWIN-26-A",
-        "KXWCNEWSERIES-26-X",
-        "KXNBA-26-LAL",
-    }
-    assert "KXBTC-26DEC31" not in service._tracked_tickers
-    assert client.list_markets.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_discovery_paginates_with_cursor_and_pacing(service):
-    """Sigue el cursor hasta la última página, con pacing entre páginas."""
-    sleep_calls: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-
-    pages = [
-        _markets_page(["KXNBA-1"], cursor="c1"),
-        _markets_page(["KXNBA-2"], cursor="c2"),
-        _markets_page(["KXNBA-3"], cursor=None),  # última
-    ]
-    client = _mock_client(pages)
-
-    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]
-    ), patch("asyncio.sleep", side_effect=fake_sleep):
-        new = await service._discover_markets()
-
-    assert new == {"KXNBA-1", "KXNBA-2", "KXNBA-3"}
-    assert client.list_markets.await_count == 3
-    # El cursor se encadenó correctamente.
-    cursors = [c.kwargs.get("cursor") for c in client.list_markets.await_args_list]
-    assert cursors == [None, "c1", "c2"]
-    # Pacing entre páginas (no después de la última).
-    assert sleep_calls == [service.DISCOVERY_PAGE_PACING_SEC] * 2
-
-
-@pytest.mark.asyncio
-async def test_discovery_safety_cap_stops_runaway_pagination(service):
-    """Cursor que nunca termina → corta en DISCOVERY_MAX_PAGES (sin loop infinito)."""
-    service.DISCOVERY_MAX_PAGES = 3
-    endless = AsyncMock()
-    endless.__aenter__ = AsyncMock(return_value=endless)
-    endless.__aexit__ = AsyncMock(return_value=False)
-    endless.list_markets = AsyncMock(return_value=_markets_page(["KXNBA-X"], cursor="more"))
-
-    with patch("src.strategies.data_capture.KalshiRestClient", return_value=endless), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]
+        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXFIFAGAME"]
     ), patch("asyncio.sleep", new=AsyncMock()):
-        await service._discover_markets()
+        new = await service._discover_markets()
 
-    assert endless.list_markets.await_count == 3  # exactamente el cap
+    assert len(new) == 5  # 2 + 3, todos nuevos
+    assert len(service._tracked_tickers) == 5
+    # list_events recibió la serie EXACTA (no un prefijo amplio).
+    series_args = [c.kwargs.get("series_ticker") for c in client.list_events.await_args_list]
+    assert series_args == ["KXMLB", "KXFIFAGAME"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_failure_per_series_continues(service):
+    """Una serie que falla NO aborta las demás (resiliencia por-serie del flujo #30)."""
+    client = _client(
+        [Exception("timeout en KXMLB"), _events_resp("KXNBA")],
+        _event_detail("KXNBA-E0", 3),
+    )
+    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
+        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXNBA"]
+    ), patch("asyncio.sleep", new=AsyncMock()):
+        new = await service._discover_markets()
+
+    assert len(new) == 3  # KXMLB falló → 0; KXNBA → 3
 
 
 @pytest.mark.asyncio
 async def test_discovery_returns_only_new_tickers(service):
-    """El delta: lo ya trackeado no se reporta como nuevo (insumo del re-discovery)."""
-    service._tracked_tickers = {"KXNBA-VIEJO"}
-    client = _mock_client([_markets_page(["KXNBA-VIEJO", "KXNBA-NUEVO"])])
-
+    """Delta para el re-discovery: lo ya trackeado no se reporta como nuevo."""
+    service._tracked_tickers = {"KXNBA-E0-T0"}
+    client = _client([_events_resp("KXNBA")], _event_detail("KXNBA-E0", 2))
     with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
         "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]
-    ):
+    ), patch("asyncio.sleep", new=AsyncMock()):
         new = await service._discover_markets()
 
-    assert new == {"KXNBA-NUEVO"}
-    assert service._tracked_tickers == {"KXNBA-VIEJO", "KXNBA-NUEVO"}
+    assert new == {"KXNBA-E0-T1"}
+    assert service._tracked_tickers == {"KXNBA-E0-T0", "KXNBA-E0-T1"}
+
+
+@pytest.mark.asyncio
+async def test_discovery_skips_closed_markets(service):
+    """Markets con status fuera de open/active no se trackean."""
+    client = _client([_events_resp("KXNBA")], _event_detail("KXNBA-E0", 2, status="settled"))
+    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
+        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]
+    ), patch("asyncio.sleep", new=AsyncMock()):
+        new = await service._discover_markets()
+    assert new == set()
+
+
+# ── Re-discovery (#41, se conserva: independiente del método interno) ─────────────
 
 
 @pytest.mark.asyncio

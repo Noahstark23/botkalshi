@@ -30,10 +30,12 @@ from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
 TARGET_SERIES_PREFIXES = [
-    # P2: ahora SÍ son PREFIJOS reales. El discovery lista TODOS los markets abiertos
-    # (list_markets paginado) y filtra ticker.startswith(prefijo) LOCALMENTE → cubre
-    # familias enteras (KXWC*/KXFIFA* completas, sin enumerar series exactas) y series
-    # nuevas que Kalshi liste durante el torneo (con el re-discovery periódico).
+    # ⚠️ Series EXACTAS (cada string es un series_ticker literal para list_events).
+    # HOTFIX 2026-06-12: el discovery por paginación amplia de #41 falló en producción
+    # (Kalshi tiene >40k markets abiertos dominados por crypto; el cap de 200 páginas
+    # se agotó sin alcanzar los deportivos → Tracking 0). Se restaura el flujo
+    # conocido-bueno (#30, 301 markets) hasta implementar el prefiltro server-side
+    # (GET /series) — P2 v2, pendiente de verificar el endpoint.
     # Deportes
     "KXMLB",   # MLB
     "KXNBA",   # NBA
@@ -42,12 +44,17 @@ TARGET_SERIES_PREFIXES = [
     "KXEPL",   # Premier League
     "KXUCL",   # Champions League
     "KXUEL",   # Europa League
-    # Mundial 2026 — familias COMPLETAS por prefijo (resuelve el misterio KXFIFAGAME:
-    # si existe bajo cualquier nombre KXFIFA*, entra solo)
-    "KXWC",
-    "KXFIFA",
-    "KXMENWORLDCUP",
+    # Mundial 2026 — series confirmadas contra la API pública (2026-06-11)
+    "KXMENWORLDCUP",  # ganador del torneo (selecciones masculinas)
     "KXMWORLDCUP",
+    "KXFIFAGAME",     # partidos (match markets)
+    "KXFIFAADVANCE",  # clasificación a siguiente ronda
+    "KXFIFATOTAL",    # totales de goles
+    "KXFIFASPREAD",   # hándicaps
+    "KXWCGROUPWIN",   # ganador de grupo
+    "KXWCSTAGE",      # alcance de ronda por equipo
+    "KXWCTEAMGOALS",  # goles por equipo
+    "KXWCGOALIEPEN",  # props (arqueros/penales)
     # Política y eventos (donde menos competencia algorítmica)
     "KXPRES",
     "KXPOTUS",
@@ -121,10 +128,7 @@ class DataCaptureService:
     MAX_TICKERS_PER_SNAPSHOT_CYCLE = 50
     WS_SILENCE_THRESHOLD_SEC = 300  # silencio del WS que dispara reconexion forzada
     WS_ZOMBIE_ALERT_THRESHOLD = 2  # detecciones consecutivas antes de alertar a Telegram
-    # P2 — discovery por prefijo (list_markets paginado) + re-discovery periódico
-    DISCOVERY_PAGE_LIMIT = 200          # markets por página
-    DISCOVERY_MAX_PAGES = 200           # corte de seguridad (200×200 = 40k markets)
-    DISCOVERY_PAGE_PACING_SEC = 1.0     # pacing entre páginas (≪ rate limit de lectura)
+    # P2 — re-discovery periódico (el método interno volvió a series exactas; hotfix)
     REDISCOVERY_INTERVAL_SEC = 6 * 3600  # re-discovery cada 6h (markets nuevos del torneo)
 
     def __init__(self, rest_client: KalshiRestClient | None = None) -> None:
@@ -255,53 +259,56 @@ class DataCaptureService:
 
     async def _discover_markets(self) -> set[str]:
         """
-        Descubre markets abiertos por PREFIJO real (P2) y devuelve los NUEVOS.
+        Descubre markets activos por SERIES EXACTAS y devuelve los NUEVOS (delta).
 
-        Lista TODOS los markets abiertos con list_markets paginado (cursor) y filtra
-        ticker.startswith(prefijo) localmente. Elimina el cuello del flujo viejo
-        (get_event por evento × sleep 2s → minutos) y cubre familias enteras: el
-        ciclo son `páginas = markets_abiertos / 200` requests planos, paceados a
-        ~1 req/s — muy por debajo del rate limit de lectura.
+        HOTFIX: flujo conocido-bueno restaurado de #30 (list_events(series_ticker=X)
+        + get_event por evento, pausas anti-429). Lento (~minutos) pero CORRECTO —
+        el listado amplio de #41 nunca alcanzaba los markets deportivos (>40k markets
+        abiertos dominados por crypto). Conserva la firma delta de #41: el
+        re-discovery periódico la usa para suscribir solo lo nuevo en caliente.
         """
-        found: set[str] = set()
-        per_prefix: dict[str, int] = {}
-        pages = 0
+        before = set(self._tracked_tickers)
+        per_series: dict[str, int] = {}
+        errors_by_prefix: dict[str, str] = {}
         async with KalshiRestClient() as client:
-            cursor: str | None = None
-            while pages < self.DISCOVERY_MAX_PAGES:
-                resp = await client.list_markets(
-                    status="open", limit=self.DISCOVERY_PAGE_LIMIT, cursor=cursor
-                )
-                markets = resp.get("markets", [])
-                for market in markets:
-                    ticker = market.get("ticker") or ""
-                    for prefix in TARGET_SERIES_PREFIXES:
-                        if ticker.startswith(prefix):
-                            found.add(ticker)
-                            per_prefix[prefix] = per_prefix.get(prefix, 0) + 1
-                            break
-                pages += 1
-                cursor = resp.get("cursor")
-                if not cursor or not markets:
-                    break  # última página
-                await asyncio.sleep(self.DISCOVERY_PAGE_PACING_SEC)
+            for prefix in TARGET_SERIES_PREFIXES:
+                try:
+                    # limit=200 (máx de Kalshi): el Mundial tiene 104 partidos — una serie
+                    # como KXFIFAGAME clipea con limit=100 y perderíamos eventos.
+                    events_resp = await client.list_events(series_ticker=prefix, limit=200)
+                    events = events_resp.get("events", [])
+                    for event in events:
+                        event_ticker = event.get("event_ticker")
+                        if not event_ticker:
+                            continue
+                        await asyncio.sleep(2.0)  # pausa entre get_event calls
+                        try:
+                            event_detail = await client.get_event(event_ticker)
+                            # get_event retorna {"event": {...}, "markets": [...]}
+                            # markets esta siempre en la raiz, NO dentro de "event"
+                            markets = event_detail.get("markets", [])
+                            for market in markets:
+                                ticker = market.get("ticker")
+                                status = market.get("status", "")
+                                if ticker and status in ("open", "active"):
+                                    self._tracked_tickers.add(ticker)
+                                    per_series[prefix] = per_series.get(prefix, 0) + 1
+                        except Exception as e:
+                            logger.warning(f"get_event({event_ticker}) error: {type(e).__name__}: {e}")
+                except Exception as e:
+                    errors_by_prefix[prefix] = type(e).__name__
+                    logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
+                await asyncio.sleep(2.0)  # pausa entre prefixes
 
-        if pages >= self.DISCOVERY_MAX_PAGES:
-            logger.warning(
-                f"Discovery cortado en {pages} páginas (DISCOVERY_MAX_PAGES) — "
-                "¿explosión de markets abiertos? Revisar paginación/límite."
-            )
-
-        new_tickers = found - self._tracked_tickers
-        self._tracked_tickers |= found
+        if errors_by_prefix:
+            logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
+        new_tickers = self._tracked_tickers - before
         BotState.tracked_markets_count = len(self._tracked_tickers)
         logger.success(
-            f"Tracking {len(self._tracked_tickers)} markets "
-            f"(+{len(new_tickers)} nuevos, {pages} páginas)"
+            f"Tracking {len(self._tracked_tickers)} markets (+{len(new_tickers)} nuevos)"
         )
-        # Conteo por prefijo: la evidencia de qué familias están vivas (ej. ver si
-        # KXFIFA* aparece y bajo qué tickers reales).
-        logger.info(f"Discovery por prefijo: {dict(sorted(per_prefix.items()))}")
+        # Conteo por serie: evidencia de qué familias están vivas (ej. KXFIFAGAME).
+        logger.info(f"Discovery por serie: {dict(sorted(per_series.items()))}")
         return new_tickers
 
     async def _run_rediscovery(self) -> None:
