@@ -171,6 +171,9 @@ class EdgeWindow(SQLModel, table=True):
     count: int | None = None       # contratos del opp detectado
     fees_cents: int | None = None  # comisión total estimada (ambas patas)
     edge_pct: float | None = None  # edge neto post-fee como % del capital comprometido
+    # Tipo de detección: "binary" (mismo market, libro cruzado) | "multi_outcome"
+    # (1X2/winner: N markets del mismo evento sumando <100). NULL = pre-P3 (binary).
+    kind: str | None = Field(default=None, max_length=20)
     leg_states: str | None = Field(default=None, max_length=50)  # "FILL/KILL", "FILL/ERROR_RED", etc.
     reconciled: bool = False
     kill_switch_fired: bool = False
@@ -255,6 +258,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("edge_windows", "count", "INTEGER"),
     ("edge_windows", "fees_cents", "INTEGER"),
     ("edge_windows", "edge_pct", "FLOAT"),
+    ("edge_windows", "kind", "VARCHAR(20)"),  # P3: binary | multi_outcome
 ]
 
 

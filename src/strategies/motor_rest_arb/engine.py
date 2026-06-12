@@ -29,9 +29,10 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from src.math.arbitrage import ArbOpportunity, detect_binary_arb
+from src.math.arbitrage import ArbOpportunity, detect_binary_arb, detect_multi_outcome_arb
 from src.monitoring.telegram_alerts import alert_trade
 from src.storage.models import EdgeWindow, get_session
+from src.strategies.data_capture import parse_price_to_cents
 from src.strategies.motor_rest_arb.trigger import (
     _YES_ASK_SIZE_KEYS,
     _YES_BID_SIZE_KEYS,
@@ -69,6 +70,17 @@ class RestArbEngine:
     # Cada cuántos tickers evaluados se emite un heartbeat INFO (evidencia de vida).
     HEARTBEAT_EVERY = 200
 
+    # ── P3: multi-outcome SHADOW (1X2/winner del Mundial) ──────────────────────
+    # SOLO series con estructura "exactamente UN outcome gana" (mutuamente excluyentes
+    # y exhaustivos). NO meter acá series de props/totals (KXWCTEAMGOALS etc.): sus
+    # markets NO son excluyentes → comprar YES en todos NO es arb → señal falsa.
+    MULTI_SERIES_PREFIXES = ("KXFIFAGAME", "KXWCGROUPWIN", "KXMENWORLDCUP", "KXMWORLDCUP")
+    # Frescura: todas las patas del evento deben tener quote con esta edad máxima.
+    # Una pata stale (precio viejo) genera arb fantasma → grupo incompleto = no evaluar.
+    MULTI_MAX_QUOTE_AGE_SEC = 30.0
+    # Mínimo de outcomes para evaluar (1X2 = 3; winner de grupo/torneo ≥ 3).
+    MULTI_MIN_LEGS = 3
+
     def __init__(
         self,
         executor: RestExecutor | None = None,
@@ -98,6 +110,40 @@ class RestArbEngine:
         # el finally del task, junto con _executing.
         self._exec_task: asyncio.Task[None] | None = None
 
+        # ── P3: estado del multi-outcome shadow ────────────────────────────────
+        # Cache del último YES-ask por ticker: ticker → (ask_cents, ask_size, monotonic).
+        self._quote_cache: dict[str, tuple[int, int, float]] = {}
+        # Universo de eventos multi (lo setea data_capture tras cada discovery):
+        # event_key → set de tickers hermanos; ticker → event_key para lookup O(1).
+        self._event_universe: dict[str, set[str]] = {}
+        self._ticker_to_event: dict[str, str] = {}
+        self._multi_signals_seen = 0
+        # P4: near-miss por ventana de heartbeat — cuán CERCA estuvo cada forma de arb.
+        self._best_binary_gap: tuple[int, str] | None = None      # (ask−bid mínimo, ticker)
+        self._best_multi_sum: tuple[int, int, str] | None = None  # (Σasks mínima, n_legs, event)
+
+    def update_universe(self, tickers: set[str]) -> None:
+        """
+        Reconstruye el universo de eventos multi-outcome desde los tickers trackeados.
+
+        Agrupa por event_key (= ticker sin el sufijo de outcome: rsplit('-', 1)[0]),
+        filtrado por MULTI_SERIES_PREFIXES (solo estructuras winner-take-all). Lo llama
+        data_capture tras el discovery del boot y tras cada re-discovery.
+        """
+        universe: dict[str, set[str]] = {}
+        for t in tickers:
+            if not t.startswith(self.MULTI_SERIES_PREFIXES):
+                continue
+            event_key = t.rsplit("-", 1)[0]
+            universe.setdefault(event_key, set()).add(t)
+        self._event_universe = universe
+        self._ticker_to_event = {t: ev for ev, ts in universe.items() for t in ts}
+        n_events = sum(1 for ts in universe.values() if len(ts) >= self.MULTI_MIN_LEGS)
+        logger.info(
+            f"motor_rest.multi.universe eventos={len(universe)} "
+            f"evaluables(≥{self.MULTI_MIN_LEGS} patas)={n_events}"
+        )
+
     async def on_ticker(self, raw_msg: dict[str, Any]) -> None:
         """Handler del canal `ticker`: evaluar trigger y, si hay señal, grabar shadow."""
         self._tickers_evaluated += 1
@@ -113,20 +159,52 @@ class RestArbEngine:
         if bid_size > 0 and ask_size > 0:
             self._ticks_with_real_size += 1
 
+        # ── P3/P4: cache de quotes + near-miss + evaluación multi-outcome (SHADOW) ──
+        # Instrumentación + detección pura: graba EdgeWindow, JAMÁS ejecuta (el path de
+        # ejecución es exclusivo del trigger binario; el multi no lo toca).
+        ticker = data.get("market_ticker")
+        yes_bid_c = parse_price_to_cents(data.get("yes_bid_dollars"))
+        yes_ask_c = parse_price_to_cents(data.get("yes_ask_dollars"))
+        if ticker and yes_bid_c is not None and yes_ask_c is not None \
+                and 1 <= yes_bid_c <= 99 and 1 <= yes_ask_c <= 99:
+            # P4 near-miss binario: gap = ask − bid (un CRUCE sería gap < 0; cuanto
+            # más chico el gap, más cerca estuvo el arb binario de existir).
+            gap = yes_ask_c - yes_bid_c
+            if self._best_binary_gap is None or gap < self._best_binary_gap[0]:
+                self._best_binary_gap = (gap, ticker)
+        if ticker and yes_ask_c is not None and 1 <= yes_ask_c <= 99 and ask_size > 0:
+            self._quote_cache[ticker] = (yes_ask_c, int(ask_size), time.monotonic())
+            event_key = self._ticker_to_event.get(ticker)
+            if event_key:
+                self._evaluate_multi_outcome(event_key)
+
         # Heartbeat de observabilidad: evidencia VIVA de que el motor procesa.
         # 0 edges es normal en mercado eficiente; el heartbeat distingue "sin cruces"
         # de "motor zombi". Ahora también reporta si el size llega real (size_real_en
         # X/N) + una muestra cruda del último tick (key=raw->parsed) para confirmar en
         # 30s que el parser NO lee None. Loguea cada HEARTBEAT_EVERY tickers a INFO.
         if self._tickers_evaluated % self.HEARTBEAT_EVERY == 0:
+            # P4 — near-miss: cuán cerca estuvo cada forma de arb en esta ventana.
+            nm_bin = (
+                f"{self._best_binary_gap[0]}c@{self._best_binary_gap[1]}"
+                if self._best_binary_gap else "n/a"
+            )
+            nm_multi = (
+                f"{self._best_multi_sum[0]}c/{self._best_multi_sum[1]}legs@{self._best_multi_sum[2]}"
+                if self._best_multi_sum else "n/a"
+            )
             logger.info(
                 f"REST Engine Heartbeat: {self._tickers_evaluated} tickers evaluados, "
                 f"{self._signals_seen} cruces detectados | "
                 f"size_real_en {self._ticks_with_real_size}/{self.HEARTBEAT_EVERY} ticks | "
                 f"ultimo_tick: {bid_key}={bid_raw!r}->{bid_size:.2f} "
-                f"{ask_key}={ask_raw!r}->{ask_size:.2f}"
+                f"{ask_key}={ask_raw!r}->{ask_size:.2f} | "
+                f"multi: {self._multi_signals_seen} señales | "
+                f"near-miss bin={nm_bin} multi={nm_multi}"
             )
             self._ticks_with_real_size = 0  # reset por ventana
+            self._best_binary_gap = None
+            self._best_multi_sum = None
 
         try:
             signal = evaluate_ticker(
@@ -304,6 +382,66 @@ class RestArbEngine:
             max_count=max_count,
         )
 
+    # =====================================================
+    # P3 — Multi-outcome SHADOW (detecta y graba; JAMÁS ejecuta)
+    # =====================================================
+
+    def _evaluate_multi_outcome(self, event_key: str) -> None:
+        """
+        Evalúa el arb multi-outcome del evento (1X2/winner): comprar YES en TODOS los
+        outcomes paga 100¢ seguro si Σasks < 100 post-fee.
+
+        SEGURIDAD ANTI-SEÑAL-FALSA: solo se evalúa con el grupo COMPLETO (todos los
+        tickers que el discovery conoce del evento) y FRESCO (cada quote con edad ≤
+        MULTI_MAX_QUOTE_AGE_SEC). Un grupo parcial (falta un outcome) o stale haría
+        parecer arb lo que no lo es. SHADOW: solo graba EdgeWindow + log.
+        """
+        members = self._event_universe.get(event_key)
+        if not members or len(members) < self.MULTI_MIN_LEGS:
+            return
+        now = time.monotonic()
+        legs: list[tuple[str, int, int]] = []
+        for t in members:
+            q = self._quote_cache.get(t)
+            if q is None or (now - q[2]) > self.MULTI_MAX_QUOTE_AGE_SEC:
+                return  # grupo incompleto o stale → NO evaluar (señal falsa imposible)
+            legs.append((t, q[0], q[1]))
+
+        sum_asks = sum(ask for _, ask, _ in legs)
+        # P4 near-miss multi: la suma mínima vista (100 − Σ = el margen bruto del arb).
+        if self._best_multi_sum is None or sum_asks < self._best_multi_sum[0]:
+            self._best_multi_sum = (sum_asks, len(legs), event_key)
+        if sum_asks >= 100:
+            return
+
+        try:
+            opp = detect_multi_outcome_arb(event_key, legs)
+        except ValueError:
+            return  # datos fuera de rango → no es señal
+        if opp is None:
+            return  # el fee se comió el spread
+
+        self._multi_signals_seen += 1
+        logger.info(
+            f"motor_rest.multi.detected event={event_key} legs={len(legs)} "
+            f"sum_asks={sum_asks}c net={opp.net_profit_cents}c edge={opp.edge_pct:.2f}% "
+            f"count={opp.count}"
+        )
+        try:
+            with get_session() as s:
+                s.add(EdgeWindow(
+                    market_ticker=event_key[:100],
+                    magnitude_cents=opp.net_profit_cents,
+                    gross_spread_cents=opp.gross_profit_cents,
+                    count=opp.count,
+                    fees_cents=opp.fees_cents,
+                    edge_pct=opp.edge_pct,
+                    kind="multi_outcome",
+                ))
+                s.commit()
+        except Exception:
+            logger.exception("motor_rest.multi.persist_error")
+
     def _record_edge_window(self, signal: TriggerSignal) -> int | None:
         """
         Graba la ventana de edge en SQLite (sesión SÍNCRONA, patrón del proyecto).
@@ -326,6 +464,7 @@ class RestArbEngine:
                     count=opp.count,            # reconstrucción exacta del gate
                     fees_cents=opp.fees_cents,
                     edge_pct=opp.edge_pct,
+                    kind="binary",
                 )
                 s.add(window)
                 s.commit()
