@@ -113,16 +113,20 @@ async def test_run_proceeds_when_tickers_found_on_first_attempt():
 
 
 @pytest.mark.asyncio
-async def test_discover_markets_propagates_errors_to_caller():
-    """P2: un fallo del listado paginado PROPAGA — lo manejan los callers (el boot
-    reintenta con backoff; el re-discovery es best-effort y registra el error)."""
+async def test_discover_markets_logs_warning_on_error():
+    """HOTFIX (flujo #30 restaurado): un fallo por serie se loguea como warning y el
+    loop CONTINÚA con las demás series (no propaga, no aborta el discovery)."""
     service = DataCaptureService()
 
     with patch("src.strategies.data_capture.KalshiRestClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.list_markets.side_effect = Exception("429 Too Many Requests")
+        mock_client.list_events.side_effect = Exception("429 Too Many Requests")
         mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        with pytest.raises(Exception, match="429"):
-            await service._discover_markets()
+        with patch("src.strategies.data_capture.logger") as mock_logger:
+            new = await service._discover_markets()
+            assert new == set()
+            assert mock_logger.warning.called
+            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+            assert any("Discovery error" in c or "Discovery con" in c for c in warning_calls)
