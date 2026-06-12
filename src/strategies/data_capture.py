@@ -30,9 +30,10 @@ from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
 TARGET_SERIES_PREFIXES = [
-    # ⚠️ NO son prefijos: el discovery pasa cada string como series_ticker EXACTO a
-    # list_events() — "KXWC" NO cubre "KXWCGROUPWIN". Cada serie va enumerada.
-    # (El nombre histórico de la variable es engañoso; se mantiene por compat.)
+    # P2: ahora SÍ son PREFIJOS reales. El discovery lista TODOS los markets abiertos
+    # (list_markets paginado) y filtra ticker.startswith(prefijo) LOCALMENTE → cubre
+    # familias enteras (KXWC*/KXFIFA* completas, sin enumerar series exactas) y series
+    # nuevas que Kalshi liste durante el torneo (con el re-discovery periódico).
     # Deportes
     "KXMLB",   # MLB
     "KXNBA",   # NBA
@@ -41,17 +42,12 @@ TARGET_SERIES_PREFIXES = [
     "KXEPL",   # Premier League
     "KXUCL",   # Champions League
     "KXUEL",   # Europa League
-    # Mundial 2026 — series confirmadas contra la API pública (2026-06-11)
-    "KXMENWORLDCUP",  # ganador del torneo (selecciones masculinas)
+    # Mundial 2026 — familias COMPLETAS por prefijo (resuelve el misterio KXFIFAGAME:
+    # si existe bajo cualquier nombre KXFIFA*, entra solo)
+    "KXWC",
+    "KXFIFA",
+    "KXMENWORLDCUP",
     "KXMWORLDCUP",
-    "KXFIFAGAME",     # partidos (match markets — el corazón para el shadow)
-    "KXFIFAADVANCE",  # clasificación a siguiente ronda
-    "KXFIFATOTAL",    # totales de goles
-    "KXFIFASPREAD",   # hándicaps
-    "KXWCGROUPWIN",   # ganador de grupo
-    "KXWCSTAGE",      # alcance de ronda por equipo
-    "KXWCTEAMGOALS",  # goles por equipo
-    "KXWCGOALIEPEN",  # props (arqueros/penales)
     # Política y eventos (donde menos competencia algorítmica)
     "KXPRES",
     "KXPOTUS",
@@ -125,6 +121,11 @@ class DataCaptureService:
     MAX_TICKERS_PER_SNAPSHOT_CYCLE = 50
     WS_SILENCE_THRESHOLD_SEC = 300  # silencio del WS que dispara reconexion forzada
     WS_ZOMBIE_ALERT_THRESHOLD = 2  # detecciones consecutivas antes de alertar a Telegram
+    # P2 — discovery por prefijo (list_markets paginado) + re-discovery periódico
+    DISCOVERY_PAGE_LIMIT = 200          # markets por página
+    DISCOVERY_MAX_PAGES = 200           # corte de seguridad (200×200 = 40k markets)
+    DISCOVERY_PAGE_PACING_SEC = 1.0     # pacing entre páginas (≪ rate limit de lectura)
+    REDISCOVERY_INTERVAL_SEC = 6 * 3600  # re-discovery cada 6h (markets nuevos del torneo)
 
     def __init__(self, rest_client: KalshiRestClient | None = None) -> None:
         self.settings = get_settings()
@@ -252,51 +253,88 @@ class DataCaptureService:
     # Discovery
     # =====================================================
 
-    async def _discover_markets(self) -> None:
-        """Descubre markets activos en las series target.
-
-        list_events() solo retorna metadatos del evento, NO markets[].
-        Para obtener los markets hay que llamar get_event(event_ticker) por separado.
-        2s de pausa entre requests para no generar burst de 429s.
+    async def _discover_markets(self) -> set[str]:
         """
-        errors_by_prefix: dict[str, str] = {}
-        async with KalshiRestClient() as client:
-            for prefix in TARGET_SERIES_PREFIXES:
-                try:
-                    # limit=200 (máx de Kalshi): el Mundial tiene 104 partidos — una serie
-                    # como KXFIFAGAME clipea con limit=100 y perderíamos eventos.
-                    events_resp = await client.list_events(series_ticker=prefix, limit=200)
-                    events = events_resp.get("events", [])
-                    for event in events:
-                        event_ticker = event.get("event_ticker")
-                        if not event_ticker:
-                            continue
-                        await asyncio.sleep(2.0)  # pausa entre get_event calls
-                        try:
-                            event_detail = await client.get_event(event_ticker)
-                            # get_event retorna {"event": {...}, "markets": [...]}
-                            # markets esta siempre en la raiz, NO dentro de "event"
-                            markets = event_detail.get("markets", [])
-                            for market in markets:
-                                ticker = market.get("ticker")
-                                status = market.get("status", "")
-                                if ticker and status in ("open", "active"):
-                                    self._tracked_tickers.add(ticker)
-                            logger.debug(
-                                f"Discovery {event_ticker}: {len(markets)} markets, "
-                                f"{sum(1 for m in markets if m.get('status') in ('open','active'))} activos"
-                            )
-                        except Exception as e:
-                            logger.warning(f"get_event({event_ticker}) error: {type(e).__name__}: {e}")
-                except Exception as e:
-                    errors_by_prefix[prefix] = type(e).__name__
-                    logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
-                await asyncio.sleep(2.0)  # pausa entre prefixes
+        Descubre markets abiertos por PREFIJO real (P2) y devuelve los NUEVOS.
 
-        if errors_by_prefix:
-            logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
+        Lista TODOS los markets abiertos con list_markets paginado (cursor) y filtra
+        ticker.startswith(prefijo) localmente. Elimina el cuello del flujo viejo
+        (get_event por evento × sleep 2s → minutos) y cubre familias enteras: el
+        ciclo son `páginas = markets_abiertos / 200` requests planos, paceados a
+        ~1 req/s — muy por debajo del rate limit de lectura.
+        """
+        found: set[str] = set()
+        per_prefix: dict[str, int] = {}
+        pages = 0
+        async with KalshiRestClient() as client:
+            cursor: str | None = None
+            while pages < self.DISCOVERY_MAX_PAGES:
+                resp = await client.list_markets(
+                    status="open", limit=self.DISCOVERY_PAGE_LIMIT, cursor=cursor
+                )
+                markets = resp.get("markets", [])
+                for market in markets:
+                    ticker = market.get("ticker") or ""
+                    for prefix in TARGET_SERIES_PREFIXES:
+                        if ticker.startswith(prefix):
+                            found.add(ticker)
+                            per_prefix[prefix] = per_prefix.get(prefix, 0) + 1
+                            break
+                pages += 1
+                cursor = resp.get("cursor")
+                if not cursor or not markets:
+                    break  # última página
+                await asyncio.sleep(self.DISCOVERY_PAGE_PACING_SEC)
+
+        if pages >= self.DISCOVERY_MAX_PAGES:
+            logger.warning(
+                f"Discovery cortado en {pages} páginas (DISCOVERY_MAX_PAGES) — "
+                "¿explosión de markets abiertos? Revisar paginación/límite."
+            )
+
+        new_tickers = found - self._tracked_tickers
+        self._tracked_tickers |= found
         BotState.tracked_markets_count = len(self._tracked_tickers)
-        logger.success(f"Tracking {len(self._tracked_tickers)} markets")
+        logger.success(
+            f"Tracking {len(self._tracked_tickers)} markets "
+            f"(+{len(new_tickers)} nuevos, {pages} páginas)"
+        )
+        # Conteo por prefijo: la evidencia de qué familias están vivas (ej. ver si
+        # KXFIFA* aparece y bajo qué tickers reales).
+        logger.info(f"Discovery por prefijo: {dict(sorted(per_prefix.items()))}")
+        return new_tickers
+
+    async def _run_rediscovery(self) -> None:
+        """
+        Re-discovery periódico (P2): toma markets listados DESPUÉS del boot — clave en
+        un torneo de un mes (partidos nuevos cada día) con uptime continuo.
+
+        BEST-EFFORT: un fallo de ciclo se loguea/registra y el loop SIGUE (no tira el
+        servicio — el bot continúa capturando lo ya suscripto). Los tickers nuevos se
+        suscriben EN CALIENTE: queue_subscription envía el subscribe inmediatamente si
+        el WS está conectado y lo re-aplica en cada reconexión.
+        """
+        while not self._stop_event.is_set():
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self.REDISCOVERY_INTERVAL_SEC
+                )
+            if self._stop_event.is_set():
+                return
+            try:
+                new_tickers = await self._discover_markets()
+                if new_tickers:
+                    batch_list = sorted(new_tickers)
+                    for i in range(0, len(batch_list), 100):
+                        self.ws.queue_subscription(
+                            channels=["orderbook_delta", "ticker"],
+                            market_tickers=batch_list[i : i + 100],
+                        )
+                    logger.success(f"Re-discovery: {len(new_tickers)} markets nuevos suscriptos")
+            except Exception as e:
+                msg = f"Re-discovery fallo: {type(e).__name__}: {e}"
+                logger.warning(msg)
+                BotState.record_error(msg)
 
     # =====================================================
     # Snapshots periodicos (REST fallback)
@@ -583,11 +621,14 @@ class DataCaptureService:
         # Supervisor pattern: excepciones reportadas y re-levadas, nunca tragadas
         ws_task = asyncio.create_task(self._run_ws_supervised(), name="ws_supervisor")
         snap_task = asyncio.create_task(self._run_snapshots_supervised(), name="snap_supervisor")
+        # Re-discovery (P2): best-effort con manejo interno de errores — solo termina
+        # con el stop_event, igual que stop_task, así que no dispara el FIRST_COMPLETED.
+        rediscovery_task = asyncio.create_task(self._run_rediscovery(), name="rediscovery")
         stop_task = asyncio.create_task(self._stop_event.wait(), name="stop_waiter")
 
         try:
             done, pending = await asyncio.wait(
-                [ws_task, snap_task, stop_task],
+                [ws_task, snap_task, rediscovery_task, stop_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
