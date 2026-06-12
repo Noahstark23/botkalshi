@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     # === Optional ===
     SENTRY_DSN: str = ""
 
+    # === Motor 2 (consenso sportsbooks) ===
+    # API key de The Odds API. Vacía por default; el cliente la lee de acá.
+    ODDS_API_KEY: str = ""
+
     # ---- Validators ----
 
     @field_validator("KALSHI_PRIVATE_KEY_PATH")
