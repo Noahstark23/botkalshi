@@ -202,6 +202,58 @@ async def test_run_supervisor_survives_source_failures():
     assert "settlement" in mock_rec.call_args.args[0]
 
 
+@pytest.mark.asyncio
+async def test_kalshi_source_parses_result_yes_no():
+    """KalshiSettlementSource: result ∈ {yes,no} → MarketResolution; otro → None (fail-safe)."""
+    from unittest.mock import AsyncMock
+
+    from src.strategies.motor_rest_arb.settlement import KalshiSettlementSource
+
+    client = AsyncMock()
+    # Resuelto a YES (shape con market anidado).
+    client.get_market = AsyncMock(return_value={"market": {"ticker": "KXT", "result": "yes"}})
+    res = await KalshiSettlementSource(client).get_resolution("KXT")
+    assert res is not None and res.result == "yes" and res.ticker == "KXT"
+
+    # Resuelto a NO (shape plano).
+    client.get_market = AsyncMock(return_value={"ticker": "KXT", "result": "NO"})
+    res = await KalshiSettlementSource(client).get_resolution("KXT")
+    assert res is not None and res.result == "no"
+
+
+@pytest.mark.asyncio
+async def test_kalshi_source_unresolved_returns_none():
+    """Mercado abierto (result vacío/ausente/otro) → None → el grupo atómico espera."""
+    from unittest.mock import AsyncMock
+
+    from src.strategies.motor_rest_arb.settlement import KalshiSettlementSource
+
+    for market in ({"market": {"result": ""}}, {"market": {"status": "open"}}, {"result": "void"}):
+        client = AsyncMock()
+        client.get_market = AsyncMock(return_value=market)
+        assert await KalshiSettlementSource(client).get_resolution("KXT") is None
+
+
+@pytest.mark.asyncio
+async def test_kalshi_source_drives_atomic_poller_end_to_end():
+    """El adaptador real conectado al poller de #39 settlea un arb COMPLETO, atómico."""
+    from unittest.mock import AsyncMock
+
+    from src.strategies.motor_rest_arb.settlement import KalshiSettlementSource, SettlementPoller
+
+    arb_id = _arb()  # yes 40¢ + no 45¢, ambos KXWC-ARG
+    client = AsyncMock()
+    client.get_market = AsyncMock(return_value={"market": {"ticker": "KXWC-ARG", "result": "yes"}})
+
+    settled = await SettlementPoller(KalshiSettlementSource(client)).settle_once()
+
+    assert settled == 2  # ambas patas en el mismo tick (atómico)
+    trades = _all_trades()
+    assert {t.status for t in trades.values()} == {"settled"}
+    assert trades[f"{arb_id}-yes"].pnl_cents == (100 - 40) * 5 - 4
+    assert trades[f"{arb_id}-no"].pnl_cents == -45 * 5 - 5
+
+
 def test_leg_pnl_uses_fill_price_and_recomputes_missing_fees():
     """PnL usa fill_price_cents (real) y recomputa fees si la fila no los trae."""
     t = models.Trade(
