@@ -27,9 +27,9 @@ from loguru import logger
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState, app
-from src.monitoring.telegram_alerts import alert_shutdown, alert_startup
+from src.monitoring.telegram_alerts import alert_shutdown, alert_startup, send_alert
 from src.risk.manager import RiskManager
-from src.storage.models import BotRun, get_session, init_db
+from src.storage.models import BotRun, get_session, init_db, kill_switch_engaged
 from src.strategies.data_capture import DataCaptureService
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
 from src.utils.config import get_settings
@@ -122,6 +122,33 @@ class ProductionRunner:
             self._capture = DataCaptureService()
             await self._capture.run()
 
+    async def _rehydrate_kill_switch(self) -> None:
+        """
+        Si el kill-switch persistente quedó ENGAGED, arrancar PAUSADO + avisar.
+
+        Tolerante a fallas de DB: si no se puede leer, NO bloquea el arranque (el
+        TRADING_ENABLED gate + la Capa A siguen protegiendo); se registra el error.
+        """
+        try:
+            engaged, reason = kill_switch_engaged()
+        except Exception:
+            logger.exception("No se pudo leer el kill-switch persistente al boot")
+            BotState.record_error("kill_switch read failed at boot")
+            return
+        if not engaged:
+            return
+        BotState.is_paused = True
+        BotState.pause_reason = f"kill-switch persistente: {reason}"
+        logger.critical(f"ARRANQUE PAUSADO por kill-switch persistente no resuelto: {reason}")
+        try:
+            await send_alert(
+                f"🚨 Bot arrancó PAUSADO: kill-switch previo sin resolver ({reason}). "
+                "No tradea hasta scripts/clear_kill_switch.py + redeploy.",
+                urgent=True,
+            )
+        except Exception:
+            logger.exception("alerta de boot-paused falló")
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -182,6 +209,12 @@ class ProductionRunner:
             init_db()
             BotState.db_initialized = True
             logger.success("DB inicializada")
+
+            # Rehidratar el kill-switch PERSISTENTE: si quedó engaged (un kill-switch
+            # previo + restart de Coolify), arrancar PAUSADO. La pausa en memoria no
+            # sobrevive restarts; esta sí. check_pre_trade corta vía BotState.is_paused y
+            # la Capa A no construye el executor. Despausa SOLO manual (clear_kill_switch.py).
+            await self._rehydrate_kill_switch()
 
             # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
             await self._reconcile_on_boot()

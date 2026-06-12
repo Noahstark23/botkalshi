@@ -13,7 +13,7 @@ from sqlmodel import col, select
 from src.math.arbitrage import ArbOpportunity
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event
-from src.storage.models import Trade, get_session
+from src.storage.models import Trade, engage_kill_switch, get_session
 from src.utils.config import get_settings
 
 
@@ -183,6 +183,12 @@ class RiskManager:
 
         BotState.is_paused = True
         BotState.pause_reason = reason
+        # Persistir para sobrevivir restarts (Coolify unless-stopped). Best-effort: un
+        # fallo de DB no debe impedir la alerta. NO cambia ninguna query/lógica de riesgo.
+        try:
+            engage_kill_switch(reason)
+        except Exception:
+            logger.exception("risk.kill_switch.persist_failed")
         msg = f"KILL SWITCH: {reason}. Bot en pausa. Requiere intervención manual."
         logger.critical(msg)
         await alert_risk_event("kill_switch", msg)

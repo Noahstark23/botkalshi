@@ -179,7 +179,29 @@ class EdgeWindow(SQLModel, table=True):
     rest_rtt_ms: int | None = None
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
+
+class OperationalState(SQLModel, table=True):
+    """
+    Estado operativo PERSISTENTE (sobrevive restarts del contenedor).
+
+    Motivación: `BotState.is_paused` vive solo en memoria. Con Coolify
+    `restart: unless-stopped`, un kill-switch a las 3am + cualquier reinicio (OOM,
+    deploy, hiccup del VPS) borraría la pausa y el bot volvería a operar solo. Esta
+    tabla guarda el estado en DB para rehidratarlo al boot. key/value genérico.
+    """
+
+    __tablename__ = "operational_state"
+
+    key: str = Field(primary_key=True, max_length=50)
+    value: str = Field(max_length=20)  # p.ej. "engaged" / "clear"
+    reason: str | None = Field(default=None, max_length=500)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+
 _engine: Any = None
+
+# Clave del kill-switch (Motor REST + RiskManager) en operational_state.
+_KILL_SWITCH_KEY = "kill_switch"
 
 
 def _apply_sqlite_pragmas(dbapi_conn: Any, _connection_record: Any) -> None:
@@ -271,3 +293,52 @@ def init_db() -> None:
 def get_session() -> Session:
     """Crear nueva sesión. Cerrar con context manager."""
     return Session(get_engine())
+
+
+# =====================================================
+# Kill-switch persistente (sobrevive restarts de Coolify)
+# =====================================================
+
+
+def engage_kill_switch(reason: str) -> None:
+    """
+    Marca el kill-switch como ENGAGED en DB (idempotente, upsert).
+
+    Lo llaman AMBOS kill-switches (RestExecutor._fire_kill_switch y
+    RiskManager._trigger_kill_switch). El caller la envuelve en try/except: un fallo
+    de persistencia NO debe tirar el path del kill-switch (prioridad: alertar al humano),
+    pero se loguea CRITICAL — si no persiste, un restart re-introduce el gap.
+    """
+    with get_session() as s:
+        row = s.get(OperationalState, _KILL_SWITCH_KEY)
+        if row is None:
+            row = OperationalState(key=_KILL_SWITCH_KEY, value="engaged", reason=reason[:500])
+        else:
+            row.value = "engaged"
+            row.reason = reason[:500]
+            row.updated_at = _utc_now()
+        s.add(row)
+        s.commit()
+
+
+def kill_switch_engaged() -> tuple[bool, str | None]:
+    """(engaged, reason) del kill-switch persistente. Propaga si la DB falla — el
+    caller decide el fail-safe (la Capa A asume engaged ante error)."""
+    with get_session() as s:
+        row = s.get(OperationalState, _KILL_SWITCH_KEY)
+        if row is None or row.value != "engaged":
+            return False, None
+        return True, row.reason
+
+
+def clear_kill_switch() -> None:
+    """Despausa el kill-switch persistente. SOLO desde scripts/clear_kill_switch.py
+    (que verifica posiciones en cero antes de llamar). Nada automático la limpia."""
+    with get_session() as s:
+        row = s.get(OperationalState, _KILL_SWITCH_KEY)
+        if row is not None:
+            row.value = "clear"
+            row.reason = None
+            row.updated_at = _utc_now()
+            s.add(row)
+            s.commit()
