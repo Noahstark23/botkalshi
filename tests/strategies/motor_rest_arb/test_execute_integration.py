@@ -45,14 +45,22 @@ def _trades() -> dict[str, models.Trade]:
 
 
 def _shared_arb_id(trades: dict[str, models.Trade]) -> str:
-    """El arb_id (prefijo del coid + notes) debe ser EL MISMO en ambas patas."""
-    ids = {t.client_order_id.rsplit("-", 1)[0] for t in trades.values()}
-    assert len(ids) == 1, f"arb_id no compartido: {ids}"
-    arb_id = ids.pop()
+    """
+    El arb_id (en notes, fuente canónica de agrupación) debe ser EL MISMO en todas las
+    patas. NO se parsea del coid: el coid lleva además un índice por pata (único, porque
+    el multi-outcome tiene todas las patas side="yes"), así que 'arb_id=' en notes es la
+    única fuente confiable — igual que settlement.arb_group_key.
+    """
+    import re
+
+    ids = set()
     for t in trades.values():
-        assert f"arb_id={arb_id}" in (t.notes or "")
+        m = re.search(r"arb_id=([0-9a-fA-F-]{36})", t.notes or "")
+        assert m is not None, f"sin arb_id en notes: {t.notes!r}"
+        ids.add(m.group(1))
         assert t.strategy == "motor_rest_arb"
-    return arb_id
+    assert len(ids) == 1, f"arb_id no compartido: {ids}"
+    return ids.pop()
 
 
 def _opp(count: int = 5) -> ArbOpportunity:
