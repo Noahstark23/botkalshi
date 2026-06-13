@@ -8,6 +8,7 @@ cuando _connect_and_listen() retornaba sin excepción (path raro en producción)
 Estrategia de mock: parcheamos _stable_connection directamente (float return)
 para controlar si el reset se aplica o no, sin depender de mocking de datetime.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -18,10 +19,9 @@ import websockets.exceptions
 
 def make_ws():
     """KalshiWebSocket con settings y signer mockeados."""
-    with patch("src.clients.kalshi_ws.get_settings"), patch(
-        "src.clients.kalshi_ws.KalshiSigner"
-    ):
+    with patch("src.clients.kalshi_ws.get_settings"), patch("src.clients.kalshi_ws.KalshiSigner"):
         from src.clients.kalshi_ws import KalshiWebSocket
+
         return KalshiWebSocket()
 
 
@@ -67,6 +67,7 @@ async def test_failure_counter_resets_after_stable_connection():
     def capture_warning(msg, *args, **kwargs):
         if "Consecutive failures" in str(msg):
             import re
+
             m = re.search(r"Consecutive failures: (\d+)", str(msg))
             if m:
                 logged_failures.append(int(m.group(1)))
@@ -78,9 +79,7 @@ async def test_failure_counter_resets_after_stable_connection():
             reset_logs.append(str(msg))
 
     stable_patch, sleep_patch = patched_run_env(ws, stable=True, max_cycles=3)
-    with stable_patch, sleep_patch, patch(
-        "src.clients.kalshi_ws.logger"
-    ) as mock_logger:
+    with stable_patch, sleep_patch, patch("src.clients.kalshi_ws.logger") as mock_logger:
         mock_logger.warning.side_effect = capture_warning
         mock_logger.info.side_effect = capture_info
         mock_logger.exception = MagicMock()
@@ -90,9 +89,7 @@ async def test_failure_counter_resets_after_stable_connection():
     assert logged_failures == [1, 1, 1], (
         f"Each failure should be isolated (counter=1), got: {logged_failures}"
     )
-    assert len(reset_logs) == 3, (
-        f"Expected 3 reset log lines, got: {reset_logs}"
-    )
+    assert len(reset_logs) == 3, f"Expected 3 reset log lines, got: {reset_logs}"
 
 
 @pytest.mark.asyncio
@@ -107,23 +104,20 @@ async def test_failure_counter_accumulates_on_rapid_failures():
     def capture_warning(msg, *args, **kwargs):
         if "Consecutive failures" in str(msg):
             import re
+
             m = re.search(r"Consecutive failures: (\d+)", str(msg))
             if m:
                 logged_failures.append(int(m.group(1)))
 
     stable_patch, sleep_patch = patched_run_env(ws, stable=False, max_cycles=3)
-    with stable_patch, sleep_patch, patch(
-        "src.clients.kalshi_ws.logger"
-    ) as mock_logger:
+    with stable_patch, sleep_patch, patch("src.clients.kalshi_ws.logger") as mock_logger:
         mock_logger.warning.side_effect = capture_warning
         mock_logger.info = MagicMock()
         mock_logger.exception = MagicMock()
         mock_logger.critical = MagicMock()
         await ws.run()
 
-    assert logged_failures == [1, 2, 3], (
-        f"Expected accumulation [1,2,3], got: {logged_failures}"
-    )
+    assert logged_failures == [1, 2, 3], f"Expected accumulation [1,2,3], got: {logged_failures}"
 
 
 @pytest.mark.asyncio
@@ -136,36 +130,36 @@ async def test_alert_fires_only_on_real_cascade():
     ws_rapid = make_ws()
     critical_calls_rapid = []
 
-    stable_patch_rapid, sleep_patch_rapid = patched_run_env(
-        ws_rapid, stable=False, max_cycles=5
-    )
-    with stable_patch_rapid, sleep_patch_rapid, patch(
-        "src.clients.kalshi_ws.logger"
-    ) as mock_logger_r:
+    stable_patch_rapid, sleep_patch_rapid = patched_run_env(ws_rapid, stable=False, max_cycles=5)
+    with (
+        stable_patch_rapid,
+        sleep_patch_rapid,
+        patch("src.clients.kalshi_ws.logger") as mock_logger_r,
+    ):
         mock_logger_r.warning = MagicMock()
         mock_logger_r.info = MagicMock()
         mock_logger_r.exception = MagicMock()
         mock_logger_r.critical.side_effect = lambda msg, *a, **kw: critical_calls_rapid.append(msg)
 
-        with patch("src.clients.kalshi_ws.asyncio.sleep", new=sleep_patch_rapid.kwargs.get("side_effect")):
+        with patch(
+            "src.clients.kalshi_ws.asyncio.sleep", new=sleep_patch_rapid.kwargs.get("side_effect")
+        ):
             pass  # already patched above via context manager
 
         await ws_rapid.run()
 
-    assert len(critical_calls_rapid) >= 1, (
-        "5 rapid failures must trigger critical log"
-    )
+    assert len(critical_calls_rapid) >= 1, "5 rapid failures must trigger critical log"
 
     # --- Caso 2: fallas estables → sin alert ---
     ws_stable = make_ws()
     critical_calls_stable = []
 
-    stable_patch_stable, sleep_patch_stable = patched_run_env(
-        ws_stable, stable=True, max_cycles=5
-    )
-    with stable_patch_stable, sleep_patch_stable, patch(
-        "src.clients.kalshi_ws.logger"
-    ) as mock_logger_s:
+    stable_patch_stable, sleep_patch_stable = patched_run_env(ws_stable, stable=True, max_cycles=5)
+    with (
+        stable_patch_stable,
+        sleep_patch_stable,
+        patch("src.clients.kalshi_ws.logger") as mock_logger_s,
+    ):
         mock_logger_s.warning = MagicMock()
         mock_logger_s.info = MagicMock()
         mock_logger_s.exception = MagicMock()

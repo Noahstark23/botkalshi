@@ -1,10 +1,10 @@
-﻿"""Tests del ProductionRunner — reconcile en boot tolerante a fallas (Fase 6)."""
+"""Tests del ProductionRunner — reconcile en boot tolerante a fallas (Fase 6)."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from loguru import logger
 
 from src.monitoring.health import BotState
 from src.runner import ProductionRunner
@@ -40,13 +40,11 @@ def mock_runner_settings():
 @pytest.mark.asyncio
 async def test_reconcile_on_boot_calls_initialize(mock_runner_settings):
     """Durante boot, ArbitrageExecutor.initialize() debe ser invocado."""
-    with patch(
-        "src.runner.KalshiRestClient"
-    ) as mock_rest_cls, patch(
-        "src.runner.RiskManager"
-    ), patch(
-        "src.runner.ArbitrageExecutor"
-    ) as mock_exec_cls:
+    with (
+        patch("src.runner.KalshiRestClient") as mock_rest_cls,
+        patch("src.runner.RiskManager"),
+        patch("src.runner.ArbitrageExecutor") as mock_exec_cls,
+    ):
         mock_rest_cls.return_value.__aenter__ = AsyncMock(return_value=mock_rest_cls.return_value)
         mock_rest_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -67,20 +65,16 @@ async def test_reconcile_failure_does_not_crash_boot(mock_runner_settings):
 
     Un Kalshi flap al arranque NO debe impedir que el bot arranque.
     """
-    with patch(
-        "src.runner.KalshiRestClient"
-    ) as mock_rest_cls, patch(
-        "src.runner.RiskManager"
-    ), patch(
-        "src.runner.ArbitrageExecutor"
-    ) as mock_exec_cls:
+    with (
+        patch("src.runner.KalshiRestClient") as mock_rest_cls,
+        patch("src.runner.RiskManager"),
+        patch("src.runner.ArbitrageExecutor") as mock_exec_cls,
+    ):
         mock_rest_cls.return_value.__aenter__ = AsyncMock(return_value=mock_rest_cls.return_value)
         mock_rest_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
         mock_executor = mock_exec_cls.return_value
-        mock_executor.initialize = AsyncMock(
-            side_effect=RuntimeError("Kalshi unreachable at boot")
-        )
+        mock_executor.initialize = AsyncMock(side_effect=RuntimeError("Kalshi unreachable at boot"))
 
         runner = ProductionRunner()
 
@@ -94,12 +88,10 @@ async def test_reconcile_failure_does_not_crash_boot(mock_runner_settings):
 @pytest.mark.asyncio
 async def test_reconcile_network_error_does_not_crash_boot(mock_runner_settings):
     """ConnectionError (red caida) tampoco debe crashear el bot."""
-    with patch(
-        "src.runner.KalshiRestClient"
-    ) as mock_rest_cls, patch(
-        "src.runner.RiskManager"
-    ), patch(
-        "src.runner.ArbitrageExecutor"
+    with (
+        patch("src.runner.KalshiRestClient") as mock_rest_cls,
+        patch("src.runner.RiskManager"),
+        patch("src.runner.ArbitrageExecutor"),
     ):
         mock_rest_cls.return_value.__aenter__ = AsyncMock(
             side_effect=ConnectionError("network gone")

@@ -21,6 +21,7 @@ RestExecutor con TRADING_ENABLED=true + cliente presente; Capa B = guard en on_t
 (executor None o flag false → return); Capa C = place_order bloquea ENTRADAS con el
 flag en false (kalshi_rest.TradingDisabledError).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -76,13 +77,15 @@ class RestArbEngine:
     # KXWCGAMEGOALS etc.): sus markets NO son excluyentes → comprar YES en todos NO
     # es arb → señal falsa. El matching es por SERIE EXACTA (primer segmento del
     # ticker), no por prefijo de string: "KXWCGAME" NO debe matchear "KXWCGAMEGOALS".
-    MULTI_SERIES = frozenset({
-        "KXWCGAME",        # partidos 1X2 — verificado 2026-06-13: 3 markets/evento
-                           # (ej. KXWCGAME-26JUN27JORARG-{JOR,ARG,TIE})
-        "KXWCGROUPWIN",    # ganador de grupo (N excluyentes)
-        "KXMENWORLDCUP",   # ganador del torneo
-        "KXMWORLDCUP",
-    })
+    MULTI_SERIES = frozenset(
+        {
+            "KXWCGAME",  # partidos 1X2 — verificado 2026-06-13: 3 markets/evento
+            # (ej. KXWCGAME-26JUN27JORARG-{JOR,ARG,TIE})
+            "KXWCGROUPWIN",  # ganador de grupo (N excluyentes)
+            "KXMENWORLDCUP",  # ganador del torneo
+            "KXMWORLDCUP",
+        }
+    )
     # Frescura: todas las patas del evento deben tener quote con esta edad máxima.
     # Una pata stale (precio viejo) genera arb fantasma → grupo incompleto = no evaluar.
     MULTI_MAX_QUOTE_AGE_SEC = 30.0
@@ -95,7 +98,7 @@ class RestArbEngine:
         risk_manager: RiskManager | None = None,
     ) -> None:
         self.settings = get_settings()
-        self._signals_seen = 0       # cruces de arbitraje detectados (EdgeWindows grabadas)
+        self._signals_seen = 0  # cruces de arbitraje detectados (EdgeWindows grabadas)
         self._tickers_evaluated = 0  # tickers procesados (para el heartbeat)
         # Diagnóstico de profundidad (instrumentación, NO afecta la lógica del trigger):
         # cuántos tickers de la ventana actual tuvieron size REAL (bid>0 Y ask>0).
@@ -127,7 +130,7 @@ class RestArbEngine:
         self._ticker_to_event: dict[str, str] = {}
         self._multi_signals_seen = 0
         # P4: near-miss por ventana de heartbeat — cuán CERCA estuvo cada forma de arb.
-        self._best_binary_gap: tuple[int, str] | None = None      # (ask−bid mínimo, ticker)
+        self._best_binary_gap: tuple[int, str] | None = None  # (ask−bid mínimo, ticker)
         self._best_multi_sum: tuple[int, int, str] | None = None  # (Σasks mínima, n_legs, event)
 
     def update_universe(self, tickers: set[str]) -> None:
@@ -175,8 +178,13 @@ class RestArbEngine:
         ticker = data.get("market_ticker")
         yes_bid_c = parse_price_to_cents(data.get("yes_bid_dollars"))
         yes_ask_c = parse_price_to_cents(data.get("yes_ask_dollars"))
-        if ticker and yes_bid_c is not None and yes_ask_c is not None \
-                and 1 <= yes_bid_c <= 99 and 1 <= yes_ask_c <= 99:
+        if (
+            ticker
+            and yes_bid_c is not None
+            and yes_ask_c is not None
+            and 1 <= yes_bid_c <= 99
+            and 1 <= yes_ask_c <= 99
+        ):
             # P4 near-miss binario: gap = ask − bid (un CRUCE sería gap < 0; cuanto
             # más chico el gap, más cerca estuvo el arb binario de existir).
             gap = yes_ask_c - yes_bid_c
@@ -197,11 +205,13 @@ class RestArbEngine:
             # P4 — near-miss: cuán cerca estuvo cada forma de arb en esta ventana.
             nm_bin = (
                 f"{self._best_binary_gap[0]}c@{self._best_binary_gap[1]}"
-                if self._best_binary_gap else "n/a"
+                if self._best_binary_gap
+                else "n/a"
             )
             nm_multi = (
                 f"{self._best_multi_sum[0]}c/{self._best_multi_sum[1]}legs@{self._best_multi_sum[2]}"
-                if self._best_multi_sum else "n/a"
+                if self._best_multi_sum
+                else "n/a"
             )
             logger.info(
                 f"REST Engine Heartbeat: {self._tickers_evaluated} tickers evaluados, "
@@ -439,15 +449,17 @@ class RestArbEngine:
         )
         try:
             with get_session() as s:
-                s.add(EdgeWindow(
-                    market_ticker=event_key[:100],
-                    magnitude_cents=opp.net_profit_cents,
-                    gross_spread_cents=opp.gross_profit_cents,
-                    count=opp.count,
-                    fees_cents=opp.fees_cents,
-                    edge_pct=opp.edge_pct,
-                    kind="multi_outcome",
-                ))
+                s.add(
+                    EdgeWindow(
+                        market_ticker=event_key[:100],
+                        magnitude_cents=opp.net_profit_cents,
+                        gross_spread_cents=opp.gross_profit_cents,
+                        count=opp.count,
+                        fees_cents=opp.fees_cents,
+                        edge_pct=opp.edge_pct,
+                        kind="multi_outcome",
+                    )
+                )
                 s.commit()
         except Exception:
             logger.exception("motor_rest.multi.persist_error")
@@ -469,9 +481,9 @@ class RestArbEngine:
                 opp = signal.opportunity
                 window = EdgeWindow(
                     market_ticker=signal.market_ticker,
-                    magnitude_cents=signal.net_edge_cents,       # edge NETO post-comisión
+                    magnitude_cents=signal.net_edge_cents,  # edge NETO post-comisión
                     gross_spread_cents=signal.gross_spread_cents,  # spread BRUTO pre-comisión
-                    count=opp.count,            # reconstrucción exacta del gate
+                    count=opp.count,  # reconstrucción exacta del gate
                     fees_cents=opp.fees_cents,
                     edge_pct=opp.edge_pct,
                     kind="binary",

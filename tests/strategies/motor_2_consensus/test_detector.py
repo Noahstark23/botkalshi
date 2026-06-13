@@ -8,6 +8,7 @@ Fixtures puras en memoria (payloads de Odds API + quotes de Kalshi, que reemplaz
   B. Edge masivo (~33%) → señal emitida con cap 5% ($15) respetado pese a Kelly mayor.
   C. Mismatch de cardinalidad/equipos → el matcher rechaza, el pipeline no colapsa, sin señal.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -23,13 +24,18 @@ CAPITAL = 300.0
 CAP_USD = CAPITAL * 0.05  # 5% = $15.00
 
 
-def _odds_event(h2h: dict[str, float], *, home="Los Angeles Lakers", away="Boston Celtics") -> OddsEvent:
+def _odds_event(
+    h2h: dict[str, float], *, home="Los Angeles Lakers", away="Boston Celtics"
+) -> OddsEvent:
     market = Market(key="h2h", outcomes=tuple(Outcome(name=n, price=p) for n, p in h2h.items()))
     bk = Bookmaker(key="pinnacle", title="Pinnacle", markets=(market,))
     return OddsEvent(
-        id="e1", sport_key="basketball_nba",
+        id="e1",
+        sport_key="basketball_nba",
         commence_time=datetime(2026, 6, 12, 18, tzinfo=UTC),
-        home_team=home, away_team=away, bookmakers=(bk,),
+        home_team=home,
+        away_team=away,
+        bookmakers=(bk,),
     )
 
 

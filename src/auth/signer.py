@@ -8,6 +8,7 @@ Cada request requiere 3 headers:
 
 Reference: https://trading-api.readme.io/reference/api-authentication-key-management
 """
+
 from __future__ import annotations
 
 import base64

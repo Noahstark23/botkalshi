@@ -6,6 +6,7 @@ con flag + executor corre detección → umbral fino → check_pre_trade → res
 execute. Y los cortes: umbral no superado, single-flight ocupado, rechazo de riesgo,
 resize no viable. execute() está mockeado (no toca red); se valida que se LLAMA (o no).
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -38,8 +39,8 @@ def _arb_ticker() -> dict:
         "type": "ticker",
         "msg": {
             "market_ticker": "KXTEST",
-            "yes_bid_dollars": "0.60",   # no_ask = 100 - 60 = 40
-            "yes_ask_dollars": "0.55",   # yes_ask + no_ask = 95 < 100 → arb
+            "yes_bid_dollars": "0.60",  # no_ask = 100 - 60 = 40
+            "yes_ask_dollars": "0.55",  # yes_ask + no_ask = 95 < 100 → arb
             "yes_bid_size_fp": "100.00",
             "yes_ask_size_fp": "100.00",
         },
@@ -75,8 +76,8 @@ async def test_shadow_never_executes():
         await eng.on_ticker(_arb_ticker())
         await _drain(eng)
 
-    assert eng._signals_seen == 1      # detectó el arb (grabó EdgeWindow)
-    assert eng._exec_task is None      # nunca lanzó task de ejecución
+    assert eng._signals_seen == 1  # detectó el arb (grabó EdgeWindow)
+    assert eng._exec_task is None  # nunca lanzó task de ejecución
     assert eng._executing is False
 
 
@@ -85,9 +86,11 @@ async def test_live_executes_full_flow():
     """flag=true + executor: detección → check_pre_trade → resize → execute → alert + update."""
     ex, rm = _mock_executor(), _mock_risk(max_count=50)
     eng = _engine(_settings(trading=True), executor=ex, risk_manager=rm)
-    with patch.object(eng, "_record_edge_window", return_value=7), patch(
-        "src.strategies.motor_rest_arb.engine.alert_trade", new=AsyncMock()
-    ) as mock_alert, patch.object(eng, "_update_edge_window_outcome") as mock_update:
+    with (
+        patch.object(eng, "_record_edge_window", return_value=7),
+        patch("src.strategies.motor_rest_arb.engine.alert_trade", new=AsyncMock()) as mock_alert,
+        patch.object(eng, "_update_edge_window_outcome") as mock_update,
+    ):
         await eng.on_ticker(_arb_ticker())
         await _drain(eng)
 
@@ -102,10 +105,10 @@ async def test_live_executes_full_flow():
     assert mock_alert.call_args.args[0] is ex.execute.return_value  # el outcome real
     mock_update.assert_called_once()
     upd_args = mock_update.call_args.args
-    assert upd_args[0] == 7                        # edge_id de la detección
+    assert upd_args[0] == 7  # edge_id de la detección
     assert upd_args[1] is ex.execute.return_value  # el outcome
     assert isinstance(upd_args[2], int) and upd_args[2] >= 0  # cycle_latency_ms medido
-    assert eng._executing is False     # limpiado en finally
+    assert eng._executing is False  # limpiado en finally
     assert eng._exec_task is None
 
 
@@ -133,7 +136,7 @@ async def test_single_flight_discards_while_busy():
         await _drain(eng)
 
     ex.execute.assert_not_awaited()
-    assert eng._exec_task is None      # no se lanzó un segundo task
+    assert eng._exec_task is None  # no se lanzó un segundo task
 
 
 @pytest.mark.asyncio
@@ -159,7 +162,7 @@ async def test_resize_not_viable_blocks_execution():
         await _drain(eng)
 
     rm.check_pre_trade.assert_awaited_once()
-    ex.execute.assert_not_awaited()    # resize None → fail-safe, no ejecuta
+    ex.execute.assert_not_awaited()  # resize None → fail-safe, no ejecuta
 
 
 # ── _resize_opportunity: mapeo de patas (corazón del cable) ──────────────────────
@@ -167,10 +170,15 @@ async def test_resize_not_viable_blocks_execution():
 # (yes_leg→no_*) produciría precios/sizes intercambiados en el opp resultante y el
 # assert falla. Mocks simétricos NO atraparían esto.
 
+
 def _asym_opp(*, reversed_order: bool) -> ArbOpportunity:
     """opp binario con YES (ask 55, depth 80) y NO (ask 40, depth 100) — asimétrico."""
-    yes_leg = ArbLeg(market_ticker="KXTEST", side="yes", price_cents=55, count=80, available_size=80)
-    no_leg = ArbLeg(market_ticker="KXTEST", side="no", price_cents=40, count=100, available_size=100)
+    yes_leg = ArbLeg(
+        market_ticker="KXTEST", side="yes", price_cents=55, count=80, available_size=80
+    )
+    no_leg = ArbLeg(
+        market_ticker="KXTEST", side="no", price_cents=40, count=100, available_size=100
+    )
     legs = (no_leg, yes_leg) if reversed_order else (yes_leg, no_leg)
     # gross/fees/net/edge dummy: el resize los RECOMPUTA vía detect_binary_arb.
     return ArbOpportunity(

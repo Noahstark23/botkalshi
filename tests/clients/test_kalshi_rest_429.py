@@ -142,6 +142,7 @@ async def test_no_retry_after_header_no_crash(mock_settings, mock_signer):
 # error.code parsing (para distinguir KILL de FOK del resto)
 # =====================================================
 
+
 def test_classify_error_extracts_fok_kill_code():
     """Un 409 con body {'error':{'code':...}} → KalshiClientError con error_code poblado."""
     from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient

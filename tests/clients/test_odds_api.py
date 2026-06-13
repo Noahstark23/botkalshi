@@ -4,6 +4,7 @@ Tests del OddsAPIClient — parsing tipado, auth por apiKey, backoff y record_er
 Usa httpx.MockTransport (incluido en httpx, sin dependencia nueva) para ejercitar el
 _request REAL (apiKey en la query, retries, clasificación de errores) sin red.
 """
+
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -105,7 +106,7 @@ async def test_429_then_200_retries_and_succeeds():
     async with _client(handler) as client:
         events = await client.get_odds("soccer_fifa_world_cup")
 
-    assert calls["n"] == 2          # reintentó tras el 429
+    assert calls["n"] == 2  # reintentó tras el 429
     assert len(events) == 1
 
 
@@ -137,7 +138,9 @@ async def test_network_error_records_and_raises():
 
 @pytest.mark.asyncio
 async def test_missing_api_key_raises_auth_error():
-    client = OddsAPIClient(api_key="", transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[])))
+    client = OddsAPIClient(
+        api_key="", transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    )
     async with client:
         with pytest.raises(OddsAPIAuthError):
             await client.get_odds("soccer_fifa_world_cup")
@@ -147,7 +150,9 @@ async def test_missing_api_key_raises_auth_error():
 async def test_get_sports_returns_list():
     def handler(request: httpx.Request) -> httpx.Response:
         assert "apiKey=TESTKEY" in str(request.url)
-        return httpx.Response(200, json=[{"key": "soccer_fifa_world_cup", "title": "FIFA World Cup"}])
+        return httpx.Response(
+            200, json=[{"key": "soccer_fifa_world_cup", "title": "FIFA World Cup"}]
+        )
 
     async with _client(handler) as client:
         sports = await client.get_sports()

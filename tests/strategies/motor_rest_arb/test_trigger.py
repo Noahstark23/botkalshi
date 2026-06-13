@@ -9,6 +9,7 @@ fixed-point strings + sizes). Casos:
   (d) sin cruce → NO trigger
 Extra: size ausente → fallo seguro (NO trigger).
 """
+
 from __future__ import annotations
 
 from src.strategies.motor_rest_arb.trigger import evaluate_ticker

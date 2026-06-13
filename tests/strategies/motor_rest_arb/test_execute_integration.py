@@ -20,6 +20,7 @@ A.1 INTEGRADO: cada ruta verifica además las Trade rows que execute() persiste
 (intents pre-red + estado final por pata) y, en la ruta 4, la pausa persistente.
 La DB temporal la monta el conftest del paquete (autouse).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -55,24 +56,37 @@ def _shared_arb_id(trades: dict[str, models.Trade]) -> str:
 
 
 def _opp(count: int = 5) -> ArbOpportunity:
-    yes = ArbLeg(market_ticker="KXWC-26-ARG", side="yes", price_cents=40, count=count, available_size=100)
-    no = ArbLeg(market_ticker="KXWC-26-ARG", side="no", price_cents=45, count=count, available_size=100)
+    yes = ArbLeg(
+        market_ticker="KXWC-26-ARG", side="yes", price_cents=40, count=count, available_size=100
+    )
+    no = ArbLeg(
+        market_ticker="KXWC-26-ARG", side="no", price_cents=45, count=count, available_size=100
+    )
     return ArbOpportunity(
-        legs=(yes, no), count=count, gross_profit_cents=75, fees_cents=4,
-        net_profit_cents=71, edge_pct=2.0,
+        legs=(yes, no),
+        count=count,
+        gross_profit_cents=75,
+        fees_cents=4,
+        net_profit_cents=71,
+        edge_pct=2.0,
     )
 
 
 # ── Shapes REALES de Kalshi (validados en demo, ver checklist_activacion_capital) ──
 
+
 def _create_order_fill(count: int = 5) -> dict:
     """CreateOrder FILL completo: fill_count_fp / remaining_count_fp como strings fp."""
-    return {"order": {"order_id": "OID", "fill_count_fp": f"{count}.00", "remaining_count_fp": "0.00"}}
+    return {
+        "order": {"order_id": "OID", "fill_count_fp": f"{count}.00", "remaining_count_fp": "0.00"}
+    }
 
 
 def _create_order_nofill(count: int = 5) -> dict:
     """CreateOrder que no llenó (FOK cancelado): fill 0, remaining = count."""
-    return {"order": {"order_id": "OID", "fill_count_fp": "0.00", "remaining_count_fp": f"{count}.00"}}
+    return {
+        "order": {"order_id": "OID", "fill_count_fp": "0.00", "remaining_count_fp": f"{count}.00"}
+    }
 
 
 def _kill_409() -> KalshiClientError:
@@ -115,7 +129,11 @@ class HarnessClient:
         # Reconstruye órdenes desde los buys grabados de ese ticker → el client_order_id
         # coincide con el que execute() acuñó internamente (no hace falta conocerlo).
         orders = [
-            {"client_order_id": c["client_order_id"], "status": self.reconcile_status, "order_id": "OID"}
+            {
+                "client_order_id": c["client_order_id"],
+                "status": self.reconcile_status,
+                "order_id": "OID",
+            }
             for m, c in self.calls
             if m == "place_order" and c.get("action") == "buy" and c.get("ticker") == ticker
         ]
@@ -216,9 +234,9 @@ async def test_route_fill_plus_rollback_fails_kill_switch():
     assert outcome.rollback_triggered is True
     assert outcome.rollback_filled is False
     assert outcome.kill_switch_fired is True
-    assert executor.is_paused is True                       # circuit/kill-switch pausó
+    assert executor.is_paused is True  # circuit/kill-switch pausó
     assert len(client.sells()) == executor.ROLLBACK_MAX_RETRIES  # reintentó el máximo
-    mock_alert.assert_awaited()                             # sonó la alerta de kill-switch
+    mock_alert.assert_awaited()  # sonó la alerta de kill-switch
     # A.1: la pata expuesta QUEDA filled (el cap del 25% la ve) con marca de auditoría,
     # y la pausa es PERSISTENTE (#32: sobrevive el restart de Coolify).
     trades = _trades()
@@ -233,8 +251,8 @@ async def test_route_error_red_reconciles_to_filled():
     """Ruta 5: yes ERROR_RED (excepción de red) → reconcilia (get_orders+get_positions)."""
     client = HarnessClient()
     client.buy = {"yes": RuntimeError("network down"), "no": _create_order_fill()}
-    client.reconcile_status = "executed"   # get_orders dice que la pata SÍ llenó
-    client.reconcile_position = 5          # get_positions confirma posición abierta
+    client.reconcile_status = "executed"  # get_orders dice que la pata SÍ llenó
+    client.reconcile_position = 5  # get_positions confirma posición abierta
     client.sell_result = _create_order_fill()  # el rollback de las patas expuestas cierra
     outcome = await RestExecutor(client).execute(_opp())
 
@@ -258,8 +276,8 @@ async def test_route_error_red_reconciles_to_not_filled():
     """Ruta 5b: ERROR_RED pero ambas fuentes coinciden en NO-llena → sin rollback."""
     client = HarnessClient()
     client.buy = {"yes": RuntimeError("timeout"), "no": _kill_409()}
-    client.reconcile_status = "canceled"   # get_orders: no ejecutó
-    client.reconcile_position = 0          # get_positions: sin posición
+    client.reconcile_status = "canceled"  # get_orders: no ejecutó
+    client.reconcile_position = 0  # get_positions: sin posición
     outcome = await RestExecutor(client).execute(_opp())
 
     assert outcome.leg_states[0] == LegState.ERROR_RED
@@ -306,7 +324,7 @@ async def test_update_failure_post_fill_engages_preventive_pause():
     ):
         outcome = await executor.execute(_opp())
 
-    assert outcome.filled is True          # el trade real ocurrió
-    assert executor.is_paused is True      # pero el motor se PAUSÓ preventivamente
+    assert outcome.filled is True  # el trade real ocurrió
+    assert executor.is_paused is True  # pero el motor se PAUSÓ preventivamente
     engaged, reason = models.kill_switch_engaged()
     assert engaged is True and "RiskManager ciego" in (reason or "")

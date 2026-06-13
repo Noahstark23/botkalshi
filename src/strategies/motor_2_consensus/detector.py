@@ -20,6 +20,7 @@ DESACOPLAMIENTO DE LA FUENTE (decisión, flag para review):
 
 NO cablea ejecución: emite señales, no coloca órdenes. TRADING_ENABLED=false.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,8 +34,8 @@ from src.math.kelly import quarter_kelly_size
 from src.math.no_vig import implied_prob, remove_vig_multiplicative
 from src.strategies.motor_2_consensus.matcher import canonical_name, match_outcomes
 
-MIN_EDGE_PCT = 0.03          # 3pp neto post-comisión
-SIZING_MAX_PCT = 5.0         # cap duro de exposición por trade (% del capital activo)
+MIN_EDGE_PCT = 0.03  # 3pp neto post-comisión
+SIZING_MAX_PCT = 5.0  # cap duro de exposición por trade (% del capital activo)
 DEFAULT_CAPITAL_USD = 300.0  # capital activo actual (mock/config local)
 
 
@@ -48,9 +49,9 @@ class KalshiQuote:
     """Un outcome de Kalshi con sus asks (lo necesario para medir edge YES/NO)."""
 
     market_ticker: str
-    outcome_name: str     # "Argentina", "Draw", ...
-    yes_ask_cents: int    # costo de comprar YES (apostar a que ocurre)
-    no_ask_cents: int     # costo de comprar NO (apostar a que NO ocurre)
+    outcome_name: str  # "Argentina", "Draw", ...
+    yes_ask_cents: int  # costo de comprar YES (apostar a que ocurre)
+    no_ask_cents: int  # costo de comprar NO (apostar a que NO ocurre)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +71,10 @@ class ConsensusSignal(BaseModel):
     """Señal de edge Motor 2 (no ejecuta — registro analítico)."""
 
     market_ticker: str
-    kalshi_side: str             # "YES" | "NO"
-    odds_api_fair_prob: float    # probabilidad JUSTA (post-no-vig) del lado señalado
-    kalshi_price_cents: int      # ask de Kalshi del lado señalado
-    edge_pct: float              # edge NETO post-comisión (fracción; 0.03 = 3pp)
+    kalshi_side: str  # "YES" | "NO"
+    odds_api_fair_prob: float  # probabilidad JUSTA (post-no-vig) del lado señalado
+    kalshi_price_cents: int  # ask de Kalshi del lado señalado
+    edge_pct: float  # edge NETO post-comisión (fracción; 0.03 = 3pp)
     recommended_size_usd: float  # ¼ Kelly con cap 5%
 
 

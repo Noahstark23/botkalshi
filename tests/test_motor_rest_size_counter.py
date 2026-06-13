@@ -20,6 +20,7 @@ en producción. El test enfrenta al parser con esos tipos reales, no con int/flo
 Corre con pytest o, sin pytest (no está en la imagen de runtime de prod), directo:
     python3 tests/test_motor_rest_size_counter.py
 """
+
 from __future__ import annotations
 
 from typing import Any

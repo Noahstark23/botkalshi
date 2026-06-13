@@ -5,6 +5,7 @@ Verifica que el engine se instancia/registra SOLO con MOTOR_REST_ENABLED=True,
 y nunca con el flag en False. El muro de ejecución (TRADING_ENABLED) es
 independiente: el shadow corre con MOTOR_REST_ENABLED=True + TRADING_ENABLED=False.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -25,11 +26,13 @@ def _service_with_flags(
     # Mockear get_settings en ambos módulos: data_capture y el engine (que lo llama en su __init__).
     # RiskManager también llama get_settings en su __init__ (path live) → mockearlo ahí.
     # kill_switch_engaged (lectura de DB en la Capa A) → mockeada para no tocar DB real.
-    with patch("src.strategies.data_capture.get_settings", return_value=settings), patch(
-        "src.strategies.data_capture.KalshiWebSocket"
-    ), patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings), patch(
-        "src.risk.manager.get_settings", return_value=settings
-    ), patch("src.storage.models.kill_switch_engaged", return_value=ks_value):
+    with (
+        patch("src.strategies.data_capture.get_settings", return_value=settings),
+        patch("src.strategies.data_capture.KalshiWebSocket"),
+        patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings),
+        patch("src.risk.manager.get_settings", return_value=settings),
+        patch("src.storage.models.kill_switch_engaged", return_value=ks_value),
+    ):
         svc = DataCaptureService(rest_client=rest_client)
         svc.ws = MagicMock()
         # _register_ws_handlers se llama dentro del with para que el engine vea el mock.
@@ -98,5 +101,5 @@ def test_motor_rest_stays_shadow_when_kill_switch_engaged():
 
     engine = svc._rest_engine
     assert engine is not None
-    assert engine._executor is None      # no se construye con el kill-switch engaged
+    assert engine._executor is None  # no se construye con el kill-switch engaged
     assert engine._risk_manager is None

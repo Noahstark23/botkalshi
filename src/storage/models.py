@@ -9,6 +9,7 @@ Schema:
     daily_pnl:         resumen diario de PnL
     bot_runs:          tracking de cada arranque del bot
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -166,15 +167,19 @@ class EdgeWindow(SQLModel, table=True):
     market_ticker: str = Field(index=True, max_length=100)
     duration_ms: int | None = None
     magnitude_cents: int  # edge NETO post-comisión (lo que decide)
-    gross_spread_cents: int | None = None  # spread BRUTO pre-comisión (para analizar cuánto come el fee)
+    gross_spread_cents: int | None = (
+        None  # spread BRUTO pre-comisión (para analizar cuánto come el fee)
+    )
     # Reconstrucción EXACTA del gate (agregadas 2026-06; NULL en ventanas pre-deploy).
-    count: int | None = None       # contratos del opp detectado
+    count: int | None = None  # contratos del opp detectado
     fees_cents: int | None = None  # comisión total estimada (ambas patas)
     edge_pct: float | None = None  # edge neto post-fee como % del capital comprometido
     # Tipo de detección: "binary" (mismo market, libro cruzado) | "multi_outcome"
     # (1X2/winner: N markets del mismo evento sumando <100). NULL = pre-P3 (binary).
     kind: str | None = Field(default=None, max_length=20)
-    leg_states: str | None = Field(default=None, max_length=50)  # "FILL/KILL", "FILL/ERROR_RED", etc.
+    leg_states: str | None = Field(
+        default=None, max_length=50
+    )  # "FILL/KILL", "FILL/ERROR_RED", etc.
     reconciled: bool = False
     kill_switch_fired: bool = False
     rollback_filled: bool = False
@@ -291,7 +296,7 @@ def init_db() -> None:
     """
     engine = get_engine()
     SQLModel.metadata.create_all(engine)  # tablas/columnas nuevas en DBs nuevas
-    apply_migrations(engine)              # columnas nuevas en tablas existentes
+    apply_migrations(engine)  # columnas nuevas en tablas existentes
 
 
 def get_session() -> Session:

@@ -1,4 +1,5 @@
-﻿"""Tests del handler de orderbook_delta y orderbook_snapshot con shape 2026 (fixed-point)."""
+"""Tests del handler de orderbook_delta y orderbook_snapshot con shape 2026 (fixed-point)."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -20,8 +21,9 @@ def reset_botstate():
 
 @pytest.fixture
 def service():
-    with patch("src.strategies.data_capture.get_settings"), patch(
-        "src.strategies.data_capture.KalshiWebSocket"
+    with (
+        patch("src.strategies.data_capture.get_settings"),
+        patch("src.strategies.data_capture.KalshiWebSocket"),
     ):
         svc = DataCaptureService()
         return svc
@@ -173,7 +175,9 @@ async def test_delta_handler_unknown_shape_records_error(mock_session, service):
     assert not mock_db.add.called
     # Pero registro error visible
     assert BotState.last_error is not None
-    assert "unknown shape" in BotState.last_error.lower() or "missing" in BotState.last_error.lower()
+    assert (
+        "unknown shape" in BotState.last_error.lower() or "missing" in BotState.last_error.lower()
+    )
 
 
 @pytest.mark.asyncio

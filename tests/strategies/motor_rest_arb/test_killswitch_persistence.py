@@ -6,6 +6,7 @@ real temporal) y que AMBOS kill-switches persisten: RiskManager._trigger_kill_sw
 (stop-loss) y RestExecutor._fire_kill_switch (rollback no convergió). El executor además
 eleva la pausa a BotState (el bonus gap: antes solo seteaba _paused en memoria).
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -77,8 +78,9 @@ async def test_risk_manager_kill_switch_persists(sqlite_engine):
     """RiskManager._trigger_kill_switch → engage en DB + BotState (sin cambiar queries)."""
     from src.risk.manager import RiskManager
 
-    with patch("src.risk.manager.get_settings", return_value=MagicMock()), patch(
-        "src.risk.manager.alert_risk_event", new=AsyncMock()
+    with (
+        patch("src.risk.manager.get_settings", return_value=MagicMock()),
+        patch("src.risk.manager.alert_risk_event", new=AsyncMock()),
     ):
         rm = RiskManager()
         await rm._trigger_kill_switch("Stop-Loss Diario superado")

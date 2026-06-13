@@ -20,6 +20,7 @@ ACENTOS: `normalize_name` pliega acentos/diacríticos vía NFKD antes del regex,
 las selecciones acentuadas del Mundial matchean ("Perú"→"peru", "México"→"mexico",
 "Côte d'Ivoire"→"cote divoire").
 """
+
 from __future__ import annotations
 
 import re
@@ -42,7 +43,7 @@ TEAM_ALIASES: dict[str, str] = {
     "republic of korea": "south korea",
     "ir iran": "iran",
     "iran islamic republic": "iran",
-    "ivory coast": "cote divoire",      # Kalshi (inglés) ↔ "côte d'ivoire" plegado
+    "ivory coast": "cote divoire",  # Kalshi (inglés) ↔ "côte d'ivoire" plegado
     "czechia": "czech republic",
 }
 

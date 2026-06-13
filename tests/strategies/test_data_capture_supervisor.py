@@ -3,6 +3,7 @@
 Regression tests para el bug del 14 mayo 2026: asyncio.gather(return_exceptions=True)
 tragaba TypeError de ws.run(), dejando BotState.last_error=null durante 11h.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +18,9 @@ from src.strategies.data_capture import DataCaptureService
 
 @pytest.fixture
 def service():
-    with patch("src.strategies.data_capture.get_settings"), patch(
-        "src.strategies.data_capture.KalshiWebSocket"
+    with (
+        patch("src.strategies.data_capture.get_settings"),
+        patch("src.strategies.data_capture.KalshiWebSocket"),
     ):
         svc = DataCaptureService()
         svc._tracked_tickers = set()
@@ -175,6 +177,7 @@ async def test_check_ws_health_sets_ws_connected_false_when_down(service):
 def loguru_caplog(caplog):
     """Redirect Loguru output to pytest's caplog handler."""
     from loguru import logger
+
     handler_id = logger.add(caplog.handler, format="{message}", level="DEBUG")
     yield caplog
     logger.remove(handler_id)
@@ -242,9 +245,7 @@ def test_current_error_ttl_expires_stale_error():
     """current_error() devuelve None y limpia un error mas viejo que el TTL."""
     BotState.record_error("error viejo")
     # Forzar timestamp por encima del TTL
-    BotState.last_error_at = datetime.now(UTC) - timedelta(
-        seconds=BotState.LAST_ERROR_TTL_SEC + 60
-    )
+    BotState.last_error_at = datetime.now(UTC) - timedelta(seconds=BotState.LAST_ERROR_TTL_SEC + 60)
 
     assert BotState.current_error() is None
     assert BotState.last_error is None

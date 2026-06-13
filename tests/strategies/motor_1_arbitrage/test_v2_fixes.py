@@ -6,6 +6,7 @@ Test 2: seq counter NOT advanced when apply_delta raises (seq ordering fix, norm
 Test 3: seq counter NOT advanced when apply_delta raises (seq ordering fix, delta=-6247, production magnitudes)
 Test 4: _dispatch logs full traceback via logger.opt(exception=r).error (not NoneType: None)
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -87,6 +88,7 @@ async def test_delta_negative_on_absent_price_preserves_seq():
     # Delta sobre price=50¢ (ausente del book): delta=-200
     delta = _delta_msg(ticker, sid, seq=101, side="yes", price="0.5000", delta="-200")
     from src.strategies.motor_1_arbitrage.orderbook import OrderbookDesyncError
+
     with pytest.raises(OrderbookDesyncError):
         await mgr.handle_message(delta)
 
@@ -111,6 +113,7 @@ async def test_regression_production_magnitudes():
     # Delta con magnitud real observada: -6247 sobre price=1¢
     delta = _delta_msg(ticker, sid, seq=1001, side="yes", price="0.0100", delta="-6247")
     from src.strategies.motor_1_arbitrage.orderbook import OrderbookDesyncError
+
     with pytest.raises(OrderbookDesyncError) as exc_info:
         await mgr.handle_message(delta)
 
@@ -147,9 +150,14 @@ async def test_dispatcher_logs_full_stack_trace():
         def error(self, msg):
             captured_calls.append((self._exc, msg))
 
-        def info(self, *a, **kw): pass
-        def debug(self, *a, **kw): pass
-        def warning(self, *a, **kw): pass
+        def info(self, *a, **kw):
+            pass
+
+        def debug(self, *a, **kw):
+            pass
+
+        def warning(self, *a, **kw):
+            pass
 
     ws_client = KalshiWebSocket.__new__(KalshiWebSocket)
     ws_client._handlers = {}

@@ -5,6 +5,7 @@ Verifica que:
   - la DB queda en journal_mode=WAL y busy_timeout=5000 tras conectar;
   - dos escritores concurrentes (V1 + shadow) NO disparan 'database is locked'.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

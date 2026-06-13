@@ -4,6 +4,7 @@ Tests del heartbeat de observabilidad del RestArbEngine.
 El heartbeat distingue "0 edges porque el mercado es eficiente" (normal) de
 "motor zombi que no procesa" — emite un log INFO cada HEARTBEAT_EVERY tickers.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

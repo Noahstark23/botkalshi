@@ -10,6 +10,7 @@ que:
 Esto valida la diferencia critica entre ambos: si el watchdog usara stop() en vez
 de force_reconnect(), mataria el feed en vez de reconectarlo.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -43,9 +44,7 @@ async def _wait_until(cond, timeout: float = 8.0, interval: float = 0.02) -> boo
 
 
 def _make_client(port: int) -> KalshiWebSocket:
-    with patch("src.clients.kalshi_ws.get_settings"), patch(
-        "src.clients.kalshi_ws.KalshiSigner"
-    ):
+    with patch("src.clients.kalshi_ws.get_settings"), patch("src.clients.kalshi_ws.KalshiSigner"):
         ws = KalshiWebSocket()
     ws.url = f"ws://localhost:{port}"
     ws.signer = MagicMock()
@@ -62,25 +61,25 @@ async def test_force_reconnect_actually_reconnects():
 
         task = asyncio.create_task(ws.run())
         try:
-            assert await _wait_until(
-                lambda: ws.is_connected and ws.last_message_at is not None
-            ), "no conecto la primera vez"
+            assert await _wait_until(lambda: ws.is_connected and ws.last_message_at is not None), (
+                "no conecto la primera vez"
+            )
             first_conn = ws._ws
 
             # Forzar reconexion: cierra el socket SIN tocar _running.
             await ws.force_reconnect()
 
             # Debe reconectar (nuevo objeto de conexion) y seguir corriendo.
-            assert await _wait_until(
-                lambda: ws.is_connected and ws._ws is not first_conn
-            ), "no reconecto tras force_reconnect"
+            assert await _wait_until(lambda: ws.is_connected and ws._ws is not first_conn), (
+                "no reconecto tras force_reconnect"
+            )
             assert ws._running is True  # clave: NO se detuvo el loop
 
             # Y debe seguir recibiendo mensajes tras reconectar.
             ts_after_reconnect = ws.last_message_at
-            assert await _wait_until(
-                lambda: ws.last_message_at != ts_after_reconnect
-            ), "no llegan mensajes tras reconexion"
+            assert await _wait_until(lambda: ws.last_message_at != ts_after_reconnect), (
+                "no llegan mensajes tras reconexion"
+            )
         finally:
             await ws.stop()
             try:
@@ -98,9 +97,9 @@ async def test_stop_terminates_loop_no_reconnect():
 
         task = asyncio.create_task(ws.run())
         try:
-            assert await _wait_until(
-                lambda: ws.is_connected and ws.last_message_at is not None
-            ), "no conecto"
+            assert await _wait_until(lambda: ws.is_connected and ws.last_message_at is not None), (
+                "no conecto"
+            )
 
             await ws.stop()
 

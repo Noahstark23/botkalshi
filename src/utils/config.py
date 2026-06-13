@@ -5,6 +5,7 @@ Toda la configuración viene de variables de entorno (que Coolify inyecta).
 Pydantic valida tipos y valores al arranque - si algo está mal, el bot
 no inicia (fail fast).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -67,7 +68,9 @@ class Settings(BaseSettings):
     MOTOR_1_ARBITRAGE_ENABLED: bool = False
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     MOTOR_3_CLV_ENABLED: bool = False
-    USE_ORDERBOOK_MANAGER_V2: bool = Field(default=False, description="Enable WS-based recovery (OrderbookManagerV2)")
+    USE_ORDERBOOK_MANAGER_V2: bool = Field(
+        default=False, description="Enable WS-based recovery (OrderbookManagerV2)"
+    )
 
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,
@@ -85,7 +88,8 @@ class Settings(BaseSettings):
     # post-comisión supera este % del capital comprometido (= opp.edge_pct, una fuente
     # de verdad). Default ALTO/conservador; se calibra con data del shadow.
     MOTOR_REST_EXECUTION_EDGE_PCT: float = Field(
-        default=1.5, ge=0.0,
+        default=1.5,
+        ge=0.0,
         description="Edge neto post-fee mínimo (% del capital comprometido) para EJECUTAR",
     )
 
@@ -124,12 +128,14 @@ class Settings(BaseSettings):
                     f"ACTIVE_CAPITAL_USD={self.ACTIVE_CAPITAL_USD} excede límite de seguridad ($5k). "
                     "Si quieres operar con más capital, modifica este check explícitamente."
                 )
-            if self.TRADING_ENABLED and not any([
-                self.MOTOR_1_ARBITRAGE_ENABLED,
-                self.MOTOR_2_SPORTSBOOK_ENABLED,
-                self.MOTOR_3_CLV_ENABLED,
-                self.MOTOR_REST_ENABLED,
-            ]):
+            if self.TRADING_ENABLED and not any(
+                [
+                    self.MOTOR_1_ARBITRAGE_ENABLED,
+                    self.MOTOR_2_SPORTSBOOK_ENABLED,
+                    self.MOTOR_3_CLV_ENABLED,
+                    self.MOTOR_REST_ENABLED,
+                ]
+            ):
                 raise ValueError(
                     "TRADING_ENABLED=true pero ningún motor está habilitado. "
                     "Activa al menos un MOTOR_X_*_ENABLED."
@@ -156,11 +162,13 @@ class Settings(BaseSettings):
 
     @property
     def any_motor_enabled(self) -> bool:
-        return any([
-            self.MOTOR_1_ARBITRAGE_ENABLED,
-            self.MOTOR_2_SPORTSBOOK_ENABLED,
-            self.MOTOR_3_CLV_ENABLED,
-        ])
+        return any(
+            [
+                self.MOTOR_1_ARBITRAGE_ENABLED,
+                self.MOTOR_2_SPORTSBOOK_ENABLED,
+                self.MOTOR_3_CLV_ENABLED,
+            ]
+        )
 
 
 # Lazy singleton
