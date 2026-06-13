@@ -173,6 +173,42 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_motor2_shadow(self) -> None:
+        """
+        Cable shadow del Motor 2 (consenso sportsbooks) — gateado por
+        MOTOR_2_SPORTSBOOK_ENABLED. SIN ejecución de capital, independiente de
+        TRADING_ENABLED.
+
+        Arranca con una fuente de odds FAKE (fixture) para correr el pipeline completo
+        sin la suscripción paga. El flip a real es UNA LÍNEA: cambiar FakeOddsSource por
+        LiveOddsSource(["soccer_fifa_world_cup"]) cuando ODDS_API_KEY esté configurada.
+
+        Best-effort: si cae, se registra y la task termina — NO tira el bot.
+        """
+        if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        await asyncio.sleep(30)  # dejar que el primer discovery puebla el universo 1X2
+        if self._capture is None:
+            return
+        try:
+            from src.strategies.motor_2_consensus.fixtures import world_cup_demo_fixture
+            from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
+            from src.strategies.motor_2_consensus.sources import (
+                FakeOddsSource,
+                RestKalshiQuoteSource,
+            )
+
+            kalshi_source = RestKalshiQuoteSource(self._capture.multi_event_universe)
+            # ── FLIP DE UNA LÍNEA: al pagar la API, reemplazar por:
+            #    odds_source = LiveOddsSource(["soccer_fifa_world_cup"])
+            odds_source = FakeOddsSource(world_cup_demo_fixture())
+            poller = Motor2ShadowPoller(kalshi_source, odds_source)
+            await poller.run(self._stop_event)
+        except Exception as e:
+            msg = f"motor2 shadow runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -251,6 +287,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_health_server(), name="health"),
                 asyncio.create_task(self._run_data_capture(), name="capture"),
                 asyncio.create_task(self._run_settlement(), name="settlement"),
+                asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
             ]
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)

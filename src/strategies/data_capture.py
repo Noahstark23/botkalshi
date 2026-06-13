@@ -147,6 +147,22 @@ class DataCaptureService:
         self._rest_client = rest_client
         self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
 
+    def multi_event_universe(self) -> dict[str, set[str]]:
+        """
+        Seam read-only para el Motor 2: {event_key → tickers hermanos} de los partidos
+        multi-outcome (1X2/winner) ya descubiertos. Agrupa por event_key con el mismo
+        filtro de series exactas del Motor REST (KXWCGAME, etc.), independiente de que el
+        engine shadow exista. No toca red ni estado.
+        """
+        from src.strategies.motor_rest_arb.engine import RestArbEngine
+
+        universe: dict[str, set[str]] = {}
+        for t in self._tracked_tickers:
+            if t.split("-", 1)[0] not in RestArbEngine.MULTI_SERIES:
+                continue
+            universe.setdefault(t.rsplit("-", 1)[0], set()).add(t)
+        return universe
+
     # =====================================================
     # WS event handlers
     # =====================================================
