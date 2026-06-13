@@ -220,16 +220,20 @@ class ProductionRunner:
                 odds_source = FakeOddsSource(world_cup_demo_fixture())
                 logger.info("motor2 odds=FAKE (ODDS_API_KEY no seteada → shadow con fixture)")
 
+            # Umbral de edge tuneable por config (pp → fracción), una sola fuente de verdad.
+            min_edge = self.settings.MOTOR_2_MIN_EDGE_PCT / 100.0
             # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
             # queda None → el poller jamás intenta apostar (y el muro Capa C de
             # place_order es la defensa final aunque algo llegara a colarse).
             if self.settings.TRADING_ENABLED:
                 async with KalshiRestClient() as client:
                     executor = Motor2Executor(client, RiskManager())
-                    poller = Motor2ShadowPoller(kalshi_source, odds_source, executor=executor)
+                    poller = Motor2ShadowPoller(
+                        kalshi_source, odds_source, min_edge=min_edge, executor=executor
+                    )
                     await poller.run(self._stop_event)
             else:
-                poller = Motor2ShadowPoller(kalshi_source, odds_source)
+                poller = Motor2ShadowPoller(kalshi_source, odds_source, min_edge=min_edge)
                 await poller.run(self._stop_event)
         except Exception as e:
             msg = f"motor2 runner: {type(e).__name__}: {e}"
