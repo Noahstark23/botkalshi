@@ -14,6 +14,7 @@ Maneja:
 
 Punto de entrada del container Docker.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -103,7 +104,9 @@ class ProductionRunner:
             loop="asyncio",
         )
         self._uvicorn_server = uvicorn.Server(config)
-        logger.info(f"Health server: http://{self.settings.HEALTH_HOST}:{self.settings.HEALTH_PORT}")
+        logger.info(
+            f"Health server: http://{self.settings.HEALTH_HOST}:{self.settings.HEALTH_PORT}"
+        )
         await self._uvicorn_server.serve()
 
     async def _run_data_capture(self) -> None:
@@ -170,6 +173,54 @@ class ProductionRunner:
                 await SettlementPoller(source).run(self._stop_event)
         except Exception as e:
             msg = f"settlement runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_motor2_shadow(self) -> None:
+        """
+        Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.
+
+        Por defecto SHADOW (solo detecta/graba). APUESTA real solo cuando se cumplen
+        las DOS condiciones, en capas independientes:
+          1. odds REALES (LiveOddsSource) — nunca apuesta sobre el fixture fake.
+          2. TRADING_ENABLED=true → se construye el Motor2Executor (Capa A) y se inyecta.
+        Con cualquiera de las dos en falso, el motor sigue siendo shadow puro.
+
+        El flip a odds reales es UNA LÍNEA: FakeOddsSource → LiveOddsSource(...).
+        Best-effort: si cae, se registra y la task termina — NO tira el bot.
+        """
+        if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        await asyncio.sleep(30)  # dejar que el primer discovery puebla el universo 1X2
+        if self._capture is None:
+            return
+        try:
+            from src.strategies.motor_2_consensus.executor import Motor2Executor
+            from src.strategies.motor_2_consensus.fixtures import world_cup_demo_fixture
+            from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
+            from src.strategies.motor_2_consensus.sources import (
+                FakeOddsSource,
+                RestKalshiQuoteSource,
+            )
+
+            kalshi_source = RestKalshiQuoteSource(self._capture.multi_event_universe)
+            # ── FLIP DE UNA LÍNEA: al pagar la API, reemplazar por:
+            #    odds_source = LiveOddsSource(["soccer_fifa_world_cup"])
+            odds_source = FakeOddsSource(world_cup_demo_fixture())
+
+            # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
+            # queda None → el poller jamás intenta apostar (y el muro Capa C de
+            # place_order es la defensa final aunque algo llegara a colarse).
+            if self.settings.TRADING_ENABLED:
+                async with KalshiRestClient() as client:
+                    executor = Motor2Executor(client, RiskManager())
+                    poller = Motor2ShadowPoller(kalshi_source, odds_source, executor=executor)
+                    await poller.run(self._stop_event)
+            else:
+                poller = Motor2ShadowPoller(kalshi_source, odds_source)
+                await poller.run(self._stop_event)
+        except Exception as e:
+            msg = f"motor2 runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
 
@@ -251,6 +302,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_health_server(), name="health"),
                 asyncio.create_task(self._run_data_capture(), name="capture"),
                 asyncio.create_task(self._run_settlement(), name="settlement"),
+                asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
             ]
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)

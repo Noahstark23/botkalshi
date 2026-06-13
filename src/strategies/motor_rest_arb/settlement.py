@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, select
 
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import Trade, get_session
@@ -131,7 +131,10 @@ class SettlementPoller:
     """
 
     POLL_INTERVAL_SEC = 300.0  # 5 min — los stop-losses son de escala diaria
-    STRATEGY = "motor_rest_arb"  # v1: solo Motor REST (extensible cuando otros persistan)
+    # Motores cuyos trades 'filled' este poller settlea. Motor 2 (apuestas direccionales
+    # single-leg) se agrega acá: cada apuesta es su propio grupo (arb_group_key cae al
+    # prefijo del coid), y _leg_pnl_cents resuelve un lado direccional sin cambios.
+    STRATEGIES = ("motor_rest_arb", "motor_2_consensus")
 
     def __init__(self, source: SettlementSource) -> None:
         self.source = source
@@ -169,7 +172,7 @@ class SettlementPoller:
         with get_session() as s:
             stmt = select(Trade).where(
                 Trade.status == "filled",
-                Trade.strategy == self.STRATEGY,
+                col(Trade.strategy).in_(self.STRATEGIES),
             )
             filled = list(s.exec(stmt))
         if not filled:
