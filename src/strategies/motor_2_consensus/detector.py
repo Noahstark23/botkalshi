@@ -76,6 +76,10 @@ class ConsensusSignal(BaseModel):
     kalshi_price_cents: int  # ask de Kalshi del lado señalado
     edge_pct: float  # edge NETO post-comisión (fracción; 0.03 = 3pp)
     recommended_size_usd: float  # ¼ Kelly con cap 5%
+    # Desglose AUDITABLE del edge (¢ por contrato): neto = bruto − fee. Permite ver en la
+    # EdgeWindow grabada de dónde sale el edge y cuánto se comió la comisión.
+    gross_edge_cents: int = 0  # fair_prob*100 − ask (PRE-comisión)
+    fee_cents: int = 0  # comisión Kalshi de 1 contrato a ese precio
 
 
 # =====================================================
@@ -193,6 +197,8 @@ def _signals_for_outcome(
 def _build(
     q: KalshiQuote, side: str, fair_prob: float, ask_cents: int, edge: float, capital_usd: float
 ) -> ConsensusSignal:
+    fee_cents = kalshi_fee_cents(1, ask_cents)
+    gross_edge_cents = int(round(fair_prob * 100.0 - ask_cents))
     sig = ConsensusSignal(
         market_ticker=q.market_ticker,
         kalshi_side=side,
@@ -200,10 +206,13 @@ def _build(
         kalshi_price_cents=ask_cents,
         edge_pct=edge,
         recommended_size_usd=_size_usd(fair_prob, ask_cents, capital_usd),
+        gross_edge_cents=gross_edge_cents,
+        fee_cents=fee_cents,
     )
     logger.info(
         f"motor2.signal ticker={sig.market_ticker} side={sig.kalshi_side} "
         f"fair_prob={sig.odds_api_fair_prob} kalshi={sig.kalshi_price_cents}c "
-        f"edge={sig.edge_pct:.3f} size=${sig.recommended_size_usd}"
+        f"gross={gross_edge_cents}c fee={fee_cents}c edge={sig.edge_pct:.3f} "
+        f"size=${sig.recommended_size_usd}"
     )
     return sig

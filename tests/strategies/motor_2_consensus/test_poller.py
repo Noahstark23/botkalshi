@@ -109,6 +109,23 @@ async def test_live_source_persists_consensus_windows():
     wins = _consensus_windows()
     assert len(wins) == len(signals) > 0
     assert all(w.kind == "consensus" and w.edge_pct > 0 for w in wins)
+    # Desglose AUDITABLE persistido (antes None): gross/fee poblados, neto = bruto − fee.
+    for w in wins:
+        assert w.gross_spread_cents is not None and w.fees_cents is not None
+        assert w.magnitude_cents == w.gross_spread_cents - w.fees_cents
+
+
+@pytest.mark.asyncio
+async def test_min_edge_threshold_filters_signals():
+    """min_edge alto → no pasa ninguna señal (umbral tuneable desde el runner/config)."""
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        min_edge=0.99,  # 99pp: imposible → 0 señales
+    )
+    assert await poller.poll_once() == []
+    assert _consensus_windows() == []
 
 
 @pytest.mark.asyncio

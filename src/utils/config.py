@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     # Regiones de casas. "eu" incluye Pinnacle (la más afilada) → fair-value más preciso;
     # se suma "us" por cobertura. 1 crédito por región por call (h2h).
     ODDS_API_REGIONS: str = "eu,us"
+    # Umbral de edge NETO post-comisión de Motor 2, en PUNTOS PORCENTUALES (3.0 = 3pp).
+    # Tuneable sin tocar código: subilo (ej. 4-5) para filtrar señales marginales pegadas
+    # al borde. NO confundir con MIN_EDGE_PCT (ese es de Motor 1; Motor 2 usa SOLO este).
+    MOTOR_2_MIN_EDGE_PCT: float = Field(
+        default=3.0, ge=0.0, description="Edge neto post-fee mínimo de Motor 2 (pp)"
+    )
 
     # ---- Validators ----
 

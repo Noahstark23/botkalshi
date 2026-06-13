@@ -20,7 +20,7 @@ import contextlib
 from loguru import logger
 
 from src.storage.models import EdgeWindow, get_session
-from src.strategies.motor_2_consensus.detector import ConsensusSignal, find_signals
+from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
 from src.utils.config import get_settings
@@ -43,6 +43,7 @@ class Motor2ShadowPoller:
         *,
         interval_sec: float | None = None,
         capital_usd: float | None = None,
+        min_edge: float | None = None,
         executor: Motor2Executor | None = None,
     ):
         self._kalshi = kalshi_source
@@ -52,6 +53,9 @@ class Motor2ShadowPoller:
         self._capital_usd = (
             capital_usd if capital_usd is not None else get_settings().ACTIVE_CAPITAL_USD
         )
+        # Umbral de edge NETO como FRACCIÓN (0.03 = 3pp). Default = el del detector; el
+        # runner lo pasa desde config (MOTOR_2_MIN_EDGE_PCT / 100).
+        self._min_edge = min_edge if min_edge is not None else MIN_EDGE_PCT
         # Presente SOLO con TRADING_ENABLED=true (lo construye el runner, Capa A). None = shadow.
         self._executor = executor
 
@@ -65,7 +69,9 @@ class Motor2ShadowPoller:
             logger.info("motor2.shadow sin eventos de odds este ciclo")
             return []
 
-        signals = find_signals(kalshi_events, odds_events, capital_usd=self._capital_usd)
+        signals = find_signals(
+            kalshi_events, odds_events, capital_usd=self._capital_usd, min_edge=self._min_edge
+        )
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
             f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"
@@ -107,10 +113,14 @@ class Motor2ShadowPoller:
         try:
             with get_session() as s:
                 for sig in signals:
+                    # magnitude = edge NETO en ¢/contrato; gross/fees pueblan el desglose
+                    # AUDITABLE (antes quedaban None → no se podía ver de dónde salía el edge).
                     s.add(
                         EdgeWindow(
                             market_ticker=sig.market_ticker[:100],
                             magnitude_cents=int(round(sig.edge_pct * 100)),
+                            gross_spread_cents=sig.gross_edge_cents,
+                            fees_cents=sig.fee_cents,
                             edge_pct=sig.edge_pct,
                             kind="consensus",
                         )
