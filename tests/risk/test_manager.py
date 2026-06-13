@@ -231,9 +231,14 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
             strategy="motor_1_arbitrage",
             status="settled",
             pnl_cents=-1000,  # -$10
-            placed_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2),
-            filled_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1),
-            settled_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=30),
+            # Anclado DENTRO de la ventana diaria de HOY (00:00 UTC + 1h): con
+            # now−30min, correr el test entre 00:00 y 00:30 UTC caía en AYER →
+            # el daily no veía la pérdida → flaky de medianoche (visto 2026-06-13).
+            placed_at=datetime.combine(datetime.now(UTC).date(), time.min),
+            filled_at=datetime.combine(datetime.now(UTC).date(), time.min)
+            + timedelta(minutes=30),
+            settled_at=datetime.combine(datetime.now(UTC).date(), time.min)
+            + timedelta(hours=1),
         )
         s.add(losing_trade)
         s.commit()
@@ -465,9 +470,11 @@ async def test_daily_breach_priority_over_weekly_monthly(
                 strategy="motor_1_arbitrage",
                 status="settled",
                 pnl_cents=-1500,  # -$15 > daily $9, weekly $24 y monthly $45 → daily primero
-                placed_at=now_naive - timedelta(hours=2),
-                filled_at=now_naive - timedelta(hours=1),
-                settled_at=now_naive - timedelta(minutes=30),
+                # Anclado a HOY 00:00 UTC (+offsets) — now−30min caía en AYER si el
+                # test corría entre 00:00-00:30 UTC → flaky de medianoche (2026-06-13).
+                placed_at=datetime.combine(now_naive.date(), time.min),
+                filled_at=datetime.combine(now_naive.date(), time.min) + timedelta(minutes=30),
+                settled_at=datetime.combine(now_naive.date(), time.min) + timedelta(hours=1),
             )
         )
         s.commit()

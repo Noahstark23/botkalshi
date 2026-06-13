@@ -16,8 +16,10 @@ from sqlmodel import select
 import src.storage.models as models
 from src.strategies.motor_rest_arb.engine import RestArbEngine
 
-EV = "KXFIFAGAME-26JUN13ARGMEX"
-T_ARG, T_MEX, T_TIE = f"{EV}-ARG", f"{EV}-MEX", f"{EV}-TIE"
+# Fixture REAL verificado contra la API (2026-06-13): el evento 1X2 tiene exactamente
+# 3 markets con sufijo de outcome en el último segmento.
+EV = "KXWCGAME-26JUN27JORARG"
+T_ARG, T_MEX, T_TIE = f"{EV}-ARG", f"{EV}-JOR", f"{EV}-TIE"
 
 
 def _engine(*, executor=None, risk_manager=None) -> RestArbEngine:
@@ -55,6 +57,17 @@ def test_update_universe_groups_by_event_and_filters_whitelist():
     eng = _engine()
     assert eng._event_universe == {EV: {T_ARG, T_MEX, T_TIE}}  # NBA filtrada
     assert eng._ticker_to_event[T_ARG] == EV
+
+
+def test_series_match_is_exact_not_prefix():
+    """KXWCGAMEGOALS (totales, NO excluyentes) NO debe caer en KXWCGAME por prefijo."""
+    eng = _engine()
+    eng.update_universe({
+        f"{EV}-ARG", f"{EV}-JOR", f"{EV}-TIE",                      # 1X2 real → entra
+        "KXWCGAMEGOALS-26JUN27JORARG-O25", "KXWCGAMEGOALS-26JUN27JORARG-U25",  # totales → FUERA
+    })
+    assert set(eng._event_universe) == {EV}
+    assert all(not t.startswith("KXWCGAMEGOALS") for ts in eng._event_universe.values() for t in ts)
 
 
 @pytest.mark.asyncio

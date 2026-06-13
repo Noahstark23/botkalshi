@@ -72,9 +72,17 @@ class RestArbEngine:
 
     # ── P3: multi-outcome SHADOW (1X2/winner del Mundial) ──────────────────────
     # SOLO series con estructura "exactamente UN outcome gana" (mutuamente excluyentes
-    # y exhaustivos). NO meter acá series de props/totals (KXWCTEAMGOALS etc.): sus
-    # markets NO son excluyentes → comprar YES en todos NO es arb → señal falsa.
-    MULTI_SERIES_PREFIXES = ("KXFIFAGAME", "KXWCGROUPWIN", "KXMENWORLDCUP", "KXMWORLDCUP")
+    # y exhaustivos). NO meter acá series de props/totals (KXWCTEAMGOALS,
+    # KXWCGAMEGOALS etc.): sus markets NO son excluyentes → comprar YES en todos NO
+    # es arb → señal falsa. El matching es por SERIE EXACTA (primer segmento del
+    # ticker), no por prefijo de string: "KXWCGAME" NO debe matchear "KXWCGAMEGOALS".
+    MULTI_SERIES = frozenset({
+        "KXWCGAME",        # partidos 1X2 — verificado 2026-06-13: 3 markets/evento
+                           # (ej. KXWCGAME-26JUN27JORARG-{JOR,ARG,TIE})
+        "KXWCGROUPWIN",    # ganador de grupo (N excluyentes)
+        "KXMENWORLDCUP",   # ganador del torneo
+        "KXMWORLDCUP",
+    })
     # Frescura: todas las patas del evento deben tener quote con esta edad máxima.
     # Una pata stale (precio viejo) genera arb fantasma → grupo incompleto = no evaluar.
     MULTI_MAX_QUOTE_AGE_SEC = 30.0
@@ -132,7 +140,9 @@ class RestArbEngine:
         """
         universe: dict[str, set[str]] = {}
         for t in tickers:
-            if not t.startswith(self.MULTI_SERIES_PREFIXES):
+            # Serie = primer segmento del ticker. Igualdad EXACTA, no startswith
+            # (evita que KXWCGAMEGOALS —totales, no excluyentes— caiga en KXWCGAME).
+            if t.split("-", 1)[0] not in self.MULTI_SERIES:
                 continue
             event_key = t.rsplit("-", 1)[0]
             universe.setdefault(event_key, set()).add(t)
