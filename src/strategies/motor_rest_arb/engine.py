@@ -172,9 +172,11 @@ class RestArbEngine:
         if bid_size > 0 and ask_size > 0:
             self._ticks_with_real_size += 1
 
-        # ── P3/P4: cache de quotes + near-miss + evaluación multi-outcome (SHADOW) ──
-        # Instrumentación + detección pura: graba EdgeWindow, JAMÁS ejecuta (el path de
-        # ejecución es exclusivo del trigger binario; el multi no lo toca).
+        # ── P3/P4: cache de quotes + near-miss + evaluación multi-outcome ──────────
+        # Detección + grabado de EdgeWindow SIEMPRE. La EJECUCIÓN del arb multi-outcome
+        # (1X2: comprar YES en todos los outcomes = profit LOCKEADO si Σasks<100) está
+        # desbloqueada pero gateada igual que el binario: Capa A (executor construido) +
+        # TRADING_ENABLED + umbral de edge. En shadow es no-op (executor None).
         ticker = data.get("market_ticker")
         yes_bid_c = parse_price_to_cents(data.get("yes_bid_dollars"))
         yes_ask_c = parse_price_to_cents(data.get("yes_ask_dollars"))
@@ -403,18 +405,22 @@ class RestArbEngine:
         )
 
     # =====================================================
-    # P3 — Multi-outcome SHADOW (detecta y graba; JAMÁS ejecuta)
+    # P3 — Multi-outcome (detecta y graba SIEMPRE; ejecuta el arb LOCKEADO si live)
     # =====================================================
 
     def _evaluate_multi_outcome(self, event_key: str) -> None:
         """
         Evalúa el arb multi-outcome del evento (1X2/winner): comprar YES en TODOS los
-        outcomes paga 100¢ seguro si Σasks < 100 post-fee.
+        outcomes paga 100¢ seguro si Σasks < 100 post-fee → profit LOCKEADO (no direccional).
 
         SEGURIDAD ANTI-SEÑAL-FALSA: solo se evalúa con el grupo COMPLETO (todos los
         tickers que el discovery conoce del evento) y FRESCO (cada quote con edad ≤
         MULTI_MAX_QUOTE_AGE_SEC). Un grupo parcial (falta un outcome) o stale haría
-        parecer arb lo que no lo es. SHADOW: solo graba EdgeWindow + log.
+        parecer arb lo que no lo es.
+
+        Siempre graba EdgeWindow. Si hay executor (Capa A) + TRADING_ENABLED + el edge
+        supera el umbral de ejecución, dispara la compra de las N patas (FOK, vía el
+        RestExecutor genérico N-leg). En shadow es no-op.
         """
         members = self._event_universe.get(event_key)
         if not members or len(members) < self.MULTI_MIN_LEGS:
@@ -447,22 +453,118 @@ class RestArbEngine:
             f"sum_asks={sum_asks}c net={opp.net_profit_cents}c edge={opp.edge_pct:.2f}% "
             f"count={opp.count}"
         )
+        edge_id = self._record_multi_edge_window(event_key, opp)
+
+        # ── Ejecución (Capa 2) del arb multi-outcome ───────────────────────────────
+        # Capa B del muro: en shadow el executor es None (Capa A no lo construyó) y/o
+        # TRADING_ENABLED=false → no se ejecuta. Cualquiera corta antes de tocar la red.
+        if self._executor is None or not self.settings.TRADING_ENABLED:
+            return
+        if opp.edge_pct < self.settings.MOTOR_REST_EXECUTION_EDGE_PCT:
+            logger.info(
+                f"motor_rest.multi.exec.below_threshold event={event_key} "
+                f"edge={opp.edge_pct:.2f}% < {self.settings.MOTOR_REST_EXECUTION_EDGE_PCT}%"
+            )
+            return
+        # Single-flight COMPARTIDO con el binario: una sola ejecución a la vez (el lock
+        # protege el circuit breaker del executor). Si hay una en curso, se descarta.
+        if self._executing:
+            logger.info(f"motor_rest.multi.exec.skip_busy event={event_key}")
+            return
+        self._executing = True
+        self._exec_task = asyncio.create_task(
+            self._execute_multi_and_record(event_key, legs, opp, edge_id)
+        )
+
+    def _record_multi_edge_window(self, event_key: str, opp: ArbOpportunity) -> int | None:
+        """Graba la ventana multi-outcome y devuelve su id (para poblar el outcome). Best-effort."""
         try:
             with get_session() as s:
-                s.add(
-                    EdgeWindow(
-                        market_ticker=event_key[:100],
-                        magnitude_cents=opp.net_profit_cents,
-                        gross_spread_cents=opp.gross_profit_cents,
-                        count=opp.count,
-                        fees_cents=opp.fees_cents,
-                        edge_pct=opp.edge_pct,
-                        kind="multi_outcome",
-                    )
+                window = EdgeWindow(
+                    market_ticker=event_key[:100],
+                    magnitude_cents=opp.net_profit_cents,
+                    gross_spread_cents=opp.gross_profit_cents,
+                    count=opp.count,
+                    fees_cents=opp.fees_cents,
+                    edge_pct=opp.edge_pct,
+                    kind="multi_outcome",
                 )
+                s.add(window)
                 s.commit()
+                s.refresh(window)
+                return window.id
         except Exception:
             logger.exception("motor_rest.multi.persist_error")
+            return None
+
+    async def _execute_multi_and_record(
+        self,
+        event_key: str,
+        legs: list[tuple[str, int, int]],
+        opp: ArbOpportunity,
+        edge_id: int | None,
+    ) -> None:
+        """
+        Task de ejecución del arb multi-outcome (NO bloquea on_ticker). Mismo patrón que
+        el binario: check_pre_trade → resize al count autorizado → executor.execute (FOK
+        N-leg) → log + update de EdgeWindow. _executing/_exec_task se limpian en finally.
+        """
+        executor = self._executor
+        risk_manager = self._risk_manager
+        try:
+            if executor is None or risk_manager is None:
+                return
+            async with self._exec_lock:
+                decision = await risk_manager.check_pre_trade(opp)
+                if not decision.approved:
+                    logger.info(
+                        f"motor_rest.multi.exec.rejected event={event_key} "
+                        f"reason={decision.reason} edge_id={edge_id}"
+                    )
+                    return
+                opp_sized = self._resize_multi(event_key, legs, decision.max_allowed_count)
+                if opp_sized is None:
+                    logger.info(
+                        f"motor_rest.multi.exec.not_viable_resized "
+                        f"count={decision.max_allowed_count} edge_id={edge_id} "
+                        "(fees consumen el edge al tamaño autorizado)"
+                    )
+                    return
+
+                t0 = time.monotonic()
+                outcome = await executor.execute(opp_sized)
+                cycle_latency_ms = int((time.monotonic() - t0) * 1000)
+                logger.info(
+                    f"motor_rest.multi.exec.outcome event={event_key} edge_id={edge_id} "
+                    f"filled={outcome.filled} leg_states={[s.value for s in outcome.leg_states]} "
+                    f"reconciled={outcome.reconciled} rollback_filled={outcome.rollback_filled} "
+                    f"kill_switch={outcome.kill_switch_fired} latency_ms={cycle_latency_ms}"
+                )
+                try:
+                    await alert_trade(outcome, opp_sized)
+                except Exception:
+                    logger.exception("motor_rest.multi.exec.alert_error")
+                self._update_edge_window_outcome(edge_id, outcome, cycle_latency_ms)
+        except Exception:
+            logger.exception("motor_rest.multi.exec.error")
+        finally:
+            self._executing = False
+            self._exec_task = None
+
+    def _resize_multi(
+        self, event_key: str, legs: list[tuple[str, int, int]], max_count: int
+    ) -> ArbOpportunity | None:
+        """
+        Redimensiona el arb multi-outcome al count autorizado REUSANDO
+        detect_multi_outcome_arb (recomputa gross/fees/net/edge coherentes). None si a
+        ese count los fees consumen el edge (no viable) → el caller NO ejecuta.
+        """
+        if max_count < 1:
+            return None
+        try:
+            return detect_multi_outcome_arb(event_key, legs, max_count=max_count)
+        except ValueError:
+            return None
 
     def _record_edge_window(self, signal: TriggerSignal) -> int | None:
         """

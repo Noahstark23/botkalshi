@@ -129,12 +129,14 @@ class RestExecutor:
             logger.critical("rest_exec.rejected reason=circuit_breaker_paused")
             return ExecutionOutcome(filled=False, rejected_paused=True)
 
-        # A.1 — arb_id compartido por ambas patas, embebido como PREFIJO del coid
-        # (recuperable con rsplit("-", 1)). PR-B (settlement) agrupa por este prefijo.
-        # [verificar en smoke] que Kalshi acepte el coid de 40 chars con sufijo -yes/-no
-        # (hoy usa uuid4 puro de 36 y funciona; el campo es string ≤100).
+        # A.1 — arb_id compartido por todas las patas, en notes (fuente PRIMARIA de
+        # agrupación de PR-B/settlement vía 'arb_id='). El coid lleva un ÍNDICE además del
+        # side para ser ÚNICO por pata: en el arb multi-outcome (1X2) TODAS las patas son
+        # side="yes", así que sin el índice colisionarían y el unique de client_order_id
+        # haría fallar _persist_intents. El binario (yes+no) también queda único.
+        # [verificar en smoke] Kalshi acepta el coid (uuid36 + '-{i}-{side}' ≤ 100 chars).
         arb_id = str(uuid.uuid4())
-        coids = {leg: f"{arb_id}-{leg.side}" for leg in opp.legs}
+        coids = {leg: f"{arb_id}-{i}-{leg.side}" for i, leg in enumerate(opp.legs)}
 
         # A.1 — INTENTS PRE-RED: la fila Trade por pata se escribe ANTES de tocar la
         # red. Es lo que permite que reconcile_pending_trades (boot) recupere un crash
