@@ -98,8 +98,13 @@ class OrderbookManagerV2:
         self._gap_timestamps: list[float] = []
         self._consecutive_warning: int = 0
         self._consecutive_critical: int = 0
-        self._last_warning_alert_at: float = 0.0
-        self._last_critical_alert_at: float = 0.0
+        # "Nunca alertó" = -inf, NO 0.0: el throttle compara now - last > THRESHOLD con
+        # now = time.monotonic() (segundos desde el boot). Con 0.0, en un proceso recién
+        # arrancado (uptime < THRESHOLD, ej. container/CI fresco) now-0 < THRESHOLD →
+        # bloquearía POR ERROR la primera alerta durante los primeros minutos de vida.
+        # -inf hace que la primera alerta SIEMPRE pase, sin depender del uptime absoluto.
+        self._last_warning_alert_at: float = float("-inf")
+        self._last_critical_alert_at: float = float("-inf")
         self._last_gap_at: datetime | None = None
 
     # =====================================================
