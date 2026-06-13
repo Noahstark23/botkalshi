@@ -25,7 +25,6 @@ from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import (
     SidGapError,
 )
 
-
 # =====================================================
 # Helpers
 # =====================================================

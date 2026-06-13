@@ -7,7 +7,6 @@ old-entry pruning, and alert send failure isolation.
 """
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -78,7 +77,6 @@ def test_critical_fires_at_20_per_min_sustained():
 def test_critical_takes_priority_over_warning():
     """When both thresholds are met, critical fires (not warning)."""
     mgr = make_v2()
-    import time
     # Warning is not throttled, critical is not throttled
     # Fire 22 gaps to hit critical threshold
     result = None
@@ -139,7 +137,6 @@ def test_warning_fires_again_after_throttle_expires():
 
 def test_old_entries_dropped_from_window():
     """Gaps older than 60s are excluded from the count and don't contribute to rate."""
-    import time
     mgr = make_v2()
 
     # Add 10 "old" gaps at timestamp t=1000
@@ -214,15 +211,14 @@ async def test_alert_failure_does_not_break_recovery():
     with patch(
         "src.monitoring.telegram_alerts.alert_orderbook_anomaly",
         new=AsyncMock(side_effect=Exception("send failed")),
-    ):
-        with patch("asyncio.create_task") as mock_create_task:
-            # Trigger the gap — even with failing alert, SidGapError must raise
-            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
-            with pytest.raises(SidGapError):
-                await mgr.handle_message(snap_msg)
+    ), patch("asyncio.create_task"):
+        # Trigger the gap — even with failing alert, SidGapError must raise
+        from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
+        with pytest.raises(SidGapError):
+            await mgr.handle_message(snap_msg)
 
-            # Recovery was initiated (mark_stale called on books)
-            assert 1 in mgr._recovering
+        # Recovery was initiated (mark_stale called on books)
+        assert 1 in mgr._recovering
 
 
 # =====================================================

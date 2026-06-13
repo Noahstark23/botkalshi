@@ -22,7 +22,6 @@ from src.strategies.motor_1_arbitrage.orderbook import (
     OrderbookState,
 )
 
-
 # =====================================================
 # Fixtures helpers
 # =====================================================

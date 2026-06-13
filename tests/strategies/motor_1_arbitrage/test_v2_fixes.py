@@ -8,14 +8,12 @@ Test 4: _dispatch logs full traceback via logger.opt(exception=r).error (not Non
 """
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import (
     OrderbookManagerV2,
-    SidGapError,
     _parse_fp_levels,
 )
 

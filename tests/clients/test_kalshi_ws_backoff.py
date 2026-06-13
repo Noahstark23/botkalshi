@@ -10,7 +10,7 @@ para controlar si el reset se aplica o no, sin depender de mocking de datetime.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import websockets.exceptions

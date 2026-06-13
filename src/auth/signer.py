@@ -79,7 +79,7 @@ class KalshiSigner:
             raise ValueError("path requerido")
 
         timestamp_ms = str(int(time.time() * 1000))
-        message = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
+        message = f"{timestamp_ms}{method.upper()}{path}".encode()
 
         signature = self._private_key.sign(
             message,
