@@ -44,10 +44,12 @@ TARGET_SERIES_PREFIXES = [
     "KXEPL",   # Premier League
     "KXUCL",   # Champions League
     "KXUEL",   # Europa League
-    # Mundial 2026 — series confirmadas contra la API pública (2026-06-11)
+    # Mundial 2026 — series confirmadas contra la API pública (2026-06-11/13)
     "KXMENWORLDCUP",  # ganador del torneo (selecciones masculinas)
     "KXMWORLDCUP",
-    "KXFIFAGAME",     # partidos (match markets)
+    "KXWCGAME",       # PARTIDOS 1X2 (Gana/Empata/Gana) — verificado 2026-06-13:
+                      # 69 eventos, exactamente 3 markets por evento (ej. -JOR/-ARG/-TIE).
+                      # EL target de alta frecuencia del multi-outcome shadow.
     "KXFIFAADVANCE",  # clasificación a siguiente ronda
     "KXFIFATOTAL",    # totales de goles
     "KXFIFASPREAD",   # hándicaps
