@@ -186,7 +186,8 @@ class ProductionRunner:
           2. TRADING_ENABLED=true → se construye el Motor2Executor (Capa A) y se inyecta.
         Con cualquiera de las dos en falso, el motor sigue siendo shadow puro.
 
-        El flip a odds reales es UNA LÍNEA: FakeOddsSource → LiveOddsSource(...).
+        El flip a odds reales es POR CONFIG: con ODDS_API_KEY seteada → LiveOddsSource
+        (odds reales, sport_keys/regions de settings); vacía → FakeOddsSource (fixture).
         Best-effort: si cae, se registra y la task termina — NO tira el bot.
         """
         if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
@@ -200,13 +201,24 @@ class ProductionRunner:
             from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
             from src.strategies.motor_2_consensus.sources import (
                 FakeOddsSource,
+                LiveOddsSource,
                 RestKalshiQuoteSource,
             )
 
             kalshi_source = RestKalshiQuoteSource(self._capture.multi_event_universe)
-            # ── FLIP DE UNA LÍNEA: al pagar la API, reemplazar por:
-            #    odds_source = LiveOddsSource(["soccer_fifa_world_cup"])
-            odds_source = FakeOddsSource(world_cup_demo_fixture())
+            # FLIP POR CONFIG: con la API paga (ODDS_API_KEY) usa odds REALES; si no, el
+            # fixture fake (shadow, jamás apuesta). Sin editar código para encender.
+            if self.settings.ODDS_API_KEY:
+                sport_keys = [
+                    s.strip() for s in self.settings.ODDS_API_SPORT_KEYS.split(",") if s.strip()
+                ]
+                odds_source = LiveOddsSource(sport_keys, regions=self.settings.ODDS_API_REGIONS)
+                logger.info(
+                    f"motor2 odds=LIVE sports={sport_keys} regions={self.settings.ODDS_API_REGIONS}"
+                )
+            else:
+                odds_source = FakeOddsSource(world_cup_demo_fixture())
+                logger.info("motor2 odds=FAKE (ODDS_API_KEY no seteada → shadow con fixture)")
 
             # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
             # queda None → el poller jamás intenta apostar (y el muro Capa C de

@@ -126,8 +126,10 @@ async def test_live_odds_source_concatenates_and_tolerates_failure():
 
         get_odds = AsyncMock(side_effect=[fixture, RuntimeError("rate limit")])
 
-    live = LiveOddsSource(["soccer_a", "soccer_b"], client_factory=_FakeOddsClient)
+    live = LiveOddsSource(["soccer_a", "soccer_b"], regions="eu,us", client_factory=_FakeOddsClient)
     assert live.is_live is True
     out = await live.fetch()
     # soccer_a devolvió el fixture; soccer_b falló pero no tiró el batch.
     assert len(out) == len(fixture)
+    # las regiones configuradas se propagan al cliente (Pinnacle vive en "eu").
+    assert _FakeOddsClient.get_odds.await_args_list[0].kwargs["regions"] == "eu,us"

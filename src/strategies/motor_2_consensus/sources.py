@@ -81,9 +81,11 @@ class LiveOddsSource:
         self,
         sport_keys: list[str],
         *,
+        regions: str = "eu,us",
         client_factory: Callable[[], OddsAPIClient] = OddsAPIClient,
     ):
         self._sport_keys = sport_keys
+        self._regions = regions
         self._client_factory = client_factory
 
     async def fetch(self) -> list[OddsEvent]:
@@ -91,10 +93,13 @@ class LiveOddsSource:
         async with self._client_factory() as client:
             for sk in self._sport_keys:
                 try:
-                    events.extend(await client.get_odds(sk))
+                    events.extend(await client.get_odds(sk, regions=self._regions))
                 except Exception as e:  # un sport_key que falla no tira el batch entero
                     logger.warning(f"motor2.odds get_odds({sk}) error: {type(e).__name__}: {e}")
-        logger.info(f"motor2.odds LIVE — {len(events)} eventos de {len(self._sport_keys)} deportes")
+        logger.info(
+            f"motor2.odds LIVE — {len(events)} eventos de {len(self._sport_keys)} "
+            f"deportes (regions={self._regions})"
+        )
         return events
 
 
