@@ -123,6 +123,40 @@ async def test_poll_once_no_kalshi_returns_empty():
 
 
 @pytest.mark.asyncio
+async def test_executor_bets_only_on_live_odds():
+    """Con executor + odds LIVE → apuesta. Con odds FAKE → JAMÁS apuesta (gate de plata)."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = False
+        filled_count = 0
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+
+    # FAKE odds → no debe ejecutar nunca (apostar contra odds inventadas = quemar plata).
+    poller_fake = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=False),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    await poller_fake.poll_once()
+    ex.execute.assert_not_awaited()
+
+    # LIVE odds → ejecuta las señales detectadas.
+    poller_live = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    signals = await poller_live.poll_once()
+    assert signals
+    assert ex.execute.await_count == len(signals)
+
+
+@pytest.mark.asyncio
 async def test_run_loop_stops_on_event():
     poller = Motor2ShadowPoller(
         _FakeKalshiSource([_kalshi_event()]),

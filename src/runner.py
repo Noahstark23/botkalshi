@@ -178,14 +178,15 @@ class ProductionRunner:
 
     async def _run_motor2_shadow(self) -> None:
         """
-        Cable shadow del Motor 2 (consenso sportsbooks) — gateado por
-        MOTOR_2_SPORTSBOOK_ENABLED. SIN ejecución de capital, independiente de
-        TRADING_ENABLED.
+        Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.
 
-        Arranca con una fuente de odds FAKE (fixture) para correr el pipeline completo
-        sin la suscripción paga. El flip a real es UNA LÍNEA: cambiar FakeOddsSource por
-        LiveOddsSource(["soccer_fifa_world_cup"]) cuando ODDS_API_KEY esté configurada.
+        Por defecto SHADOW (solo detecta/graba). APUESTA real solo cuando se cumplen
+        las DOS condiciones, en capas independientes:
+          1. odds REALES (LiveOddsSource) — nunca apuesta sobre el fixture fake.
+          2. TRADING_ENABLED=true → se construye el Motor2Executor (Capa A) y se inyecta.
+        Con cualquiera de las dos en falso, el motor sigue siendo shadow puro.
 
+        El flip a odds reales es UNA LÍNEA: FakeOddsSource → LiveOddsSource(...).
         Best-effort: si cae, se registra y la task termina — NO tira el bot.
         """
         if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
@@ -194,6 +195,7 @@ class ProductionRunner:
         if self._capture is None:
             return
         try:
+            from src.strategies.motor_2_consensus.executor import Motor2Executor
             from src.strategies.motor_2_consensus.fixtures import world_cup_demo_fixture
             from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
             from src.strategies.motor_2_consensus.sources import (
@@ -205,10 +207,20 @@ class ProductionRunner:
             # ── FLIP DE UNA LÍNEA: al pagar la API, reemplazar por:
             #    odds_source = LiveOddsSource(["soccer_fifa_world_cup"])
             odds_source = FakeOddsSource(world_cup_demo_fixture())
-            poller = Motor2ShadowPoller(kalshi_source, odds_source)
-            await poller.run(self._stop_event)
+
+            # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
+            # queda None → el poller jamás intenta apostar (y el muro Capa C de
+            # place_order es la defensa final aunque algo llegara a colarse).
+            if self.settings.TRADING_ENABLED:
+                async with KalshiRestClient() as client:
+                    executor = Motor2Executor(client, RiskManager())
+                    poller = Motor2ShadowPoller(kalshi_source, odds_source, executor=executor)
+                    await poller.run(self._stop_event)
+            else:
+                poller = Motor2ShadowPoller(kalshi_source, odds_source)
+                await poller.run(self._stop_event)
         except Exception as e:
-            msg = f"motor2 shadow runner: {type(e).__name__}: {e}"
+            msg = f"motor2 runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
 

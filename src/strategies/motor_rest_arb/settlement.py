@@ -21,6 +21,7 @@ get_market().result — una sesión cuando los shapes estén confirmados).
 Reglas del proyecto: select()+s.exec() (nunca .query()), naive UTC en writes,
 supervisor pattern con try/except (sin gather(return_exceptions)).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +32,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, select
 
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import Trade, get_session
@@ -112,7 +113,9 @@ def _leg_pnl_cents(trade: Trade, result: str) -> int:
     límite; fees de la fila (A.1 los registró al fill) o recomputados como fallback.
     """
     price = trade.fill_price_cents or trade.price_cents
-    fees = trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(trade.count, price)
+    fees = (
+        trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(trade.count, price)
+    )
     if trade.side == result:
         return (100 - price) * trade.count - fees
     return -price * trade.count - fees
@@ -128,7 +131,10 @@ class SettlementPoller:
     """
 
     POLL_INTERVAL_SEC = 300.0  # 5 min — los stop-losses son de escala diaria
-    STRATEGY = "motor_rest_arb"  # v1: solo Motor REST (extensible cuando otros persistan)
+    # Motores cuyos trades 'filled' este poller settlea. Motor 2 (apuestas direccionales
+    # single-leg) se agrega acá: cada apuesta es su propio grupo (arb_group_key cae al
+    # prefijo del coid), y _leg_pnl_cents resuelve un lado direccional sin cambios.
+    STRATEGIES = ("motor_rest_arb", "motor_2_consensus")
 
     def __init__(self, source: SettlementSource) -> None:
         self.source = source
@@ -166,7 +172,7 @@ class SettlementPoller:
         with get_session() as s:
             stmt = select(Trade).where(
                 Trade.status == "filled",
-                Trade.strategy == self.STRATEGY,
+                col(Trade.strategy).in_(self.STRATEGIES),
             )
             filled = list(s.exec(stmt))
         if not filled:
