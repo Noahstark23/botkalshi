@@ -98,7 +98,15 @@ class Settings(BaseSettings):
 
     # === Motor 2 (consenso sportsbooks) ===
     # API key de The Odds API. Vacía por default; el cliente la lee de acá.
+    # ENCENDIDO POR CONFIG: con la key seteada, el runner usa LiveOddsSource (odds reales);
+    # vacía → FakeOddsSource (fixture, shadow). No requiere editar código para el flip.
     ODDS_API_KEY: str = ""
+    # Deportes a consultar en The Odds API (sport_keys separados por coma). El Mundial es
+    # "soccer_fifa_world_cup"; confirmá el key exacto con get_sports() la 1ra vez.
+    ODDS_API_SPORT_KEYS: str = "soccer_fifa_world_cup"
+    # Regiones de casas. "eu" incluye Pinnacle (la más afilada) → fair-value más preciso;
+    # se suma "us" por cobertura. 1 crédito por región por call (h2h).
+    ODDS_API_REGIONS: str = "eu,us"
 
     # ---- Validators ----
 
