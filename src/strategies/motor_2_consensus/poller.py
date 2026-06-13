@@ -21,14 +21,20 @@ from loguru import logger
 
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_2_consensus.detector import ConsensusSignal, find_signals
+from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
 from src.utils.config import get_settings
 
 
 class Motor2ShadowPoller:
-    """Loop de detección shadow del Motor 2. No ejecuta capital."""
+    """
+    Loop del Motor 2. Por defecto SHADOW (solo detecta/graba). Si se le inyecta un
+    `executor` Y la fuente de odds es REAL (is_live), apuesta — nunca sobre el fixture
+    fake (apostar contra odds inventadas sería quemar plata).
+    """
 
     DEFAULT_INTERVAL_SEC = 300.0  # 5 min — calibrable; el consenso no se mueve por segundo.
+    MAX_BETS_PER_CYCLE = 5  # tope de órdenes por ciclo (el RiskManager además frena por exposición)
 
     def __init__(
         self,
@@ -37,6 +43,7 @@ class Motor2ShadowPoller:
         *,
         interval_sec: float | None = None,
         capital_usd: float | None = None,
+        executor: Motor2Executor | None = None,
     ):
         self._kalshi = kalshi_source
         self._odds = odds_source
@@ -45,9 +52,11 @@ class Motor2ShadowPoller:
         self._capital_usd = (
             capital_usd if capital_usd is not None else get_settings().ACTIVE_CAPITAL_USD
         )
+        # Presente SOLO con TRADING_ENABLED=true (lo construye el runner, Capa A). None = shadow.
+        self._executor = executor
 
     async def poll_once(self) -> list[ConsensusSignal]:
-        """Un ciclo: extrae, cruza, detecta, (persiste si live). Devuelve las señales."""
+        """Un ciclo: extrae, cruza, detecta, (persiste + apuesta si live). Devuelve las señales."""
         kalshi_events = await self._kalshi.fetch()
         if not kalshi_events:
             return []
@@ -59,11 +68,35 @@ class Motor2ShadowPoller:
         signals = find_signals(kalshi_events, odds_events, capital_usd=self._capital_usd)
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
-            f"señales={len(signals)} live={self._odds.is_live}"
+            f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"
         )
+        # GATE DE DINERO REAL: persistir Y apostar SOLO con odds reales (nunca sobre el
+        # fixture fake). Apostar exige además executor presente (TRADING_ENABLED, Capa A).
         if signals and self._odds.is_live:
             self._persist(signals)
+            if self._executor is not None:
+                await self._execute(signals)
         return signals
+
+    async def _execute(self, signals: list[ConsensusSignal]) -> None:
+        """
+        Apuesta las mejores señales del ciclo (mayor edge primero), hasta MAX_BETS_PER_CYCLE.
+        El RiskManager (dentro del executor) corta por exposición/stop-loss. Best-effort:
+        un error de una señal se loguea y NO frena las demás ni el loop.
+        """
+        top = sorted(signals, key=lambda s: s.edge_pct, reverse=True)[: self.MAX_BETS_PER_CYCLE]
+        for sig in top:
+            try:
+                outcome = await self._executor.execute(sig)  # type: ignore[union-attr]
+                if outcome.filled:
+                    logger.info(
+                        f"motor2.bet FILLED ticker={sig.market_ticker} side={sig.kalshi_side} "
+                        f"count={outcome.filled_count}"
+                    )
+            except Exception as e:
+                logger.exception(
+                    f"motor2.bet error ticker={sig.market_ticker}: {type(e).__name__}: {e}"
+                )
 
     def _persist(self, signals: list[ConsensusSignal]) -> None:
         """
