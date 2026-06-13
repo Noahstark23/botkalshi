@@ -235,10 +235,8 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
             # now−30min, correr el test entre 00:00 y 00:30 UTC caía en AYER →
             # el daily no veía la pérdida → flaky de medianoche (visto 2026-06-13).
             placed_at=datetime.combine(datetime.now(UTC).date(), time.min),
-            filled_at=datetime.combine(datetime.now(UTC).date(), time.min)
-            + timedelta(minutes=30),
-            settled_at=datetime.combine(datetime.now(UTC).date(), time.min)
-            + timedelta(hours=1),
+            filled_at=datetime.combine(datetime.now(UTC).date(), time.min) + timedelta(minutes=30),
+            settled_at=datetime.combine(datetime.now(UTC).date(), time.min) + timedelta(hours=1),
         )
         s.add(losing_trade)
         s.commit()

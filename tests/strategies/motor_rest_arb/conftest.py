@@ -9,6 +9,7 @@ de rutas no fallan por falta de engine (y ninguno toca la DB real).
 Los archivos con fixture propia (test_capa3_outcome, test_killswitch_persistence) la
 pisan tranquilamente: re-asignan models._engine y lo limpian al salir.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

@@ -41,7 +41,9 @@ class KalshiAPIError(Exception):
         # None si el body no traía un code parseable. Lo usan los callers para distinguir
         # causas determinísticas (KILL de FOK) de errores genéricos.
         self.error_code = error_code
-        super().__init__(f"[{status_code}] {message}" + (f" code={error_code}" if error_code else ""))
+        super().__init__(
+            f"[{status_code}] {message}" + (f" code={error_code}" if error_code else "")
+        )
 
 
 class KalshiAuthError(KalshiAPIError):
@@ -83,9 +85,7 @@ def _record_api_error(method: str, path: str, exc: Exception) -> None:
     try:
         from src.monitoring.health import BotState  # noqa: PLC0415
 
-        BotState.record_error(
-            f"Kalshi {method} {path}: {type(exc).__name__}: {str(exc)[:200]}"
-        )
+        BotState.record_error(f"Kalshi {method} {path}: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception:
         pass  # best-effort; never let logging crash a request
 

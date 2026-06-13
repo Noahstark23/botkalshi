@@ -8,6 +8,7 @@ a medias), idempotencia del poller, re-entrega del mismo settlement, pata expues
 
 La DB temporal la monta el conftest del paquete (autouse).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,17 +43,33 @@ class FakeSettlementSource:
 
 
 def _mk_trade(
-    *, ticker: str, side: str, arb_id: str, status: str = "filled",
-    price: int = 40, count: int = 5, fees: int = 4,
+    *,
+    ticker: str,
+    side: str,
+    arb_id: str,
+    status: str = "filled",
+    price: int = 40,
+    count: int = 5,
+    fees: int = 4,
 ) -> str:
     """Inserta una fila Trade con la convención de A.1; devuelve el coid."""
     coid = f"{arb_id}-{side}"
     with models.get_session() as s:
-        s.add(models.Trade(
-            client_order_id=coid, ticker=ticker, side=side, action="buy",
-            count=count, price_cents=price, fill_price_cents=price, fees_cents=fees,
-            strategy="motor_rest_arb", status=status, notes=f"arb_id={arb_id}",
-        ))
+        s.add(
+            models.Trade(
+                client_order_id=coid,
+                ticker=ticker,
+                side=side,
+                action="buy",
+                count=count,
+                price_cents=price,
+                fill_price_cents=price,
+                fees_cents=fees,
+                strategy="motor_rest_arb",
+                status=status,
+                notes=f"arb_id={arb_id}",
+            )
+        )
         s.commit()
     return coid
 
@@ -82,8 +99,8 @@ async def test_both_legs_settle_atomically_with_correct_pnl():
     trades = _all_trades()
     yes, no = trades[f"{arb_id}-yes"], trades[f"{arb_id}-no"]
     assert yes.status == "settled" and no.status == "settled"
-    assert yes.pnl_cents == (100 - 40) * 5 - 4   # ganadora: +296
-    assert no.pnl_cents == -45 * 5 - 5           # perdedora: −230
+    assert yes.pnl_cents == (100 - 40) * 5 - 4  # ganadora: +296
+    assert no.pnl_cents == -45 * 5 - 5  # perdedora: −230
     assert yes.settled_at is not None and yes.settled_at.tzinfo is None  # naive UTC
     assert "settled_by_poller" in (yes.notes or "")
 
@@ -98,7 +115,7 @@ async def test_partial_resolution_settles_nothing():
 
     assert settled == 0
     trades = _all_trades()
-    assert trades[f"{arb_id}-yes"].status == "filled"   # ni siquiera la resuelta
+    assert trades[f"{arb_id}-yes"].status == "filled"  # ni siquiera la resuelta
     assert trades[f"{arb_id}-no"].status == "filled"
     assert trades[f"{arb_id}-yes"].pnl_cents is None
 
@@ -117,14 +134,17 @@ async def test_crash_mid_commit_leaves_no_half_settled_group():
         calls["n"] += 1
         s = real_get_session()
         if calls["n"] >= 2:  # 1ª = lectura; 2ª = la transacción de escritura
+
             def _boom() -> None:
                 raise RuntimeError("db crash mid-commit")
+
             s.commit = _boom  # type: ignore[method-assign]
         return s
 
-    with patch(
-        "src.strategies.motor_rest_arb.settlement.get_session", side_effect=flaky_session
-    ), pytest.raises(RuntimeError, match="mid-commit"):
+    with (
+        patch("src.strategies.motor_rest_arb.settlement.get_session", side_effect=flaky_session),
+        pytest.raises(RuntimeError, match="mid-commit"),
+    ):
         await poller.settle_once()
 
     trades = _all_trades()
@@ -164,7 +184,7 @@ async def test_single_exposed_leg_settles_alone():
     trades = _all_trades()
     assert trades[f"{arb_id}-yes"].status == "settled"
     assert trades[f"{arb_id}-yes"].pnl_cents == -40 * 5 - 4  # pérdida → el stop-loss la ve
-    assert trades[f"{arb_id}-no"].status == "cancelled"      # intacta
+    assert trades[f"{arb_id}-no"].status == "cancelled"  # intacta
 
 
 @pytest.mark.asyncio
@@ -257,10 +277,18 @@ async def test_kalshi_source_drives_atomic_poller_end_to_end():
 def test_leg_pnl_uses_fill_price_and_recomputes_missing_fees():
     """PnL usa fill_price_cents (real) y recomputa fees si la fila no los trae."""
     t = models.Trade(
-        client_order_id="x", ticker="T", side="yes", action="buy", count=10,
-        price_cents=50, fill_price_cents=47, fees_cents=None,
-        strategy="motor_rest_arb", status="filled",
+        client_order_id="x",
+        ticker="T",
+        side="yes",
+        action="buy",
+        count=10,
+        price_cents=50,
+        fill_price_cents=47,
+        fees_cents=None,
+        strategy="motor_rest_arb",
+        status="filled",
     )
     pnl = _leg_pnl_cents(t, "yes")
     from src.math.fees import kalshi_fee_cents
+
     assert pnl == (100 - 47) * 10 - kalshi_fee_cents(10, 47)

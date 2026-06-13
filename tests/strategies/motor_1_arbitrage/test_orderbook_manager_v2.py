@@ -10,6 +10,7 @@ AC6: error message → BotState.last_error populated, no exception propagated
 
 También incluye: fixture loading, multi-ticker recovery, stats().
 """
+
 from __future__ import annotations
 
 import json
@@ -24,7 +25,6 @@ from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import (
     OrderbookManagerV2,
     SidGapError,
 )
-
 
 # =====================================================
 # Helpers
@@ -146,7 +146,9 @@ def test_fixtures_loadable_and_correct_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ac1_gap_raises_sid_gap_error(manager: OrderbookManagerV2, mock_ws: AsyncMock) -> None:
+async def test_ac1_gap_raises_sid_gap_error(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
     """Gap in seq → SidGapError raised with correct attrs."""
     ticker = "KXNBA-26-NYK"
     await manager.handle_message(make_ws_snapshot(ticker, sid=1, seq=1))
@@ -160,7 +162,9 @@ async def test_ac1_gap_raises_sid_gap_error(manager: OrderbookManagerV2, mock_ws
 
 
 @pytest.mark.asyncio
-async def test_ac1_gap_marks_all_tickers_stale(manager: OrderbookManagerV2, mock_ws: AsyncMock) -> None:
+async def test_ac1_gap_marks_all_tickers_stale(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
     """Gap → all tickers in that sid are marked stale, not other sids."""
     ticker_a = "TICKER-SID1-A"
     ticker_b = "TICKER-SID1-B"
@@ -220,9 +224,7 @@ async def test_ac2_recovery_snapshot_restores_state(
     assert manager._books[ticker].is_stale
 
     # Recovery snapshot arrives with id=42
-    recovery = make_ws_snapshot(
-        ticker, sid=1, seq=50, yes_fp=[["0.1200", "500.00"]], req_id=42
-    )
+    recovery = make_ws_snapshot(ticker, sid=1, seq=50, yes_fp=[["0.1200", "500.00"]], req_id=42)
     await manager.handle_message(recovery)
 
     assert manager._books[ticker].is_initialized
@@ -281,7 +283,9 @@ async def test_ac3_negative_qty_raises_orderbook_desync(manager: OrderbookManage
     # 10 existing - 15 delta = -5 → feed corruption
     with pytest.raises(OrderbookDesyncError) as exc_info:
         await manager.handle_message(
-            make_ws_delta(ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00", side="yes")
+            make_ws_delta(
+                ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00", side="yes"
+            )
         )
 
     assert exc_info.value.ticker == ticker
@@ -545,8 +549,7 @@ async def test_delta_from_fixture_after_snapshot(manager: OrderbookManagerV2) ->
     # To test normal delta application, apply intermediate seqs or use seq=2 directly.
     # This test verifies fixture processing, not gap detection (AC1 covers that).
     delta = make_ws_delta(
-        "KXNBA-26-NYK", sid=1, seq=2,
-        price_dollars="0.8500", delta_fp="-100.00", side="no"
+        "KXNBA-26-NYK", sid=1, seq=2, price_dollars="0.8500", delta_fp="-100.00", side="no"
     )
     await manager.handle_message(delta)
 

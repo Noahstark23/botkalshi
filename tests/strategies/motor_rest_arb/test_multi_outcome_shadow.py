@@ -6,6 +6,7 @@ Verifica el invariante de seguridad central: el grupo se evalúa SOLO completo y
 EdgeWindow kind="multi_outcome", y que el path multi JAMÁS toca el executor (shadow).
 La DB temporal la monta el conftest del paquete (autouse).
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -62,10 +63,15 @@ def test_update_universe_groups_by_event_and_filters_whitelist():
 def test_series_match_is_exact_not_prefix():
     """KXWCGAMEGOALS (totales, NO excluyentes) NO debe caer en KXWCGAME por prefijo."""
     eng = _engine()
-    eng.update_universe({
-        f"{EV}-ARG", f"{EV}-JOR", f"{EV}-TIE",                      # 1X2 real → entra
-        "KXWCGAMEGOALS-26JUN27JORARG-O25", "KXWCGAMEGOALS-26JUN27JORARG-U25",  # totales → FUERA
-    })
+    eng.update_universe(
+        {
+            f"{EV}-ARG",
+            f"{EV}-JOR",
+            f"{EV}-TIE",  # 1X2 real → entra
+            "KXWCGAMEGOALS-26JUN27JORARG-O25",
+            "KXWCGAMEGOALS-26JUN27JORARG-U25",  # totales → FUERA
+        }
+    )
     assert set(eng._event_universe) == {EV}
     assert all(not t.startswith("KXWCGAMEGOALS") for ts in eng._event_universe.values() for t in ts)
 
@@ -76,7 +82,7 @@ async def test_complete_fresh_1x2_under_100_records_multi_window():
     eng = _engine()
     await eng.on_ticker(_tick(T_ARG, "0.40"))
     await eng.on_ticker(_tick(T_MEX, "0.30"))
-    assert _multi_windows() == []          # con 2/3 patas todavía NO evalúa
+    assert _multi_windows() == []  # con 2/3 patas todavía NO evalúa
     await eng.on_ticker(_tick(T_TIE, "0.25"))  # Σ = 95
 
     wins = _multi_windows()
@@ -133,8 +139,8 @@ async def test_multi_path_never_touches_executor():
     await eng.on_ticker(_tick(T_MEX, "0.30"))
     await eng.on_ticker(_tick(T_TIE, "0.25"))  # arb multi detectado y grabado
 
-    assert len(_multi_windows()) == 1      # detectó y grabó
-    ex.execute.assert_not_awaited()        # pero NUNCA ejecutó
+    assert len(_multi_windows()) == 1  # detectó y grabó
+    ex.execute.assert_not_awaited()  # pero NUNCA ejecutó
 
 
 @pytest.mark.asyncio

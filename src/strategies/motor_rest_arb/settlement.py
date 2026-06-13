@@ -21,6 +21,7 @@ get_market().result — una sesión cuando los shapes estén confirmados).
 Reglas del proyecto: select()+s.exec() (nunca .query()), naive UTC en writes,
 supervisor pattern con try/except (sin gather(return_exceptions)).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -112,7 +113,9 @@ def _leg_pnl_cents(trade: Trade, result: str) -> int:
     límite; fees de la fila (A.1 los registró al fill) o recomputados como fallback.
     """
     price = trade.fill_price_cents or trade.price_cents
-    fees = trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(trade.count, price)
+    fees = (
+        trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(trade.count, price)
+    )
     if trade.side == result:
         return (100 - price) * trade.count - fees
     return -price * trade.count - fees

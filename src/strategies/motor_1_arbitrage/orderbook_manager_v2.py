@@ -21,6 +21,7 @@ Recovery flow on gap detection:
   6. Drain: messages sorted by seq, those <= snapshot seq discarded, rest applied.
   7. SidGapError raised AFTER recovery is initiated (caller sees the error).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -61,9 +62,7 @@ class SidGapError(OrderbookError):
         self.sid = sid
         self.expected_seq = expected_seq
         self.received_seq = received_seq
-        super().__init__(
-            f"Sid {sid} gap: expected seq={expected_seq}, got {received_seq}"
-        )
+        super().__init__(f"Sid {sid} gap: expected seq={expected_seq}, got {received_seq}")
 
 
 class OrderbookManagerV2:
@@ -142,9 +141,7 @@ class OrderbookManagerV2:
             new_seq: int = raw_msg["seq"]
             ticker: str = raw_msg["msg"]["market_ticker"]
         except KeyError as e:
-            raise ValueError(
-                f"Malformed WS message missing field {e}: {raw_msg}"
-            ) from e
+            raise ValueError(f"Malformed WS message missing field {e}: {raw_msg}") from e
 
         # Register ticker in its sid (always, before buffering or gap check)
         self._tickers_by_sid.setdefault(sid, set()).add(ticker)
@@ -254,6 +251,7 @@ class OrderbookManagerV2:
         """Fire-and-forget alert. Catches all exceptions to protect the caller."""
         try:
             from src.monitoring.telegram_alerts import alert_orderbook_anomaly
+
             await alert_orderbook_anomaly(kind, details)
         except Exception as e:
             logger.warning(f"v2.alert_send_failed kind={kind} error={e}")
@@ -419,17 +417,14 @@ class OrderbookManagerV2:
 
         if price_cents is None or delta_size is None:
             raise ValueError(
-                f"Delta parse error for {ticker}: "
-                f"price_raw={price_raw!r}, delta_raw={delta_raw!r}"
+                f"Delta parse error for {ticker}: price_raw={price_raw!r}, delta_raw={delta_raw!r}"
             )
 
         # May raise OrderbookDesyncError (new_qty < 0). Capturamos SOLO para emitir
         # logging diagnostico defensivo y re-lanzamos la excepcion intacta: no se
         # altera la logica ni el control flow (la misma excepcion propaga igual).
         try:
-            state.apply_delta(
-                {"side": side, "price": price_cents, "delta": delta_size, "seq": seq}
-            )
+            state.apply_delta({"side": side, "price": price_cents, "delta": delta_size, "seq": seq})
         except OrderbookDesyncError:
             # El bloque de logging va envuelto en su propio try/except para que
             # ningun fallo del diagnostico introduzca un path de excepcion nuevo.
@@ -468,16 +463,12 @@ def _parse_fp_levels(
     result: list[list[int]] = []
     for lvl in raw_levels:
         if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
-            logger.warning(
-                f"OrderbookManagerV2: invalid level shape for {ticker}/{side}: {lvl!r}"
-            )
+            logger.warning(f"OrderbookManagerV2: invalid level shape for {ticker}/{side}: {lvl!r}")
             continue
         price_cents = parse_price_to_cents(lvl[0])
         size = parse_size(lvl[1])
         if price_cents is None or size is None:
-            logger.warning(
-                f"OrderbookManagerV2: unparseable level for {ticker}/{side}: {lvl!r}"
-            )
+            logger.warning(f"OrderbookManagerV2: unparseable level for {ticker}/{side}: {lvl!r}")
             continue
         if size == 0:
             continue

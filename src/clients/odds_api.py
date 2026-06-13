@@ -16,6 +16,7 @@ un evento malformado se descarta (log), no tira el batch entero.
 NO toca capital ni ejecución. NO escribe SQLite (no aplica la regla de naive-UTC; los
 commence_time se parsean a datetime AWARE en UTC para comparación del matcher).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -73,19 +74,19 @@ _RETRYABLE_EXCEPTIONS = (
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    name: str       # nombre del equipo/resultado ("Argentina", "Draw", ...)
-    price: float    # cuota DECIMAL (oddsFormat=decimal)
+    name: str  # nombre del equipo/resultado ("Argentina", "Draw", ...)
+    price: float  # cuota DECIMAL (oddsFormat=decimal)
 
 
 @dataclass(frozen=True, slots=True)
 class Market:
-    key: str                       # "h2h" (moneyline), "spreads", "totals"
+    key: str  # "h2h" (moneyline), "spreads", "totals"
     outcomes: tuple[Outcome, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class Bookmaker:
-    key: str                       # "pinnacle", "draftkings", ...
+    key: str  # "pinnacle", "draftkings", ...
     title: str
     markets: tuple[Market, ...]
 
@@ -94,7 +95,7 @@ class Bookmaker:
 class OddsEvent:
     id: str
     sport_key: str
-    commence_time: datetime        # AWARE, UTC
+    commence_time: datetime  # AWARE, UTC
     home_team: str
     away_team: str
     bookmakers: tuple[Bookmaker, ...]
@@ -135,7 +136,9 @@ def _parse_event(d: dict[str, Any]) -> OddsEvent | None:
             bookmakers=bookmakers,
         )
     except (KeyError, ValueError, TypeError) as exc:
-        logger.warning(f"odds_api: evento descartado por shape inválido: {type(exc).__name__}: {exc}")
+        logger.warning(
+            f"odds_api: evento descartado por shape inválido: {type(exc).__name__}: {exc}"
+        )
         return None
 
 
@@ -159,10 +162,12 @@ class OddsAPIClient:
     """
 
     RETRY_ATTEMPTS = 4
-    RETRY_WAIT_MIN = 1.0   # s — primer backoff
+    RETRY_WAIT_MIN = 1.0  # s — primer backoff
     RETRY_WAIT_MAX = 60.0  # s — cap del backoff (regla del brief)
 
-    def __init__(self, api_key: str | None = None, *, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self, api_key: str | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+    ):
         self.api_key = api_key if api_key is not None else get_settings().ODDS_API_KEY
         self._transport = transport  # seam de testing (httpx.MockTransport)
         self._client: httpx.AsyncClient | None = None
@@ -201,7 +206,9 @@ class OddsAPIClient:
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self.RETRY_ATTEMPTS),
-                wait=wait_exponential(multiplier=1, min=self.RETRY_WAIT_MIN, max=self.RETRY_WAIT_MAX),
+                wait=wait_exponential(
+                    multiplier=1, min=self.RETRY_WAIT_MIN, max=self.RETRY_WAIT_MAX
+                ),
                 retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
                 reraise=True,
             ):
@@ -209,7 +216,9 @@ class OddsAPIClient:
                     resp = await self._client.get(path, params=query)
                     if resp.status_code >= 400:
                         err = self._classify(resp.status_code, resp.text[:500])
-                        logger.warning(f"odds_api GET {path} → {resp.status_code}: {resp.text[:200]}")
+                        logger.warning(
+                            f"odds_api GET {path} → {resp.status_code}: {resp.text[:200]}"
+                        )
                         raise err
                     return resp.json()
         except Exception as exc:

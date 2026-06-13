@@ -1,4 +1,4 @@
-﻿"""
+"""
 Cliente WebSocket para Kalshi.
 
 Recibe orderbook deltas, tickers, fills, etc. en tiempo real.
@@ -11,6 +11,7 @@ Features:
     - Shutdown limpio con stop()
     - Escalacion a Telegram tras N fallos consecutivos
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -139,9 +140,7 @@ class KalshiWebSocket:
                     backoff = 1.0
                     alerted = False
                 consecutive_failures += 1
-                logger.warning(
-                    f"WS closed: {e}. Consecutive failures: {consecutive_failures}"
-                )
+                logger.warning(f"WS closed: {e}. Consecutive failures: {consecutive_failures}")
             except Exception:
                 stable_s = _stable_connection(connected_at)
                 if stable_s:
@@ -236,7 +235,11 @@ class KalshiWebSocket:
                         msg = json.loads(raw)
                         await self._dispatch(msg)
                     except json.JSONDecodeError:
-                        preview = raw[:200].decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw[:200]
+                        preview = (
+                            raw[:200].decode("utf-8", errors="replace")
+                            if isinstance(raw, bytes)
+                            else raw[:200]
+                        )
                         logger.error(f"JSON invalido: {preview}")
                     except Exception:
                         logger.exception("Error en dispatch")
@@ -300,9 +303,7 @@ class KalshiWebSocket:
         await self._ws.send(json.dumps(msg))
 
         n_tickers = len(params.get("market_tickers", []))
-        logger.info(
-            f"Subscribed: channels={params['channels']} markets={n_tickers}"
-        )
+        logger.info(f"Subscribed: channels={params['channels']} markets={n_tickers}")
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         """Distribuye mensaje a handlers registrados."""

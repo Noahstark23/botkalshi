@@ -2,6 +2,7 @@
 Tests del event matcher (Motor 2) — 4 reglas estrictas: normalización, alias,
 cardinalidad, comparación por conjuntos. Fixtures de fútbol (1X2) y deportes US.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -14,11 +15,11 @@ from src.strategies.motor_2_consensus.matcher import (
 )
 
 # ── Fixtures de payloads (solo los nombres de outcome, que es lo que el matcher compara) ──
-WC_KALSHI = ["Argentina", "Mexico", "Draw"]          # 1X2, orden Kalshi
-WC_ODDS = ["Mexico", "Draw", "Argentina"]            # 1X2, orden invertido (Odds API)
-WC_KALSHI_2WAY = ["Argentina", "Mexico"]             # gana/pierde (sin empate)
+WC_KALSHI = ["Argentina", "Mexico", "Draw"]  # 1X2, orden Kalshi
+WC_ODDS = ["Mexico", "Draw", "Argentina"]  # 1X2, orden invertido (Odds API)
+WC_KALSHI_2WAY = ["Argentina", "Mexico"]  # gana/pierde (sin empate)
 MLB_KALSHI = ["New York Yankees", "Boston Red Sox"]
-MLB_ODDS = ["Boston Red Sox", "New York Yankees"]    # home/away invertido
+MLB_ODDS = ["Boston Red Sox", "New York Yankees"]  # home/away invertido
 NBA_ODDS = ["Los Angeles Lakers", "Boston Celtics"]
 
 
@@ -31,10 +32,10 @@ NBA_ODDS = ["Los Angeles Lakers", "Boston Celtics"]
     ("raw", "expected"),
     [
         ("New York Yankees", "new york yankees"),
-        ("St. Louis", "st louis"),                 # puntuación eliminada
-        ("Côte d'Ivoire", "cote divoire"),         # apóstrofo fuera + acento plegado
-        ("Real   Madrid", "real madrid"),          # espacios colapsados
-        ("  Draw  ", "draw"),                       # trim
+        ("St. Louis", "st louis"),  # puntuación eliminada
+        ("Côte d'Ivoire", "cote divoire"),  # apóstrofo fuera + acento plegado
+        ("Real   Madrid", "real madrid"),  # espacios colapsados
+        ("  Draw  ", "draw"),  # trim
     ],
 )
 def test_normalize_name(raw, expected):
@@ -121,8 +122,12 @@ def test_missing_team_rejected():
 
 def test_punctuation_and_case_differences_match():
     """Diferencias de puntuación/caso no impiden el match (normalización)."""
-    assert outcomes_match(["St. Louis Cardinals", "CHICAGO CUBS"],
-                          ["St Louis Cardinals", "Chicago Cubs"]) is True
+    assert (
+        outcomes_match(
+            ["St. Louis Cardinals", "CHICAGO CUBS"], ["St Louis Cardinals", "Chicago Cubs"]
+        )
+        is True
+    )
 
 
 def test_different_sport_pair_does_not_match():

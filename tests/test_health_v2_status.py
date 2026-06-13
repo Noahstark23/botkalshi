@@ -4,6 +4,7 @@ Tests for /status endpoint — orderbook_manager_v2 section.
 Covers: flag=False → {"enabled": false}, flag=True + instance present → full metrics,
 flag=True + instance missing → {"enabled": true, "instance": "missing"} + record_error.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

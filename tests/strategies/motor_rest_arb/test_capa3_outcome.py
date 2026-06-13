@@ -8,6 +8,7 @@ Cubren:
     reconciled/kill_switch/rollback/latencia; best-effort (fallo no propaga; edge_id
     None no-op). rest_rtt_ms queda en default (no medible desde el engine).
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch

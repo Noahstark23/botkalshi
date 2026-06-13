@@ -9,7 +9,6 @@ Verifica:
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -95,16 +94,18 @@ async def test_429_exhausted_calls_record_error(mock_settings, mock_signer):
 
     recorded_errors: list[str] = []
 
-    with patch("asyncio.sleep", new=AsyncMock()):
-        with patch("src.monitoring.health.BotState") as mock_botstate:
-            mock_botstate.record_error = MagicMock(side_effect=lambda msg: recorded_errors.append(msg))
+    with (
+        patch("asyncio.sleep", new=AsyncMock()),
+        patch("src.monitoring.health.BotState") as mock_botstate,
+    ):
+        mock_botstate.record_error = MagicMock(side_effect=lambda msg: recorded_errors.append(msg))
 
-            client = KalshiRestClient()
-            client._client = AsyncMock(spec=httpx.AsyncClient)
-            client._client.request = AsyncMock(side_effect=responses)
+        client = KalshiRestClient()
+        client._client = AsyncMock(spec=httpx.AsyncClient)
+        client._client.request = AsyncMock(side_effect=responses)
 
-            with pytest.raises(KalshiRateLimitError):
-                await client._request("GET", "/portfolio/balance")
+        with pytest.raises(KalshiRateLimitError):
+            await client._request("GET", "/portfolio/balance")
 
     assert len(recorded_errors) >= 1
     assert any("429" in e or "RateLimit" in e for e in recorded_errors)
@@ -140,6 +141,7 @@ async def test_no_retry_after_header_no_crash(mock_settings, mock_signer):
 # =====================================================
 # error.code parsing (para distinguir KILL de FOK del resto)
 # =====================================================
+
 
 def test_classify_error_extracts_fok_kill_code():
     """Un 409 con body {'error':{'code':...}} → KalshiClientError con error_code poblado."""

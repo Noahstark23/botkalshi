@@ -27,6 +27,7 @@ Diseño:
     - Monotonicidad de seq validada en cada delta; gap detection en Manager.
     - Asks solo se populan si el WS snapshot los incluye explícitamente (raro).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -316,9 +317,7 @@ class OrderbookState:
                 raise ValueError(f"Invalid ts_ms: {ts_ms!r}")
             ts_ms_int = int(ts_ms)
             if self._last_ts_ms is not None and ts_ms_int < self._last_ts_ms:
-                raise ValueError(
-                    f"ts_ms not monotonic: {ts_ms_int} < {self._last_ts_ms}"
-                )
+                raise ValueError(f"ts_ms not monotonic: {ts_ms_int} < {self._last_ts_ms}")
             self._last_ts_ms = ts_ms_int
 
         # Kalshi orderbook_delta always targets bids
@@ -437,16 +436,10 @@ def _parse_level(level: object, context: str) -> tuple[int, int]:
         ValueError: si level no es [int, int] con price en [0, 100] y size >= 0.
     """
     if not isinstance(level, (list, tuple)) or len(level) != 2:  # type: ignore[arg-type]
-        raise ValueError(
-            f"Invalid level in {context}: expected [price, size], got {level!r}"
-        )
+        raise ValueError(f"Invalid level in {context}: expected [price, size], got {level!r}")
     price, size = level
     if not isinstance(price, int) or not (0 <= price <= 100):
-        raise ValueError(
-            f"Invalid price in {context}: {price!r} (must be int in [0, 100])"
-        )
+        raise ValueError(f"Invalid price in {context}: {price!r} (must be int in [0, 100])")
     if not isinstance(size, int) or size < 0:
-        raise ValueError(
-            f"Invalid size in {context}: {size!r} (must be int >= 0)"
-        )
+        raise ValueError(f"Invalid size in {context}: {size!r} (must be int >= 0)")
     return price, size

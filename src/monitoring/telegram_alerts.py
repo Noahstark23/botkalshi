@@ -4,6 +4,7 @@ Telegram alerts.
 Notifica eventos importantes al chat configurado.
 Falla silenciosa si Telegram no está configurado (opcional).
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -131,8 +132,7 @@ async def alert_trade(outcome: ExecutionOutcome, opp: ArbOpportunity) -> None:
         )
     elif outcome.rejected_paused:
         await send_alert(
-            f"*Motor REST: orden rechazada — circuit breaker pausado*\n"
-            f"Market: `{ticker}`",
+            f"*Motor REST: orden rechazada — circuit breaker pausado*\nMarket: `{ticker}`",
             urgent=True,
         )
     # else: ambas KILL → sin mensaje (no spamear)

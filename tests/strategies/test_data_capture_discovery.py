@@ -20,8 +20,9 @@ from src.strategies.data_capture import DataCaptureService
 
 @pytest.fixture
 def service():
-    with patch("src.strategies.data_capture.get_settings"), patch(
-        "src.strategies.data_capture.KalshiWebSocket"
+    with (
+        patch("src.strategies.data_capture.get_settings"),
+        patch("src.strategies.data_capture.KalshiWebSocket"),
     ):
         svc = DataCaptureService()
         svc._tracked_tickers = set()
@@ -56,9 +57,11 @@ async def test_discovery_exact_series_collects_open_markets(service):
         [_events_resp("KXMLB"), _events_resp("KXFIFAGAME")],
         [_event_detail("KXMLB-E0", 2), _event_detail("KXFIFAGAME-E0", 3)],
     )
-    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXFIFAGAME"]
-    ), patch("asyncio.sleep", new=AsyncMock()):
+    with (
+        patch("src.strategies.data_capture.KalshiRestClient", return_value=client),
+        patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXFIFAGAME"]),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
         new = await service._discover_markets()
 
     assert len(new) == 5  # 2 + 3, todos nuevos
@@ -75,9 +78,11 @@ async def test_discovery_failure_per_series_continues(service):
         [Exception("timeout en KXMLB"), _events_resp("KXNBA")],
         _event_detail("KXNBA-E0", 3),
     )
-    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXNBA"]
-    ), patch("asyncio.sleep", new=AsyncMock()):
+    with (
+        patch("src.strategies.data_capture.KalshiRestClient", return_value=client),
+        patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXNBA"]),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
         new = await service._discover_markets()
 
     assert len(new) == 3  # KXMLB falló → 0; KXNBA → 3
@@ -88,9 +93,11 @@ async def test_discovery_returns_only_new_tickers(service):
     """Delta para el re-discovery: lo ya trackeado no se reporta como nuevo."""
     service._tracked_tickers = {"KXNBA-E0-T0"}
     client = _client([_events_resp("KXNBA")], _event_detail("KXNBA-E0", 2))
-    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]
-    ), patch("asyncio.sleep", new=AsyncMock()):
+    with (
+        patch("src.strategies.data_capture.KalshiRestClient", return_value=client),
+        patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
         new = await service._discover_markets()
 
     assert new == {"KXNBA-E0-T1"}
@@ -101,9 +108,11 @@ async def test_discovery_returns_only_new_tickers(service):
 async def test_discovery_skips_closed_markets(service):
     """Markets con status fuera de open/active no se trackean."""
     client = _client([_events_resp("KXNBA")], _event_detail("KXNBA-E0", 2, status="settled"))
-    with patch("src.strategies.data_capture.KalshiRestClient", return_value=client), patch(
-        "src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]
-    ), patch("asyncio.sleep", new=AsyncMock()):
+    with (
+        patch("src.strategies.data_capture.KalshiRestClient", return_value=client),
+        patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
         new = await service._discover_markets()
     assert new == set()
 
@@ -142,9 +151,10 @@ async def test_rediscovery_survives_failures_best_effort(service):
         service._stop_event.set()
         return set()
 
-    with patch.object(service, "_discover_markets", side_effect=flaky_discover), patch(
-        "src.strategies.data_capture.BotState"
-    ) as mock_state:
+    with (
+        patch.object(service, "_discover_markets", side_effect=flaky_discover),
+        patch("src.strategies.data_capture.BotState") as mock_state,
+    ):
         await asyncio.wait_for(service._run_rediscovery(), timeout=1.0)
 
     assert calls["n"] == 2  # sobrevivió el fallo y reintentó

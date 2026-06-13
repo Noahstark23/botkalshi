@@ -8,6 +8,7 @@ Mocks rigurosos sobre KalshiRestClient (AsyncMock). Escenarios:
   - Rollback que no llena → kill-switch (pausa + alerta).
   - Circuit breaker: 3 rollbacks/1h → pausa, rechaza nuevas órdenes.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
@@ -19,19 +20,33 @@ from src.strategies.motor_rest_arb.executor import LegState, RestExecutor
 
 
 def _opp(count: int = 5) -> ArbOpportunity:
-    yes = ArbLeg(market_ticker="KXWC-26-ARG", side="yes", price_cents=40, count=count, available_size=100)
-    no = ArbLeg(market_ticker="KXWC-26-ARG", side="no", price_cents=45, count=count, available_size=100)
+    yes = ArbLeg(
+        market_ticker="KXWC-26-ARG", side="yes", price_cents=40, count=count, available_size=100
+    )
+    no = ArbLeg(
+        market_ticker="KXWC-26-ARG", side="no", price_cents=45, count=count, available_size=100
+    )
     return ArbOpportunity(
-        legs=(yes, no), count=count, gross_profit_cents=75, fees_cents=4,
-        net_profit_cents=71, edge_pct=2.0,
+        legs=(yes, no),
+        count=count,
+        gross_profit_cents=75,
+        fees_cents=4,
+        net_profit_cents=71,
+        edge_pct=2.0,
     )
 
 
 # Shape real de Kalshi CreateOrder (V2): fill_count + remaining_count (no 'status').
 # FILL completo = fill_count >= count y remaining_count == 0. _opp() usa count=5.
 def _filled_resp(count: int = 5, coid: str | None = None) -> dict:
-    return {"order": {"order_id": "OID", "fill_count": count, "remaining_count": 0,
-                      "client_order_id": coid or ""}}
+    return {
+        "order": {
+            "order_id": "OID",
+            "fill_count": count,
+            "remaining_count": 0,
+            "client_order_id": coid or "",
+        }
+    }
 
 
 def _killed_resp(count: int = 5) -> dict:
@@ -94,8 +109,8 @@ async def test_error_red_reconciles_not_filled():
     assert LegState.ERROR_RED in out.leg_states
     # La pata yes (FILL) sí queda expuesta → rollback de esa.
     assert out.rollback_triggered is True
-    client.get_orders.assert_awaited()      # fuente 1
-    client.get_positions.assert_awaited()   # fuente 2 (cruce independiente)
+    client.get_orders.assert_awaited()  # fuente 1
+    client.get_positions.assert_awaited()  # fuente 2 (cruce independiente)
 
 
 @pytest.mark.asyncio
@@ -103,11 +118,13 @@ async def test_error_red_sources_discrepancy_assumes_exposed():
     """ERROR_RED: get_orders dice NO-llena pero get_positions ve posición → exposición (rollback)."""
     client = AsyncMock()
     # Ambas patas ERROR_RED para forzar reconciliación de ambas.
-    client.place_order = AsyncMock(side_effect=[ConnectionError("x"), ConnectionError("y"),
-                                                _filled_resp(), _filled_resp()])  # rollbacks
+    client.place_order = AsyncMock(
+        side_effect=[ConnectionError("x"), ConnectionError("y"), _filled_resp(), _filled_resp()]
+    )  # rollbacks
     client.get_orders = AsyncMock(return_value={"orders": []})  # fuente 1: no llena
-    client.get_positions = AsyncMock(return_value={"market_positions": [
-        {"ticker": "KXWC-26-ARG", "position": 5}]})  # fuente 2: SÍ posición → discrepancia
+    client.get_positions = AsyncMock(
+        return_value={"market_positions": [{"ticker": "KXWC-26-ARG", "position": 5}]}
+    )  # fuente 2: SÍ posición → discrepancia
     ex = RestExecutor(client)
 
     out = await ex.execute(_opp())
@@ -140,10 +157,15 @@ async def test_rollback_not_filled_fires_kill_switch():
     """Rollback que no se llena tras reintentos → kill-switch (pausa + alerta)."""
     client = AsyncMock()
     # yes FILL, no KILL; rollback sell NUNCA llena (3 intentos canceled).
-    client.place_order = AsyncMock(side_effect=[
-        _filled_resp(), _killed_resp(),
-        _killed_resp(), _killed_resp(), _killed_resp(),  # 3 reintentos de rollback
-    ])
+    client.place_order = AsyncMock(
+        side_effect=[
+            _filled_resp(),
+            _killed_resp(),
+            _killed_resp(),
+            _killed_resp(),
+            _killed_resp(),  # 3 reintentos de rollback
+        ]
+    )
     ex = RestExecutor(client)
 
     out = await ex.execute(_opp())
@@ -162,11 +184,19 @@ async def test_circuit_breaker_after_3_rollbacks():
     # Forzar 3 rollbacks exitosos (sin kill-switch) para tripear el breaker.
     client = ex.client
     # Cada execute: FILL + KILL + rollback-fill (3 place_order).
-    client.place_order = AsyncMock(side_effect=[
-        _filled_resp(), _killed_resp(), _filled_resp(),  # exec 1
-        _filled_resp(), _killed_resp(), _filled_resp(),  # exec 2
-        _filled_resp(), _killed_resp(), _filled_resp(),  # exec 3
-    ])
+    client.place_order = AsyncMock(
+        side_effect=[
+            _filled_resp(),
+            _killed_resp(),
+            _filled_resp(),  # exec 1
+            _filled_resp(),
+            _killed_resp(),
+            _filled_resp(),  # exec 2
+            _filled_resp(),
+            _killed_resp(),
+            _filled_resp(),  # exec 3
+        ]
+    )
 
     for _ in range(3):
         await ex.execute(_opp())
@@ -225,8 +255,8 @@ async def test_fok_kill_409_read_as_kill_not_error_red():
     assert out.leg_states == [LegState.KILL, LegState.KILL]
     assert out.filled is False
     assert out.rollback_triggered is False
-    assert out.reconciled is False          # KILL determinístico: nada que reconciliar
-    client.get_orders.assert_not_called()   # no se consultó nada
+    assert out.reconciled is False  # KILL determinístico: nada que reconciliar
+    client.get_orders.assert_not_called()  # no se consultó nada
     client.get_positions.assert_not_called()
 
 
@@ -246,7 +276,7 @@ async def test_other_409_is_error_red_not_kill():
     out = await ex.execute(_opp())
 
     assert LegState.ERROR_RED in out.leg_states  # NO se trató como KILL
-    assert out.reconciled is True                # se reconcilió (es lo correcto para 'desconocido')
+    assert out.reconciled is True  # se reconcilió (es lo correcto para 'desconocido')
 
 
 @pytest.mark.asyncio
@@ -273,10 +303,10 @@ async def test_fill_plus_kill409_rolls_back_immediately_no_reconcile():
     out = await ex.execute(_opp())
 
     assert out.leg_states == [LegState.FILL, LegState.KILL]
-    assert out.rollback_triggered is True       # rollback de la pata 1 (FILL)
+    assert out.rollback_triggered is True  # rollback de la pata 1 (FILL)
     assert out.rollback_filled is True
-    assert out.reconciled is False              # ← clave: NO se reconcilió la pata 2
-    client.get_orders.assert_not_called()       # KILL-409 es determinístico, no se consulta
+    assert out.reconciled is False  # ← clave: NO se reconcilió la pata 2
+    client.get_orders.assert_not_called()  # KILL-409 es determinístico, no se consulta
     client.get_positions.assert_not_called()
     # El rollback fue un sell a 1¢ de la pata YES (la única llena).
     sell_call = client.place_order.await_args_list[2]

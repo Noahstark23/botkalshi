@@ -19,6 +19,7 @@ Trabaja sobre PROBABILIDADES implícitas (no cuotas) para separar parsing de mat
 Soporta 2-way (NBA/MLB moneyline) y 3-way (fútbol 1X2: Local/Empate/Visitante) — la
 cardinalidad la decide el caller (el matcher); acá solo se normaliza la lista recibida.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence

@@ -5,6 +5,7 @@ El primer ALTER de la historia del proyecto: la DB productiva tiene `edge_window
 sin count/fees_cents/edge_pct (la tabla nació antes). create_all NO altera tablas
 existentes → apply_migrations las agrega, idempotente, sin perder datos.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

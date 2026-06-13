@@ -7,6 +7,7 @@ True at some point, pauses the bot and fires a Telegram alert.
 Does NOT flip USE_ORDERBOOK_MANAGER_V2 (avoids race conditions).
 Only observes BotState.capture_running and BotState.last_capture_running_true_at.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -63,6 +64,7 @@ class CaptureWatchdog:
                 BotState.record_error(msg)
                 try:
                     from src.monitoring.telegram_alerts import alert_error
+
                     await alert_error(msg)
                 except Exception:
                     logger.exception("Watchdog Telegram alert failed")

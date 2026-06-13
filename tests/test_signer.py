@@ -1,4 +1,5 @@
 """Tests del signer RSA-PSS."""
+
 from __future__ import annotations
 
 import base64
@@ -47,9 +48,7 @@ def test_signature_is_cryptographically_valid(temp_key: Path):
     public_key = private_key.public_key()
 
     # Reconstruir y verificar
-    message = (
-        f"{headers['KALSHI-ACCESS-TIMESTAMP']}POST/trade-api/v2/portfolio/orders"
-    ).encode()
+    message = (f"{headers['KALSHI-ACCESS-TIMESTAMP']}POST/trade-api/v2/portfolio/orders").encode()
     signature = base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"])
 
     public_key.verify(

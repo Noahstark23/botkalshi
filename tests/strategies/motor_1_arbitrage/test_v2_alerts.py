@@ -5,9 +5,9 @@ Covers: warning/critical thresholds (5/min, 20/min sustained for 3 evaluations),
 throttle (5min warning, 2min critical), single burst suppression,
 old-entry pruning, and alert send failure isolation.
 """
+
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -65,6 +65,7 @@ def test_critical_fires_at_20_per_min_sustained():
     mgr = make_v2()
     # Suppress the warning alert that fires around gap 7 by pre-setting throttle
     import time
+
     mgr._last_warning_alert_at = time.monotonic()  # already "fired" recently
 
     result = None
@@ -78,7 +79,6 @@ def test_critical_fires_at_20_per_min_sustained():
 def test_critical_takes_priority_over_warning():
     """When both thresholds are met, critical fires (not warning)."""
     mgr = make_v2()
-    import time
     # Warning is not throttled, critical is not throttled
     # Fire 22 gaps to hit critical threshold
     result = None
@@ -95,6 +95,7 @@ def test_critical_takes_priority_over_warning():
 def test_warning_throttled_to_once_per_5min():
     """After warning fires, same rate for next 4min → no second alert."""
     import time
+
     mgr = make_v2()
 
     # Fire 7 gaps → warning fires
@@ -121,6 +122,7 @@ def test_warning_throttled_to_once_per_5min():
 def test_warning_fires_again_after_throttle_expires():
     """After 5min, warning can fire again."""
     import time
+
     mgr = make_v2()
 
     now = time.monotonic()
@@ -139,7 +141,6 @@ def test_warning_fires_again_after_throttle_expires():
 
 def test_old_entries_dropped_from_window():
     """Gaps older than 60s are excluded from the count and don't contribute to rate."""
-    import time
     mgr = make_v2()
 
     # Add 10 "old" gaps at timestamp t=1000
@@ -160,6 +161,7 @@ def test_old_entries_dropped_from_window():
 def test_consecutive_counter_resets_when_count_drops():
     """If rate drops below threshold, consecutive counters reset."""
     import time
+
     mgr = make_v2()
 
     # Build up 6 gaps in window
@@ -211,18 +213,21 @@ async def test_alert_failure_does_not_break_recovery():
     }
 
     # Make alert send fail
-    with patch(
-        "src.monitoring.telegram_alerts.alert_orderbook_anomaly",
-        new=AsyncMock(side_effect=Exception("send failed")),
+    with (
+        patch(
+            "src.monitoring.telegram_alerts.alert_orderbook_anomaly",
+            new=AsyncMock(side_effect=Exception("send failed")),
+        ),
+        patch("asyncio.create_task"),
     ):
-        with patch("asyncio.create_task") as mock_create_task:
-            # Trigger the gap — even with failing alert, SidGapError must raise
-            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
-            with pytest.raises(SidGapError):
-                await mgr.handle_message(snap_msg)
+        # Trigger the gap — even with failing alert, SidGapError must raise
+        from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
 
-            # Recovery was initiated (mark_stale called on books)
-            assert 1 in mgr._recovering
+        with pytest.raises(SidGapError):
+            await mgr.handle_message(snap_msg)
+
+        # Recovery was initiated (mark_stale called on books)
+        assert 1 in mgr._recovering
 
 
 # =====================================================
@@ -238,6 +243,7 @@ async def test_create_task_called_when_alert_fires():
 
     # Pre-load state so next gap fires warning (consecutive_warning=2, count=6)
     import time
+
     now = time.monotonic()
     mgr._gap_timestamps = [now - 1] * 6
     mgr._consecutive_warning = 2

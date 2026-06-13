@@ -4,6 +4,7 @@ Tests de src/math/no_vig.py — remoción de vig con cuotas reales (2-way y 3-wa
 Casos con cuotas de sportsbook reales para anclar la matemática contra números que
 un operador puede verificar a mano.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -89,6 +90,6 @@ def test_rejects_fewer_than_two_outcomes(fn):
 @pytest.mark.parametrize("fn", [remove_vig_multiplicative, remove_vig_additive])
 def test_rejects_out_of_range_probs(fn):
     with pytest.raises(ValueError):
-        fn([0.5, 1.5])   # >1 inválido
+        fn([0.5, 1.5])  # >1 inválido
     with pytest.raises(ValueError):
-        fn([0.5, 0.0])   # 0 inválido
+        fn([0.5, 0.0])  # 0 inválido

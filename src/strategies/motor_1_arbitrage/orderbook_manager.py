@@ -16,6 +16,7 @@ Contexto Kalshi:
     WS orderbook_delta:    price_dollars + delta_fp como strings.
     REST get_orderbook:    prices ya en centavos enteros (formato histórico, sin cambio).
 """
+
 from __future__ import annotations
 
 from contextlib import suppress
@@ -52,9 +53,7 @@ class OrderbookDesyncError(OrderbookError):
         self.sid = sid
         self.expected_seq = expected_seq
         self.received_seq = received_seq
-        super().__init__(
-            f"Sid {sid} desync: expected seq={expected_seq}, got {received_seq}"
-        )
+        super().__init__(f"Sid {sid} desync: expected seq={expected_seq}, got {received_seq}")
 
 
 class OrderbookManager:
@@ -147,9 +146,7 @@ class OrderbookManager:
         """Estado interno para debugging desde /status."""
         return {
             "tracked_tickers": len(self._books),
-            "initialized_tickers": sum(
-                1 for b in self._books.values() if b.is_initialized
-            ),
+            "initialized_tickers": sum(1 for b in self._books.values() if b.is_initialized),
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
         }
@@ -178,11 +175,13 @@ class OrderbookManager:
         if ticker not in self._books:
             self._books[ticker] = OrderbookState(ticker)
 
-        self._books[ticker].apply_snapshot({
-            "seq": seq,
-            "yes": yes_levels,
-            "no": no_levels,
-        })
+        self._books[ticker].apply_snapshot(
+            {
+                "seq": seq,
+                "yes": yes_levels,
+                "no": no_levels,
+            }
+        )
 
     async def _handle_delta(self, raw_msg: dict) -> None:
         """
@@ -216,12 +215,14 @@ class OrderbookManager:
             )
             return
 
-        state.apply_delta({
-            "side": side,
-            "price": price_cents,
-            "delta": delta_size,
-            "seq": seq,
-        })
+        state.apply_delta(
+            {
+                "side": side,
+                "price": price_cents,
+                "delta": delta_size,
+                "seq": seq,
+            }
+        )
 
     # =====================================================
     # Recovery
@@ -262,15 +263,15 @@ class OrderbookManager:
             if ticker not in self._books:
                 self._books[ticker] = OrderbookState(ticker)
 
-            self._books[ticker].apply_snapshot({
-                "seq": 0,
-                "yes": yes_levels,
-                "no": no_levels,
-            })
-        except Exception as e:
-            BotState.record_error(
-                f"Snapshot REST failed for {ticker}: {type(e).__name__}: {e}"
+            self._books[ticker].apply_snapshot(
+                {
+                    "seq": 0,
+                    "yes": yes_levels,
+                    "no": no_levels,
+                }
             )
+        except Exception as e:
+            BotState.record_error(f"Snapshot REST failed for {ticker}: {type(e).__name__}: {e}")
             raise
 
 
@@ -297,9 +298,7 @@ def _parse_fp_levels(
         price_cents = parse_price_to_cents(lvl[0])
         size = parse_size(lvl[1])
         if price_cents is None or size is None:
-            logger.warning(
-                f"OrderbookManager: unparseable level for {ticker}/{side}: {lvl!r}"
-            )
+            logger.warning(f"OrderbookManager: unparseable level for {ticker}/{side}: {lvl!r}")
             continue
         result.append([price_cents, size])
     return result

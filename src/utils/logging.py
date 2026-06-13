@@ -4,6 +4,7 @@ Configuración de logging.
 En Coolify, los logs se ven mejor en formato simple con timestamp.
 Loguru maneja rotación, retención, y output simultáneo a stdout + archivo.
 """
+
 import sys
 from pathlib import Path
 
@@ -25,10 +26,7 @@ def setup_logging() -> None:
         sys.stderr,
         level=settings.LOG_LEVEL,
         format=(
-            "{time:YYYY-MM-DD HH:mm:ss.SSS} | "
-            "{level: <8} | "
-            "{name}:{function}:{line} | "
-            "{message}"
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
         ),
         backtrace=True,
         diagnose=False,  # no exponer valores en errores (puede leak datos)

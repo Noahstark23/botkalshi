@@ -3,6 +3,7 @@
 Regression tests para el bug del 14 mayo 2026: extra_headers → additional_headers.
 Si alguno de estos tests falla, pyproject.toml tiene un pin incorrecto de websockets.
 """
+
 import inspect
 
 import pytest
@@ -40,6 +41,5 @@ def test_websockets_version_is_at_least_13():
     major, minor, *_ = websockets.__version__.split(".")
     version_tuple = (int(major), int(minor))
     assert version_tuple >= (13, 0), (
-        f"websockets {websockets.__version__} < 13.0. "
-        "Update pyproject.toml pin to >=13.0,<17.0"
+        f"websockets {websockets.__version__} < 13.0. Update pyproject.toml pin to >=13.0,<17.0"
     )

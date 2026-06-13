@@ -1,4 +1,4 @@
-﻿"""
+"""
 Health server FastAPI.
 
 Endpoints:

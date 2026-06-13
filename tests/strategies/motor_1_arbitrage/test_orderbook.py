@@ -10,6 +10,7 @@ Nota: previous_seq eliminado de apply_delta en refactor Día 2. El state
 garantiza monotonicidad local; gap detection es responsabilidad de
 OrderbookManager (ver test_orderbook_manager.py).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -21,7 +22,6 @@ from src.strategies.motor_1_arbitrage.orderbook import (
     OrderbookNotInitializedError,
     OrderbookState,
 )
-
 
 # =====================================================
 # Fixtures helpers

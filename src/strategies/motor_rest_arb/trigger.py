@@ -18,6 +18,7 @@ como strings ("8.73"). _parse_size_float castea a float con fallo seguro a 0.0
 (llave ausente / None / casteo inválido → 0.0 → no alcanza min_depth → no dispara,
 sin interrumpir el feed).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,9 +40,9 @@ class TriggerSignal:
 
     market_ticker: str
     opportunity: ArbOpportunity
-    net_edge_cents: int      # net_profit_cents de la opp
+    net_edge_cents: int  # net_profit_cents de la opp
     gross_spread_cents: int  # gross_profit_cents (pre-comisión)
-    limiting_depth: int      # contratos enteros disponibles en la pata limitante
+    limiting_depth: int  # contratos enteros disponibles en la pata limitante
 
 
 def _parse_size_float(data: dict[str, Any], keys: tuple[str, ...]) -> float:
