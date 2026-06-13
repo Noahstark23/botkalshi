@@ -9,6 +9,7 @@ FakeOddsSource va marcado `is_live=False` (el poller NO las persiste).
 El día que se paga The Odds API, este fixture se descarta: el poller se construye con
 `LiveOddsSource(["soccer_fifa_world_cup"])` y mide cuotas reales.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

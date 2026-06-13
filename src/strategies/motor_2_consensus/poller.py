@@ -11,6 +11,7 @@ Por ciclo:
 SHADOW estricto: emite/loguea/graba señales, JAMÁS coloca órdenes. Independiente de
 TRADING_ENABLED. Best-effort: un ciclo que falla se loguea y el loop sigue.
 """
+
 from __future__ import annotations
 
 import asyncio

@@ -5,6 +5,7 @@ Verifica: el extractor de Kalshi parsea nombre real (yes_sub_title) + ambos asks
 descarta eventos incompletos; FakeOddsSource es no-live y devuelve el fixture;
 LiveOddsSource concatena sport_keys y tolera un deporte que falla.
 """
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -123,9 +124,7 @@ async def test_live_odds_source_concatenates_and_tolerates_failure():
         async def __aexit__(self, *a):
             return False
 
-        get_odds = AsyncMock(
-            side_effect=[fixture, RuntimeError("rate limit")]
-        )
+        get_odds = AsyncMock(side_effect=[fixture, RuntimeError("rate limit")])
 
     live = LiveOddsSource(["soccer_a", "soccer_b"], client_factory=_FakeOddsClient)
     assert live.is_live is True

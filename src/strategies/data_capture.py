@@ -1,4 +1,4 @@
-﻿"""
+"""
 Servicio de captura de datos.
 
 Responsabilidad unica: alimentar la DB con precios reales de Kalshi.
@@ -37,24 +37,24 @@ TARGET_SERIES_PREFIXES = [
     # conocido-bueno (#30, 301 markets) hasta implementar el prefiltro server-side
     # (GET /series) — P2 v2, pendiente de verificar el endpoint.
     # Deportes
-    "KXMLB",   # MLB
-    "KXNBA",   # NBA
-    "KXNHL",   # NHL
-    "KXNFL",   # NFL (en temporada)
-    "KXEPL",   # Premier League
-    "KXUCL",   # Champions League
-    "KXUEL",   # Europa League
+    "KXMLB",  # MLB
+    "KXNBA",  # NBA
+    "KXNHL",  # NHL
+    "KXNFL",  # NFL (en temporada)
+    "KXEPL",  # Premier League
+    "KXUCL",  # Champions League
+    "KXUEL",  # Europa League
     # Mundial 2026 — series confirmadas contra la API pública (2026-06-11/13)
     "KXMENWORLDCUP",  # ganador del torneo (selecciones masculinas)
     "KXMWORLDCUP",
-    "KXWCGAME",       # PARTIDOS 1X2 (Gana/Empata/Gana) — verificado 2026-06-13:
-                      # 69 eventos, exactamente 3 markets por evento (ej. -JOR/-ARG/-TIE).
-                      # EL target de alta frecuencia del multi-outcome shadow.
+    "KXWCGAME",  # PARTIDOS 1X2 (Gana/Empata/Gana) — verificado 2026-06-13:
+    # 69 eventos, exactamente 3 markets por evento (ej. -JOR/-ARG/-TIE).
+    # EL target de alta frecuencia del multi-outcome shadow.
     "KXFIFAADVANCE",  # clasificación a siguiente ronda
-    "KXFIFATOTAL",    # totales de goles
-    "KXFIFASPREAD",   # hándicaps
-    "KXWCGROUPWIN",   # ganador de grupo
-    "KXWCSTAGE",      # alcance de ronda por equipo
+    "KXFIFATOTAL",  # totales de goles
+    "KXFIFASPREAD",  # hándicaps
+    "KXWCGROUPWIN",  # ganador de grupo
+    "KXWCSTAGE",  # alcance de ronda por equipo
     "KXWCTEAMGOALS",  # goles por equipo
     "KXWCGOALIEPEN",  # props (arqueros/penales)
     # Política y eventos (donde menos competencia algorítmica)
@@ -312,7 +312,9 @@ class DataCaptureService:
                                     self._tracked_tickers.add(ticker)
                                     per_series[prefix] = per_series.get(prefix, 0) + 1
                         except Exception as e:
-                            logger.warning(f"get_event({event_ticker}) error: {type(e).__name__}: {e}")
+                            logger.warning(
+                                f"get_event({event_ticker}) error: {type(e).__name__}: {e}"
+                            )
                 except Exception as e:
                     errors_by_prefix[prefix] = type(e).__name__
                     logger.warning(f"Discovery error en {prefix}: {type(e).__name__}: {e}")
@@ -412,16 +414,20 @@ class DataCaptureService:
                             # Fallback a campos enteros legacy para compatibilidad.
                             yes_bid=parse_price_to_cents(
                                 market.get("yes_bid_dollars") or market.get("yes_bid")
-                            ) or 0,
+                            )
+                            or 0,
                             yes_ask=parse_price_to_cents(
                                 market.get("yes_ask_dollars") or market.get("yes_ask")
-                            ) or 0,
+                            )
+                            or 0,
                             no_bid=parse_price_to_cents(
                                 market.get("no_bid_dollars") or market.get("no_bid")
-                            ) or 0,
+                            )
+                            or 0,
                             no_ask=parse_price_to_cents(
                                 market.get("no_ask_dollars") or market.get("no_ask")
-                            ) or 0,
+                            )
+                            or 0,
                             last_price=market.get("last_price"),
                             volume=market.get("volume", 0) or 0,
                             open_interest=market.get("open_interest", 0) or 0,
@@ -551,6 +557,7 @@ class DataCaptureService:
         # When MOTOR_1_ARBITRAGE_ENABLED=True, runner.py owns the manager lifecycle.
         if self.settings.USE_ORDERBOOK_MANAGER_V2 and not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
+
             self._v2_manager = OrderbookManagerV2(self.ws)
             BotState.v2_manager = self._v2_manager
             self.ws.on("orderbook_delta", self._v2_manager.handle_message)
@@ -572,6 +579,7 @@ class DataCaptureService:
             # (no construir). Cubre el restart de Coolify tras un kill-switch a las 3am.
             from src.storage.models import kill_switch_engaged
             from src.strategies.motor_rest_arb.engine import RestArbEngine
+
             try:
                 ks_engaged, ks_reason = kill_switch_engaged()
             except Exception:
@@ -583,6 +591,7 @@ class DataCaptureService:
             if self.settings.TRADING_ENABLED and self._rest_client is not None and not ks_engaged:
                 from src.risk.manager import RiskManager
                 from src.strategies.motor_rest_arb.executor import RestExecutor
+
                 executor = RestExecutor(self._rest_client)
                 risk_manager = RiskManager()
             elif self.settings.TRADING_ENABLED and ks_engaged:
@@ -603,8 +612,7 @@ class DataCaptureService:
             self.ws.on("ticker", self._rest_engine.on_ticker)
             mode = "LIVE: ejecuta" if executor is not None else "SHADOW: detecta y graba EdgeWindow"
             logger.info(
-                f"Motor REST registered ({mode}, "
-                f"trading_enabled={self.settings.TRADING_ENABLED})"
+                f"Motor REST registered ({mode}, trading_enabled={self.settings.TRADING_ENABLED})"
             )
 
     async def run(self) -> None:
@@ -669,9 +677,7 @@ class DataCaptureService:
                 if not t.cancelled():
                     exc = t.exception()
                     if exc and not isinstance(exc, asyncio.CancelledError):
-                        logger.error(
-                            f"Subloop {t.get_name()} crashed: {type(exc).__name__}: {exc}"
-                        )
+                        logger.error(f"Subloop {t.get_name()} crashed: {type(exc).__name__}: {exc}")
         finally:
             BotState.capture_running = False
             BotState.ws_connected = False

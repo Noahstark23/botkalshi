@@ -15,6 +15,7 @@ Invariante de seguridad: NINGUNA de estas fuentes ejecuta capital. La fuente fak
 marca `is_live=False` para que el poller NO persista señales basura (las odds fake dan
 edges sin sentido); solo loguea. Con la fuente real (`is_live=True`) el poller graba.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -42,8 +43,7 @@ class OddsSource(Protocol):
 
     is_live: bool
 
-    async def fetch(self) -> list[OddsEvent]:
-        ...
+    async def fetch(self) -> list[OddsEvent]: ...
 
 
 class FakeOddsSource:
@@ -105,8 +105,7 @@ class LiveOddsSource:
 
 @runtime_checkable
 class KalshiQuoteSource(Protocol):
-    async def fetch(self) -> list[KalshiEventQuotes]:
-        ...
+    async def fetch(self) -> list[KalshiEventQuotes]: ...
 
 
 def _parse_event_quotes(event_key: str, markets: list[dict]) -> KalshiEventQuotes | None:
@@ -170,7 +169,9 @@ class RestKalshiQuoteSource:
                 try:
                     detail = await client.get_event(event_key)
                 except Exception as e:
-                    logger.warning(f"motor2.kalshi get_event({event_key}) error: {type(e).__name__}: {e}")
+                    logger.warning(
+                        f"motor2.kalshi get_event({event_key}) error: {type(e).__name__}: {e}"
+                    )
                     continue
                 eq = _parse_event_quotes(event_key, detail.get("markets", []))
                 if eq is not None:

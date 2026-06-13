@@ -14,6 +14,7 @@ Maneja:
 
 Punto de entrada del container Docker.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -103,7 +104,9 @@ class ProductionRunner:
             loop="asyncio",
         )
         self._uvicorn_server = uvicorn.Server(config)
-        logger.info(f"Health server: http://{self.settings.HEALTH_HOST}:{self.settings.HEALTH_PORT}")
+        logger.info(
+            f"Health server: http://{self.settings.HEALTH_HOST}:{self.settings.HEALTH_PORT}"
+        )
         await self._uvicorn_server.serve()
 
     async def _run_data_capture(self) -> None:

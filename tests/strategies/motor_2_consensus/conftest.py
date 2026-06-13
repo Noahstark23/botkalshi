@@ -5,6 +5,7 @@ El poller shadow persiste EdgeWindow(kind="consensus") cuando la fuente de odds 
 (is_live). Esta fixture autouse monta un SQLite temporal como engine global de models,
 aislado por test, para que el path de persistencia no falle ni toque la DB real.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

@@ -5,6 +5,7 @@ Verifica: un ciclo cruza Kalshi↔odds y emite señales; con fuente FAKE NO pers
 (edges no reales); con fuente LIVE persiste EdgeWindow(kind="consensus"); el path JAMÁS
 ejecuta capital; el loop respeta stop_event.
 """
+
 from __future__ import annotations
 
 import asyncio
