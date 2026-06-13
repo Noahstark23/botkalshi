@@ -26,6 +26,22 @@ def make_v2() -> OrderbookManagerV2:
 # =====================================================
 
 
+def test_warning_fires_on_fresh_boot_low_monotonic():
+    """
+    REGRESIÓN: en un proceso recién arrancado (time.monotonic() pequeño, < 300), la
+    primera alerta de warning NO debe quedar bloqueada por el throttle. Con el bug viejo
+    (_last_warning_alert_at=0.0) → now-0 < 300 → devolvía None. Init a -inf lo arregla.
+    """
+    with patch("src.strategies.motor_1_arbitrage.orderbook_manager_v2.time") as mock_t:
+        mock_t.monotonic.return_value = 5.0  # 5s de uptime (container/CI fresco)
+        mgr = make_v2()
+        result = None
+        for _ in range(7):  # 7 gaps en el mismo instante → count=7 ≥ 5, 3 consecutivos
+            result = mgr._record_gap_and_should_alert()
+    assert result is not None, "la 1ra alerta no debe throttlearse por uptime bajo"
+    assert result[0] == "sid_gap_warning"
+
+
 def test_single_burst_does_not_fire():
     """3 gaps in < 60s (count=3 < warning threshold 5) → no alert."""
     mgr = make_v2()
