@@ -64,6 +64,23 @@ def test_parse_event_quotes_extracts_real_names_and_both_asks():
     assert arg.yes_ask_cents == 55 and arg.no_ask_cents == 46
 
 
+def test_parse_event_quotes_skips_resolved_closed_markets():
+    """GUARDARRAÍL: un market resuelto/cerrado (status != open/active) se saltea — sus
+    precios colapsan a 0/100 y generan edges fantasma contra una odds API pre-partido."""
+    markets = [
+        _market(f"{EV}-ARG", "Argentina", "0.55", "0.46"),  # open → entra
+        {
+            **_market(f"{EV}-JOR", "Jordan", "0.01", "0.99"),
+            "status": "finalized",
+        },  # resuelto → FUERA
+        _market(f"{EV}-TIE", "Draw", "0.30", "0.71"),  # open → entra
+    ]
+    eq = _parse_event_quotes(EV, markets)
+    assert eq is not None
+    names = {q.outcome_name for q in eq.outcomes}
+    assert names == {"Argentina", "Draw"}  # Jordan (finalized) descartado
+
+
 def test_parse_event_quotes_skips_markets_missing_data():
     markets = [
         _market(f"{EV}-ARG", "Argentina", "0.55", "0.46"),

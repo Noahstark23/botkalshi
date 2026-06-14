@@ -120,10 +120,17 @@ def _parse_event_quotes(event_key: str, markets: list[dict]) -> KalshiEventQuote
     El nombre sale de `yes_sub_title` ("Argentina", "Draw", ...) — lo que el matcher
     cruza contra The Odds API. Un market sin nombre o sin ambos asks se descarta
     (fail-safe). Solo devuelve el evento si quedan ≥2 outcomes usables.
+
+    GUARDARRAÍL: un market que NO está abierto (resuelto/cerrado/settled tras terminar el
+    partido) se SALTEA — sus precios colapsan a 0/100 y compararlos contra una odds API
+    pre-partido genera edges fantasma. Solo se confía en status open/active.
     """
     quotes: list[KalshiQuote] = []
     for m in markets:
         ticker = m.get("ticker")
+        status = str(m.get("status", "")).lower()
+        if status and status not in ("open", "active"):
+            continue  # mercado resuelto/cerrado → quotes no confiables
         name = m.get("yes_sub_title") or m.get("yes_subtitle") or ""
         yes_ask = parse_price_to_cents(m.get("yes_ask_dollars") or m.get("yes_ask"))
         no_ask = parse_price_to_cents(m.get("no_ask_dollars") or m.get("no_ask"))

@@ -12,7 +12,7 @@ El día que se paga The Odds API, este fixture se descarta: el poller se constru
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 
@@ -25,7 +25,9 @@ def _h2h_event(
     return OddsEvent(
         id=event_id,
         sport_key="soccer_fifa_world_cup",
-        commence_time=datetime(2026, 6, 27, 18, 0, tzinfo=UTC),
+        # Siempre PRE-MATCH (futuro vs now): el guardarraíl pre-match del detector skipea
+        # partidos ya iniciados; con fecha fija el fixture quedaría stale tras pasar.
+        commence_time=datetime.now(UTC) + timedelta(days=1),
         home_team=home,
         away_team=away,
         bookmakers=(
