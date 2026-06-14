@@ -11,7 +11,7 @@ Fixtures puras en memoria (payloads de Odds API + quotes de Kalshi, que reemplaz
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 from src.strategies.motor_2_consensus.detector import (
@@ -32,7 +32,10 @@ def _odds_event(
     return OddsEvent(
         id="e1",
         sport_key="basketball_nba",
-        commence_time=datetime(2026, 6, 12, 18, tzinfo=UTC),
+        # PRE-MATCH: futuro relativo a now → el guardarraíl pre-match no lo saltea
+        # (fijo a una fecha pasada haría flakear según el reloj — la misma clase de bug
+        # de uptime que ya arreglamos).
+        commence_time=datetime.now(UTC) + timedelta(hours=2),
         home_team=home,
         away_team=away,
         bookmakers=(bk,),
@@ -54,10 +57,12 @@ def test_case_a_gross_edge_eaten_by_commission_no_signal():
     assert find_signals([ke], [odds], capital_usd=CAPITAL) == []
 
 
-def test_case_b_massive_edge_emits_signal_capped_at_5pct():
-    """Caso B: edge masivo → señal YES; ¼ Kelly pediría >5% pero el cap lo fija en $15."""
-    # Lakers 1.20 / Celtics 6.0 → fair Lakers ≈ 0.833; ask 50c → edge enorme.
-    odds = _odds_event({"Los Angeles Lakers": 1.20, "Boston Celtics": 6.0})
+def test_case_b_large_edge_emits_signal_capped_at_5pct():
+    """Caso B: edge grande pero PLAUSIBLE (~11pp) → señal YES; ¼ Kelly pediría >5% pero el
+    cap lo fija en $15. (Un edge 'masivo' >15pp ahora es artefacto y se descarta — ver
+    test_implausible_edge_discarded.)"""
+    # Lakers 1.55 / Celtics 2.5 → fair Lakers ≈ 0.617; ask 50c → edge ≈ 11pp (plausible).
+    odds = _odds_event({"Los Angeles Lakers": 1.55, "Boston Celtics": 2.5})
     ke = _kalshi_event(
         KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=50, no_ask_cents=90),
         KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=90, no_ask_cents=90),
@@ -65,10 +70,40 @@ def test_case_b_massive_edge_emits_signal_capped_at_5pct():
     signals = find_signals([ke], [odds], capital_usd=CAPITAL)
     yes = next(s for s in signals if s.kalshi_side == "YES" and s.market_ticker == "KXNBA-LAL")
     assert yes.edge_pct > 0.03
-    assert 0.80 < yes.odds_api_fair_prob < 0.85
-    # ¼ Kelly daría ~16.7% ($50); el cap duro del 5% lo limita estrictamente a $15.
+    assert 0.58 < yes.odds_api_fair_prob < 0.66
+    # ¼ Kelly daría ~5.85% ($17.5); el cap duro del 5% lo limita estrictamente a $15.
     assert yes.recommended_size_usd <= CAP_USD
     assert yes.recommended_size_usd == 15.0
+
+
+def test_implausible_edge_discarded():
+    """GUARDARRAÍL: un edge monstruoso (>15pp, ej. mercado resuelto/in-play) se DESCARTA."""
+    # Lakers 1.05 (fair ≈ 0.93) / Celtics 12.0 ask 40c → edge ≈ 52pp → artefacto → sin señal.
+    odds = _odds_event({"Los Angeles Lakers": 1.05, "Boston Celtics": 12.0})
+    ke = _kalshi_event(
+        KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=40, no_ask_cents=95),
+        KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=95, no_ask_cents=95),
+    )
+    signals = find_signals([ke], [odds], capital_usd=CAPITAL)
+    assert all(s.market_ticker != "KXNBA-LAL" or s.kalshi_side != "YES" for s in signals)
+
+
+def test_started_match_skipped_pre_match_guard():
+    """GUARDARRAÍL: un partido ya iniciado (commence_time ≤ now) NO se evalúa (spread fantasma)."""
+    odds = _odds_event({"Los Angeles Lakers": 1.55, "Boston Celtics": 2.5})
+    started = odds.__class__(  # mismo evento pero ya arrancó hace 1h
+        id=odds.id,
+        sport_key=odds.sport_key,
+        commence_time=datetime.now(UTC) - timedelta(hours=1),
+        home_team=odds.home_team,
+        away_team=odds.away_team,
+        bookmakers=odds.bookmakers,
+    )
+    ke = _kalshi_event(
+        KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=50, no_ask_cents=90),
+        KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=90, no_ask_cents=90),
+    )
+    assert find_signals([ke], [started], capital_usd=CAPITAL) == []
 
 
 def test_case_c_matcher_mismatch_no_signal_no_crash():

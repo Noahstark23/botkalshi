@@ -24,6 +24,7 @@ NO cablea ejecución: emite señales, no coloca órdenes. TRADING_ENABLED=false.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from loguru import logger
 from pydantic import BaseModel
@@ -37,6 +38,11 @@ from src.strategies.motor_2_consensus.matcher import canonical_name, match_outco
 MIN_EDGE_PCT = 0.03  # 3pp neto post-comisión
 SIZING_MAX_PCT = 5.0  # cap duro de exposición por trade (% del capital activo)
 DEFAULT_CAPITAL_USD = 300.0  # capital activo actual (mock/config local)
+# Edge máximo PLAUSIBLE (fracción): una ventaja de consenso real sobre un binario líquido
+# rara vez supera ~10-15pp. Un "edge" mayor es casi seguro un ARTEFACTO de datos (mercado
+# resuelto/in-play, quotes stale, set de odds degenerado) → se descarta y loguea, NO se
+# graba ni se apuesta. Backstop contra spreads fantasma (ej. GER vs CUW, ~50pp in-play).
+MAX_PLAUSIBLE_EDGE = 0.15
 
 
 # =====================================================
@@ -151,14 +157,25 @@ def find_signals(
     *,
     capital_usd: float = DEFAULT_CAPITAL_USD,
     min_edge: float = MIN_EDGE_PCT,
+    now: datetime | None = None,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
+
+    GUARDARRAÍL PRE-MATCH: solo evalúa partidos que AÚN NO arrancaron (commence_time > now).
+    Una vez que rueda la pelota, los precios de Kalshi reaccionan al juego en vivo mientras
+    la odds API puede seguir reportando líneas pre-partido/in-play degeneradas → spread
+    FANTASMA (ej. GER vs CUW resuelto: edges de ~50pp imposibles). El edge de consenso solo
+    es válido antes del kickoff.
     """
+    now = now or datetime.now(UTC)
     signals: list[ConsensusSignal] = []
     for ke in kalshi_events:
         k_names = [q.outcome_name for q in ke.outcomes]
         for oe in odds_events:
+            # PRE-MATCH ONLY: partido ya iniciado → comparación inválida, se saltea.
+            if oe.commence_time <= now:
+                continue
             odds_names = _h2h_outcome_names(oe)
             if not odds_names:
                 continue
@@ -178,6 +195,29 @@ def find_signals(
     return signals
 
 
+def _emit_if_plausible(
+    out: list[ConsensusSignal],
+    q: KalshiQuote,
+    side: str,
+    fair_prob: float,
+    ask_cents: int,
+    edge: float,
+    capital_usd: float,
+    min_edge: float,
+) -> None:
+    """Emite la señal si min_edge < edge ≤ MAX_PLAUSIBLE_EDGE; un edge monstruoso se descarta."""
+    if edge <= min_edge:
+        return
+    if edge > MAX_PLAUSIBLE_EDGE:
+        # Backstop: edge implausible = artefacto (mercado resuelto/stale) → NO graba ni apuesta.
+        logger.warning(
+            f"motor2.signal.discarded_suspicious ticker={q.market_ticker} side={side} "
+            f"edge={edge:.3f} (> {MAX_PLAUSIBLE_EDGE} → artefacto probable: mercado stale/in-play)"
+        )
+        return
+    out.append(_build(q, side, fair_prob, ask_cents, edge, capital_usd))
+
+
 def _signals_for_outcome(
     q: KalshiQuote, fair_prob: float, capital_usd: float, min_edge: float
 ) -> list[ConsensusSignal]:
@@ -185,12 +225,12 @@ def _signals_for_outcome(
     out: list[ConsensusSignal] = []
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
     yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
-    if yes_edge > min_edge:
-        out.append(_build(q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd))
+    _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     # NO: comprar a no_ask con la prob complementaria.
     no_edge = _net_edge_pct(1.0 - fair_prob, q.no_ask_cents)
-    if no_edge > min_edge:
-        out.append(_build(q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd))
+    _emit_if_plausible(
+        out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
+    )
     return out
 
 

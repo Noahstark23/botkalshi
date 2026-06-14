@@ -39,11 +39,11 @@ class _StubOdds:
 
 
 def _kalshi_event() -> KalshiEventQuotes:
-    # Argentina barata en Kalshi (40c YES) → con fair alto, edge YES grande.
+    # Argentina a 64c en Kalshi vs fair ~0.726 → edge YES ~8pp (PLAUSIBLE, no artefacto).
     return KalshiEventQuotes(
         event_key=EV,
         outcomes=(
-            KalshiQuote(f"{EV}-ARG", "Argentina", yes_ask_cents=40, no_ask_cents=62),
+            KalshiQuote(f"{EV}-ARG", "Argentina", yes_ask_cents=64, no_ask_cents=38),
             KalshiQuote(f"{EV}-JOR", "Jordan", yes_ask_cents=8, no_ask_cents=93),
             KalshiQuote(f"{EV}-TIE", "Draw", yes_ask_cents=30, no_ask_cents=71),
         ),
@@ -51,8 +51,8 @@ def _kalshi_event() -> KalshiEventQuotes:
 
 
 def _odds_event() -> OddsEvent:
-    # Consenso: Argentina favorita fuerte → fair_prob ~0.7 ≫ ask 40c.
-    from datetime import UTC, datetime
+    # Consenso: Argentina favorita fuerte → fair_prob ~0.726. PRE-MATCH (futuro vs now).
+    from datetime import UTC, datetime, timedelta
 
     outcomes = (
         Outcome("Argentina", 1.30),
@@ -62,7 +62,7 @@ def _odds_event() -> OddsEvent:
     return OddsEvent(
         id="x",
         sport_key="soccer_fifa_world_cup",
-        commence_time=datetime(2026, 6, 27, tzinfo=UTC),
+        commence_time=datetime.now(UTC) + timedelta(hours=2),
         home_team="Argentina",
         away_team="Jordan",
         bookmakers=(Bookmaker("book", "Book", (Market("h2h", outcomes),)),),
