@@ -103,7 +103,14 @@ class Settings(BaseSettings):
     ODDS_API_KEY: str = ""
     # Deportes a consultar en The Odds API (sport_keys separados por coma). El Mundial es
     # "soccer_fifa_world_cup"; confirmá el key exacto con get_sports() la 1ra vez.
+    # Para sumar béisbol (corre todo el año): agregar "baseball_mlb".
     ODDS_API_SPORT_KEYS: str = "soccer_fifa_world_cup"
+    # Series de Kalshi que Motor 2 cruza contra el consenso (primer segmento del ticker,
+    # separadas por coma). Default = los 1X2/winner del Mundial (= MULTI_SERIES del Motor
+    # REST), para que el comportamiento NO cambie. Para encender MLB: agregar la serie
+    # exacta de los moneyline de béisbol (verificá el prefijo real en prod, ej. "KXMLBGAME")
+    # — y en paralelo sumar "baseball_mlb" a ODDS_API_SPORT_KEYS.
+    MOTOR_2_KALSHI_SERIES: str = "KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP"
     # Regiones de casas. "eu" incluye Pinnacle (la más afilada) → fair-value más preciso;
     # se suma "us" por cobertura. 1 crédito por región por call (h2h).
     ODDS_API_REGIONS: str = "eu,us"

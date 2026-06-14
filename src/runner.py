@@ -205,7 +205,16 @@ class ProductionRunner:
                 RestKalshiQuoteSource,
             )
 
-            kalshi_source = RestKalshiQuoteSource(self._capture.multi_event_universe)
+            # Universo Kalshi de Motor 2: config-driven (series separadas por coma). Default
+            # = Mundial 1X2 (comportamiento actual). Sumar la serie de MLB lo enciende para
+            # béisbol sin tocar código. Capturamos el set una vez; el provider lo relee del
+            # tracker en cada ciclo (se actualiza con el re-discovery).
+            motor2_series = {
+                s.strip() for s in self.settings.MOTOR_2_KALSHI_SERIES.split(",") if s.strip()
+            }
+            capture = self._capture
+            kalshi_source = RestKalshiQuoteSource(lambda: capture.event_universe(motor2_series))
+            logger.info(f"motor2 kalshi_series={sorted(motor2_series)}")
             # FLIP POR CONFIG: con la API paga (ODDS_API_KEY) usa odds REALES; si no, el
             # fixture fake (shadow, jamás apuesta). Sin editar código para encender.
             if self.settings.ODDS_API_KEY:

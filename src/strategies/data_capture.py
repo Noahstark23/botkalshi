@@ -147,21 +147,28 @@ class DataCaptureService:
         self._rest_client = rest_client
         self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
 
-    def multi_event_universe(self) -> dict[str, set[str]]:
+    def event_universe(self, series: set[str]) -> dict[str, set[str]]:
         """
-        Seam read-only para el Motor 2: {event_key → tickers hermanos} de los partidos
-        multi-outcome (1X2/winner) ya descubiertos. Agrupa por event_key con el mismo
-        filtro de series exactas del Motor REST (KXWCGAME, etc.), independiente de que el
-        engine shadow exista. No toca red ni estado.
-        """
-        from src.strategies.motor_rest_arb.engine import RestArbEngine
+        Seam read-only GENÉRICO: {event_key → tickers hermanos} de los tickers trackeados
+        cuya SERIE (primer segmento del ticker, igualdad exacta) está en `series`. Agrupa
+        por event_key (ticker sin el sufijo de outcome). No toca red ni estado.
 
+        Sport-agnóstico: Motor 2 lo usa para los 1X2 del Mundial y/o los moneyline de MLB,
+        según MOTOR_2_KALSHI_SERIES. La igualdad EXACTA de serie evita que KXWCGAMEGOALS
+        (totales) caiga en KXWCGAME.
+        """
         universe: dict[str, set[str]] = {}
         for t in self._tracked_tickers:
-            if t.split("-", 1)[0] not in RestArbEngine.MULTI_SERIES:
+            if t.split("-", 1)[0] not in series:
                 continue
             universe.setdefault(t.rsplit("-", 1)[0], set()).add(t)
         return universe
+
+    def multi_event_universe(self) -> dict[str, set[str]]:
+        """Back-compat: el universo 1X2/winner del Mundial (MULTI_SERIES del Motor REST)."""
+        from src.strategies.motor_rest_arb.engine import RestArbEngine
+
+        return self.event_universe(set(RestArbEngine.MULTI_SERIES))
 
     # =====================================================
     # WS event handlers
