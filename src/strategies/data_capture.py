@@ -37,7 +37,13 @@ TARGET_SERIES_PREFIXES = [
     # conocido-bueno (#30, 301 markets) hasta implementar el prefiltro server-side
     # (GET /series) — P2 v2, pendiente de verificar el endpoint.
     # Deportes
-    "KXMLB",  # MLB
+    # NOTA 2026-06-15 (histograma de discovery, PR #58): el prefijo CRUDO de cada liga
+    # (KXMLB/KXNBA/KXNHL) devuelve el FUTURO DE CAMPEÓN, no los partidos: 1 evento con
+    # 1 market por equipo (KXMLB=1ev×30mkt = 30 equipos MLB, KXNHL=1ev×32mkt = 32 NHL).
+    # Los PARTIDOS diarios viven bajo el sufijo GAME (patrón confirmado por KXWCGAME).
+    # KXMLBGAME debe aparecer como Nev×~2.0mkt (2 markets por-equipo) → Motor 2 lo maneja ✓.
+    "KXMLB",  # MLB — futuro de campeón (30-way multi-outcome)
+    "KXMLBGAME",  # MLB — PARTIDOS (candidato a verificar en el próximo histograma)
     "KXNBA",  # NBA
     "KXNHL",  # NHL
     "KXNFL",  # NFL (en temporada)
