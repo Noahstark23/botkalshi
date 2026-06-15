@@ -127,6 +127,49 @@ def test_diag_funnel_counts_started_skips():
     assert diag["best_net_edge"] == -1.0  # ningún outcome pre-match evaluado
 
 
+def test_diag_reject_names_when_team_name_differs():
+    """FIXABLE: mismo partido pero un nombre no canoniza igual → reject_names (no 'eficiente')."""
+    # Odds dice "LA Lakers" (sin alias) vs Kalshi "Los Angeles Lakers" → set difiere, overlap≥1.
+    odds = _odds_event({"LA Lakers": 1.55, "Boston Celtics": 2.5})
+    ke = _kalshi_event(
+        KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=50, no_ask_cents=90),
+        KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=90, no_ask_cents=90),
+    )
+    diag: dict[str, float] = {}
+    assert find_signals([ke], [odds], capital_usd=CAPITAL, diag=diag) == []
+    assert diag["events_matched"] == 0.0
+    assert diag["reject_names"] == 1.0  # diagnostica BUG de matching, no eficiencia
+    assert diag["reject_absent"] == 0.0
+
+
+def test_diag_reject_absent_when_game_not_in_odds_feed():
+    """El partido de Kalshi no está en el feed de odds (sin overlap) → reject_absent (benigno)."""
+    odds = _odds_event({"Real Madrid": 1.5, "Barcelona": 2.5}, home="Real Madrid", away="Barcelona")
+    ke = _kalshi_event(
+        KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=50, no_ask_cents=90),
+        KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=90, no_ask_cents=90),
+    )
+    diag: dict[str, float] = {}
+    assert find_signals([ke], [odds], capital_usd=CAPITAL, diag=diag) == []
+    assert diag["reject_absent"] == 1.0
+    assert diag["reject_names"] == 0.0
+
+
+def test_diag_reject_cardinality_2way_vs_3way():
+    """Kalshi 2-way vs Odds 3-way (mismo partido) → reject_cardinality, no reject_absent."""
+    odds = _odds_event(
+        {"Argentina": 1.8, "Mexico": 4.5, "Draw": 3.6}, home="Argentina", away="Mexico"
+    )
+    ke = _kalshi_event(
+        KalshiQuote("KX-ARG", "Argentina", yes_ask_cents=40, no_ask_cents=60),
+        KalshiQuote("KX-MEX", "Mexico", yes_ask_cents=40, no_ask_cents=60),
+    )
+    diag: dict[str, float] = {}
+    assert find_signals([ke], [odds], capital_usd=CAPITAL, diag=diag) == []
+    assert diag["reject_cardinality"] == 1.0
+    assert diag["reject_absent"] == 0.0
+
+
 def test_started_match_skipped_pre_match_guard():
     """GUARDARRAÍL: un partido ya iniciado (commence_time ≤ now) NO se evalúa (spread fantasma)."""
     odds = _odds_event({"Los Angeles Lakers": 1.55, "Boston Celtics": 2.5})

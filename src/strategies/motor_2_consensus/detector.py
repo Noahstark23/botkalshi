@@ -170,18 +170,36 @@ def find_signals(
     es válido antes del kickoff.
 
     DIAGNÓSTICO (opcional `diag`): puebla el embudo del ciclo para distinguir "mercado
-    eficiente" de "filtro demasiado angosto" cuando señales=0 — cuántos eventos de odds se
-    saltearon por in-play, cuántos matchearon, y el MEJOR edge neto visto (aunque < umbral).
+    eficiente" de "el matcher rechaza en silencio" cuando señales=0. Por cada evento de
+    Kalshi que NO matchea, clasifica POR QUÉ según su evento de odds pre-match más cercano
+    (mayor solapamiento de nombres canónicos):
+      - reject_absent: el partido no está en el feed de odds (overlap 0) — cobertura/timing.
+      - reject_cardinality: mismo partido pero distinto nº de outcomes (2-way vs 3-way).
+      - reject_names: mismo partido, set de nombres difiere → FIXABLE con alias (loguea ambos).
+      - reject_no_fair: matcheó pero no hubo consenso usable.
     """
     now = now or datetime.now(UTC)
     if diag is not None:
-        diag["odds_total"] = float(len(odds_events))
-        diag["odds_started_skip"] = float(sum(1 for oe in odds_events if oe.commence_time <= now))
-        diag["events_matched"] = 0.0
-        diag["best_net_edge"] = -1.0  # fracción; -1 = no se evaluó ningún outcome
+        diag.update(
+            odds_total=float(len(odds_events)),
+            odds_started_skip=float(sum(1 for oe in odds_events if oe.commence_time <= now)),
+            kalshi_total=float(len(kalshi_events)),
+            events_matched=0.0,
+            reject_absent=0.0,
+            reject_cardinality=0.0,
+            reject_names=0.0,
+            reject_no_fair=0.0,
+            best_net_edge=-1.0,  # fracción; -1 = no se evaluó ningún outcome
+        )
     signals: list[ConsensusSignal] = []
+    name_debug_budget = 3  # cap de logs name_debug por ciclo (evita spam)
     for ke in kalshi_events:
         k_names = [q.outcome_name for q in ke.outcomes]
+        k_canon = {canonical_name(n) for n in k_names}
+        matched = False
+        best_overlap = -1
+        best_reason = "absent"
+        best_pair: tuple[set[str], set[str]] | None = None
         for oe in odds_events:
             # PRE-MATCH ONLY: partido ya iniciado → comparación inválida, se saltea.
             if oe.commence_time <= now:
@@ -189,12 +207,28 @@ def find_signals(
             odds_names = _h2h_outcome_names(oe)
             if not odds_names:
                 continue
+            o_canon = {canonical_name(n) for n in odds_names}
+            # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
+            overlap = len(k_canon & o_canon)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_pair = (k_canon, o_canon)
+                if overlap == 0:
+                    best_reason = "absent"
+                elif len(k_names) != len(odds_names):
+                    best_reason = "cardinality"
+                elif k_canon != o_canon:
+                    best_reason = "names"
+                else:
+                    best_reason = "no_fair"  # set igual → si no matchea/no fair, es esto
             # Regla del matcher: cardinalidad + conjuntos exactos. None → no es el partido.
             if match_outcomes(k_names, odds_names) is None:
                 continue
             fair = _consensus_fair_probs(oe)
             if not fair:
+                best_reason = "no_fair"
                 continue
+            matched = True
             if diag is not None:
                 diag["events_matched"] += 1.0
             for q in ke.outcomes:
@@ -204,6 +238,16 @@ def find_signals(
                     continue
                 signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
             break  # ya emparejado este evento Kalshi
+        if not matched and diag is not None:
+            diag["reject_" + best_reason] = diag.get("reject_" + best_reason, 0.0) + 1.0
+            # name_debug SOLO para el caso fixable (mismo partido, nombres distintos): muestra
+            # los dos sets canónicos → se ve EXACTO qué alias falta agregar a TEAM_ALIASES.
+            if best_reason in ("names", "cardinality") and best_pair and name_debug_budget > 0:
+                name_debug_budget -= 1
+                logger.info(
+                    f"motor2.name_debug reason={best_reason} "
+                    f"kalshi={sorted(best_pair[0])} odds={sorted(best_pair[1])}"
+                )
     return signals
 
 
