@@ -69,12 +69,31 @@ class Motor2ShadowPoller:
             logger.info("motor2.shadow sin eventos de odds este ciclo")
             return []
 
+        diag: dict[str, float] = {}
         signals = find_signals(
-            kalshi_events, odds_events, capital_usd=self._capital_usd, min_edge=self._min_edge
+            kalshi_events,
+            odds_events,
+            capital_usd=self._capital_usd,
+            min_edge=self._min_edge,
+            diag=diag,
         )
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
             f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"
+        )
+        # Embudo diagnóstico: cuando señales=0, distingue "mercado eficiente" (best_edge bajo,
+        # matched>0) de "el matcher rechaza" (reject_names/cardinality altos) o "pocas ventanas
+        # pre-match" (started_skip alto / reject_absent alto). best_edge<0 = nada evaluado.
+        best_pp = diag.get("best_net_edge", -1.0) * 100
+        logger.info(
+            f"motor2.funnel odds={int(diag.get('odds_total', 0))} "
+            f"started_skip={int(diag.get('odds_started_skip', 0))} "
+            f"kalshi={int(diag.get('kalshi_total', 0))} matched={int(diag.get('events_matched', 0))} "
+            f"rej_absent={int(diag.get('reject_absent', 0))} "
+            f"rej_card={int(diag.get('reject_cardinality', 0))} "
+            f"rej_names={int(diag.get('reject_names', 0))} "
+            f"rej_nofair={int(diag.get('reject_no_fair', 0))} "
+            f"best_edge={best_pp:.2f}pp umbral={self._min_edge * 100:.1f}pp"
         )
         # GATE DE DINERO REAL: persistir Y apostar SOLO con odds reales (nunca sobre el
         # fixture fake). Apostar exige además executor presente (TRADING_ENABLED, Capa A).
