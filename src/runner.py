@@ -240,6 +240,23 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_analyst_loop(self) -> None:
+        """
+        Analyst Loop (loop engineering) — gateado por ANALYST_LOOP_ENABLED. ADVISORY ONLY:
+        observa EdgeWindow + el embudo de Motor 2, computa un veredicto, lo persiste y manda
+        un digest a Telegram. NUNCA tradea, cambia config ni mergea. Best-effort: si cae,
+        se registra y la task termina — NO tira el bot.
+        """
+        await asyncio.sleep(15)  # dejar que init_db / boot terminen
+        try:
+            from src.analytics.analyst_loop import AnalystLoop
+
+            await AnalystLoop().run(self._stop_event)
+        except Exception as e:
+            msg = f"analyst_loop runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -320,6 +337,8 @@ class ProductionRunner:
                 asyncio.create_task(self._run_settlement(), name="settlement"),
                 asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
             ]
+            if self.settings.ANALYST_LOOP_ENABLED:
+                tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
             done, pending = await asyncio.wait(

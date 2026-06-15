@@ -206,6 +206,58 @@ class OperationalState(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utc_now)
 
 
+class Motor2FunnelSnapshot(SQLModel, table=True):
+    """
+    Foto del embudo de Motor 2 por ciclo (Loop Engineering — memoria del diagnóstico).
+
+    El embudo (matched / reject_* / best_edge) vivía SOLO en logs efímeros → no se podía
+    trendear. El poller persiste una fila por ciclo (con odds REALES) para que el Analyst
+    Loop agregue la ventana y distinga "mercado eficiente" de "bug de matching" en el tiempo.
+    """
+
+    __tablename__ = "motor2_funnel_snapshots"
+
+    id: int | None = Field(default=None, primary_key=True)
+    odds_total: int = 0
+    started_skip: int = 0
+    kalshi_total: int = 0
+    events_matched: int = 0
+    reject_absent: int = 0
+    reject_cardinality: int = 0
+    reject_names: int = 0
+    reject_no_fair: int = 0
+    best_net_edge_pp: float = -1.0  # mejor edge neto visto (pp); -1 = nada evaluado
+    signals: int = 0  # señales emitidas ese ciclo
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
+
+
+class AnalystVerdict(SQLModel, table=True):
+    """
+    Veredicto diario del Analyst Loop (memoria persistente que se compara día-a-día).
+
+    ADVISORY-ONLY: registro de análisis; NO gatea trading. Lo escribe AnalystLoop tras
+    agregar EdgeWindow(consensus) + Motor2FunnelSnapshot de la ventana.
+    """
+
+    __tablename__ = "analyst_verdicts"
+
+    id: int | None = Field(default=None, primary_key=True)
+    window_hours: int = 24
+    consensus_total: int = 0  # filas EdgeWindow(kind=consensus) en la ventana
+    consensus_gt_thresh: int = 0  # cuántas superan el umbral (edges accionables)
+    best_edge_pp: float = -1.0
+    mean_edge_pp: float = 0.0
+    funnel_cycles: int = 0  # ciclos del embudo en la ventana (0 = sin datos)
+    matched: int = 0
+    reject_absent: int = 0
+    reject_cardinality: int = 0
+    reject_names: int = 0
+    reject_no_fair: int = 0
+    verdict: str = Field(max_length=30)  # eficiente / matching_bug / edge_candidato / ...
+    recommendation: str | None = Field(default=None, max_length=500)
+    recorded_at: datetime = Field(default_factory=_utc_now, index=True)
+
+
 _engine: Any = None
 
 # Clave del kill-switch (Motor REST + RiskManager) en operational_state.

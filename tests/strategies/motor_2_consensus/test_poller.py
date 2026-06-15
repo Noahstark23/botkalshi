@@ -116,6 +116,34 @@ async def test_live_source_persists_consensus_windows():
 
 
 @pytest.mark.asyncio
+async def test_live_cycle_persists_funnel_snapshot():
+    """Con odds reales, cada ciclo graba un Motor2FunnelSnapshot (memoria para el Analyst Loop)."""
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+    )
+    await poller.poll_once()
+    with models.get_session() as s:
+        snaps = list(s.exec(select(models.Motor2FunnelSnapshot)).all())
+    assert len(snaps) == 1
+    assert snaps[0].kalshi_total >= 1 and snaps[0].events_matched >= 1
+
+
+@pytest.mark.asyncio
+async def test_fake_cycle_does_not_persist_funnel():
+    """Con fixture fake (no-live), NO se graba snapshot (data no real)."""
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=False),
+        capital_usd=300.0,
+    )
+    await poller.poll_once()
+    with models.get_session() as s:
+        assert list(s.exec(select(models.Motor2FunnelSnapshot)).all()) == []
+
+
+@pytest.mark.asyncio
 async def test_min_edge_threshold_filters_signals():
     """min_edge alto → no pasa ninguna señal (umbral tuneable desde el runner/config)."""
     poller = Motor2ShadowPoller(

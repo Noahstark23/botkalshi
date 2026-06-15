@@ -114,6 +114,18 @@ class Settings(BaseSettings):
         default=3.0, ge=0.0, description="Edge neto post-fee mínimo de Motor 2 (pp)"
     )
 
+    # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
+    # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
+    # (eficiente / matching_bug / edge_candidato), lo persiste (memoria día-a-día) y manda
+    # un digest a Telegram. NUNCA tradea, ni cambia config, ni mergea. Default off.
+    ANALYST_LOOP_ENABLED: bool = False
+    ANALYST_LOOP_INTERVAL_SEC: float = Field(
+        default=86400.0, ge=3600.0, description="Intervalo del Analyst Loop (s, mín 1h)"
+    )
+    ANALYST_LOOP_WINDOW_HOURS: int = Field(
+        default=24, ge=1, description="Ventana de agregación del veredicto (horas)"
+    )
+
     # ---- Validators ----
 
     @field_validator("KALSHI_PRIVATE_KEY_PATH")
