@@ -163,6 +163,29 @@ class DataCaptureService:
             universe.setdefault(t.rsplit("-", 1)[0], set()).add(t)
         return universe
 
+    def series_histogram(self) -> dict[str, tuple[int, float]]:
+        """
+        Foto read-only por serie: {prefijo → (n_eventos, markets/evento)}.
+
+        Computada de self._tracked_tickers agrupando ticker→evento (rsplit, igual que
+        multi_event_universe) y ticker→serie (split). Revela DOS incógnitas de prod que el
+        repo no puede saber sin red — el gate para onboardear MLB al Motor 2:
+          (a) el PREFIJO exacto de cada familia (ej. KXMLBGAME vs KXMLB...), y
+          (b) la ESTRUCTURA: ~2.0 mkts/evento = 2 markets por-equipo (lo que
+              _parse_event_quotes ya maneja ✓); ~1.0 = 1 market 2-way (necesitaría variante).
+        Sport-agnóstica y sin red: leer este histograma ES el diagnóstico de MLB.
+        """
+        events_by_prefix: dict[str, set[str]] = {}
+        markets_by_prefix: dict[str, int] = {}
+        for t in self._tracked_tickers:
+            prefix = t.split("-", 1)[0]
+            events_by_prefix.setdefault(prefix, set()).add(t.rsplit("-", 1)[0])
+            markets_by_prefix[prefix] = markets_by_prefix.get(prefix, 0) + 1
+        return {
+            prefix: (len(events), markets_by_prefix[prefix] / len(events))
+            for prefix, events in events_by_prefix.items()
+        }
+
     # =====================================================
     # WS event handlers
     # =====================================================
@@ -329,6 +352,13 @@ class DataCaptureService:
         )
         # Conteo por serie: evidencia de qué familias están vivas (ej. KXFIFAGAME).
         logger.info(f"Discovery por serie: {dict(sorted(per_series.items()))}")
+        # Estructura por serie (prefijo, n_eventos, mkts/evento): revela el prefijo exacto
+        # de MLB y si los partidos son 2-market-por-equipo (~2.0 ✓) o 1-market-2-way (~1.0).
+        hist = self.series_histogram()
+        logger.info(
+            "Discovery estructura: "
+            + ", ".join(f"{p}={n}ev×{mpe:.1f}mkt" for p, (n, mpe) in sorted(hist.items()))
+        )
         return new_tickers
 
     async def _run_rediscovery(self) -> None:
