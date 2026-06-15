@@ -19,7 +19,7 @@ import contextlib
 
 from loguru import logger
 
-from src.storage.models import EdgeWindow, get_session
+from src.storage.models import EdgeWindow, Motor2FunnelSnapshot, get_session
 from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
@@ -95,13 +95,38 @@ class Motor2ShadowPoller:
             f"rej_nofair={int(diag.get('reject_no_fair', 0))} "
             f"best_edge={best_pp:.2f}pp umbral={self._min_edge * 100:.1f}pp"
         )
-        # GATE DE DINERO REAL: persistir Y apostar SOLO con odds reales (nunca sobre el
-        # fixture fake). Apostar exige además executor presente (TRADING_ENABLED, Capa A).
-        if signals and self._odds.is_live:
-            self._persist(signals)
-            if self._executor is not None:
-                await self._execute(signals)
+        # GATE DE DINERO REAL: persistir/apostar SOLO con odds reales (nunca sobre el fixture).
+        if self._odds.is_live:
+            # Memoria del embudo: una foto por ciclo (también con 0 señales — ESE es el dato
+            # que el Analyst Loop necesita para trendear eficiente-vs-bug). Best-effort.
+            self._persist_funnel(diag, len(signals))
+            if signals:
+                self._persist(signals)
+                if self._executor is not None:
+                    await self._execute(signals)
         return signals
+
+    def _persist_funnel(self, diag: dict[str, float], n_signals: int) -> None:
+        """Graba la foto del embudo del ciclo (Loop Engineering — memoria del diagnóstico)."""
+        try:
+            with get_session() as s:
+                s.add(
+                    Motor2FunnelSnapshot(
+                        odds_total=int(diag.get("odds_total", 0)),
+                        started_skip=int(diag.get("odds_started_skip", 0)),
+                        kalshi_total=int(diag.get("kalshi_total", 0)),
+                        events_matched=int(diag.get("events_matched", 0)),
+                        reject_absent=int(diag.get("reject_absent", 0)),
+                        reject_cardinality=int(diag.get("reject_cardinality", 0)),
+                        reject_names=int(diag.get("reject_names", 0)),
+                        reject_no_fair=int(diag.get("reject_no_fair", 0)),
+                        best_net_edge_pp=diag.get("best_net_edge", -1.0) * 100,
+                        signals=n_signals,
+                    )
+                )
+                s.commit()
+        except Exception:
+            logger.exception("motor2.funnel.persist_error")
 
     async def _execute(self, signals: list[ConsensusSignal]) -> None:
         """
