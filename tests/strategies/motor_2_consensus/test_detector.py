@@ -88,6 +88,45 @@ def test_implausible_edge_discarded():
     assert all(s.market_ticker != "KXNBA-LAL" or s.kalshi_side != "YES" for s in signals)
 
 
+def test_diag_funnel_distinguishes_efficient_from_filtered():
+    """El embudo diagnóstico puebla started_skip/matched/best_net_edge para leer el 0-señales."""
+    # Mercado eficiente: fair ≈ ask → best_edge bajo, 0 señales, pero matched=1.
+    odds = _odds_event({"Los Angeles Lakers": 1.95, "Boston Celtics": 1.95})  # fair ≈ 0.50
+    ke = _kalshi_event(
+        KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=50, no_ask_cents=51),
+        KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=51, no_ask_cents=51),
+    )
+    diag: dict[str, float] = {}
+    signals = find_signals([ke], [odds], capital_usd=CAPITAL, diag=diag)
+    assert signals == []  # eficiente → sin señal
+    assert diag["odds_total"] == 1.0
+    assert diag["odds_started_skip"] == 0.0  # pre-match
+    assert diag["events_matched"] == 1.0  # SÍ matcheó (no es problema de matching)
+    assert diag["best_net_edge"] < 0.03  # best edge por debajo del umbral → mercado eficiente
+
+
+def test_diag_funnel_counts_started_skips():
+    """Un partido ya iniciado cuenta en started_skip y NO en matched (best_edge queda en -1)."""
+    odds = _odds_event({"Los Angeles Lakers": 1.55, "Boston Celtics": 2.5})
+    started = odds.__class__(
+        id=odds.id,
+        sport_key=odds.sport_key,
+        commence_time=datetime.now(UTC) - timedelta(hours=1),
+        home_team=odds.home_team,
+        away_team=odds.away_team,
+        bookmakers=odds.bookmakers,
+    )
+    ke = _kalshi_event(
+        KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=50, no_ask_cents=90),
+        KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=90, no_ask_cents=90),
+    )
+    diag: dict[str, float] = {}
+    assert find_signals([ke], [started], capital_usd=CAPITAL, diag=diag) == []
+    assert diag["odds_started_skip"] == 1.0
+    assert diag["events_matched"] == 0.0
+    assert diag["best_net_edge"] == -1.0  # ningún outcome pre-match evaluado
+
+
 def test_started_match_skipped_pre_match_guard():
     """GUARDARRAÍL: un partido ya iniciado (commence_time ≤ now) NO se evalúa (spread fantasma)."""
     odds = _odds_event({"Los Angeles Lakers": 1.55, "Boston Celtics": 2.5})

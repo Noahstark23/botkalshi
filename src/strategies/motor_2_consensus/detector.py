@@ -158,6 +158,7 @@ def find_signals(
     capital_usd: float = DEFAULT_CAPITAL_USD,
     min_edge: float = MIN_EDGE_PCT,
     now: datetime | None = None,
+    diag: dict[str, float] | None = None,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -167,8 +168,17 @@ def find_signals(
     la odds API puede seguir reportando líneas pre-partido/in-play degeneradas → spread
     FANTASMA (ej. GER vs CUW resuelto: edges de ~50pp imposibles). El edge de consenso solo
     es válido antes del kickoff.
+
+    DIAGNÓSTICO (opcional `diag`): puebla el embudo del ciclo para distinguir "mercado
+    eficiente" de "filtro demasiado angosto" cuando señales=0 — cuántos eventos de odds se
+    saltearon por in-play, cuántos matchearon, y el MEJOR edge neto visto (aunque < umbral).
     """
     now = now or datetime.now(UTC)
+    if diag is not None:
+        diag["odds_total"] = float(len(odds_events))
+        diag["odds_started_skip"] = float(sum(1 for oe in odds_events if oe.commence_time <= now))
+        diag["events_matched"] = 0.0
+        diag["best_net_edge"] = -1.0  # fracción; -1 = no se evaluó ningún outcome
     signals: list[ConsensusSignal] = []
     for ke in kalshi_events:
         k_names = [q.outcome_name for q in ke.outcomes]
@@ -185,12 +195,14 @@ def find_signals(
             fair = _consensus_fair_probs(oe)
             if not fair:
                 continue
+            if diag is not None:
+                diag["events_matched"] += 1.0
             for q in ke.outcomes:
                 cn = canonical_name(q.outcome_name)
                 fp = fair.get(cn)
                 if fp is None:
                     continue
-                signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge))
+                signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
             break  # ya emparejado este evento Kalshi
     return signals
 
@@ -219,15 +231,23 @@ def _emit_if_plausible(
 
 
 def _signals_for_outcome(
-    q: KalshiQuote, fair_prob: float, capital_usd: float, min_edge: float
+    q: KalshiQuote,
+    fair_prob: float,
+    capital_usd: float,
+    min_edge: float,
+    diag: dict[str, float] | None = None,
 ) -> list[ConsensusSignal]:
     """Evalúa YES (prob justa) y NO (complemento) para un outcome; emite el/los que superen el edge."""
     out: list[ConsensusSignal] = []
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
     yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
-    _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     # NO: comprar a no_ask con la prob complementaria.
     no_edge = _net_edge_pct(1.0 - fair_prob, q.no_ask_cents)
+    if diag is not None:
+        # Mejor edge NETO visto (aunque no supere el umbral) → distingue "mercado eficiente"
+        # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
+        diag["best_net_edge"] = max(diag.get("best_net_edge", -1.0), yes_edge, no_edge)
+    _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     _emit_if_plausible(
         out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
     )

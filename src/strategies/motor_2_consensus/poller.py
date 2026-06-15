@@ -69,12 +69,27 @@ class Motor2ShadowPoller:
             logger.info("motor2.shadow sin eventos de odds este ciclo")
             return []
 
+        diag: dict[str, float] = {}
         signals = find_signals(
-            kalshi_events, odds_events, capital_usd=self._capital_usd, min_edge=self._min_edge
+            kalshi_events,
+            odds_events,
+            capital_usd=self._capital_usd,
+            min_edge=self._min_edge,
+            diag=diag,
         )
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
             f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"
+        )
+        # Embudo diagnóstico: cuando señales=0, distingue "mercado eficiente" (best_edge bajo)
+        # de "filtro angosto / sin pre-match" (started_skip alto o matched=0). best_edge<0 =
+        # no se evaluó ningún outcome pre-match este ciclo.
+        best_pp = diag.get("best_net_edge", -1.0) * 100
+        logger.info(
+            f"motor2.funnel odds={int(diag.get('odds_total', 0))} "
+            f"started_skip={int(diag.get('odds_started_skip', 0))} "
+            f"matched={int(diag.get('events_matched', 0))} "
+            f"best_edge={best_pp:.2f}pp umbral={self._min_edge * 100:.1f}pp"
         )
         # GATE DE DINERO REAL: persistir Y apostar SOLO con odds reales (nunca sobre el
         # fixture fake). Apostar exige además executor presente (TRADING_ENABLED, Capa A).
