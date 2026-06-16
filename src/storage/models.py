@@ -26,6 +26,13 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _naive_utc_now() -> datetime:
+    """UTC naive — convención de comparación del RiskManager/settlement (SQLite no
+    preserva tz; mezclar aware/naive lanza TypeError al comparar). Motor 3 la usa para
+    todos sus campos de tiempo (close_time / synced_at)."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 # =====================================================
 # Tablas
 # =====================================================
@@ -97,6 +104,28 @@ class Trade(SQLModel, table=True):
     settled_at: datetime | None = None
 
     notes: str | None = Field(default=None, max_length=500)
+
+
+class PortfolioPosition(SQLModel, table=True):
+    """
+    Cache de una posición ABIERTA de Kalshi — el estado real de la cuenta para el Motor 3
+    (CLV). Una fila por market con posición neta != 0. El PortfolioPoller la sincroniza
+    cada 60s desde GET /portfolio/positions, cruzando get_market() para el `close_time`
+    (el endpoint de posiciones no lo trae). Read-only respecto al capital: solo cachea.
+
+    Convención de tiempo: NAIVE UTC en todos los campos (close_time/synced_at) para poder
+    comparar con `datetime.now(UTC).replace(tzinfo=None)` sin TypeError.
+    """
+
+    __tablename__ = "portfolio_positions"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ticker: str = Field(unique=True, index=True, max_length=100)
+    side: str = Field(max_length=10)  # "yes" | "no" — lado neto que tenemos abierto
+    count: int  # contratos (abs de la posición neta de Kalshi)
+    exposure_cents: int | None = None  # market_exposure de Kalshi (capital en riesgo)
+    close_time: datetime | None = None  # cierre del mercado (NAIVE UTC) — gate del CLV
+    synced_at: datetime = Field(default_factory=_naive_utc_now, index=True)
 
 
 class RiskEvent(SQLModel, table=True):
