@@ -45,6 +45,43 @@ TEAM_ALIASES: dict[str, str] = {
     "iran islamic republic": "iran",
     "ivory coast": "cote divoire",  # Kalshi (inglés) ↔ "côte d'ivoire" plegado
     "czechia": "czech republic",
+    # === MLB (2026) — Kalshi usa nombre CORTO (ciudad/abrev), The Odds API el FULL
+    # "Ciudad Equipo". Mapea el corto canónico → full canónico (el full ya canoniza a sí
+    # mismo, sin entrada). Ciudades compartidas: Kalshi desambigua con sufijo (m/y, c/ws,
+    # a/d) → claves DISTINTAS → imposible cruzar Mets↔Yankees con el matcher de igualdad
+    # exacta de conjuntos. ⚠️ Alias ciudad→equipo MLB-scoped: si se onboarda otro deporte con
+    # las mismas ciudades (NBA Celtics/Lakers...), revisar (idealmente alias por deporte);
+    # hoy Motor 2 corre 1 sport_key a la vez, así que es seguro.
+    "arizona": "arizona diamondbacks",
+    "atlanta": "atlanta braves",
+    "as": "athletics",  # [verificar] Kalshi "A's"→'as'; Odds podría usar "Oakland/Sacramento Athletics"
+    "baltimore": "baltimore orioles",
+    "boston": "boston red sox",
+    "chicago c": "chicago cubs",
+    "chicago ws": "chicago white sox",
+    "cincinnati": "cincinnati reds",
+    "cleveland": "cleveland guardians",
+    "colorado": "colorado rockies",
+    "detroit": "detroit tigers",
+    "houston": "houston astros",
+    "kansas city": "kansas city royals",
+    "los angeles a": "los angeles angels",
+    "los angeles d": "los angeles dodgers",
+    "miami": "miami marlins",
+    "milwaukee": "milwaukee brewers",
+    "minnesota": "minnesota twins",
+    "new york m": "new york mets",
+    "new york y": "new york yankees",
+    "philadelphia": "philadelphia phillies",
+    "pittsburgh": "pittsburgh pirates",
+    "san diego": "san diego padres",
+    "san francisco": "san francisco giants",
+    "seattle": "seattle mariners",
+    "st louis": "st louis cardinals",
+    "tampa bay": "tampa bay rays",
+    "texas": "texas rangers",
+    "toronto": "toronto blue jays",
+    "washington": "washington nationals",
 }
 
 
