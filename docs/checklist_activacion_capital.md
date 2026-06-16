@@ -87,7 +87,8 @@ Verificación contra el código (read-only, 2026-06-16):
 - [x] **RiskManager apto para Motor REST** — ✅ resuelto (ver sección de arriba, re-auditado
   2026-06-16): intents + settlement real + pausa persistente. Deuda menor vigente documentada
   (manager.py:42-50: PnL realized-only por decisión del owner, residual de lock con N=1 motor).
-  Falta solo el smoke del shape de `result` (Fase 1).
+  Smoke del shape de `result` ✅ CONFIRMADO 2026-06-16 (`scripts/inspect_settlement_shape.py`:
+  campo `result` ∈ {yes,no}, `KalshiSettlementSource` lo mapea bien).
 - [ ] **Cap de 5% por trade** confirmado activo (`MAX_TRADE_SIZE_PCT=5.0`); sizing por caps,
   **cero Kelly** (decisión 2026-06: en arb p≈1, Kelly diría 100% del bankroll).
 - [ ] **Smoke test de `place_order` contra producción** — pendiente, post-demo.
@@ -105,6 +106,16 @@ Verificación contra el código (read-only, 2026-06-16):
   bid > 0). Si el book está vacío, no se llena → kill-switch (correcto). Validar en demo.
 - **Reconciliación de doble fuente:** `get_orders` (por `client_order_id`) + `get_positions`.
   Discrepancia o fallo de cualquiera → exposición (rollback). Validar shapes en demo.
+- **Settlement sin rama de refund/void (HARDENING, baja prioridad):** `_leg_pnl_cents`
+  (`settlement.py:107`) solo tiene rama ganadora/perdedora; un grupo multi-outcome que se
+  voidee (cero ganadores, todas las patas `no`) se contaría como pérdida total → PnL fantasma.
+  **Evidencia (2026-06-16):** escaneo de 22 eventos settled (`scripts/scan_settled_voids.py`)
+  encontró **0 voids reales** — el único 🚩 (`KXWCGROUPWIN-26K`) era un grupo a medio jugar
+  (2/6 patas finalized), confirmado con `scripts/inspect_event_legs.py`. No es mundo (A) ni (C):
+  Kalshi marca las patas no resueltas con `result=''`, no con un status/result especial.
+  **Plan:** fix defensivo a nivel GRUPO (grupo COMPLETO con cero ganadores → refund) con test
+  sintético; **cerrar antes del canary de Fase 3**, sin urgencia hoy (no hay caso real que lo
+  dispare). El scanner ya exige grupo completo (`get_event`) para no confundir void con stale.
 
 ---
 

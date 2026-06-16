@@ -53,16 +53,23 @@ async def _all_events(client: KalshiRestClient, series: str, status: str) -> lis
             return out
 
 
-async def _event_markets(client: KalshiRestClient, event_ticker: str, status: str) -> list[dict]:
-    """Markets de un evento (status/result crudos). Un page basta para un 1X2."""
-    resp = await client.list_markets(event_ticker=event_ticker, status=status, limit=200)
-    return resp.get("markets", [])
+async def _event_markets(client: KalshiRestClient, event_ticker: str) -> list[dict]:
+    """TODAS las patas del evento vía get_event (lista canónica, SIN filtro de status).
+
+    Clave del hardening: `list_markets(status=settled)` devuelve un grupo PARCIAL (solo
+    las patas ya resueltas). Un grupo a medio jugar parecería entonces 'cero ganadores'
+    → falso positivo de void (fue justo el caso KXWCGROUPWIN-26K: 2/6 patas finalized,
+    4 active con result=''). get_event trae las N patas reales, activas incluidas.
+    """
+    resp = await client.get_event(event_ticker)
+    return resp.get("markets", []) if isinstance(resp, dict) else []
 
 
 async def scan(series_list: list[str], statuses: list[str]) -> int:
     """Escanea y reporta voids/anomalías. Exit 0 siempre (es diagnóstico)."""
     flagged: list[str] = []
     total_events = 0
+    in_progress = 0  # grupos a medio resolver (saltados, NO son voids)
     seen_statuses: Counter[str] = Counter()
 
     async with KalshiRestClient() as client:
@@ -79,45 +86,47 @@ async def scan(series_list: list[str], statuses: list[str]) -> int:
             for et in event_tickers:
                 total_events += 1
                 await asyncio.sleep(_PAUSE_SEC)
-                markets: list[dict] = []
-                for status in statuses:
-                    try:
-                        markets = await _event_markets(client, et, status)
-                    except Exception as e:
-                        print(f"  ⚠️  list_markets({et}, {status}): {type(e).__name__}: {e}")
-                        continue
-                    if markets:
-                        break
+                try:
+                    markets = await _event_markets(client, et)
+                except Exception as e:
+                    print(f"  ⚠️  get_event({et}): {type(e).__name__}: {e}")
+                    continue
                 if not markets:
                     continue
 
-                results = Counter(str(m.get("result", "<none>")).lower() for m in markets)
-                statuses_here = {str(m.get("status", "<none>")).lower() for m in markets}
+                results = Counter(str(m.get("result", "")).strip().lower() for m in markets)
+                statuses_here = {str(m.get("status", "")).strip().lower() for m in markets}
                 seen_statuses.update(statuses_here)
-                winners = results.get("yes", 0)
-                non_yes_no = sum(v for k, v in results.items() if k not in ("yes", "no"))
-                weird_status = statuses_here - {"finalized", "settled"}
 
-                # 1X2 LIMPIO = exactamente 1 ganador, todo yes/no, status normal.
-                if winners == 1 and non_yes_no == 0 and not weird_status:
+                # COMPUERTA DE COMPLETITUD: una pata sin resolver (result vacío) = grupo EN
+                # CURSO, no un void. Juzgar ganadores sobre un grupo parcial fue exactamente
+                # el falso positivo de KXWCGROUPWIN-26K → se saltea, no se flagea.
+                if results.get("", 0):
+                    in_progress += 1
                     continue
 
-                # ── ANOMALÍA: candidato a void ──
+                winners = results.get("yes", 0)
+                non_yes_no = sum(v for k, v in results.items() if k not in ("yes", "no"))
+
+                # Grupo COMPLETO y limpio = exactamente 1 ganador, todo yes/no.
+                if winners == 1 and non_yes_no == 0:
+                    continue
+
+                # ── ANOMALÍA real sobre un grupo COMPLETO ──
                 tag = []
                 if winners == 0:
-                    tag.append("CERO ganadores (posible void → mundo B)")
+                    tag.append("CERO ganadores en grupo COMPLETO (void real → mundo B)")
                 elif winners > 1:
                     tag.append(f"{winners} ganadores (NO mutuamente excluyente)")
-                if weird_status:
-                    tag.append(f"status anómalo {weird_status} (mundo A)")
                 if non_yes_no:
-                    tag.append(f"{non_yes_no} result fuera de yes/no")
+                    tag.append(f"{non_yes_no} result fuera de yes/no (posible void tipo C)")
                 line = f"  🚩 {et}: {dict(results)} | status={statuses_here} → {'; '.join(tag)}"
                 print(line)
                 flagged.append(line)
 
     print(f"\n{'=' * 64}\nRESUMEN")
     print(f"  eventos escaneados : {total_events}")
+    print(f"  grupos en curso    : {in_progress} (saltados — NO son voids)")
     print(f"  statuses vistos    : {dict(seen_statuses)}")
     print(f"  eventos flageados  : {len(flagged)}")
     if not flagged:
