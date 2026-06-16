@@ -173,7 +173,9 @@ class RestKalshiQuoteSource:
 
         universe = self._universe_provider()
         if not universe:
-            logger.info("motor2.kalshi universo vacío (discovery aún sin partidos 1X2)")
+            logger.info(
+                "motor2.kalshi universo vacío (discovery aún sin partidos en MOTOR2_SERIES)"
+            )
             return []
         out: list[KalshiEventQuotes] = []
         async with self._client_factory() as client:
@@ -190,5 +192,7 @@ class RestKalshiQuoteSource:
                     out.append(eq)
                 if self._pause_sec:
                     await asyncio.sleep(self._pause_sec)
-        logger.info(f"motor2.kalshi {len(out)}/{len(universe)} eventos 1X2 con quotes usables")
+        logger.info(
+            f"motor2.kalshi {len(out)}/{len(universe)} eventos con quotes usables (2-way/1X2)"
+        )
         return out

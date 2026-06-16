@@ -155,16 +155,27 @@ class DataCaptureService:
 
     def multi_event_universe(self) -> dict[str, set[str]]:
         """
-        Seam read-only para el Motor 2: {event_key → tickers hermanos} de los partidos
-        multi-outcome (1X2/winner) ya descubiertos. Agrupa por event_key con el mismo
-        filtro de series exactas del Motor REST (KXWCGAME, etc.), independiente de que el
-        engine shadow exista. No toca red ni estado.
+        Seam read-only para el Motor REST: {event_key → tickers hermanos} de los partidos
+        multi-outcome (1X2/winner) ya descubiertos. Filtra por MULTI_SERIES (winner-take-all
+        ≥3 legs). No toca red ni estado.
         """
         from src.strategies.motor_rest_arb.engine import RestArbEngine
 
+        return self._event_universe_for(RestArbEngine.MULTI_SERIES)
+
+    def motor2_event_universe(self, series: frozenset[str]) -> dict[str, set[str]]:
+        """
+        Seam read-only para el MOTOR 2: {event_key → tickers hermanos} de las series que
+        Motor 2 consume. DESACOPLADO de MULTI_SERIES — incluye 2-way (MLB moneyline,
+        KXMLBGAME) además de los multi-outcome. `series` viene de MOTOR2_SERIES (config).
+        """
+        return self._event_universe_for(series)
+
+    def _event_universe_for(self, series: frozenset[str]) -> dict[str, set[str]]:
+        """Agrupa los tickers trackeados de `series` por event_key (rsplit). Helper común."""
         universe: dict[str, set[str]] = {}
         for t in self._tracked_tickers:
-            if t.split("-", 1)[0] not in RestArbEngine.MULTI_SERIES:
+            if t.split("-", 1)[0] not in series:
                 continue
             universe.setdefault(t.rsplit("-", 1)[0], set()).add(t)
         return universe
