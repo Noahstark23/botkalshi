@@ -35,9 +35,34 @@ rollback INMEDIATO de la pata llena, sin reconciliación demorada (test
 
 ---
 
-## 🔴 BLOQUEANTE pre-plata real: RiskManager CIEGO al Motor REST (verificado 2026-06-10)
+## ✅ RESUELTO (re-auditado 2026-06-16): RiskManager YA VE al Motor REST
 
-Rastreo contra el código real (read-only):
+> El veredicto 🔴 abajo era de 2026-06-10. Re-auditado contra el código de hoy,
+> el bloqueante está **resuelto en las 3 patas** por PRs posteriores. Se deja el
+> diagnóstico original como contexto histórico, tachado por la resolución.
+
+Verificación contra el código (read-only, 2026-06-16):
+
+- (a) **Exposición** — `_persist_intents` (`motor_rest_arb/executor.py:500`) graba una
+  fila `Trade` por pata (`status='pending'`, `strategy='motor_rest_arb'`,
+  `notes='arb_id=…'`) **antes de tocar la red**; si la DB falla → **ABORTA sin operar**.
+  El RiskManager la lee en `_get_current_exposure_usd` (`manager.py:131`), y el
+  `notes='arb_id='` alimenta el descuento de hedge (`manager.py:142`). ✅
+- (b) **Stop-losses** — `SettlementPoller` (`settlement.py:124`) settlea los `Trade`
+  `filled` de `motor_rest_arb` escribiendo `pnl_cents` + `status='settled'` +
+  `settled_at` **atómico por arb_id** (`settlement.py:209`); inyectado con el adaptador
+  **REAL** `KalshiSettlementSource` en prod (`runner.py:172`, corre siempre). Los
+  stop-losses (`manager.py:210`) ya tienen de dónde leer. ✅
+- (c) **Pausa persistente** — `_update_trade` crítico fallido → pausa preventiva
+  (`executor.py:566`); `engage_kill_switch` persiste en `OperationalState`
+  (`manager.py:251`, tabla `operational_state`) → sobrevive restarts de Coolify. ✅
+
+**Residual de código (único):** `[verificar en smoke]` el shape EXACTO del campo
+`result` de `get_market` contra un mercado del Mundial ya resuelto
+(`KalshiSettlementSource.get_resolution`). Cubierto por
+`scripts/inspect_settlement_shape.py` (read-only, sin capital). Fase 1 del go-live.
+
+<details><summary>Diagnóstico original 2026-06-10 (histórico — ya resuelto)</summary>
 
 - El RiskManager lee **SOLO la tabla `Trade`**: exposición = `Trade` con
   `status in ('pending','filled')` (manager.py:95); stop-losses −3/−8/−15% = `Trade` con
@@ -49,11 +74,7 @@ Rastreo contra el código real (read-only):
   simultánea (25%) no acumula sus posiciones; (c) el kill-switch del Motor REST pausa solo
   el `RestExecutor` **en memoria** (no `BotState.is_paused`) → un restart borra la pausa.
 
-**Fix (tarea aparte, diseño → review → código):** el cable persiste `Trade` rows
-(`strategy="motor_rest_arb"`, intents pre-red + status post-outcome, patrón Motor 1) →
-alimenta exposición y stop-losses sin tocar `manager.py`. Resolver además settlement
-(`settled_at`/`pnl_cents`). **NO bloquea la demo** (capital ficticio); **SÍ bloquea**
-`TRADING_ENABLED=true` real.
+</details>
 
 ---
 
@@ -63,9 +84,10 @@ alimenta exposición y stop-losses sin tocar `manager.py`. Resolver además sett
   arranca con el deploy post-demo.
 - [ ] **Arbitrajes detectados en logs** — **NO cumplido** (`edge_windows=0` a la fecha); lo
   llena la data del Mundial en shadow.
-- [ ] **RiskManager apto para Motor REST** — NO cumplido: deuda documentada (manager.py:33-39:
-  sobrestima exposición, PnL realized-only, race en check concurrente) + tests de integración
-  pendientes + **veredicto CIEGO de arriba (🔴)**.
+- [x] **RiskManager apto para Motor REST** — ✅ resuelto (ver sección de arriba, re-auditado
+  2026-06-16): intents + settlement real + pausa persistente. Deuda menor vigente documentada
+  (manager.py:42-50: PnL realized-only por decisión del owner, residual de lock con N=1 motor).
+  Falta solo el smoke del shape de `result` (Fase 1).
 - [ ] **Cap de 5% por trade** confirmado activo (`MAX_TRADE_SIZE_PCT=5.0`); sizing por caps,
   **cero Kelly** (decisión 2026-06: en arb p≈1, Kelly diría 100% del bankroll).
 - [ ] **Smoke test de `place_order` contra producción** — pendiente, post-demo.
@@ -95,5 +117,5 @@ alimenta exposición y stop-losses sin tocar `manager.py`. Resolver además sett
 | Sensor de fill validado en API viva (FILL/KILL/ERROR_RED) | ✅ **cerrado** (demo, PR #22) |
 | Wiring `execute()` (cable Capas 1+2+3, muro A/B/C) | ✅ en main (PRs #26/#27/#28) — **sin validar en demo** |
 | Demo end-to-end (Telegram suena + EdgeWindow poblado) | ❌ pendiente (ventana muerta, Opción B) |
-| RiskManager VE al Motor REST (Trade rows) | 🔴 **CIEGO** — bloqueante pre-plata real |
+| RiskManager VE al Motor REST (Trade rows) | ✅ resuelto (intents + settlement + pausa persist.) — falta smoke del shape `result` |
 | Runbook kill-switch manual | ✅ `docs/runbook_kill_switch.md` |
