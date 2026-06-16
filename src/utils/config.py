@@ -92,6 +92,14 @@ class Settings(BaseSettings):
         ge=0.0,
         description="Edge neto post-fee mínimo (% del capital comprometido) para EJECUTAR",
     )
+    # TECHO anti-fantasma: un arb 1X2 real (3 outcomes ~100¢) rara vez supera pocos %.
+    # Un edge enorme (ej. 132% visto en shadow 2026-06-16) implica patas que NO suman ~100:
+    # pata ~0¢ de equipo eliminado, quote stale-pero-fresca, o grupo/mercado a medio resolver.
+    # NO es un regalo — es casi siempre una señal fantasma no-fillable. Se DETECTA/graba igual
+    # (EdgeWindow para análisis), pero NO se EJECUTA por encima de este %. Default conservador.
+    MOTOR_REST_MAX_EDGE_PCT: float = Field(
+        default=10.0, gt=0.0, description="Techo de edge para EJECUTAR (anti-fantasma, %)"
+    )
 
     # === Optional ===
     SENTRY_DSN: str = ""

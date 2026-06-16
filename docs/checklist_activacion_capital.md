@@ -106,6 +106,28 @@ Verificación contra el código (read-only, 2026-06-16):
   bid > 0). Si el book está vacío, no se llena → kill-switch (correcto). Validar en demo.
 - **Reconciliación de doble fuente:** `get_orders` (por `client_order_id`) + `get_positions`.
   Discrepancia o fallo de cualquiera → exposición (rollback). Validar shapes en demo.
+## Fase 2 (acumular + validar shadow) — evidencia 2026-06-16
+
+Camino del canary = **Motor REST** (arb 1X2/binary, hedged p≈1). Validación con
+`scripts/report_edge_windows.py --breakdown` sobre ~3 días de shadow (3054 EdgeWindows,
+todas multi_outcome):
+
+- **Señal real y repartida:** 653/3054 cruzan el umbral de ejecución (≥1.5%); 98% en
+  bandas sanas (64% en 1.5–3%, 34% en 3–10%), solo 2% en la cola >10%. 22 eventos
+  distintos, ninguno domina (máx ~16%). Medianas por evento ~2%; los picos (best 132%)
+  son ticks outlier aislados que NO contaminan la mediana → estructura de arb genuino.
+- **Pendiente Fase 2 (time-bound):** confirmar **consistencia multi-día** cuando baje el
+  volumen del Mundial (que los 653 no sean un pico de fin de semana cargado).
+- **Salvaguarda añadida:** techo `MOTOR_REST_MAX_EDGE_PCT` (default 10%, ver § toggles):
+  el edge de cola (ej. 132%) es casi seguro fantasma (pata ~0¢ / mercado por resolver);
+  se graba pero NO se ejecuta. Cierra la pérdida #1 del canary. Con test
+  (`test_above_max_edge_does_not_execute`).
+
+**Antes del canary de $100 (Motor REST) quedan:** (1) consistencia multi-día, (2) cerrar
+el hardening de void/refund (abajo). El techo anti-fantasma ✅ ya está.
+
+---
+
 - **Settlement sin rama de refund/void (HARDENING, baja prioridad):** `_leg_pnl_cents`
   (`settlement.py:107`) solo tiene rama ganadora/perdedora; un grupo multi-outcome que se
   voidee (cero ganadores, todas las patas `no`) se contaría como pérdida total → PnL fantasma.

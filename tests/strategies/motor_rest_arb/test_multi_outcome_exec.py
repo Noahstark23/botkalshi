@@ -29,6 +29,7 @@ def _engine(*, executor=None, risk_manager=None, trading_enabled=True) -> RestAr
     settings.MOTOR_REST_MIN_EDGE_CENTS = 1
     settings.MOTOR_REST_MIN_DEPTH = 2
     settings.MOTOR_REST_EXECUTION_EDGE_PCT = 0.0  # umbral bajo: cualquier arb viable ejecuta
+    settings.MOTOR_REST_MAX_EDGE_PCT = 10_000.0  # techo alto: no interfiere en estos tests
     settings.TRADING_ENABLED = trading_enabled
     with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
         eng = RestArbEngine(executor=executor, risk_manager=risk_manager)

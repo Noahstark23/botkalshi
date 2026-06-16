@@ -259,6 +259,16 @@ class RestArbEngine:
                 f"edge={opp.edge_pct:.2f}% < {self.settings.MOTOR_REST_EXECUTION_EDGE_PCT}%"
             )
             return
+        # TECHO anti-fantasma: un edge demasiado alto NO es un regalo, es casi siempre una
+        # pata sin precio / mercado a medio resolver. Se grabó el EdgeWindow; aquí se corta
+        # la EJECUCIÓN (la pérdida #1 del canary sería ejecutar sobre uno de estos).
+        if opp.edge_pct > self.settings.MOTOR_REST_MAX_EDGE_PCT:
+            logger.warning(
+                f"motor_rest.exec.edge_too_high ticker={opp.legs[0].market_ticker} "
+                f"edge={opp.edge_pct:.2f}% > {self.settings.MOTOR_REST_MAX_EDGE_PCT}% "
+                "(sospecha de fantasma: pata ~0¢ / mercado por resolver) → NO ejecuta"
+            )
+            return
 
         # Single-flight con DESCARTE: si ya hay una ejecución en curso, se descarta este
         # arb (no se encola: estaría stale al terminar la anterior). Si sigue vivo,
@@ -464,6 +474,15 @@ class RestArbEngine:
             logger.info(
                 f"motor_rest.multi.exec.below_threshold event={event_key} "
                 f"edge={opp.edge_pct:.2f}% < {self.settings.MOTOR_REST_EXECUTION_EDGE_PCT}%"
+            )
+            return
+        # TECHO anti-fantasma (ver path binario): un edge enorme en un 1X2 = patas que no
+        # suman ~100 (equipo eliminado a ~0¢ / mercado por resolver). Graba pero NO ejecuta.
+        if opp.edge_pct > self.settings.MOTOR_REST_MAX_EDGE_PCT:
+            logger.warning(
+                f"motor_rest.multi.exec.edge_too_high event={event_key} "
+                f"edge={opp.edge_pct:.2f}% > {self.settings.MOTOR_REST_MAX_EDGE_PCT}% "
+                "(sospecha de fantasma: pata ~0¢ / mercado por resolver) → NO ejecuta"
             )
             return
         # Single-flight COMPARTIDO con el binario: una sola ejecución a la vez (el lock
