@@ -109,9 +109,11 @@ class Settings(BaseSettings):
     # ENCENDIDO POR CONFIG: con la key seteada, el runner usa LiveOddsSource (odds reales);
     # vacía → FakeOddsSource (fixture, shadow). No requiere editar código para el flip.
     ODDS_API_KEY: str = ""
-    # Deportes a consultar en The Odds API (sport_keys separados por coma). El Mundial es
-    # "soccer_fifa_world_cup"; confirmá el key exacto con get_sports() la 1ra vez.
-    ODDS_API_SPORT_KEYS: str = "soccer_fifa_world_cup"
+    # Deportes a consultar en The Odds API (sport_keys separados por coma). MLB diario =
+    # "baseball_mlb" (el play sostenible cuando acabe el Mundial). El Mundial es
+    # "soccer_fifa_world_cup". Para correr ambos en transición: "baseball_mlb,soccer_fifa_world_cup"
+    # (ojo: cada sport_key extra consume más créditos). Confirmá el key con get_sports() la 1ra vez.
+    ODDS_API_SPORT_KEYS: str = "baseball_mlb"
     # Regiones de casas. "eu" incluye Pinnacle (la más afilada) → fair-value más preciso;
     # se suma "us" por cobertura. 1 crédito por región por call (h2h).
     ODDS_API_REGIONS: str = "eu,us"
