@@ -18,7 +18,8 @@ Read-only: solo lee la tabla edge_windows. NO toca capital ni red a Kalshi.
 
 Uso (dentro del container Coolify):
     python scripts/report_edge_windows.py
-    python scripts/report_edge_windows.py --hours 168   # últimos 7 días
+    python scripts/report_edge_windows.py --hours 168              # últimos 7 días
+    python scripts/report_edge_windows.py --breakdown             # triage de ejecutables
 """
 
 from __future__ import annotations
@@ -45,7 +46,40 @@ def _fmt(vals: list[float], unit: str = "") -> str:
     )
 
 
-def report(hours: int | None) -> int:
+def _breakdown(exec_rows: list[EdgeWindow], exec_thresh: float) -> None:
+    """Triage de los ejecutables: banda de edge (fantasmas) + concentración por evento.
+
+    La sospecha de fantasma crece con el edge — un 1X2 real (3 outcomes ~100¢) rara vez
+    pasa de pocos %. Un edge alto implica patas que NO suman ~100 (stale / equipo
+    eliminado a ~0¢ / mercado por resolver). El desglose por evento revela si los
+    ejecutables están repartidos o concentrados en un puñado de partidos.
+    """
+    print(f"\n{'-' * 64}\nDESGLOSE DE EJECUTABLES (edge_pct ≥ {exec_thresh}%), n={len(exec_rows)}")
+
+    bands = [
+        (exec_thresh, 3.0, "arb plausible"),
+        (3.0, 10.0, "revisar"),
+        (10.0, 50.0, "⚠️  sospechoso"),
+        (50.0, float("inf"), "🚩 casi seguro fantasma (pata ~0¢ / mercado por resolver)"),
+    ]
+    print("\n  Por banda de edge_pct:")
+    for lo, hi, label in bands:
+        n = sum(1 for r in exec_rows if lo <= r.edge_pct < hi)
+        rng = f">{lo:.0f}%" if hi == float("inf") else f"{lo:.1f}–{hi:.0f}%"
+        print(f"    {rng:<9}: {n:>5}  {label}")
+
+    by_event: dict[str, list[float]] = {}
+    for r in exec_rows:
+        by_event.setdefault(r.market_ticker, []).append(r.edge_pct)
+    print(f"\n  Eventos distintos con ≥1 ejecutable: {len(by_event)}")
+    print("  Top 10 por nº de ventanas ejecutables (concentración):")
+    print(f"    {'evento':<34} {'windows':>7} {'best%':>7} {'med%':>7}")
+    top = sorted(by_event.items(), key=lambda kv: len(kv[1]), reverse=True)[:10]
+    for ev, edges in top:
+        print(f"    {ev[:34]:<34} {len(edges):>7} {max(edges):>6.1f} {statistics.median(edges):>6.1f}")
+
+
+def report(hours: int | None, breakdown: bool) -> int:
     """Imprime el reporte. Exit 0 siempre (diagnóstico)."""
     s = get_settings()
     exec_thresh = s.MOTOR_REST_EXECUTION_EDGE_PCT
@@ -79,7 +113,8 @@ def report(hours: int | None) -> int:
     gross_cents = [float(r.gross_spread_cents) for r in rows if r.gross_spread_cents is not None]
     fees = [float(r.fees_cents) for r in rows if r.fees_cents is not None]
     counts = [float(r.count) for r in rows if r.count is not None]
-    would_execute = [e for e in edge_pcts if e >= exec_thresh]
+    exec_rows = [r for r in rows if r.edge_pct is not None and r.edge_pct >= exec_thresh]
+    would_execute = [r.edge_pct for r in exec_rows]
 
     print(f"  total            : {len(rows)}  ({by_kind})")
     print(f"  ventana temporal : {span}")
@@ -110,9 +145,15 @@ def report(hours: int | None) -> int:
         print("     Las fees se comen el spread / mercado eficiente — el canary no dispararía hoy.")
         print("     Útil igual: confirma que el detector vive. Seguir acumulando.")
     else:
-        print(f"  🟢 {len(would_execute)} edges EJECUTABLES en la ventana.")
-        print("     Candidato real a canary. ANTES de encender: revisar consistencia varios")
-        print("     días (que no sea un pico aislado) y cerrar el hardening de void.")
+        print(f"  🟢 {len(would_execute)} edges cruzan el umbral de edge.")
+        print("     OJO: es una COTA SUPERIOR — 'cruzó el umbral' ≠ 'ejecutaría'. Los")
+        print("     guardarraíles de tiempo-de-ejecución (quote stale, mercado resuelto,")
+        print("     check_pre_trade) podrían rechazar parte. Y la COLA alta (edge_pct grande)")
+        print("     es casi seguro fantasma (pata ~0¢ / equipo eliminado), no arb real.")
+        print("     ANTES de encender: correr con --breakdown (descartar fantasmas y")
+        print("     concentración), revisar consistencia varios días, y cerrar el void.")
+        if breakdown:
+            _breakdown(exec_rows, exec_thresh)
     return 0
 
 
@@ -121,8 +162,13 @@ def main() -> None:
     p.add_argument(
         "--hours", type=int, default=None, help="Ventana en horas (default: histórico completo)."
     )
+    p.add_argument(
+        "--breakdown",
+        action="store_true",
+        help="Desglosar ejecutables por banda de edge (fantasmas) y por evento (concentración).",
+    )
     args = p.parse_args()
-    raise SystemExit(report(args.hours))
+    raise SystemExit(report(args.hours, args.breakdown))
 
 
 if __name__ == "__main__":
