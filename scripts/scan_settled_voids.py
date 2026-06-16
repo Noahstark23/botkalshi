@@ -19,7 +19,10 @@ productivo a propósito (mismo criterio que inspect_settlement_shape.py).
 Uso (dentro del container Coolify, con las env vars del bot):
     python scripts/scan_settled_voids.py
     python scripts/scan_settled_voids.py --series KXWCGAME KXWCGROUPWIN
-    python scripts/scan_settled_voids.py --statuses settled finalized
+
+NOTA: el filtro ?status= solo acepta unopened/open/closed/settled. 'finalized' es el
+valor del CAMPO status de un market resuelto, NO un filtro válido (→ 400). Un void cae
+igual bajo 'settled'; su status/result reales se leen del objeto y los flagea el scanner.
 """
 
 from __future__ import annotations
@@ -78,7 +81,11 @@ async def scan(series_list: list[str], statuses: list[str]) -> int:
                 await asyncio.sleep(_PAUSE_SEC)
                 markets: list[dict] = []
                 for status in statuses:
-                    markets = await _event_markets(client, et, status)
+                    try:
+                        markets = await _event_markets(client, et, status)
+                    except Exception as e:
+                        print(f"  ⚠️  list_markets({et}, {status}): {type(e).__name__}: {e}")
+                        continue
                     if markets:
                         break
                 if not markets:
@@ -126,8 +133,12 @@ async def scan(series_list: list[str], statuses: list[str]) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(description="Scanner read-only de voids en settled.")
     p.add_argument("--series", nargs="+", default=["KXWCGAME"], help="Series a escanear.")
+    # OJO: el FILTRO ?status= de /events y /markets solo acepta unopened/open/closed/settled.
+    # 'finalized' es el valor del CAMPO status de un market resuelto, NO un filtro válido
+    # (→ 400 bad_request). Un void igual cae bajo el filtro 'settled'; su status/result reales
+    # se leen del objeto market y los flagea la lógica de anomalías.
     p.add_argument(
-        "--statuses", nargs="+", default=["settled", "finalized"], help="Statuses a consultar."
+        "--statuses", nargs="+", default=["settled"], help="Statuses de FILTRO (no 'finalized')."
     )
     args = p.parse_args()
     raise SystemExit(asyncio.run(scan(args.series, args.statuses)))
