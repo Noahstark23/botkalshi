@@ -117,6 +117,11 @@ class Settings(BaseSettings):
     # Regiones de casas. "eu" incluye Pinnacle (la más afilada) → fair-value más preciso;
     # se suma "us" por cobertura. 1 crédito por región por call (h2h).
     ODDS_API_REGIONS: str = "eu,us"
+    # Series de Kalshi que MOTOR 2 consume (su universo de quotes). DESACOPLADO de
+    # MULTI_SERIES (Motor REST, winner-take-all ≥3 legs): Motor 2 también opera 2-way
+    # (MLB/NBA moneyline) que el arb NO toca. Coma-separado, tuneable por env — sumar
+    # KXNBAGAME/KXNHLGAME aquí onboarda esos deportes a Motor 2 sin tocar código.
+    MOTOR2_SERIES: str = "KXMLBGAME,KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP"
     # Umbral de edge NETO post-comisión de Motor 2, en PUNTOS PORCENTUALES (3.0 = 3pp).
     # Tuneable sin tocar código: subilo (ej. 4-5) para filtrar señales marginales pegadas
     # al borde. NO confundir con MIN_EDGE_PCT (ese es de Motor 1; Motor 2 usa SOLO este).

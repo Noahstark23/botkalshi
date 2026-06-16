@@ -205,7 +205,15 @@ class ProductionRunner:
                 RestKalshiQuoteSource,
             )
 
-            kalshi_source = RestKalshiQuoteSource(self._capture.multi_event_universe)
+            # Universo de Motor 2: series de MOTOR2_SERIES (incluye MLB 2-way), NO el de
+            # Motor REST (MULTI_SERIES, solo winner-take-all ≥3). Sin esto, MLB no entra al
+            # funnel de Motor 2 por más sport_key/alias que haya.
+            motor2_series = frozenset(
+                s.strip() for s in self.settings.MOTOR2_SERIES.split(",") if s.strip()
+            )
+            kalshi_source = RestKalshiQuoteSource(
+                lambda: self._capture.motor2_event_universe(motor2_series)
+            )
             # FLIP POR CONFIG: con la API paga (ODDS_API_KEY) usa odds REALES; si no, el
             # fixture fake (shadow, jamás apuesta). Sin editar código para encender.
             if self.settings.ODDS_API_KEY:
