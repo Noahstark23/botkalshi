@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     # === Capital ===
     # Bankroll base. Stop-losses (-3/-8/-15%) se derivan de acá → -$120/-$320/-$600 a $4k.
     ACTIVE_CAPITAL_USD: float = Field(4000.0, gt=0, le=100_000)
+    # Bankroll inicial REAL en USD para la reconciliación de balance del dashboard
+    # (scripts/check_portfolio.py). Solo lectura/observabilidad — NO afecta sizing ni riesgo.
+    # 0.0 = sin setear → el dashboard usa DailyPnL.starting_capital si existe, o lo omite.
+    KALSHI_INITIAL_BANKROLL: float = Field(0.0, ge=0)
 
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: str = ""
