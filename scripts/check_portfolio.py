@@ -25,6 +25,16 @@ def _cents(v: object) -> str:
         return str(v)
 
 
+def _num(v: object) -> int | None:
+    """int desde int o fixed-point string ('10.00', '0.42'→0). None si inválido."""
+    if v is None:
+        return None
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
 async def run() -> int:
     ok = True
     async with KalshiRestClient() as kc:
@@ -57,14 +67,47 @@ async def run() -> int:
             resp = await kc.get_fills(limit=50)
             fills = resp.get("fills", []) or []
             print(f"\n✅ fills: 200 OK — {len(fills)} fill(s) recientes")
-            for f in fills[:20]:
+            if fills:
+                # Dump CRUDO del 1er fill → vemos las claves/valores reales (sin adivinar).
+                print(f"  (claves 1er fill: {sorted(fills[0].keys())})")
+            print(f"  {'ticker':<30} {'side':<4} {'act':<5} {'cant':>5} {'precio¢':>8}")
+            for f in fills[:25]:
+                side = str(f.get("side", "")).lower()
+                # cantidad: count int, o count_fp fixed-point.
+                count = _num(f.get("count"))
+                if count is None:
+                    count = _num(f.get("count_fp"))
+                # precio del lado tradeado: yes_price/no_price (¢) según side; fallbacks.
+                price = f.get("yes_price") if side == "yes" else f.get("no_price")
+                if price is None:
+                    price = f.get("price") or f.get("price_dollars") or f.get("yes_price")
+                price_c = _num(price)
                 print(
-                    f"  {str(f.get('ticker', '')):<34} {f.get('side', ''):<4} "
-                    f"{f.get('action', ''):<5} count={f.get('count')} @ {f.get('yes_price', f.get('price'))}"
+                    f"  {str(f.get('ticker', ''))[:30]:<30} {side:<4} "
+                    f"{str(f.get('action', '')):<5} {str(count):>5} {str(price_c):>8}"
                 )
         except Exception as e:
             ok = False
             print(f"\n❌ fills: {type(e).__name__}: {e}  ← el fix de firma NO está activo")
+
+        # 4) órdenes resting (explica portfolio_value con 0 posiciones)
+        try:
+            resp = await kc.get_orders(status="resting", limit=100)
+            orders = resp.get("orders", []) or []
+            print(f"\n✅ orders resting: 200 OK — {len(orders)} viva(s)")
+            for o in orders[:20]:
+                rem = _num(o.get("remaining_count")) or _num(o.get("remaining_count_fp"))
+                price = (
+                    o.get("yes_price")
+                    if str(o.get("side", "")).lower() == "yes"
+                    else o.get("no_price")
+                )
+                print(
+                    f"  {str(o.get('ticker', ''))[:30]:<30} {str(o.get('side', '')):<4} "
+                    f"{str(o.get('action', '')):<5} rem={rem} @ {_num(price)}c"
+                )
+        except Exception as e:
+            print(f"\n⚠️  orders: {type(e).__name__}: {e}")
 
     print(f"\n{'=' * 60}")
     if ok:
