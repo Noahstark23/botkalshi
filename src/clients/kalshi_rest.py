@@ -251,6 +251,27 @@ class KalshiRestClient:
             params["ticker"] = ticker
         return await self._request("GET", "/portfolio/fills", params=params)
 
+    async def get_settlements(
+        self,
+        *,
+        limit: int = 200,
+        cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+    ) -> dict:
+        """
+        Posiciones resueltas por el exchange. `revenue` (¢) = lo recibido al settlement.
+        `min_ts`/`max_ts` son Unix en SEGUNDOS. Read-only.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        return await self._request("GET", "/portfolio/settlements", params=params)
+
     # =====================================================
     # Markets (público, no necesita auth técnicamente, pero firmamos igual)
     # =====================================================
