@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.strategies.motor_2_consensus.detector import (
+    MAX_PLAUSIBLE_EDGE,
     _consensus_fair_probs,
     _h2h_outcome_names,
     _net_edge_pct,
@@ -32,8 +33,9 @@ from src.strategies.motor_2_consensus.sources import LiveOddsSource, _parse_even
 from src.utils.config import get_settings
 
 
-async def _find_kalshi_event(client: KalshiRestClient, series: str, team: str):
-    """KalshiEventQuotes del evento ABIERTO de la serie cuyos outcomes incluyen `team`."""
+async def _find_events(client: KalshiRestClient, series: str, teams: list[str]):
+    """Eventos ABIERTOS de la serie cuyos outcomes (canónicos) contienen TODOS los `teams`."""
+    matches = []
     resp = await client.list_events(series_ticker=series, status="open", limit=200)
     for ev in resp.get("events", []):
         et = ev.get("event_ticker")
@@ -41,27 +43,35 @@ async def _find_kalshi_event(client: KalshiRestClient, series: str, team: str):
             continue
         detail = await client.get_event(et)
         eq = _parse_event_quotes(et, detail.get("markets", []))
-        if eq is not None and any(
-            team.lower() in canonical_name(q.outcome_name) for q in eq.outcomes
-        ):
-            return eq
+        if eq is None:
+            continue
+        canon = " ".join(canonical_name(q.outcome_name) for q in eq.outcomes)
+        if all(t.lower() in canon for t in teams):
+            matches.append(eq)
         await asyncio.sleep(0.2)
-    return None
+    return matches
 
 
-async def run(series: str, sport: str, team: str) -> int:
+async def run(series: str, sport: str, teams: list[str]) -> int:
     s = get_settings()
     capital = s.ACTIVE_CAPITAL_USD
     min_edge = s.MOTOR_2_MIN_EDGE_PCT / 100.0
     now = datetime.now(UTC)
 
     async with KalshiRestClient() as kc:
-        eq = await _find_kalshi_event(kc, series, team)
-    if eq is None:
+        events = await _find_events(kc, series, teams)
+    if not events:
         print(
-            f"❌ No encontré un evento {series} ABIERTO con '{team}'. ¿Ya empezó o no está listado?"
+            f"❌ Ningún evento {series} ABIERTO con {teams}. ¿Ya empezó/cerró (sale de 'open') "
+            "o los nombres difieren? Probá con un solo --team para listar candidatos."
         )
         return 1
+    if len(events) > 1:
+        print(f"⚠️  {len(events)} eventos matchean {teams} — especificá el rival con --vs:")
+        for e in events:
+            print(f"   {e.event_key}: {[q.outcome_name for q in e.outcomes]}")
+        return 3
+    eq = events[0]
     odds = await LiveOddsSource([sport], regions=s.ODDS_API_REGIONS).fetch()
 
     print(f"\n{'=' * 64}\nPartido Kalshi: {eq.event_key}")
@@ -107,7 +117,12 @@ async def run(series: str, sport: str, team: str) -> int:
             print(f"    {q.outcome_name:<20} {'—':>7} {q.yes_ask_cents:>7}c {'(sin fair)':>10}")
             continue
         net = _net_edge_pct(fp, q.yes_ask_cents)
-        flag = "  ← BET" if net > min_edge else ""
+        if net > MAX_PLAUSIBLE_EDGE:
+            flag = f"  🚩 fantasma (el bot lo DESCARTA: >{MAX_PLAUSIBLE_EDGE * 100:.0f}%)"
+        elif net > min_edge:
+            flag = "  ← BET"
+        else:
+            flag = ""
         print(
             f"    {q.outcome_name:<20} {fp * 100:>6.1f}% {q.yes_ask_cents:>7}c {net * 100:>8.1f}pp{flag}"
         )
@@ -130,11 +145,13 @@ async def run(series: str, sport: str, team: str) -> int:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="El bot elige las líneas de un partido (Motor 2).")
-    p.add_argument("--team", required=True, help="Filtro de equipo (ej. austria, jordan).")
+    p.add_argument("--team", required=True, help="Equipo (ej. austria).")
+    p.add_argument("--vs", default=None, help="Rival, para fijar el partido exacto (ej. jordan).")
     p.add_argument("--series", default="KXWCGAME", help="Serie Kalshi (default KXWCGAME 1X2).")
     p.add_argument("--sport", default="soccer_fifa_world_cup", help="sport_key de The Odds API.")
     args = p.parse_args()
-    raise SystemExit(asyncio.run(run(args.series, args.sport, args.team)))
+    teams = [args.team] + ([args.vs] if args.vs else [])
+    raise SystemExit(asyncio.run(run(args.series, args.sport, teams)))
 
 
 if __name__ == "__main__":
