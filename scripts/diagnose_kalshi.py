@@ -63,19 +63,15 @@ async def probe(
     *,
     params: dict | None = None,
 ) -> None:
-    full_path = f"/trade-api/v2{path}"
-    if params:
-        from urllib.parse import urlencode
-
-        qs = urlencode(sorted(params.items()))
-        sign_path = f"{full_path}?{qs}"
-    else:
-        sign_path = full_path
+    # Kalshi firma timestamp+method+path SIN querystring; los params van en la URL del
+    # request (abajo). Incluir el ?qs en la firma da 401 INCORRECT_API_KEY_SIGNATURE
+    # (mismo bug que se corrigió en kalshi_rest.py el 2026-06-17).
+    sign_path = f"/trade-api/v2{path}"
 
     headers = _sign_request(method, sign_path, api_key_id, private_key)
     url = f"{BASE_URL}{path}"
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"→ {method} {path}")
     if params:
         print(f"  params: {params}")
@@ -129,6 +125,9 @@ async def main() -> None:
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
         endpoints = [
             ("GET", "/portfolio/balance", None),
+            # positions/fills con params: ahora firman bien (path sin qs) → prueban el fix.
+            ("GET", "/portfolio/positions", {"limit": 200}),
+            ("GET", "/portfolio/fills", {"limit": 50}),
             ("GET", "/account/limits", None),
             ("GET", "/exchange/status", None),
             ("GET", "/events", {"limit": 5, "status": "open"}),
@@ -138,7 +137,7 @@ async def main() -> None:
             await probe(client, method, path, private_key, api_key_id, params=params)
             await asyncio.sleep(PAUSE_BETWEEN_REQUESTS)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Diagnóstico completo.")
 
 
