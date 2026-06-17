@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
 from loguru import logger
@@ -147,16 +146,17 @@ class KalshiRestClient:
             await self._client.aclose()
             self._client = None
 
-    def _build_sign_path(self, path: str, params: dict | None) -> str:
+    def _build_sign_path(self, path: str) -> str:
         """
-        Construye el path para signing.
-        Kalshi requiere que el query string se incluya en el mensaje firmado.
+        Path para el signing. Kalshi firma `timestamp + method + path` SIN el query string.
+
+        FIX 2026-06-17 (bug de plata real): incluir el ?qs en la firma daba 401
+        INCORRECT_API_KEY_SIGNATURE en TODO endpoint autenticado con params
+        (portfolio/fills?limit=, portfolio/positions?limit=) → el bot quedaba CIEGO a su
+        cartera mientras place_order (POST sin query) sí firmaba bien. Evidencia: balance
+        (sin params) firmaba OK. El querystring va en la URL del request, NUNCA en la firma.
         """
-        sign_path = f"/trade-api/v2{path}"
-        if params:
-            qs = urlencode(sorted(params.items()))  # ordenado para reproducibilidad
-            sign_path = f"{sign_path}?{qs}"
-        return sign_path
+        return f"/trade-api/v2{path}"
 
     @staticmethod
     def _classify_error(status_code: int, response_text: str) -> KalshiAPIError:
@@ -182,9 +182,8 @@ class KalshiRestClient:
         if self._client is None:
             raise RuntimeError("Cliente no inicializado. Usar `async with KalshiRestClient()`")
 
-        # Solo GET puede llevar query string en signing
-        sign_params = params if method.upper() == "GET" else None
-        sign_path = self._build_sign_path(path, sign_params)
+        # La firma va SOBRE EL PATH BASE (sin querystring); los params van en la URL.
+        sign_path = self._build_sign_path(path)
 
         try:
             async for attempt in AsyncRetrying(
