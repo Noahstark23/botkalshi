@@ -73,6 +73,21 @@ async def test_no_side_uses_no_price():
 
 
 @pytest.mark.asyncio
+async def test_lock_released_after_exit_allows_reattempt():
+    """FASE 3: tras un exit (incl. fill parcial), el lock del ticker se LIBERA → el próximo
+    tick puede reintentar el remanente. Si no se liberara, la salida quedaría trabada."""
+    c = _client(
+        {"orderbook": {"yes": [["0.60", "50"]], "no": []}},
+        place_resp={"order": {"fill_count": 4}},  # parcial: vende 4 de 10
+    )
+    ex = Motor3ExitExecutor(c)
+    pos = _pos("yes", count=10)
+    out = await ex.exit_position(pos)
+    assert out.filled is True and out.filled_count == 4
+    assert ex._lock_for(pos.ticker).locked() is False  # liberado → reintento posible
+
+
+@pytest.mark.asyncio
 async def test_concurrent_exit_skips_busy():
     """Si el lock del ticker ya está tomado (otra venta en curso) → se descarta, no doble-vende."""
     c = _client(

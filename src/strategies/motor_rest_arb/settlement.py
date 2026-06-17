@@ -175,6 +175,10 @@ class SettlementPoller:
                 col(Trade.strategy).in_(self.STRATEGIES),
             )
             filled = list(s.exec(stmt))
+        # Motor 3: una posición cerrada con SELL anticipado de CLV NO se settlea por
+        # resolución del mercado — su PnL ya quedó realizado al salir. Saltearla evita
+        # el doble-conteo (NULL/0 en filas viejas = no-CLV → se procesan normal).
+        filled = [t for t in filled if not t.closed_by_clv]
         if not filled:
             return 0
 

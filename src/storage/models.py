@@ -98,6 +98,11 @@ class Trade(SQLModel, table=True):
     fees_cents: int | None = None
     pnl_cents: int | None = None
 
+    # Motor 3 (CLV): la posición se cerró con un SELL anticipado de Motor 3, NO por
+    # resolución del mercado. El SettlementPoller SALTEA estas filas → no doble-cuenta
+    # el PnL (la pérdida/ganancia ya quedó realizada al precio de salida).
+    closed_by_clv: bool = False
+
     # Timestamps
     placed_at: datetime = Field(default_factory=_utc_now, index=True)
     filled_at: datetime | None = None
@@ -345,6 +350,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("edge_windows", "fees_cents", "INTEGER"),
     ("edge_windows", "edge_pct", "FLOAT"),
     ("edge_windows", "kind", "VARCHAR(20)"),  # P3: binary | multi_outcome
+    ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
 ]
 
 
@@ -365,7 +371,10 @@ def apply_migrations(engine: Any) -> None:
         return
     with engine.begin() as conn:
         for table, column, col_type in _MIGRATIONS:
-            if column not in _existing_columns(conn, table):
+            existing = _existing_columns(conn, table)
+            if not existing:
+                continue  # la tabla no existe en esta DB → create_all la creará con el schema actual
+            if column not in existing:
                 conn.exec_driver_sql(f'ALTER TABLE {table} ADD COLUMN "{column}" {col_type}')
                 logger.info(f"migration: ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 

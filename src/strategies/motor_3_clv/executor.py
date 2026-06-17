@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass
 
 from loguru import logger
+from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.math.fees import kalshi_fee_cents
@@ -123,10 +124,13 @@ class Motor3ExitExecutor:
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = str(order.get("order_id", "")) or None
         fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
-        filled = fill_count > 0
-        self._record_exit(coid, ticker, side, count, bid, fill_count, order_id, filled)
 
-        if filled:
+        if fill_count > 0:
+            # Audit del SELL (status=settled → realizado, NO cuenta como exposición) +
+            # FASE 2: cierre de la pata original para que el SettlementPoller no la liquide
+            # de nuevo por resolución (anti doble-conteo de PnL).
+            self._record_exit(coid, ticker, side, fill_count, bid, order_id)
+            self._settle_originals(ticker, side, bid, fill_count)
             logger.info(f"motor3.exit.filled ticker={ticker} side={side} sold={fill_count}@{bid}c")
             return Motor3ExitOutcome(
                 True, True, filled_count=fill_count, sell_price_cents=bid, client_order_id=coid
@@ -135,17 +139,17 @@ class Motor3ExitExecutor:
         return Motor3ExitOutcome(True, False, reason="ioc_no_fill", client_order_id=coid)
 
     def _record_exit(
-        self,
-        coid: str,
-        ticker: str,
-        side: str,
-        count: int,
-        price: int,
-        fill_count: int,
-        order_id: str | None,
-        filled: bool,
+        self, coid: str, ticker: str, side: str, fill_count: int, price: int, order_id: str | None
     ) -> None:
-        """Registra el SELL del exit como fila Trade (auditoría). Best-effort."""
+        """
+        Registra el SELL del exit como fila Trade de AUDITORÍA. Best-effort.
+
+        status='settled' a propósito: un SELL llenado es una salida YA realizada — así NO
+        cuenta como exposición (la query del RiskManager es pending/filled) ni dobla el PnL
+        (pnl_cents queda en None aquí; el PnL realizado vive en la pata BUY que settlea
+        `_settle_originals`).
+        """
+        now = _naive_utc_now()
         try:
             with get_session() as s:
                 s.add(
@@ -154,17 +158,92 @@ class Motor3ExitExecutor:
                         ticker=ticker,
                         side=side,
                         action="sell",
-                        count=count,
+                        count=fill_count,
                         price_cents=price,
                         strategy=STRATEGY,
-                        status="filled" if filled else "cancelled",
+                        status="settled",
                         kalshi_order_id=order_id,
-                        fill_price_cents=price if filled else None,
-                        fees_cents=kalshi_fee_cents(fill_count, price) if filled else None,
-                        filled_at=_naive_utc_now() if filled else None,
+                        fill_price_cents=price,
+                        fees_cents=kalshi_fee_cents(fill_count, price),
+                        filled_at=now,
+                        settled_at=now,
                         notes="clv_exit",
                     )
                 )
                 s.commit()
         except Exception:
             logger.exception(f"motor3.exit.record_failed coid={coid}")
+
+    def _settle_originals(self, ticker: str, side: str, exit_price: int, filled_count: int) -> None:
+        """
+        Cierra las patas BUY originales (Motor 2/REST) que este exit liquidó (FIFO por
+        antigüedad), marcándolas closed_by_clv + settled con el PnL REALIZADO al precio de
+        salida → el SettlementPoller las saltea (no doble-cuenta por resolución de mercado).
+
+        Parcial: si el fill cubre solo parte de una pata, esa pata se PARTE — el remanente
+        sigue 'filled' (abierto, el poller lo re-sincroniza y se reintenta) y se crea una
+        hija 'settled' por la porción cerrada. Best-effort: un fallo se loguea, no rompe.
+        """
+        origin = ("motor_2_consensus", "motor_rest_arb")
+        now = _naive_utc_now()
+        try:
+            with get_session() as s:
+                buys = list(
+                    s.exec(
+                        select(Trade)
+                        .where(
+                            Trade.ticker == ticker,
+                            Trade.side == side,
+                            Trade.action == "buy",
+                            Trade.status == "filled",
+                            col(Trade.strategy).in_(origin),
+                        )
+                        .order_by(col(Trade.placed_at))
+                    )
+                )
+                remaining = filled_count
+                for b in buys:
+                    if remaining <= 0:
+                        break
+                    if b.closed_by_clv:
+                        continue
+                    buy_price = b.fill_price_cents or b.price_cents
+                    closed = min(b.count, remaining)
+                    # PnL realizado del tramo cerrado: (salida − entrada) − fees de ambos lados.
+                    pnl = (
+                        closed * (exit_price - buy_price)
+                        - kalshi_fee_cents(closed, exit_price)
+                        - kalshi_fee_cents(closed, buy_price)
+                    )
+                    if closed == b.count:
+                        b.status = "settled"
+                        b.closed_by_clv = True
+                        b.settled_at = now
+                        b.pnl_cents = pnl
+                        b.notes = f"{b.notes or ''} closed_by_clv".strip()[:500]
+                        s.add(b)
+                    else:
+                        # Partial: reduce el original (remanente sigue abierto) + hija settled.
+                        b.count = b.count - closed
+                        s.add(b)
+                        s.add(
+                            Trade(
+                                client_order_id=f"{b.client_order_id}-clv{uuid.uuid4().hex[:8]}",
+                                ticker=ticker,
+                                side=side,
+                                action="buy",
+                                count=closed,
+                                price_cents=b.price_cents,
+                                fill_price_cents=buy_price,
+                                strategy=b.strategy,
+                                status="settled",
+                                closed_by_clv=True,
+                                settled_at=now,
+                                pnl_cents=pnl,
+                                notes="closed_by_clv split",
+                            )
+                        )
+                    remaining -= closed
+                s.commit()
+        except Exception:
+            logger.exception(f"motor3.exit.settle_originals_failed ticker={ticker}")
