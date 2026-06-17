@@ -26,6 +26,13 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _naive_utc_now() -> datetime:
+    """UTC naive — convención de comparación del RiskManager/settlement (SQLite no
+    preserva tz; mezclar aware/naive lanza TypeError al comparar). Motor 3 la usa para
+    todos sus campos de tiempo (close_time / synced_at)."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 # =====================================================
 # Tablas
 # =====================================================
@@ -91,12 +98,39 @@ class Trade(SQLModel, table=True):
     fees_cents: int | None = None
     pnl_cents: int | None = None
 
+    # Motor 3 (CLV): la posición se cerró con un SELL anticipado de Motor 3, NO por
+    # resolución del mercado. El SettlementPoller SALTEA estas filas → no doble-cuenta
+    # el PnL (la pérdida/ganancia ya quedó realizada al precio de salida).
+    closed_by_clv: bool = False
+
     # Timestamps
     placed_at: datetime = Field(default_factory=_utc_now, index=True)
     filled_at: datetime | None = None
     settled_at: datetime | None = None
 
     notes: str | None = Field(default=None, max_length=500)
+
+
+class PortfolioPosition(SQLModel, table=True):
+    """
+    Cache de una posición ABIERTA de Kalshi — el estado real de la cuenta para el Motor 3
+    (CLV). Una fila por market con posición neta != 0. El PortfolioPoller la sincroniza
+    cada 60s desde GET /portfolio/positions, cruzando get_market() para el `close_time`
+    (el endpoint de posiciones no lo trae). Read-only respecto al capital: solo cachea.
+
+    Convención de tiempo: NAIVE UTC en todos los campos (close_time/synced_at) para poder
+    comparar con `datetime.now(UTC).replace(tzinfo=None)` sin TypeError.
+    """
+
+    __tablename__ = "portfolio_positions"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ticker: str = Field(unique=True, index=True, max_length=100)
+    side: str = Field(max_length=10)  # "yes" | "no" — lado neto que tenemos abierto
+    count: int  # contratos (abs de la posición neta de Kalshi)
+    exposure_cents: int | None = None  # market_exposure de Kalshi (capital en riesgo)
+    close_time: datetime | None = None  # cierre del mercado (NAIVE UTC) — gate del CLV
+    synced_at: datetime = Field(default_factory=_naive_utc_now, index=True)
 
 
 class RiskEvent(SQLModel, table=True):
@@ -316,6 +350,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("edge_windows", "fees_cents", "INTEGER"),
     ("edge_windows", "edge_pct", "FLOAT"),
     ("edge_windows", "kind", "VARCHAR(20)"),  # P3: binary | multi_outcome
+    ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
 ]
 
 
@@ -336,7 +371,10 @@ def apply_migrations(engine: Any) -> None:
         return
     with engine.begin() as conn:
         for table, column, col_type in _MIGRATIONS:
-            if column not in _existing_columns(conn, table):
+            existing = _existing_columns(conn, table)
+            if not existing:
+                continue  # la tabla no existe en esta DB → create_all la creará con el schema actual
+            if column not in existing:
                 conn.exec_driver_sql(f'ALTER TABLE {table} ADD COLUMN "{column}" {col_type}')
                 logger.info(f"migration: ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 

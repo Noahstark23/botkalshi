@@ -176,6 +176,26 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_motor3_clv(self) -> None:
+        """
+        Motor 3 (CLV) — gateado por MOTOR_3_CLV_ENABLED. Liquida posiciones direccionales
+        a T-30min del cierre para capturar el closing line value. CAPA A: el executor (que
+        vende) solo se construye con TRADING_ENABLED=true — en shadow detecta y loguea las
+        salidas pero NUNCA vende (clave: place_order no frena 'sell', así que la protección
+        es Capa A, no el muro global). Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.MOTOR_3_CLV_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        try:
+            from src.strategies.motor_3_clv.engine import Motor3Engine
+
+            await Motor3Engine(trading_enabled=self.settings.TRADING_ENABLED).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor3_clv runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _run_motor2_shadow(self) -> None:
         """
         Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.
@@ -347,6 +367,8 @@ class ProductionRunner:
             ]
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
+            if self.settings.MOTOR_3_CLV_ENABLED:
+                tasks.append(asyncio.create_task(self._run_motor3_clv(), name="motor3_clv"))
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
             done, pending = await asyncio.wait(
