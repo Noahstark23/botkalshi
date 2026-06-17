@@ -38,7 +38,7 @@ Bot de trading algorítmico para **Kalshi prediction markets** (regulado por CFT
 
 **Tesis del sistema:** El edge en prediction markets en 2026 NO viene de predecir resultados (mercados son ~98% eficientes). Viene de detectar ineficiencias matemáticas estructurales que duran segundos a minutos, antes de que market makers institucionales las capturen.
 
-**Bankroll target:** $2,500 ($300 inicial → escala hasta $2,000 si el sistema valida)
+**Bankroll target:** $4,000 (topado a $200/trade; escala desde el canary chico tras validar consistencia multi-día)
 **ROI realista 2026:** 1-2% mensual (no 3-5% como en 2024)
 **Mes 1 esperado:** -1% a 0% (calibración)
 **Función estratégica:** Ingreso pasivo complementario, NO plan principal de capital
@@ -125,6 +125,11 @@ src/
 ---
 
 ## 4. LOS 3 MOTORES DE TRADING
+
+> **Estrategia de volumen ($4k, 2026-06):** Para lograr el objetivo de **$220/mes** con
+> capital de **$4k topado a $200/trade**, el sistema requiere **volumen (90-120 trades/mes)**.
+> El **Motor 2 (Consensus)** y los **mercados multi-outcome** asumen la prioridad para
+> alcanzar esa frecuencia operativa (el arbitraje puro es de baja frecuencia y no la sostiene).
 
 ### Motor 1: Arbitraje Intra-Kalshi
 **Tesis:** En cada evento con N outcomes, sus precios deberían sumar ≥100¢. Si suman <100¢ después de comisión, arbitraje matemático garantizado.

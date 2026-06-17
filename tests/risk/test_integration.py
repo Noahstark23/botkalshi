@@ -51,12 +51,13 @@ def _reset_botstate():
 
 def _risk_settings() -> MagicMock:
     s = MagicMock()
-    s.ACTIVE_CAPITAL_USD = 300.0
-    s.MAX_DAILY_LOSS_PCT = 3.0  # $9
-    s.MAX_WEEKLY_LOSS_PCT = 8.0
-    s.MAX_MONTHLY_LOSS_PCT = 15.0
-    s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # $75
-    s.MAX_TRADE_SIZE_PCT = 5.0
+    s.ACTIVE_CAPITAL_USD = 4000.0  # bankroll escalado
+    s.MAX_DAILY_LOSS_PCT = 3.0  # $120
+    s.MAX_WEEKLY_LOSS_PCT = 8.0  # $320
+    s.MAX_MONTHLY_LOSS_PCT = 15.0  # $600
+    s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # $1000
+    s.MAX_TRADE_SIZE_PCT = 5.0  # $200
+    s.MAX_TRADE_SIZE_USD = 200.0  # cap absoluto anti-slippage
     return s
 
 
@@ -116,9 +117,9 @@ def _insert_trade(
 
 @pytest.mark.asyncio
 async def test_daily_stop_loss_fires_on_settled_pnl_from_both_motors():
-    """Pérdidas settled de motor_rest (-$5) + motor_1 (-$4.50) = -$9.50 ≥ $9 → DISPARA."""
-    _insert_trade(strategy="motor_rest_arb", status="settled", pnl=-500, settled=True)
-    _insert_trade(strategy="motor_1_arbitrage", status="settled", pnl=-450, settled=True)
+    """Pérdidas settled de motor_rest (-$70) + motor_1 (-$51) = -$121 ≥ $120 → DISPARA."""
+    _insert_trade(strategy="motor_rest_arb", status="settled", pnl=-7000, settled=True)
+    _insert_trade(strategy="motor_1_arbitrage", status="settled", pnl=-5100, settled=True)
     mgr = _manager()
 
     with patch("src.risk.manager.alert_risk_event", new=AsyncMock()) as mock_alert:
@@ -133,8 +134,8 @@ async def test_daily_stop_loss_fires_on_settled_pnl_from_both_motors():
 
 @pytest.mark.asyncio
 async def test_losses_below_threshold_do_not_fire():
-    """-$8.99 < $9 → no dispara; el check sigue su curso y aprueba."""
-    _insert_trade(strategy="motor_rest_arb", status="settled", pnl=-899, settled=True)
+    """-$119 < $120 → no dispara; el check sigue su curso y aprueba."""
+    _insert_trade(strategy="motor_rest_arb", status="settled", pnl=-11900, settled=True)
     mgr = _manager()
     with patch("src.risk.manager.alert_risk_event", new=AsyncMock()):
         decision = await mgr.check_pre_trade(_opp())
@@ -149,9 +150,9 @@ async def test_losses_below_threshold_do_not_fire():
 
 @pytest.mark.asyncio
 async def test_exposure_cap_accumulates_both_motors():
-    """Motor 1 filled $40 + Motor REST pending $36 = $76 > $75 → rechazado por exposición."""
-    _insert_trade(strategy="motor_1_arbitrage", status="filled", price=40, count=100)  # $40
-    _insert_trade(strategy="motor_rest_arb", status="pending", price=45, count=80)  # $36
+    """Motor 1 filled $600 + Motor REST pending $450 = $1050 > $1000 → rechazado por exposición."""
+    _insert_trade(strategy="motor_1_arbitrage", status="filled", price=60, count=1000)  # $600
+    _insert_trade(strategy="motor_rest_arb", status="pending", price=45, count=1000)  # $450
     mgr = _manager()
     with patch("src.risk.manager.alert_risk_event", new=AsyncMock()):
         decision = await mgr.check_pre_trade(_opp())

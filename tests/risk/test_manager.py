@@ -36,12 +36,13 @@ def mock_settings():
     with patch("src.risk.manager.get_settings") as m:
         s = MagicMock()
         s.TRADING_ENABLED = True
-        s.ACTIVE_CAPITAL_USD = 300.0
-        s.MAX_DAILY_LOSS_PCT = 3.0
-        s.MAX_WEEKLY_LOSS_PCT = 8.0
-        s.MAX_MONTHLY_LOSS_PCT = 15.0
-        s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0
-        s.MAX_TRADE_SIZE_PCT = 5.0
+        s.ACTIVE_CAPITAL_USD = 4000.0  # bankroll escalado
+        s.MAX_DAILY_LOSS_PCT = 3.0  # → $120
+        s.MAX_WEEKLY_LOSS_PCT = 8.0  # → $320
+        s.MAX_MONTHLY_LOSS_PCT = 15.0  # → $600
+        s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # → $1000
+        s.MAX_TRADE_SIZE_PCT = 5.0  # 5% de $4k = $200
+        s.MAX_TRADE_SIZE_USD = 200.0  # cap absoluto anti-slippage
         m.return_value = s
         yield s
 
@@ -53,7 +54,7 @@ def risk_manager(mock_settings):
 
 @pytest.fixture
 def sample_opp():
-    """Arb binario: cost=85¢, count=15. Capital cap = 1500//85 = 17, so opp.count=15 wins."""
+    """Arb binario: cost=85¢, count=15. usable=$200 → 20000//85=235 cap, so opp.count=15 wins."""
     leg1 = ArbLeg(market_ticker="KX-TEST", side="yes", price_cents=40, count=15, available_size=100)
     leg2 = ArbLeg(market_ticker="KX-TEST", side="no", price_cents=45, count=15, available_size=100)
     return ArbOpportunity(
@@ -90,17 +91,17 @@ async def test_no_active_trades_allows_full_sizing(mock_session, risk_manager, s
     decision = await risk_manager.check_pre_trade(sample_opp)
 
     assert decision.approved is True
-    # 1500 cents max // 85 cents = 17 contracts cap, but opp.count=15 wins
+    # usable=$200 → 20000¢ // 85¢ = 235 cap, but opp.count=15 wins
     assert decision.max_allowed_count == 15
 
 
 @pytest.mark.asyncio
 @patch("src.risk.manager.get_session")
 async def test_exposure_exhausted_rejects(mock_session, risk_manager, sample_opp):
-    """$80 ya invertido, cap=$75 (25% of $300), debe rechazar."""
+    """$1040 ya invertido, cap=$1000 (25% of $4000), debe rechazar."""
     mock_trade = MagicMock()
     mock_trade.price_cents = 80
-    mock_trade.count = 100  # $80 exposure
+    mock_trade.count = 1300  # $1040 exposure > $1000 cap
 
     mock_db = MagicMock()
     mock_session.return_value.__enter__.return_value = mock_db
@@ -137,8 +138,8 @@ async def test_sizing_cap_strictly_applied(mock_session, risk_manager):
 
     decision = await risk_manager.check_pre_trade(opp)
     assert decision.approved is True
-    # usable=$15 (5% of $300), cost/unit=90¢ → 1500//90 = 16
-    assert decision.max_allowed_count == 16
+    # usable=$200 (min de 5%·$4k=$200 y cap absoluto $200), cost/unit=90¢ → 20000//90 = 222
+    assert decision.max_allowed_count == 222
 
 
 @pytest.mark.asyncio
@@ -163,6 +164,48 @@ async def test_opp_count_constrains_when_below_capital(mock_session, risk_manage
     decision = await risk_manager.check_pre_trade(opp)
     assert decision.approved is True
     assert decision.max_allowed_count == 5
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_absolute_usd_cap_binds_when_pct_would_exceed(mock_session):
+    """FASE 2: con capital alto, 5% daría >$200, pero el cap ABSOLUTO $200 es el que manda."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]
+
+    with patch("src.risk.manager.get_settings") as m:
+        s = MagicMock()
+        s.TRADING_ENABLED = True
+        s.ACTIVE_CAPITAL_USD = 5000.0  # 5% = $250 > cap absoluto $200
+        s.MAX_DAILY_LOSS_PCT = 3.0
+        s.MAX_WEEKLY_LOSS_PCT = 8.0
+        s.MAX_MONTHLY_LOSS_PCT = 15.0
+        s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # remaining $1250
+        s.MAX_TRADE_SIZE_PCT = 5.0
+        s.MAX_TRADE_SIZE_USD = 200.0
+        m.return_value = s
+        rm = RiskManager()
+        leg1 = ArbLeg(
+            market_ticker="KX", side="yes", price_cents=50, count=1000, available_size=1000
+        )
+        leg2 = ArbLeg(
+            market_ticker="KX", side="no", price_cents=50, count=1000, available_size=1000
+        )
+        opp = ArbOpportunity(
+            legs=(leg1, leg2),
+            count=1000,
+            gross_profit_cents=0,
+            fees_cents=0,
+            net_profit_cents=0,
+            edge_pct=5.0,
+        )
+        decision = await rm.check_pre_trade(opp)
+
+    # usable = min(5%·$5000=$250, remaining $1250, cap $200) = $200 → 20000//100 = 200
+    # Sin el cap absoluto serían 250 → el cap recortó 50 contratos.
+    assert decision.approved is True
+    assert decision.max_allowed_count == 200
 
 
 @pytest.mark.asyncio
@@ -219,7 +262,7 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
 
     monkeypatch.setattr(rm_module, "get_session", make_session)
 
-    # Insertar trade settled hoy con pérdida $10 (excede límite $9 = 3% de $300)
+    # Insertar trade settled hoy con pérdida $121 (excede límite $120 = 3% de $4000)
     with Session(real_db_engine) as s:
         losing_trade = Trade(
             client_order_id="e2e-loss-1",
@@ -230,7 +273,7 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
             price_cents=50,
             strategy="motor_1_arbitrage",
             status="settled",
-            pnl_cents=-1000,  # -$10
+            pnl_cents=-12100,  # -$121 > $120 daily
             # Anclado DENTRO de la ventana diaria de HOY (00:00 UTC + 1h): con
             # now−30min, correr el test entre 00:00 y 00:30 UTC caía en AYER →
             # el daily no veía la pérdida → flaky de medianoche (visto 2026-06-13).
@@ -277,7 +320,7 @@ async def test_daily_pnl_only_counts_settled_not_filled_e2e(
             price_cents=50,
             strategy="motor_1_arbitrage",
             status="filled",
-            pnl_cents=-1000,
+            pnl_cents=-13000,  # -$130 (superaría $120 daily SI estuviera settled; no lo está)
             placed_at=datetime.now(UTC).replace(tzinfo=None),
             filled_at=datetime.now(UTC).replace(tzinfo=None),
         )
@@ -298,12 +341,12 @@ async def test_weekly_pnl_breach_triggers_killswitch_e2e(
     risk_manager, sample_opp, real_db_engine, monkeypatch
 ):
     """
-    Pérdida dentro de la ventana semanal (> 8% capital = $24) dispara kill switch.
+    Pérdida dentro de la ventana semanal (> 8% capital = $320) dispara kill switch.
 
     El trade se inserta justo después del inicio de semana (lunes 00:01 UTC).
     Si hoy ES lunes, settled_at cae en today_start → también cuenta para daily.
     En ambos casos el resultado debe ser approved=False con "Stop-Loss" en reason.
-    Capital=$300, weekly cap=$24. Pérdida=$30 supera el límite.
+    Capital=$4000, weekly cap=$320. Pérdida=$321 supera el límite.
     """
     import src.risk.manager as rm_module
 
@@ -328,7 +371,7 @@ async def test_weekly_pnl_breach_triggers_killswitch_e2e(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-3000,  # -$30 > weekly cap $24
+                pnl_cents=-32100,  # -$321 > weekly cap $320
                 placed_at=settled_time - timedelta(hours=1),
                 filled_at=settled_time - timedelta(hours=1),
                 settled_at=settled_time,
@@ -350,7 +393,7 @@ async def test_weekly_pnl_old_trades_outside_window_dont_count(
 ):
     """
     Trade de hace 10 días NO cuenta para la ventana semanal (siempre fuera del
-    calendario de lunes a hoy). Pérdida $15 < weekly cap $24 y < monthly cap $45.
+    calendario de lunes a hoy). Pérdida $15 < weekly cap $320 y < monthly cap $600.
     """
     import src.risk.manager as rm_module
 
@@ -372,7 +415,7 @@ async def test_weekly_pnl_old_trades_outside_window_dont_count(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-1500,  # -$15: < weekly $24, < monthly $45
+                pnl_cents=-1500,  # -$15: < weekly $320, < monthly $600
                 placed_at=now_naive - timedelta(days=11),
                 filled_at=now_naive - timedelta(days=11),
                 settled_at=now_naive - timedelta(days=10),
@@ -381,7 +424,7 @@ async def test_weekly_pnl_old_trades_outside_window_dont_count(
         s.commit()
 
     # 10 días > 7 días → siempre fuera de la ventana semanal.
-    # -$15 < cap mensual $45 → sin breach mensual tampoco.
+    # -$15 < cap mensual $600 → sin breach mensual tampoco.
     decision = await risk_manager.check_pre_trade(sample_opp)
 
     assert decision.approved is True
@@ -395,8 +438,8 @@ async def test_monthly_pnl_breach_triggers_killswitch_e2e(
     Pérdida > 15% capital ($45) en el mes actual dispara kill switch.
 
     Trade insertado al inicio del mes (mes actual, fuera de la semana actual
-    cuando el día del mes lo permite). Capital=$300, monthly cap=$45.
-    Pérdida=$50 supera el límite sin importar la ventana que lo atrape primero.
+    cuando el día del mes lo permite). Capital=$4000, monthly cap=$600.
+    Pérdida=$601 supera el límite sin importar la ventana que lo atrape primero.
     """
     import src.risk.manager as rm_module
 
@@ -420,7 +463,7 @@ async def test_monthly_pnl_breach_triggers_killswitch_e2e(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-5000,  # -$50 > monthly cap $45
+                pnl_cents=-60100,  # -$601 > monthly cap $600
                 placed_at=settled_time - timedelta(hours=1),
                 filled_at=settled_time - timedelta(hours=1),
                 settled_at=settled_time,
@@ -445,7 +488,7 @@ async def test_daily_breach_priority_over_weekly_monthly(
 
     El loop de limits = [Diario, Semanal, Mensual] retorna el primero que dispara.
     Un trade de hace 30 minutos cae en daily, weekly y monthly → 'Diario' gana.
-    Capital=$300, daily cap=$9 (3%). Pérdida=$15 supera.
+    Capital=$4000, daily cap=$120 (3%). Pérdida=$130 supera.
     """
     import src.risk.manager as rm_module
 
@@ -467,7 +510,7 @@ async def test_daily_breach_priority_over_weekly_monthly(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-1500,  # -$15 > daily $9, weekly $24 y monthly $45 → daily primero
+                pnl_cents=-13000,  # -$130 > daily $120 (y weekly/monthly) → daily primero
                 # Anclado a HOY 00:00 UTC (+offsets) — now−30min caía en AYER si el
                 # test corría entre 00:00-00:30 UTC → flaky de medianoche (2026-06-13).
                 placed_at=datetime.combine(now_naive.date(), time.min),
