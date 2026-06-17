@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import os
 import time
 from pathlib import Path
@@ -108,7 +107,7 @@ async def main() -> None:
         print("❌ KALSHI_PRIVATE_KEY_PATH y KALSHI_API_KEY_ID deben estar en .env")
         return
 
-    if not Path(key_path).exists():
+    if not Path(key_path).exists():  # noqa: ASYNC240 — chequeo sync de arranque, no I/O en loop
         print(f"❌ Clave privada no encontrada: {key_path}")
         return
 
