@@ -97,7 +97,11 @@ class RiskManager:
         max_trade_usd = self.settings.ACTIVE_CAPITAL_USD * (
             self.settings.MAX_TRADE_SIZE_PCT / 100.0
         )
-        usable_usd = min(max_trade_usd, remaining_exposure_usd)
+        # Cap ABSOLUTO anti-slippage: el USD comprometido por orden nunca supera
+        # MAX_TRADE_SIZE_USD ($200), sin importar % ni capital. Combinado con
+        # remaining_exposure y opp.count (liquidez real del book) abajo, el size final es
+        # min(liquidez_book, kelly/%, $200).
+        usable_usd = min(max_trade_usd, remaining_exposure_usd, self.settings.MAX_TRADE_SIZE_USD)
 
         total_cost_per_unit_cents = sum(leg.price_cents for leg in opp.legs)
         if total_cost_per_unit_cents <= 0:

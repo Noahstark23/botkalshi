@@ -45,12 +45,17 @@ class Settings(BaseSettings):
     MAX_MONTHLY_LOSS_PCT: float = Field(15.0, gt=0, le=30)
     MAX_SIMULTANEOUS_EXPOSURE_PCT: float = Field(25.0, gt=0, le=100)
     MAX_TRADE_SIZE_PCT: float = Field(5.0, gt=0, le=20)
+    # Cap ABSOLUTO por orden (anti-slippage), en USD — independiente del % y del capital.
+    # El size final = min(liquidez_book, kelly/%, MAX_TRADE_SIZE_USD). A $4k el 5% ya da
+    # $200; este techo lo BLINDA aunque el capital o el % suban.
+    MAX_TRADE_SIZE_USD: float = Field(200.0, gt=0, le=10_000)
     KELLY_FRACTION: float = Field(0.25, gt=0, le=1)
     MIN_EDGE_PCT: float = Field(2.0, gt=0, le=20)
     MIN_LIQUIDITY_CONTRACTS: int = Field(10, ge=1)
 
     # === Capital ===
-    ACTIVE_CAPITAL_USD: float = Field(300.0, gt=0, le=100_000)
+    # Bankroll base. Stop-losses (-3/-8/-15%) se derivan de acá → -$120/-$320/-$600 a $4k.
+    ACTIVE_CAPITAL_USD: float = Field(4000.0, gt=0, le=100_000)
 
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: str = ""
