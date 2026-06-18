@@ -641,21 +641,33 @@ class DataCaptureService:
 
             executor = None
             risk_manager = None
-            if self.settings.TRADING_ENABLED and self._rest_client is not None and not ks_engaged:
+            # CAPA A: ejecutar requiere el CONSENSO de dos flags — TRADING_ENABLED (global) Y
+            # MOTOR_REST_EXECUTION_ENABLED (propio del motor). Con el propio en False el motor
+            # corre en SHADOW aunque el trading global esté ON → valida el guardarraíl
+            # pata-dura-primero (#85) sin ejecutar ni apagar a los otros motores.
+            exec_requested = (
+                self.settings.TRADING_ENABLED and self.settings.MOTOR_REST_EXECUTION_ENABLED
+            )
+            if exec_requested and self._rest_client is not None and not ks_engaged:
                 from src.risk.manager import RiskManager
                 from src.strategies.motor_rest_arb.executor import RestExecutor
 
                 executor = RestExecutor(self._rest_client)
                 risk_manager = RiskManager()
-            elif self.settings.TRADING_ENABLED and ks_engaged:
+            elif self.settings.TRADING_ENABLED and not self.settings.MOTOR_REST_EXECUTION_ENABLED:
+                logger.info(
+                    "Motor REST: MOTOR_REST_EXECUTION_ENABLED=false → SHADOW "
+                    "(detecta y graba EdgeWindow; valida el guardarraíl sin ejecutar órdenes)."
+                )
+            elif exec_requested and ks_engaged:
                 logger.critical(
                     f"Motor REST: kill-switch persistente ENGAGED ({ks_reason}) → SHADOW "
                     "forzado. Resolver con scripts/clear_kill_switch.py + redeploy."
                 )
-            elif self.settings.TRADING_ENABLED and self._rest_client is None:
+            elif exec_requested and self._rest_client is None:
                 logger.error(
-                    "Motor REST: TRADING_ENABLED=true pero SIN cliente REST persistente "
-                    "→ se queda en SHADOW (no se construye el executor)."
+                    "Motor REST: ejecución pedida (ambos flags ON) pero SIN cliente REST "
+                    "persistente → se queda en SHADOW (no se construye el executor)."
                 )
 
             self._rest_engine = RestArbEngine(executor=executor, risk_manager=risk_manager)

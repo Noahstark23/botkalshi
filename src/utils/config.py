@@ -103,6 +103,14 @@ class Settings(BaseSettings):
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,
     # graba EdgeWindow). Default False. Para shadow mode = True + TRADING_ENABLED=False.
     MOTOR_REST_ENABLED: bool = Field(default=False, description="Run Motor REST (shadow/live)")
+    # Desacopla la EJECUCIÓN del Motor REST del TRADING_ENABLED global (igual que
+    # MOTOR_3_EXECUTION_ENABLED): con MOTOR_REST_ENABLED=True + esto en False, el motor corre
+    # en SHADOW (detecta + graba EdgeWindow) aunque el trading global esté ON → valida el
+    # guardarraíl pata-dura-primero (#85) sin ejecutar ni apagar a los otros motores.
+    MOTOR_REST_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="Si es True (y TRADING_ENABLED es True), Motor REST EJECUTA órdenes. Si es False, solo detecta y loguea (shadow).",
+    )
     # Umbrales calibrables con data real del shadow (NO hardcodear en el motor).
     MOTOR_REST_MIN_EDGE_CENTS: int = Field(
         default=1, ge=0, description="Edge neto post-comisión mínimo para disparar (cents)"
@@ -203,6 +211,7 @@ class Settings(BaseSettings):
                     self.MOTOR_3_CLV_ENABLED,
                     self.MOTOR_3_EXECUTION_ENABLED,
                     self.MOTOR_REST_ENABLED,
+                    self.MOTOR_REST_EXECUTION_ENABLED,
                 ]
             ):
                 raise ValueError(
