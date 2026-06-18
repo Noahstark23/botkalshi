@@ -4,8 +4,44 @@ from __future__ import annotations
 
 import pytest
 
-from src.math.arbitrage import detect_binary_arb, detect_multi_outcome_arb
+from src.math.arbitrage import (
+    ArbLeg,
+    ArbOpportunity,
+    detect_binary_arb,
+    detect_multi_outcome_arb,
+    select_hard_leg,
+)
 from src.math.fees import kalshi_fee_cents
+
+
+def _opp(*legs: ArbLeg) -> ArbOpportunity:
+    return ArbOpportunity(
+        legs=tuple(legs),
+        count=min((lg.count for lg in legs), default=0),
+        gross_profit_cents=0,
+        fees_cents=0,
+        net_profit_cents=0,
+        edge_pct=1.0,
+    )
+
+
+def test_select_hard_leg_picks_most_expensive():
+    """La pata dura = mayor price_cents; las otras conservan el orden original."""
+    a = ArbLeg(market_ticker="A", side="yes", price_cents=80, count=5, available_size=100)
+    b = ArbLeg(market_ticker="B", side="yes", price_cents=15, count=5, available_size=100)
+    c = ArbLeg(market_ticker="C", side="yes", price_cents=3, count=5, available_size=100)
+    hard, others = select_hard_leg(_opp(b, a, c))  # orden mezclado a propósito
+    assert hard is a  # la de 80c
+    assert others == [b, c]  # las otras, en orden original
+
+
+def test_select_hard_leg_tiebreak_by_thinner_depth():
+    """A igual precio, gana la de menor available_size (la más fina, la que más probable KILL-ea)."""
+    thick = ArbLeg(market_ticker="THICK", side="yes", price_cents=50, count=5, available_size=100)
+    thin = ArbLeg(market_ticker="THIN", side="yes", price_cents=50, count=5, available_size=10)
+    hard, others = select_hard_leg(_opp(thick, thin))
+    assert hard is thin and others == [thick]
+
 
 # =====================================================
 # detect_binary_arb — happy path

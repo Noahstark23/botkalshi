@@ -28,6 +28,7 @@ def _engine(*, executor=None, risk_manager=None) -> RestArbEngine:
     settings.MOTOR_REST_MIN_EDGE_CENTS = 1
     settings.MOTOR_REST_MIN_DEPTH = 2
     settings.MOTOR_REST_EXECUTION_EDGE_PCT = 1.5
+    settings.MOTOR_REST_MAX_EDGE_PCT = 10_000.0  # techo alto: no interfiere en estos tests
     settings.TRADING_ENABLED = False
     with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
         eng = RestArbEngine(executor=executor, risk_manager=risk_manager)
@@ -141,6 +142,74 @@ async def test_multi_path_never_touches_executor():
 
     assert len(_multi_windows()) == 1  # detectó y grabó
     ex.execute.assert_not_awaited()  # pero NUNCA ejecutó
+
+
+@pytest.mark.asyncio
+async def test_shadow_logs_hard_first_intent():
+    """
+    SHADOW: un 1X2 con arb claro loguea la INTENCIÓN hard-first (#85) sin ejecutar:
+    la pata MÁS CARA se dispararía PRIMERO y las otras NO se envían hasta que llene.
+    """
+    from loguru import logger as _logger
+
+    eng = _engine()  # shadow (executor=None)
+    records: list[str] = []
+    sink = _logger.add(records.append, level="INFO", format="{message}")
+    try:
+        # Σasks = 80 < 100 (edge amplio, pasa el umbral). ARG es la pata más cara (40c).
+        await eng.on_ticker(_tick(T_ARG, "0.40"))
+        await eng.on_ticker(_tick(T_MEX, "0.25"))
+        await eng.on_ticker(_tick(T_TIE, "0.15"))
+    finally:
+        _logger.remove(sink)
+
+    intents = [r for r in records if "motor_rest.shadow.intent" in r]
+    assert len(intents) == 1
+    # La pata dura es la más cara (ARG @40c) y se anuncia "PRIMERO".
+    assert f"hard_leg={T_ARG}" in intents[0] and "@40c" in intents[0]
+    assert "PRIMERO" in intents[0] and "no-op" in intents[0]
+    # Las otras dos patas aparecen como "otras" (no se enviarían hasta que la dura llene).
+    assert T_MEX in intents[0] and T_TIE in intents[0]
+
+
+@pytest.mark.asyncio
+async def test_shadow_intent_dedupes_per_persistent_cross():
+    """El mismo arb repetido tick a tick loguea la intención UNA vez (anti-flood)."""
+    from loguru import logger as _logger
+
+    eng = _engine()
+    records: list[str] = []
+    sink = _logger.add(records.append, level="INFO", format="{message}")
+    try:
+        for _ in range(3):  # mismo grupo, 3 rondas
+            await eng.on_ticker(_tick(T_ARG, "0.40"))
+            await eng.on_ticker(_tick(T_MEX, "0.25"))
+            await eng.on_ticker(_tick(T_TIE, "0.15"))
+    finally:
+        _logger.remove(sink)
+
+    intents = [r for r in records if "motor_rest.shadow.intent" in r]
+    assert len(intents) == 1  # de-dupe: una sola intención pese a 3 evaluaciones
+
+
+@pytest.mark.asyncio
+async def test_shadow_no_intent_below_exec_threshold():
+    """Si el edge no supera MOTOR_REST_EXECUTION_EDGE_PCT, NO se loguea intención."""
+    from loguru import logger as _logger
+
+    eng = _engine()
+    eng.settings.MOTOR_REST_EXECUTION_EDGE_PCT = 99.0  # umbral imposible → nunca "ejecutaría"
+    records: list[str] = []
+    sink = _logger.add(records.append, level="INFO", format="{message}")
+    try:
+        await eng.on_ticker(_tick(T_ARG, "0.40"))
+        await eng.on_ticker(_tick(T_MEX, "0.25"))
+        await eng.on_ticker(_tick(T_TIE, "0.15"))  # arb real pero bajo el umbral de ejecución
+    finally:
+        _logger.remove(sink)
+
+    assert _multi_windows()  # se DETECTÓ y grabó (shadow detecta siempre)...
+    assert [r for r in records if "motor_rest.shadow.intent" in r] == []  # ...pero sin intención
 
 
 @pytest.mark.asyncio
