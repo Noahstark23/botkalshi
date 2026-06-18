@@ -19,12 +19,14 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiRestClient
-from src.storage.models import Trade, get_session
+from src.storage.models import DailyPnL, Trade, get_session
+from src.utils.config import get_settings
 
 
 def _cents(v: object) -> str:
@@ -122,6 +124,8 @@ async def run() -> int:
     print(f"📒 trades en DB local: {len(all_trades)} (con kalshi_order_id: {n_with_koid})")
 
     fills: list[dict] = []
+    positions: list[dict] = []
+    settlements: list[dict] = []
     async with KalshiRestClient() as kc:
         # 1) balance crudo (control + auditar portfolio_value).
         bal: dict = {}
@@ -169,7 +173,19 @@ async def run() -> int:
         except Exception as e:
             print(f"\n⚠️  orders: {type(e).__name__}: {e}")
 
+        # 5) settlements (revenue por resolución) — desglosa el portfolio_value.
+        try:
+            resp = await kc.get_settlements(limit=200)
+            settlements = resp.get("settlements", []) or []
+            print(f"\n✅ settlements: 200 OK — {len(settlements)} resuelto(s)")
+            if settlements:
+                print(f"  (1er settlement crudo: {settlements[0]})")
+        except Exception as e:
+            print(f"\n⚠️  settlements: {type(e).__name__}: {e}  (verificá el path/campo en prod)")
+
     _print_summary(fills, idx, bal)
+    _print_pv_breakdown(positions, settlements, bal)
+    _print_balance_reconciliation(bal, settlements, all_trades)
     _print_unmatched(fills, idx, all_trades)
     _print_motor_rest_arbs(all_trades)
     _print_pnl_by_motor(all_trades)
@@ -265,6 +281,119 @@ def _print_summary(fills: list[dict], idx: dict[str, Trade], bal: dict) -> None:
         print(f"    {motor:<20} {d['fills']:>3} fills  {d['contratos']:>6} contratos")
     if "balance" in bal:
         print(f"  balance actual: {_cents(bal.get('balance'))}  (crudo arriba para auditar pv)")
+
+
+def _pv_cents(bal: dict) -> int | None:
+    """portfolio_value en ¢ desde el balance crudo (escanea clave *portfolio*/*value*)."""
+    for k, v in bal.items():
+        kl = k.lower()
+        if ("portfolio" in kl or "value" in kl) and v is not None:
+            n = _num(v)
+            if n is not None:
+                return n
+    return None
+
+
+def _settle_revenue(s: dict) -> int | None:
+    """revenue del settlement en ¢ (revenue; fallback settlement_amount/value)."""
+    for key in ("revenue", "settlement_amount", "value"):
+        if s.get(key) is not None:
+            return _num(s.get(key))
+    return None
+
+
+def _parse_ts(v: object) -> datetime | None:
+    """A datetime naive-UTC desde ISO ('...Z') o epoch (seg/ms). None si no parsea."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        ts = v / 1000 if v > 1e12 else v
+        return datetime.fromtimestamp(ts, UTC).replace(tzinfo=None)
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return dt.astimezone(UTC).replace(tzinfo=None) if dt.tzinfo else dt
+    except (TypeError, ValueError):
+        return None
+
+
+def _print_pv_breakdown(positions: list[dict], settlements: list[dict], bal: dict) -> None:
+    """Desglosa el portfolio_value: exposición abierta + revenue de settlements recientes."""
+    pv = _pv_cents(bal)
+    print(f"\n{'=' * 70}\n💼 DESGLOSE portfolio_value ({_cents(pv) if pv is not None else '—'})")
+    exp = sum(_num(p.get("market_exposure")) or 0 for p in positions if _num(p.get("position")))
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=24)
+    rev_24h = 0
+    n_24h = 0
+    for s in settlements:
+        ts = _parse_ts(s.get("settled_time") or s.get("settled_ts"))
+        if ts is None or ts >= cutoff:  # sin ts confiable → incluir (conservador)
+            rev_24h += _settle_revenue(s) or 0
+            n_24h += 1
+    print(f"  Σ exposición posiciones abiertas:   {_cents(exp):>10}")
+    print(f"  Σ revenue settlements (~24h, {n_24h} filas): {_cents(rev_24h):>10}")
+    if pv is not None:
+        residual = pv - exp - rev_24h
+        print(f"  residual no atribuido:              {_cents(residual):>10}")
+    if not settlements:
+        print(
+            "  (sin settlements legibles — si el endpoint falló, verificá en el dashboard Kalshi)"
+        )
+
+
+def _initial_bankroll_cents() -> tuple[int | None, str]:
+    """Bankroll inicial en ¢: DailyPnL.starting_capital (hoy/último) o env. (valor, fuente)."""
+    try:
+        with get_session() as s:
+            rows = s.exec(select(DailyPnL).order_by(DailyPnL.date.desc())).all()
+        if rows:
+            return int(round(rows[0].starting_capital * 100)), f"DailyPnL {rows[0].date}"
+    except Exception:
+        pass
+    try:
+        env = get_settings().KALSHI_INITIAL_BANKROLL
+        if env > 0:
+            return int(round(env * 100)), "env KALSHI_INITIAL_BANKROLL"
+    except Exception:
+        pass
+    return None, "(sin fuente — seteá KALSHI_INITIAL_BANKROLL)"
+
+
+def _print_balance_reconciliation(
+    bal: dict, settlements: list[dict], all_trades: list[Trade]
+) -> None:
+    """Concilia balance_actual vs balance_inicial usando pnl settled y fees (24h, DB)."""
+    print(f"\n{'=' * 70}\n🧮 RECONCILIACIÓN BALANCE")
+    actual = _num(bal.get("balance"))
+    inicial, fuente = _initial_bankroll_cents()
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=24)
+    fees_24h = sum(t.fees_cents or 0 for t in all_trades if t.filled_at and t.filled_at >= cutoff)
+    pnl_24h = sum(t.pnl_cents or 0 for t in all_trades if t.settled_at and t.settled_at >= cutoff)
+    pv = _pv_cents(bal)
+    print(f"  balance_actual:        {_cents(actual):>10}")
+    print(
+        f"  balance_inicial:       {_cents(inicial) if inicial is not None else '—':>10}  {fuente}"
+    )
+    if actual is not None and inicial is not None:
+        delta = actual - inicial
+        explained = pnl_24h - fees_24h
+        print(f"  Δ (actual − inicial):  {_cents(delta):>10}")
+        print(f"  Σ pnl settled (24h):   {_cents(pnl_24h):>10}")
+        print(f"  Σ fees pagados (24h):  {_cents(-fees_24h):>10}")
+        if pv is not None:
+            print(f"  Σ portfolio_value:     {_cents(pv):>10}  (capital atado, NO perdido)")
+        no_expl = delta - explained
+        print(f"  delta no explicado:    {_cents(no_expl):>10}  (Δ − (pnl − fees))")
+        if pv is not None:
+            print(
+                f"  └─ tras descontar pv:  {_cents(no_expl + pv):>10}  "
+                "(≈0 si el faltante es solo capital atado en pv)"
+            )
+        if abs(no_expl) > 100:
+            print(
+                "  ⚠️  delta no explicado > $1 — flujo no atribuido (revisá fills sin motor / fees)"
+            )
+    else:
+        print("  (sin balance_inicial → no se puede conciliar; seteá KALSHI_INITIAL_BANKROLL)")
 
 
 def _print_unmatched(fills: list[dict], idx: dict[str, Trade], all_trades: list[Trade]) -> None:
