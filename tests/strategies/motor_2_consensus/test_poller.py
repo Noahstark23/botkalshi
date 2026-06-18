@@ -202,6 +202,87 @@ async def test_executor_bets_only_on_live_odds():
 
 
 @pytest.mark.asyncio
+async def test_filled_bet_sends_telegram_alert(monkeypatch):
+    """Cuando una apuesta de Motor 2 LLENA → se manda aviso a Telegram con los datos."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = True
+        filled_count = 4
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+    alert = AsyncMock()
+    monkeypatch.setattr("src.monitoring.telegram_alerts.alert_bet_placed", alert)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    signals = await poller.poll_once()
+
+    assert signals
+    assert alert.await_count == ex.execute.await_count  # un aviso por apuesta llena
+    kwargs = alert.await_args.kwargs
+    assert kwargs["count"] == 4
+    assert kwargs["ticker"].startswith(EV)
+    assert kwargs["side"] in ("YES", "NO")
+    assert "price_cents" in kwargs and "edge_pct" in kwargs
+
+
+@pytest.mark.asyncio
+async def test_no_fill_does_not_alert(monkeypatch):
+    """IOC sin fill (no apostó de verdad) → NO se manda aviso (no spamear)."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = False
+        filled_count = 0
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+    alert = AsyncMock()
+    monkeypatch.setattr("src.monitoring.telegram_alerts.alert_bet_placed", alert)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    await poller.poll_once()
+    alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_alert_failure_does_not_break_betting_loop(monkeypatch):
+    """Si Telegram tira excepción, el loop de apuestas NO se rompe (best-effort aislado)."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = True
+        filled_count = 2
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+    monkeypatch.setattr(
+        "src.monitoring.telegram_alerts.alert_bet_placed",
+        AsyncMock(side_effect=RuntimeError("telegram down")),
+    )
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    signals = await poller.poll_once()  # no debe propagar la excepción
+    assert ex.execute.await_count == len(signals)  # se intentaron todas las apuestas
+
+
+@pytest.mark.asyncio
 async def test_run_loop_stops_on_event():
     poller = Motor2ShadowPoller(
         _FakeKalshiSource([_kalshi_event()]),

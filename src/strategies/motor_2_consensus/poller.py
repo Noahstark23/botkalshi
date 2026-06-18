@@ -143,6 +143,22 @@ class Motor2ShadowPoller:
                         f"motor2.bet FILLED ticker={sig.market_ticker} side={sig.kalshi_side} "
                         f"count={outcome.filled_count}"
                     )
+                    # Aviso a Telegram: el bot APOSTÓ. Best-effort y aislado — si Telegram
+                    # falla NO debe romper el loop ni la próxima apuesta. edge_pct es
+                    # FRACCIÓN (0.03=3%) → ×100 para mostrarlo en porcentaje.
+                    try:
+                        from src.monitoring.telegram_alerts import alert_bet_placed
+
+                        await alert_bet_placed(
+                            motor="Motor 2 (consenso deportes)",
+                            ticker=sig.market_ticker,
+                            side=sig.kalshi_side,
+                            count=outcome.filled_count,
+                            price_cents=sig.kalshi_price_cents,
+                            edge_pct=sig.edge_pct * 100,
+                        )
+                    except Exception:
+                        logger.exception("motor2.bet.alert_error")
             except Exception as e:
                 logger.exception(
                     f"motor2.bet error ticker={sig.market_ticker}: {type(e).__name__}: {e}"
