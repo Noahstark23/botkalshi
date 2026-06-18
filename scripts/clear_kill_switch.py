@@ -9,6 +9,7 @@ vuelva a construir el executor.
 Uso (en el host):
     docker exec -it kalshi-bot python -m scripts.clear_kill_switch
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,9 +19,11 @@ from src.storage import models
 
 
 def _position_count(p: dict) -> int:
-    raw = p.get("position")
+    # Kalshi devuelve `position_fp` como fixed-point string ("-1.00"); el `position` plano
+    # puede faltar. Leer _fp primero y parsear con float (int("-1.00") rompería).
+    raw = p.get("position_fp", p.get("position"))
     try:
-        return int(raw) if raw is not None else 0
+        return int(round(float(raw))) if raw is not None else 0
     except (ValueError, TypeError):
         return 0
 
@@ -43,10 +46,12 @@ def main() -> int:
     open_positions = asyncio.run(_open_positions())
 
     if open_positions:
-        print(f"\n⛔ ABORT: hay {len(open_positions)} posición(es) abierta(s). "
-              "Cerralas a mano (Kalshi UI) ANTES de limpiar el kill-switch:")
+        print(
+            f"\n⛔ ABORT: hay {len(open_positions)} posición(es) abierta(s). "
+            "Cerralas a mano (Kalshi UI) ANTES de limpiar el kill-switch:"
+        )
         for p in open_positions:
-            print(f"  - {p.get('ticker')}: position={p.get('position')}")
+            print(f"  - {p.get('ticker')}: position={_position_count(p)}")
         return 1
 
     print("✅ Posiciones en cero confirmado.")
@@ -56,8 +61,10 @@ def main() -> int:
         return 1
 
     models.clear_kill_switch()
-    print("🔓 Kill-switch LIMPIADO. REDEPLOYÁ para reactivar el trading "
-          "(la Capa A reconstruye el executor solo si NO está engaged).")
+    print(
+        "🔓 Kill-switch LIMPIADO. REDEPLOYÁ para reactivar el trading "
+        "(la Capa A reconstruye el executor solo si NO está engaged)."
+    )
     return 0
 
 

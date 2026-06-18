@@ -236,6 +236,34 @@ def test_create_order_filled_shape_and_conservative_fail():
     assert f({"status": "executed"}, leg) is False  # campo de OTRO endpoint → no se confía
 
 
+@pytest.mark.asyncio
+async def test_has_open_position_reads_position_fp():
+    """
+    _has_open_position (2da fuente del reconcile real-money) debe leer `position_fp`
+    (fixed-point string de Kalshi, ej. "-1.00"), no `position` (que puede no venir).
+    Antes leía `position` → siempre None → siempre "sin posición" → degradaba el
+    cross-check de doble fuente a una sola.
+    """
+    client = AsyncMock()
+    client.get_positions = AsyncMock(
+        return_value={"market_positions": [{"ticker": "KXWC-26-ARG", "position_fp": "-1.00"}]}
+    )
+    ex = RestExecutor(client)
+    assert await ex._has_open_position("KXWC-26-ARG") is True
+
+    # position_fp="0.00" → sin posición abierta.
+    client.get_positions = AsyncMock(
+        return_value={"market_positions": [{"ticker": "KXWC-26-ARG", "position_fp": "0.00"}]}
+    )
+    assert await ex._has_open_position("KXWC-26-ARG") is False
+
+    # Fallback: `position` plano (int) sigue funcionando.
+    client.get_positions = AsyncMock(
+        return_value={"market_positions": [{"ticker": "KXWC-26-ARG", "position": 5}]}
+    )
+    assert await ex._has_open_position("KXWC-26-ARG") is True
+
+
 def test_get_orders_filled_status():
     """Reconciliación: GetOrders usa status=='executed'."""
     leg = ArbLeg(market_ticker="T", side="yes", price_cents=40, count=5, available_size=100)

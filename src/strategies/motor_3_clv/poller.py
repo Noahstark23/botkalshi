@@ -100,11 +100,15 @@ class PortfolioPoller:
             open_now: dict[str, tuple[str, int, int | None]] = {}
             for p in raw_positions:
                 ticker = str(p.get("ticker", ""))
-                pos = _as_int(p.get("position"))
+                # Kalshi devuelve los numéricos como fixed-point string en el campo
+                # `<name>_fp` (ej. position_fp="-1.00"); el `<name>` plano puede no venir.
+                # Leer el _fp primero con fallback al plano (robusto ante ambos shapes).
+                pos = _as_int(p.get("position_fp", p.get("position")))
                 if not ticker or pos is None or pos == 0:
                     continue  # sin posición abierta en este market
                 side = "yes" if pos > 0 else "no"
-                open_now[ticker] = (side, abs(pos), _as_int(p.get("market_exposure")))
+                exposure = _as_int(p.get("market_exposure_fp", p.get("market_exposure")))
+                open_now[ticker] = (side, abs(pos), exposure)
 
             # close_time: reusar el cacheado; solo get_market para los que falten.
             close_times: dict[str, datetime | None] = {}
