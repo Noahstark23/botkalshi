@@ -75,6 +75,20 @@ class Settings(BaseSettings):
     # === Operational toggles ===
     TRADING_ENABLED: bool = False
     MOTOR_1_ARBITRAGE_ENABLED: bool = False
+    # Umbral FINO de EJECUCIÓN del Motor 1 (binario WS), distinto del MIN_EDGE_PCT de
+    # DETECCIÓN: se DETECTA/graba EdgeWindow con MIN_EDGE_PCT pero se EJECUTA solo si el
+    # edge neto post-fee supera este % (= opp.edge_pct, una fuente de verdad). Conservador.
+    MOTOR_1_EXECUTION_EDGE_PCT: float = Field(
+        default=1.5,
+        ge=0.0,
+        description="Edge neto post-fee mínimo (% del capital comprometido) para EJECUTAR (Motor 1)",
+    )
+    # TECHO anti-fantasma del Motor 1: un edge enorme NO es un regalo — es casi siempre una
+    # pata sin precio / mercado a medio resolver. Se DETECTA/graba igual (EdgeWindow) pero
+    # NO se EJECUTA por encima de este %. Mismo default conservador que el Motor REST.
+    MOTOR_1_MAX_EDGE_PCT: float = Field(
+        default=10.0, gt=0.0, description="Techo de edge para EJECUTAR (anti-fantasma, %) (Motor 1)"
+    )
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     MOTOR_3_CLV_ENABLED: bool = False
     USE_ORDERBOOK_MANAGER_V2: bool = Field(

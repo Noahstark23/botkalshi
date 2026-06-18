@@ -196,6 +196,44 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_motor1_arb(self) -> None:
+        """
+        Motor 1 (arbitraje binario WS) — gateado por MOTOR_1_ARBITRAGE_ENABLED. Detecta
+        cruces YES+NO sobre el OrderbookManagerV2 (que vive en data_capture, alimentado por
+        el WS) y graba EdgeWindow. CAPA A: el ArbitrageExecutor (que coloca órdenes) SOLO se
+        construye con TRADING_ENABLED=true — en shadow el engine recibe executor=None y es
+        estructuralmente incapaz de ejecutar. Best-effort: si cae, se registra y la task
+        termina — NO tira el bot.
+        """
+        if not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        # Dar tiempo a que el WS se suscriba y aterricen los primeros snapshots del book.
+        await asyncio.sleep(30)
+        if self._capture is None:
+            logger.error("motor1_arb: capture service no disponible → no arranca")
+            return
+        manager = getattr(self._capture, "_v2_manager", None)
+        if manager is None:
+            logger.error(
+                "motor1_arb: OrderbookManagerV2 no disponible en el capture service → no arranca"
+            )
+            return
+        try:
+            from src.strategies.motor_1_arbitrage.engine import Motor1Engine
+
+            # Capa A: el executor SOLO se construye con TRADING_ENABLED=true; en shadow el
+            # engine recibe executor=None (incapaz de ejecutar).
+            if self.settings.TRADING_ENABLED:
+                async with KalshiRestClient() as client:
+                    executor = ArbitrageExecutor(client, RiskManager())
+                    await Motor1Engine(manager, executor=executor).run(self._stop_event)
+            else:
+                await Motor1Engine(manager).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor1_arb runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _run_motor2_shadow(self) -> None:
         """
         Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.
@@ -369,6 +407,8 @@ class ProductionRunner:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
             if self.settings.MOTOR_3_CLV_ENABLED:
                 tasks.append(asyncio.create_task(self._run_motor3_clv(), name="motor3_clv"))
+            if self.settings.MOTOR_1_ARBITRAGE_ENABLED:
+                tasks.append(asyncio.create_task(self._run_motor1_arb(), name="motor1_arb"))
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
             done, pending = await asyncio.wait(

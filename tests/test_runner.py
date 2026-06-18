@@ -86,6 +86,74 @@ async def test_reconcile_failure_does_not_crash_boot(mock_runner_settings):
 
 
 @pytest.mark.asyncio
+async def test_motor1_arb_noop_when_disabled(mock_runner_settings):
+    """MOTOR_1_ARBITRAGE_ENABLED=False → _run_motor1_arb retorna sin tocar nada."""
+    mock_runner_settings.MOTOR_1_ARBITRAGE_ENABLED = False
+    runner = ProductionRunner()
+    with patch("src.runner.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        await runner._run_motor1_arb()
+    mock_sleep.assert_not_called()  # retornó antes de cualquier sleep
+
+
+@pytest.mark.asyncio
+async def test_motor1_arb_shadow_runs_without_executor(mock_runner_settings):
+    """
+    MOTOR_1_ARBITRAGE_ENABLED=True + TRADING_ENABLED=False → engine corre en SHADOW:
+    NO se construye ArbitrageExecutor ni KalshiRestClient, executor=None.
+    """
+    mock_runner_settings.MOTOR_1_ARBITRAGE_ENABLED = True
+    mock_runner_settings.TRADING_ENABLED = False
+    runner = ProductionRunner()
+    runner._capture = MagicMock()
+    runner._capture._v2_manager = MagicMock()
+
+    fake_engine = MagicMock()
+    fake_engine.run = AsyncMock()
+    with (
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+        patch("src.runner.KalshiRestClient") as mock_client,
+        patch(
+            "src.strategies.motor_1_arbitrage.engine.Motor1Engine", return_value=fake_engine
+        ) as mock_eng_cls,
+    ):
+        await runner._run_motor1_arb()
+
+    mock_client.assert_not_called()  # shadow: sin cliente REST de órdenes
+    fake_engine.run.assert_awaited_once()
+    # Motor1Engine se construyó sin executor (Capa A).
+    assert "executor" not in mock_eng_cls.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_motor1_arb_aborts_when_manager_missing(mock_runner_settings):
+    """Sin OrderbookManagerV2 en el capture → log + return (no crash, no engine)."""
+    mock_runner_settings.MOTOR_1_ARBITRAGE_ENABLED = True
+    runner = ProductionRunner()
+    runner._capture = MagicMock()
+    runner._capture._v2_manager = None
+
+    with (
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+        patch("src.strategies.motor_1_arbitrage.engine.Motor1Engine") as mock_eng_cls,
+    ):
+        await runner._run_motor1_arb()
+
+    mock_eng_cls.assert_not_called()
+
+
+def test_task_list_includes_motor1_arb_only_when_enabled(mock_runner_settings):
+    """El task motor1_arb se agrega SII MOTOR_1_ARBITRAGE_ENABLED — invariante de seguridad."""
+    import inspect
+
+    import src.runner as runner_mod
+
+    src = inspect.getsource(runner_mod.ProductionRunner.run)
+    # El append está gateado por el flag (no incondicional).
+    assert "if self.settings.MOTOR_1_ARBITRAGE_ENABLED:" in src
+    assert 'name="motor1_arb"' in src
+
+
+@pytest.mark.asyncio
 async def test_reconcile_network_error_does_not_crash_boot(mock_runner_settings):
     """ConnectionError (red caida) tampoco debe crashear el bot."""
     with (
