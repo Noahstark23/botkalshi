@@ -2,7 +2,9 @@
 RestExecutor — ejecutor nativo del Motor REST, AISLADO del Motor 1.
 
 Implementa el diseño aprobado en docs/motor_rest_design.md §4.2/4.3:
-  - FOK nativo (time_in_force="fill_or_kill") en ambas patas, en paralelo.
+  - FOK nativo (time_in_force="fill_or_kill"). Fase 3b: la pata HARD (cara/fina, la
+    que empíricamente KILL-ea) se dispara PRIMERO y se espera; solo si llena se
+    disparan las baratas. Si la hard KILL-ea, no se compra nada → no-op (cero pérdida).
   - Manejo EXPLÍCITO por pata → máquina de 4 estados: FILL / KILL / ERROR_RED.
     NO se usa asyncio.gather(return_exceptions=True) (prohibido, Lección 7) ni se
     asume "excepción de red = no ejecutó" (eso es el bug de Issue #14): un
@@ -120,7 +122,16 @@ class RestExecutor:
 
     async def execute(self, opp: ArbOpportunity) -> ExecutionOutcome:
         """
-        Ejecuta una oportunidad de arbitraje binario con FOK en ambas patas.
+        Ejecuta una oportunidad de arbitraje con FOK, SECUENCIANDO la pata HARD primero.
+
+        Fase 3b — guardrail "hard-leg-first": en vez de disparar TODAS las patas en
+        paralelo (bug confirmado en prod: la pata cara/favorita KILL-ea por falta de
+        volumen resting mientras las patas baratas profundas LLENAN → quedan patas
+        huérfanas que el rollback liquida a 1¢ con PÉRDIDA GARANTIZADA cada ciclo),
+        se dispara PRIMERO la pata más difícil (la cara/fina, la que empíricamente
+        KILL-ea) y se ESPERA su resultado. Solo si LLENA se disparan las patas baratas
+        restantes. Si la hard KILL-ea, no se compró NADA → cero exposición → no-op (en
+        vez de un rollback con pérdida). Esto convierte ~91% de las pérdidas en no-ops.
 
         Returns ExecutionOutcome con el desenlace. NUNCA deja exposición silenciosa:
         toda pata huérfana se rollbackea o escala a kill-switch.
@@ -142,58 +153,113 @@ class RestExecutor:
         # red. Es lo que permite que reconcile_pending_trades (boot) recupere un crash
         # a mitad de ejecución, y lo que alimenta exposición/stop-loss del RiskManager.
         # Si el persist falla → ABORT sin colocar órdenes (sin fila, el RiskManager
-        # quedaría ciego a un fill real — fail-safe hacia no-operar).
+        # quedaría ciego a un fill real — fail-safe hacia no-operar). Se persisten TODAS
+        # las patas (incluidas las baratas que quizá no se envíen): el RiskManager
+        # necesita los intents y el reconcile de boot las cierra si quedan pending.
         if not self._persist_intents(arb_id, opp, coids):
             return ExecutionOutcome(filled=False)
 
-        # Lanzar ambas patas en paralelo con manejo EXPLÍCITO por pata (no gather
-        # que colapsa estados). Cada tarea resuelve a LegResult con su estado.
-        tasks = [asyncio.create_task(self._place_fok(leg, coids[leg])) for leg in opp.legs]
-        results: list[LegResult] = [await t for t in tasks]
+        # HARD LEG = la pata más cara (mayor price_cents); desempate por menor
+        # available_size (la más fina). Empíricamente (prod, 4/4 KILLs) es la favorita
+        # cara/fina la que NO encuentra volumen resting y KILL-ea. Disparar la FOK
+        # secuenciada sobre ella ES el test barato de profundidad viva: un KILL ahora no
+        # cuesta nada (no se compró nada), así que NO hace falta un pre-check de depth.
+        hard_leg = max(opp.legs, key=lambda lg: (lg.price_cents, -lg.available_size))
+        other_legs = [lg for lg in opp.legs if lg is not hard_leg]
 
+        # Paso 1: disparar SOLO la pata hard y esperarla.
+        hard_result = await self._place_fok(hard_leg, coids[hard_leg])
+        self._apply_leg_result_to_trade(hard_result)
+
+        # Caso KILL de la hard: no se compró nada → no-op, cero exposición. Las patas
+        # baratas NO se envían (su fila pending se cierra como cancelada).
+        if hard_result.state is LegState.KILL:
+            self._cancel_unsent_legs(other_legs, coids)
+            logger.info(
+                f"rest_exec.hard_leg_kill ticker={hard_leg.market_ticker} "
+                f"side={hard_leg.side} price={hard_leg.price_cents}c → no se envían "
+                f"{len(other_legs)} patas baratas (no-op, cero exposición)"
+            )
+            # leg_states sobre el orden de opp.legs: la hard con su KILL, las demás KILL
+            # (terminaron no-llenas). El orden es solo auditoría; se mantiene estable.
+            leg_states = [hard_result.state if lg is hard_leg else LegState.KILL for lg in opp.legs]
+            return ExecutionOutcome(filled=False, leg_states=leg_states, rollback_triggered=False)
+
+        # Caso ERROR_RED de la hard: estado DESCONOCIDO. NO perseguimos las patas
+        # baratas durante red degradada; reconciliamos la hard sola y, si resultó llena,
+        # rollback de esa única pata expuesta.
+        if hard_result.state is LegState.ERROR_RED:
+            self._cancel_unsent_legs(other_legs, coids)
+            outcome = ExecutionOutcome(filled=False, leg_states=[hard_result.state])
+            filled_legs = await self._resolve_exposure([hard_result], outcome)
+            if filled_legs:
+                await self._rollback(filled_legs, outcome)
+            return outcome
+
+        # Paso 2: la hard LLENÓ → ahora sí disparar las patas baratas (profundas, pueden
+        # ir en paralelo ENTRE ELLAS) con manejo EXPLÍCITO por pata.
+        tasks = [asyncio.create_task(self._place_fok(lg, coids[lg])) for lg in other_legs]
+        cheap_results: list[LegResult] = [await t for t in tasks]
+        for r in cheap_results:
+            self._apply_leg_result_to_trade(r)
+
+        results = [hard_result, *cheap_results]
         states = [r.state for r in results]
         outcome = ExecutionOutcome(filled=False, leg_states=states)
 
-        # A.1 — actualizar cada fila al estado resuelto de su pata. FILL es CRÍTICO
-        # (posición real abierta: si la DB falla acá, el RiskManager queda ciego →
-        # pausa preventiva). KILL es best-effort (sin posición; la fila pending residual
-        # la marca el reconcile de boot con alerta conservadora).
-        for r in results:
-            if r.state is LegState.FILL:
-                self._update_trade(
-                    r.client_order_id,
-                    critical=True,
-                    status="filled",
-                    filled_at=_naive_utc_now(),
-                    fill_price_cents=r.leg.price_cents,
-                    fees_cents=kalshi_fee_cents(r.leg.count, r.leg.price_cents),
-                    kalshi_order_id=r.order_id,
-                )
-            elif r.state is LegState.KILL:
-                self._update_trade(
-                    r.client_order_id,
-                    critical=False,
-                    status="cancelled",
-                    notes_append="fok_kill",
-                )
-
-        # Caso 1: ambas FILL → arb capturado completo.
+        # Caso 1: todas FILL → arb capturado completo.
         if all(s is LegState.FILL for s in states):
             outcome.filled = True
             logger.info(f"rest_exec.filled legs={len(results)} net={opp.net_profit_cents}c")
             return outcome
 
-        # Caso 2: ambas KILL → ninguna ejecutó (ventana cerrada). Cero exposición.
-        if all(s is LegState.KILL for s in states):
-            logger.info("rest_exec.no_fill both_legs=KILL (ventana cerrada, sin exposición)")
-            return outcome
-
-        # Caso 3/4: hay asimetría o ERROR_RED → reconciliar y, si quedó exposición,
-        # rollback de las patas efectivamente llenas.
+        # Caso residual (asimétrico/ERROR_RED tras la hard llena, raro) → reconciliar y,
+        # si quedó exposición, rollback de las patas efectivamente llenas.
         filled_legs = await self._resolve_exposure(results, outcome)
         if filled_legs:
             await self._rollback(filled_legs, outcome)
         return outcome
+
+    def _apply_leg_result_to_trade(self, r: LegResult) -> None:
+        """
+        Actualiza la fila Trade de una pata a su estado resuelto.
+
+        FILL es CRÍTICO (posición real abierta: si la DB falla acá, el RiskManager queda
+        ciego → pausa preventiva). KILL es best-effort (sin posición; la fila pending
+        residual la marca el reconcile de boot con alerta conservadora). ERROR_RED no se
+        toca acá: lo resuelve _resolve_exposure tras reconciliar.
+        """
+        if r.state is LegState.FILL:
+            self._update_trade(
+                r.client_order_id,
+                critical=True,
+                status="filled",
+                filled_at=_naive_utc_now(),
+                fill_price_cents=r.leg.price_cents,
+                fees_cents=kalshi_fee_cents(r.leg.count, r.leg.price_cents),
+                kalshi_order_id=r.order_id,
+            )
+        elif r.state is LegState.KILL:
+            self._update_trade(
+                r.client_order_id,
+                critical=False,
+                status="cancelled",
+                notes_append="fok_kill",
+            )
+
+    def _cancel_unsent_legs(self, legs: list[ArbLeg], coids: dict[ArbLeg, str]) -> None:
+        """
+        Cierra como canceladas las filas pending de patas que NUNCA se enviaron a la red
+        (porque la hard KILL-eó o quedó ERROR_RED). Best-effort: sin posición real, solo
+        marca de auditoría para distinguirlas de un KILL real (no_sent ≠ fok_kill).
+        """
+        for leg in legs:
+            self._update_trade(
+                coids[leg],
+                critical=False,
+                status="cancelled",
+                notes_append="not_sent_hard_first",
+            )
 
     # =====================================================
     # Ejecución de pata (FOK)

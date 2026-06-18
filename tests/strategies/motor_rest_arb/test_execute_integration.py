@@ -187,7 +187,7 @@ async def test_route_fill_fill():
 
 @pytest.mark.asyncio
 async def test_route_kill_kill():
-    """Ruta 2: 409 FOK en ambas → KILL/KILL, cero exposición, sin rollback."""
+    """Ruta 2: hard (no) KILL-ea (409 FOK) → la barata (yes) NUNCA se envía → no-op."""
     client = HarnessClient()
     client.buy = {"yes": _kill_409(), "no": _kill_409()}
     outcome = await RestExecutor(client).execute(_opp())
@@ -196,44 +196,47 @@ async def test_route_kill_kill():
     assert outcome.leg_states == [LegState.KILL, LegState.KILL]
     assert outcome.rollback_triggered is False
     assert outcome.reconciled is False
+    assert len(client.buys()) == 1  # SOLO la hard (no) se envió
     assert len(client.sells()) == 0
-    # A.1: ambas canceladas con audit trail (sin exposición fantasma).
+    # A.1: ambas canceladas con audit trail (sin exposición fantasma). La hard con
+    # fok_kill (el 409 real); la barata con not_sent_hard_first (nunca salió a la red).
     trades = _trades()
     assert {t.status for t in trades.values()} == {"cancelled"}
-    assert all("fok_kill" in (t.notes or "") for t in trades.values())
+    assert "fok_kill" in (trades["no"].notes or "")
+    assert "not_sent_hard_first" in (trades["yes"].notes or "")
     _shared_arb_id(trades)
 
 
 @pytest.mark.asyncio
 async def test_route_fill_plus_rollback_ok():
-    """Ruta 3: yes FILL + no KILL(409) → rollback que SÍ cierra la pata expuesta."""
+    """Ruta 3: hard (no) FILL + barata (yes) KILL(409) → rollback que SÍ cierra la pata NO."""
     client = HarnessClient()
-    client.buy = {"yes": _create_order_fill(), "no": _kill_409()}
+    client.buy = {"no": _create_order_fill(), "yes": _kill_409()}  # hard=no llena, barata=yes KILL
     client.sell_result = _create_order_fill()  # el sell de rollback llena
     outcome = await RestExecutor(client).execute(_opp())
 
     assert outcome.filled is False
-    assert outcome.leg_states == [LegState.FILL, LegState.KILL]
+    assert LegState.FILL in outcome.leg_states and LegState.KILL in outcome.leg_states
     assert outcome.rollback_triggered is True
     assert outcome.rollback_filled is True
     assert outcome.kill_switch_fired is False
-    assert len(client.sells()) == 1  # se vendió la pata yes expuesta
+    assert len(client.sells()) == 1  # se vendió la pata no expuesta
     # A.1 — EL CASO POR EL QUE EXISTE LA TAREA: la pérdida del rollback se REALIZA
     # al instante (settled + pnl<0 a precios límite) → el stop-loss del RiskManager
     # la ve HOY, sin esperar la resolución del evento.
     trades = _trades()
-    assert trades["yes"].status == "settled"
-    assert trades["yes"].pnl_cents is not None and trades["yes"].pnl_cents < 0
-    assert trades["yes"].settled_at is not None
-    assert "rollback_closed" in (trades["yes"].notes or "")
-    assert trades["no"].status == "cancelled"
+    assert trades["no"].status == "settled"
+    assert trades["no"].pnl_cents is not None and trades["no"].pnl_cents < 0
+    assert trades["no"].settled_at is not None
+    assert "rollback_closed" in (trades["no"].notes or "")
+    assert trades["yes"].status == "cancelled"
 
 
 @pytest.mark.asyncio
 async def test_route_fill_plus_rollback_fails_kill_switch():
-    """Ruta 4: rollback NO llena en 3 intentos → kill-switch (pausa + alerta)."""
+    """Ruta 4: hard (no) FILL + barata KILL → rollback NO llena → kill-switch (pausa + alerta)."""
     client = HarnessClient()
-    client.buy = {"yes": _create_order_fill(), "no": _kill_409()}
+    client.buy = {"no": _create_order_fill(), "yes": _kill_409()}  # hard=no llena, barata=yes KILL
     client.sell_result = _create_order_nofill()  # el rollback nunca llena
     executor = RestExecutor(client)
     with patch("src.monitoring.telegram_alerts.alert_error", new=AsyncMock()) as mock_alert:
@@ -248,24 +251,25 @@ async def test_route_fill_plus_rollback_fails_kill_switch():
     # A.1: la pata expuesta QUEDA filled (el cap del 25% la ve) con marca de auditoría,
     # y la pausa es PERSISTENTE (#32: sobrevive el restart de Coolify).
     trades = _trades()
-    assert trades["yes"].status == "filled"
-    assert "exposed_killswitch" in (trades["yes"].notes or "")
+    assert trades["no"].status == "filled"
+    assert "exposed_killswitch" in (trades["no"].notes or "")
     engaged, _reason = models.kill_switch_engaged()
     assert engaged is True
 
 
 @pytest.mark.asyncio
 async def test_route_error_red_reconciles_to_filled():
-    """Ruta 5: yes ERROR_RED (excepción de red) → reconcilia (get_orders+get_positions)."""
+    """Ruta 5: hard (no) FILL + barata (yes) ERROR_RED → reconcilia (get_orders+get_positions)."""
     client = HarnessClient()
-    client.buy = {"yes": RuntimeError("network down"), "no": _create_order_fill()}
+    client.buy = {"no": _create_order_fill(), "yes": RuntimeError("network down")}
     client.reconcile_status = "executed"  # get_orders dice que la pata SÍ llenó
     client.reconcile_position = 5  # get_positions confirma posición abierta
     client.sell_result = _create_order_fill()  # el rollback de las patas expuestas cierra
     outcome = await RestExecutor(client).execute(_opp())
 
-    assert outcome.leg_states[0] == LegState.ERROR_RED
-    assert outcome.leg_states[1] == LegState.FILL
+    # results = [hard(no)=FILL, barata(yes)=ERROR_RED] → ese es el orden de leg_states.
+    assert outcome.leg_states[0] == LegState.FILL
+    assert outcome.leg_states[1] == LegState.ERROR_RED
     assert outcome.reconciled is True
     # Doble fuente consultada para resolver el estado desconocido:
     assert any(m == "get_orders" for m, _ in client.calls)
@@ -281,21 +285,26 @@ async def test_route_error_red_reconciles_to_filled():
 
 @pytest.mark.asyncio
 async def test_route_error_red_reconciles_to_not_filled():
-    """Ruta 5b: ERROR_RED pero ambas fuentes coinciden en NO-llena → sin rollback."""
+    """Ruta 5b: hard (no) ERROR_RED reconcilia a NO-llena → sin exposición, barata no se envía."""
     client = HarnessClient()
-    client.buy = {"yes": RuntimeError("timeout"), "no": _kill_409()}
+    # La HARD (no) es la ERROR_RED; reconcilia a no-llena → no se compró nada → barata no sale.
+    client.buy = {"no": RuntimeError("timeout"), "yes": _kill_409()}
     client.reconcile_status = "canceled"  # get_orders: no ejecutó
     client.reconcile_position = 0  # get_positions: sin posición
     outcome = await RestExecutor(client).execute(_opp())
 
-    assert outcome.leg_states[0] == LegState.ERROR_RED
+    assert outcome.leg_states[0] == LegState.ERROR_RED  # solo la hard se envió
     assert outcome.reconciled is True
     assert outcome.rollback_triggered is False  # nada expuesto → no rollback
     assert len(client.sells()) == 0
-    # A.1: la ERROR_RED confirmada no-llena se cierra como cancelled con su motivo.
+    assert len(client.buys()) == 1  # SOLO la hard (no) se envió
+    # A.1: la hard ERROR_RED confirmada no-llena se cierra como cancelled con su motivo;
+    # la barata (yes), nunca enviada, se cierra con not_sent_hard_first.
     trades = _trades()
+    assert trades["no"].status == "cancelled"
+    assert "error_red_reconciled" in (trades["no"].notes or "")
     assert trades["yes"].status == "cancelled"
-    assert "error_red_reconciled" in (trades["yes"].notes or "")
+    assert "not_sent_hard_first" in (trades["yes"].notes or "")
 
 
 # =====================================================
