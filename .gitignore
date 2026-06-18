@@ -109,3 +109,8 @@ docker-compose.override.yml
 # =====================================================
 .ipynb_checkpoints/
 *.ipynb
+
+# =====================================================
+# Claude Code (worktrees efímeros de agentes, estado local)
+# =====================================================
+.claude/
