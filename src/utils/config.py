@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     )
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     MOTOR_3_CLV_ENABLED: bool = False
+    MOTOR_3_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="Si es True (y TRADING_ENABLED es True), Motor 3 VENDERÁ posiciones. Si es False, solo detecta y loguea (shadow).",
+    )
     USE_ORDERBOOK_MANAGER_V2: bool = Field(
         default=False, description="Enable WS-based recovery (OrderbookManagerV2)"
     )
@@ -197,6 +201,7 @@ class Settings(BaseSettings):
                     self.MOTOR_1_ARBITRAGE_ENABLED,
                     self.MOTOR_2_SPORTSBOOK_ENABLED,
                     self.MOTOR_3_CLV_ENABLED,
+                    self.MOTOR_3_EXECUTION_ENABLED,
                     self.MOTOR_REST_ENABLED,
                 ]
             ):

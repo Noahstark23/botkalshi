@@ -85,6 +85,44 @@ async def test_reconcile_failure_does_not_crash_boot(mock_runner_settings):
         assert "Reconcile" in BotState.last_error or "Kalshi" in BotState.last_error
 
 
+@pytest.mark.parametrize(
+    ("trading", "execution", "expected"),
+    [
+        (True, True, True),  # ambos on → Motor 3 VENDE
+        (True, False, False),  # trading global on pero execution off → SHADOW (el caso clave)
+        (False, True, False),  # execution on pero trading global off → shadow
+        (False, False, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_motor3_execution_requires_both_flags(
+    mock_runner_settings, trading, execution, expected
+):
+    """
+    Motor 3 solo vende con TRADING_ENABLED **y** MOTOR_3_EXECUTION_ENABLED ambos True.
+    El caso central: con el trading global ON (Motor 2 live) pero execution OFF, Motor 3
+    corre en SHADOW (detecta + loguea, jamás vende) → se puede validar sin riesgo.
+    """
+    s = mock_runner_settings
+    s.MOTOR_3_CLV_ENABLED = True
+    s.TRADING_ENABLED = trading
+    s.MOTOR_3_EXECUTION_ENABLED = execution
+
+    mock_engine = MagicMock()
+    mock_engine.run = AsyncMock()
+    with (
+        patch(
+            "src.strategies.motor_3_clv.engine.Motor3Engine", return_value=mock_engine
+        ) as mock_cls,
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+    ):
+        runner = ProductionRunner()
+        await runner._run_motor3_clv()
+
+    mock_cls.assert_called_once_with(trading_enabled=expected)
+    mock_engine.run.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_motor1_arb_noop_when_disabled(mock_runner_settings):
     """MOTOR_1_ARBITRAGE_ENABLED=False → _run_motor1_arb retorna sin tocar nada."""
