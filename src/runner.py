@@ -190,7 +190,11 @@ class ProductionRunner:
         try:
             from src.strategies.motor_3_clv.engine import Motor3Engine
 
-            await Motor3Engine(trading_enabled=self.settings.TRADING_ENABLED).run(self._stop_event)
+            await Motor3Engine(
+                trading_enabled=(
+                    self.settings.TRADING_ENABLED and self.settings.MOTOR_3_EXECUTION_ENABLED
+                )
+            ).run(self._stop_event)
         except Exception as e:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"
             logger.exception(msg)
