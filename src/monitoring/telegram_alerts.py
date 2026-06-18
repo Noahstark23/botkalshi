@@ -136,3 +136,35 @@ async def alert_trade(outcome: ExecutionOutcome, opp: ArbOpportunity) -> None:
             urgent=True,
         )
     # else: ambas KILL → sin mensaje (no spamear)
+
+
+async def alert_bet_placed(
+    *,
+    motor: str,
+    ticker: str,
+    side: str,
+    count: int,
+    price_cents: int,
+    edge_pct: float | None = None,
+    extra: str | None = None,
+) -> None:
+    """
+    Notifica que el bot COLOCÓ (y llenó) una apuesta/orden real. Genérico y reusable por
+    cualquier motor direccional (Motor 2 hoy; Motor 1/3 cuando ejecuten).
+
+    `edge_pct` debe venir ya en PORCENTAJE (el caller convierte si su fuente es fracción).
+    Best-effort: send_alert ya falla en silencio si Telegram no está configurado o la red
+    cae — el caller igual lo envuelve en try/except para aislar el flujo de ejecución.
+    """
+    cost_usd = count * price_cents / 100
+    lines = [
+        f"🎰 *{motor}: apuesta colocada*",
+        f"Market: `{ticker}`",
+        f"Lado: `{side.upper()}` · `{count}` contrato(s) @ `{price_cents}¢`",
+        f"Costo: `${cost_usd:.2f}`",
+    ]
+    if edge_pct is not None:
+        lines.append(f"Edge estimado: `{edge_pct:.2f}%`")
+    if extra:
+        lines.append(extra)
+    await send_alert("\n".join(lines))
