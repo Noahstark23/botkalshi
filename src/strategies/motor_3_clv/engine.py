@@ -20,7 +20,7 @@ from sqlmodel import select
 from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState
 from src.storage.models import PortfolioPosition, _naive_utc_now, get_session
-from src.strategies.motor_3_clv.detector import detect_and_log
+from src.strategies.motor_3_clv.detector import detect_and_log, summarize_exits
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.poller import PortfolioPoller
 
@@ -62,6 +62,8 @@ class Motor3Engine:
         now = _naive_utc_now()
         with get_session() as s:
             positions = list(s.exec(select(PortfolioPosition)))
+        # DIAG: por qué dispara (o no) este tick — evita el silencio total cuando nada es debido.
+        logger.info(f"[MOTOR 3 DIAG] {summarize_exits(positions, now).one_line()}")
         due = detect_and_log(positions, now)  # SHADOW: siempre loguea las salidas debidas
         if self._executor is not None:
             for position in due:

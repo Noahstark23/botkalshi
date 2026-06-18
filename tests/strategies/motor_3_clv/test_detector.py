@@ -18,6 +18,7 @@ from src.strategies.motor_3_clv.detector import (
     CLV_EXIT_FLOOR,
     clv_exit_due,
     scan_exits,
+    summarize_exits,
 )
 
 # NAIVE UTC fijo (la convención del Motor 3).
@@ -68,3 +69,47 @@ def test_scan_exits_filters_only_due():
     ]
     due = scan_exits(positions, NOW)
     assert {p.ticker for p in due} == {"A", "C"}
+
+
+def test_summarize_exits_classifies_every_bucket():
+    """El diagnóstico cuenta cada posición en exactamente un bucket y reporta totales."""
+    positions = [
+        _pos("A", minutes_to_close=29.0),  # due
+        _pos("B", minutes_to_close=45.0),  # pre-window
+        _pos("C", minutes_to_close=28.5),  # due
+        _pos("D", minutes_to_close=None),  # sin close_time
+        _pos("E", minutes_to_close=-3.0),  # past (ya cerrado)
+        _pos("F", minutes_to_close=10.0),  # past (<28)
+    ]
+    s = summarize_exits(positions, NOW)
+    assert s.total == 6
+    assert s.with_close_time == 5
+    assert s.without_close_time == 1
+    assert s.due == 2  # A, C
+    assert s.pre_window == 1  # B
+    assert s.past_window == 2  # E, F
+    # cada posición-con-close_time cae en exactamente un bucket
+    assert s.due + s.pre_window + s.past_window == s.with_close_time
+
+
+def test_summarize_exits_nearest_is_soonest_not_past():
+    """La 'próxima salida' es la posición no-pasada con menos tiempo restante."""
+    positions = [
+        _pos("FAR", minutes_to_close=120.0),
+        _pos("SOON", minutes_to_close=31.0),  # aún pre-window pero la más próxima
+        _pos("PAST", minutes_to_close=-5.0),  # pasada → no compite
+    ]
+    s = summarize_exits(positions, NOW)
+    assert s.nearest_ticker == "SOON"
+    assert s.nearest_remaining_min == pytest.approx(31.0)
+
+
+def test_summarize_exits_empty_and_none_close_time():
+    """Sin posiciones, o todas sin close_time → no hay 'próxima salida'."""
+    empty = summarize_exits([], NOW)
+    assert empty.total == 0 and empty.nearest_ticker is None
+
+    only_none = summarize_exits([_pos("X", minutes_to_close=None)], NOW)
+    assert only_none.without_close_time == 1
+    assert only_none.nearest_ticker is None
+    assert only_none.nearest_remaining_min is None

@@ -12,6 +12,7 @@ lock por-ticker viven aparte. Funciones puras (testeable sin red ni DB).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from loguru import logger
@@ -54,3 +55,67 @@ def detect_and_log(positions: list[PortfolioPosition], now: datetime) -> list[Po
     for p in due:
         logger.info(f"[MOTOR 3 SHADOW] CLV Exit detectado para {p.ticker}, {p.count} contratos.")
     return due
+
+
+@dataclass(frozen=True, slots=True)
+class ClvScanSummary:
+    """Foto de por qué Motor 3 dispara (o no) en un tick. Pura/testeable; sin red ni DB."""
+
+    total: int  # posiciones sincronizadas desde la cartera
+    with_close_time: int  # con close_time resuelto (sin esto NO se puede decidir)
+    without_close_time: int  # close_time None → el poller aún no las resolvió
+    due: int  # en la ventana [28, 30]min → salida debida AHORA
+    pre_window: int  # remaining > 30min → todavía lejos del cierre
+    past_window: int  # remaining < 28min (incl. ya cerrado) → fuera de ventana
+    nearest_ticker: str | None  # posición más próxima a entrar/dentro de la ventana
+    nearest_remaining_min: float | None  # minutos hasta su cierre (None si ninguna aplica)
+
+    def one_line(self) -> str:
+        nxt = (
+            f"{self.nearest_ticker} en {self.nearest_remaining_min:.1f}min"
+            if self.nearest_ticker is not None
+            else "—"
+        )
+        return (
+            f"posiciones={self.total} con_close_time={self.with_close_time} "
+            f"sin_close_time={self.without_close_time} | ventana(28-30m): "
+            f"debidas={self.due} pre={self.pre_window} post={self.past_window} | próxima salida: {nxt}"
+        )
+
+
+def summarize_exits(positions: list[PortfolioPosition], now: datetime) -> ClvScanSummary:
+    """
+    Desglose de por qué Motor 3 dispara o no: cuántas posiciones hay, cuántas tienen
+    close_time, cuántas están en/antes/después de la ventana, y cuál es la más próxima a
+    salir. Permite VERIFICAR en logs que el motor evalúa posiciones reales de Motor 2 y
+    cuándo será la próxima salida — en vez del silencio total cuando no hay nada debido.
+    """
+    with_ct = [p for p in positions if p.close_time is not None]
+    due = pre = past = 0
+    nearest_ticker: str | None = None
+    nearest_remaining: timedelta | None = None
+    for p in with_ct:
+        remaining = p.close_time - now  # type: ignore[operator]  # close_time != None aquí
+        if remaining > CLV_EXIT_CEIL:
+            pre += 1
+        elif remaining < CLV_EXIT_FLOOR:
+            past += 1
+            continue  # ya pasó la ventana: no compite por "próxima salida"
+        else:
+            due += 1
+        # "próxima salida": la posición no-pasada con menor tiempo restante.
+        if nearest_remaining is None or remaining < nearest_remaining:
+            nearest_remaining = remaining
+            nearest_ticker = p.ticker
+    return ClvScanSummary(
+        total=len(positions),
+        with_close_time=len(with_ct),
+        without_close_time=len(positions) - len(with_ct),
+        due=due,
+        pre_window=pre,
+        past_window=past,
+        nearest_ticker=nearest_ticker,
+        nearest_remaining_min=(
+            nearest_remaining.total_seconds() / 60 if nearest_remaining is not None else None
+        ),
+    )
