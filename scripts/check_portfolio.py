@@ -30,8 +30,9 @@ from src.utils.config import get_settings
 
 
 def _cents(v: object) -> str:
+    # round(float()) tolera fixed-point strings de Kalshi ('22.00') además de int.
     try:
-        return f"${int(v) / 100:.2f}"
+        return f"${int(round(float(v))) / 100:.2f}"  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return str(v)
 
@@ -201,9 +202,14 @@ async def run() -> int:
 def _print_positions(positions: list[dict]) -> bool:
     """Imprime TODAS las posiciones (no solo position!=0): la masa del portfolio_value
     suele estar en filas con position=0 pero market_exposure / settlement pendiente."""
-    nonzero = [p for p in positions if _num(p.get("position"))]
+    # Kalshi devuelve los numéricos como fixed-point string en `<name>_fp` (ej.
+    # position_fp="-1.00"); el `<name>` plano puede faltar. Leer _fp primero con fallback.
+    nonzero = [p for p in positions if _num(p.get("position_fp", p.get("position")))]
     withexp = [
-        p for p in positions if not _num(p.get("position")) and _num(p.get("market_exposure"))
+        p
+        for p in positions
+        if not _num(p.get("position_fp", p.get("position")))
+        and _num(p.get("market_exposure_fp", p.get("market_exposure")))
     ]
     print(
         f"\n✅ positions: 200 OK — {len(nonzero)} abierta(s), "
@@ -214,8 +220,10 @@ def _print_positions(positions: list[dict]) -> bool:
         print(f"  {'ticker':<34} {'pos':>6} {'exposición':>12} {'pnl_real':>10}")
         for p in rows[:30]:
             print(
-                f"  {str(p.get('ticker', '')):<34} {_num(p.get('position')) or 0:>6} "
-                f"{_cents(p.get('market_exposure')):>12} {_cents(p.get('realized_pnl')):>10}"
+                f"  {str(p.get('ticker', '')):<34} "
+                f"{_num(p.get('position_fp', p.get('position'))) or 0:>6} "
+                f"{_cents(p.get('market_exposure_fp', p.get('market_exposure'))):>12} "
+                f"{_cents(p.get('realized_pnl_fp', p.get('realized_pnl'))):>10}"
             )
         if rows and withexp:
             print(f"  (1er position con position=0+exposición, crudo: {withexp[0]})")
@@ -320,7 +328,11 @@ def _print_pv_breakdown(positions: list[dict], settlements: list[dict], bal: dic
     """Desglosa el portfolio_value: exposición abierta + revenue de settlements recientes."""
     pv = _pv_cents(bal)
     print(f"\n{'=' * 70}\n💼 DESGLOSE portfolio_value ({_cents(pv) if pv is not None else '—'})")
-    exp = sum(_num(p.get("market_exposure")) or 0 for p in positions if _num(p.get("position")))
+    exp = sum(
+        _num(p.get("market_exposure_fp", p.get("market_exposure"))) or 0
+        for p in positions
+        if _num(p.get("position_fp", p.get("position")))
+    )
     cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=24)
     rev_24h = 0
     n_24h = 0

@@ -466,8 +466,10 @@ class RestExecutor:
         )
         for p in positions:
             if str(p.get("ticker", "")) == ticker:
-                # 'position' (contratos netos) != 0 → posición abierta.
-                pos = _as_int(p.get("position"))
+                # Contratos netos != 0 → posición abierta. Kalshi devuelve el numérico como
+                # fixed-point string en `position_fp` (ej. "-1.00"); el `position` plano puede
+                # no venir. Leer _fp primero con fallback al plano (robusto ante ambos shapes).
+                pos = _as_int(p.get("position_fp", p.get("position")))
                 if pos is not None and pos != 0:
                     return True
         return False
