@@ -32,7 +32,7 @@ from loguru import logger
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
-from src.math.arbitrage import ArbLeg, ArbOpportunity
+from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import Trade, engage_kill_switch, get_session
 
@@ -159,13 +159,13 @@ class RestExecutor:
         if not self._persist_intents(arb_id, opp, coids):
             return ExecutionOutcome(filled=False)
 
-        # HARD LEG = la pata más cara (mayor price_cents); desempate por menor
-        # available_size (la más fina). Empíricamente (prod, 4/4 KILLs) es la favorita
-        # cara/fina la que NO encuentra volumen resting y KILL-ea. Disparar la FOK
-        # secuenciada sobre ella ES el test barato de profundidad viva: un KILL ahora no
-        # cuesta nada (no se compró nada), así que NO hace falta un pre-check de depth.
-        hard_leg = max(opp.legs, key=lambda lg: (lg.price_cents, -lg.available_size))
-        other_legs = [lg for lg in opp.legs if lg is not hard_leg]
+        # HARD LEG = la pata más cara (mayor price_cents; desempate por menor
+        # available_size). Empíricamente (prod, 4/4 KILLs) es la favorita cara/fina la que
+        # NO encuentra volumen resting y KILL-ea. Disparar la FOK secuenciada sobre ella ES
+        # el test barato de profundidad viva: un KILL ahora no cuesta nada (no se compró
+        # nada), así que NO hace falta un pre-check de depth. select_hard_leg es la FUENTE
+        # ÚNICA que comparten esta ejecución y el log de intención shadow del engine.
+        hard_leg, other_legs = select_hard_leg(opp)
 
         # Paso 1: disparar SOLO la pata hard y esperarla.
         hard_result = await self._place_fok(hard_leg, coids[hard_leg])
