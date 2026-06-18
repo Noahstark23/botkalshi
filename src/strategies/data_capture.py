@@ -600,9 +600,12 @@ class DataCaptureService:
         self.ws.on("ticker", self._on_ticker)
         self.ws.on("trade", self._on_trade)
 
-        # Orderbook manager — V2 if flag enabled and Motor 1 is not already wiring it.
-        # When MOTOR_1_ARBITRAGE_ENABLED=True, runner.py owns the manager lifecycle.
-        if self.settings.USE_ORDERBOOK_MANAGER_V2 and not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
+        # Orderbook manager — V2 cuando el flag V2 está on O Motor 1 está on. data_capture
+        # SIEMPRE construye el manager y registra sus 4 handlers en el WS (lifecycle del
+        # feed = del WS). Motor 1 lo LEE desde el servicio (self._v2_manager) y BotState;
+        # NO lo reconstruye. Con MOTOR_1_ARBITRAGE_ENABLED=False y V2=False no se construye
+        # nada (path idéntico al previo).
+        if self.settings.USE_ORDERBOOK_MANAGER_V2 or self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
 
             self._v2_manager = OrderbookManagerV2(self.ws)
@@ -611,7 +614,10 @@ class DataCaptureService:
             self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)
             self.ws.on("ok", self._v2_manager.handle_message)
             self.ws.on("error", self._v2_manager.handle_message)
-            logger.info("OrderbookManagerV2 registered (data-capture only, no Motor 1)")
+            logger.info(
+                f"OrderbookManagerV2 registered (v2_flag={self.settings.USE_ORDERBOOK_MANAGER_V2}, "
+                f"motor1={self.settings.MOTOR_1_ARBITRAGE_ENABLED})"
+            )
 
         # Motor REST — shadow mode. Estrictamente condicionado por MOTOR_REST_ENABLED.
         # SHADOW: detecta arbitraje sobre el canal `ticker` y graba EdgeWindow; NUNCA
