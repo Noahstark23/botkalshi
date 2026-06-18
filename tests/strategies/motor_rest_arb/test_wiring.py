@@ -14,13 +14,20 @@ from src.strategies.data_capture import DataCaptureService
 
 
 def _service_with_flags(
-    *, motor_rest: bool, trading: bool = False, with_client: bool = False, ks_engaged: bool = False
+    *,
+    motor_rest: bool,
+    trading: bool = False,
+    execution: bool = False,
+    with_client: bool = False,
+    ks_engaged: bool = False,
 ) -> DataCaptureService:
     settings = MagicMock()
     settings.USE_ORDERBOOK_MANAGER_V2 = False
     settings.MOTOR_1_ARBITRAGE_ENABLED = False
     settings.MOTOR_REST_ENABLED = motor_rest
     settings.TRADING_ENABLED = trading
+    # Ejecutar requiere TRADING_ENABLED Y MOTOR_REST_EXECUTION_ENABLED (consenso de 2 flags).
+    settings.MOTOR_REST_EXECUTION_ENABLED = execution
     rest_client = MagicMock() if with_client else None
     ks_value = (True, "test kill-switch") if ks_engaged else (False, None)
     # Mockear get_settings en ambos módulos: data_capture y el engine (que lo llama en su __init__).
@@ -76,8 +83,8 @@ def test_motor_rest_does_not_touch_execution_in_shadow():
 
 
 def test_motor_rest_builds_executor_when_live_with_client():
-    """Capa A: TRADING_ENABLED=true + cliente presente → executor + risk_manager construidos."""
-    svc = _service_with_flags(motor_rest=True, trading=True, with_client=True)
+    """Capa A: ambos flags ON + cliente presente → executor + risk_manager construidos."""
+    svc = _service_with_flags(motor_rest=True, trading=True, execution=True, with_client=True)
 
     engine = svc._rest_engine
     assert engine is not None
@@ -85,9 +92,23 @@ def test_motor_rest_builds_executor_when_live_with_client():
     assert engine._risk_manager is not None
 
 
+def test_motor_rest_shadow_when_execution_disabled_even_if_trading_on():
+    """
+    EL CASO QUE HABILITA LA VALIDACIÓN: TRADING_ENABLED=true (Motor 2 live) pero
+    MOTOR_REST_EXECUTION_ENABLED=false → Motor REST corre en SHADOW (executor=None),
+    detecta y graba EdgeWindow sin ejecutar. Permite validar el guardarraíl sin riesgo.
+    """
+    svc = _service_with_flags(motor_rest=True, trading=True, execution=False, with_client=True)
+
+    engine = svc._rest_engine
+    assert engine is not None
+    assert engine._executor is None  # execution flag OFF → no se construye aunque haya cliente
+    assert engine._risk_manager is None
+
+
 def test_motor_rest_stays_shadow_when_live_but_no_client():
-    """Capa A (guard): TRADING_ENABLED=true pero SIN cliente → se queda en shadow (executor=None)."""
-    svc = _service_with_flags(motor_rest=True, trading=True, with_client=False)
+    """Capa A (guard): ambos flags ON pero SIN cliente → se queda en shadow (executor=None)."""
+    svc = _service_with_flags(motor_rest=True, trading=True, execution=True, with_client=False)
 
     engine = svc._rest_engine
     assert engine is not None
@@ -96,8 +117,10 @@ def test_motor_rest_stays_shadow_when_live_but_no_client():
 
 
 def test_motor_rest_stays_shadow_when_kill_switch_engaged():
-    """Capa A (guard): kill-switch persistente ENGAGED → shadow forzado aun con trading+cliente."""
-    svc = _service_with_flags(motor_rest=True, trading=True, with_client=True, ks_engaged=True)
+    """Capa A (guard): kill-switch persistente ENGAGED → shadow forzado aun con ambos flags+cliente."""
+    svc = _service_with_flags(
+        motor_rest=True, trading=True, execution=True, with_client=True, ks_engaged=True
+    )
 
     engine = svc._rest_engine
     assert engine is not None
