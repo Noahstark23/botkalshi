@@ -45,6 +45,18 @@ TEAM_ALIASES: dict[str, str] = {
     "iran islamic republic": "iran",
     "ivory coast": "cote divoire",  # Kalshi (inglés) ↔ "côte d'ivoire" plegado
     "czechia": "czech republic",
+    # === Mundial 2026 — selecciones con grafía distinta entre Kalshi y The Odds API.
+    # Cada entrada es el MISMO país en dos grafías (oficial vs común): el alias se aplica a
+    # AMBOS lados, así que matchea sin importar qué plataforma use cuál. NUNCA mapear dos
+    # países distintos (sería el match catastrófico que advierte el docstring).
+    "turkiye": "turkey",  # confirmado en prod (Kalshi "Türkiye" ↔ Odds "Turkey")
+    "cabo verde": "cape verde",
+    "congo dr": "dr congo",  # RD del Congo — NO toca "congo" (Rep. del Congo, otro país)
+    "democratic republic of the congo": "dr congo",
+    "democratic republic of congo": "dr congo",
+    "korea dpr": "north korea",
+    "dpr korea": "north korea",
+    "china pr": "china",
     # === MLB (2026) — Kalshi usa nombre CORTO (ciudad/abrev), The Odds API el FULL
     # "Ciudad Equipo". Mapea el corto canónico → full canónico (el full ya canoniza a sí
     # mismo, sin entrada). Ciudades compartidas: Kalshi desambigua con sufijo (m/y, c/ws,

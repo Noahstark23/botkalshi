@@ -74,6 +74,45 @@ def test_canonical_name_resolves_alias(raw, expected):
 
 
 # =====================================================
+# Mundial 2026 — aliases de selecciones (grafías Kalshi ↔ The Odds API)
+# =====================================================
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("Türkiye", "Turkey"),  # confirmado en prod
+        ("Cabo Verde", "Cape Verde"),
+        ("Congo DR", "DR Congo"),
+        ("Democratic Republic of the Congo", "DR Congo"),
+        ("Korea DPR", "North Korea"),
+        ("China PR", "China"),
+    ],
+)
+def test_worldcup_team_alias_pairs_canonicalize_equal(a, b):
+    """Mismo país en dos grafías → mismo canónico (el alias es simétrico)."""
+    assert canonical_name(a) == canonical_name(b)
+
+
+def test_worldcup_turkey_real_1x2_matches():
+    """Partido real del Mundial: 'Türkiye' (Kalshi) ↔ 'Turkey' (Odds) → matchea."""
+    kalshi = ["Türkiye", "Paraguay", "Draw"]
+    odds = ["Turkey", "Draw", "Paraguay"]
+    assert outcomes_match(kalshi, odds) is True
+    assert match_outcomes(kalshi, odds) == {
+        "Türkiye": "Turkey",
+        "Paraguay": "Paraguay",
+        "Draw": "Draw",
+    }
+
+
+def test_dr_congo_does_not_match_republic_of_congo():
+    """SALVAGUARDA: RD del Congo y Rep. del Congo son países DISTINTOS → NO deben matchear."""
+    assert canonical_name("DR Congo") != canonical_name("Congo")
+    assert outcomes_match(["DR Congo", "Draw", "Spain"], ["Congo", "Draw", "Spain"]) is False
+
+
+# =====================================================
 # Regla 3 — cardinalidad estricta
 # =====================================================
 
