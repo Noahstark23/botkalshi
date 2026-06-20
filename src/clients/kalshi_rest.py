@@ -12,6 +12,8 @@ Features:
 from __future__ import annotations
 
 import json
+import uuid
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -343,7 +345,11 @@ class KalshiRestClient:
         time_in_force: str = "gtc",
     ) -> dict:
         """
-        Coloca una orden.
+        Coloca una orden vía el endpoint V2 (POST /portfolio/events/orders).
+
+        La firma sigue siendo (side yes/no, action buy/sell, yes_price/no_price en ¢):
+        internamente se traduce al contrato V2 (side bid/ask, price único en dólares). Ver
+        el bloque de traducción abajo. `order_type` se ignora (V2 no tiene campo type).
 
         IMPORTANTE: Antes de llamar este método:
         1. Verifica TRADING_ENABLED=true
@@ -377,25 +383,55 @@ class KalshiRestClient:
                 f"(action={action} ticker={ticker} count={count})"
             )
 
+        # ── Traducción al contrato V2 (POST /portfolio/events/orders) ──────────────
+        # Kalshi deprecó el endpoint legacy /portfolio/orders (410 deprecated_v1_order_endpoint).
+        # V2 cotiza TODO desde el libro YES: `side` ∈ {bid = comprar YES, ask = vender YES},
+        # un ÚNICO `price` en DÓLARES (string fixed-point, ej. "0.52"), SIN campos `action`
+        # ni `type`. El bot razona en (side yes/no, action buy/sell, precio en ¢ del lado);
+        # se mapea con la identidad comprar-NO @ P¢ ≡ vender-YES @ (100−P)¢:
+        #   yes + buy  → bid,  precio = yes_price
+        #   yes + sell → ask,  precio = yes_price
+        #   no  + buy  → ask,  precio = 100 − no_price   (comprar NO = vender YES al complemento)
+        #   no  + sell → bid,  precio = 100 − no_price   (vender  NO = comprar YES al complemento)
+        if side == "yes":
+            if yes_price is None:
+                raise ValueError("place_order: side='yes' requiere yes_price")
+            price_cents = yes_price
+            book_side = "bid" if action == "buy" else "ask"
+        elif side == "no":
+            if no_price is None:
+                raise ValueError("place_order: side='no' requiere no_price")
+            price_cents = 100 - no_price
+            book_side = "ask" if action == "buy" else "bid"
+        else:
+            raise ValueError(f"place_order: side inválido {side!r} (esperado 'yes'|'no')")
+        if not (1 <= price_cents <= 99):
+            raise ValueError(f"place_order: precio fuera de rango [1,99]: {price_cents}c")
+
+        # V2 solo acepta los TIF completos; normalizar el atajo histórico 'gtc'. order_type
+        # ('limit'/'market') NO existe en V2: la inmediatez la da el time_in_force (FOK/IOC).
+        tif = "good_till_canceled" if time_in_force == "gtc" else time_in_force
+        # FixedPointDollars: dólares como string (Decimal exacto, NUNCA float), 2 decimales
+        # (el precio es en ¢ enteros → exacto). 52¢ → "0.52", 40¢ → "0.40".
+        price_dollars = f"{Decimal(price_cents) / 100:.2f}"
+
         body: dict[str, Any] = {
             "ticker": ticker,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": order_type,
-            "time_in_force": time_in_force,
+            # client_order_id es REQUERIDO en V2 (idempotencia); los callers siempre lo pasan.
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": book_side,
+            "count": str(count),  # FixedPointCount: acepta "10"
+            "price": price_dollars,
+            "time_in_force": tif,
+            # Cancela la pata taker si se auto-cruzaría (lo ya matcheado igual ejecuta).
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        if yes_price is not None:
-            body["yes_price"] = yes_price
-        if no_price is not None:
-            body["no_price"] = no_price
-        if client_order_id:
-            body["client_order_id"] = client_order_id
 
         logger.info(
-            f"Placing order: {action} {count} {side} {ticker} @ yes={yes_price} no={no_price}"
+            f"Placing order (V2): {action} {count} {side} {ticker} @ {price_cents}c "
+            f"→ side={book_side} price=${price_dollars} tif={tif}"
         )
-        return await self._request("POST", "/portfolio/orders", json=body)
+        return await self._request("POST", "/portfolio/events/orders", json=body)
 
     async def cancel_order(self, order_id: str) -> dict:
         """Cancela una orden por ID."""
