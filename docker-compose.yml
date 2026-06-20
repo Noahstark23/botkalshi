@@ -50,10 +50,17 @@ services:
       MOTOR_1_ARBITRAGE_ENABLED: ${MOTOR_1_ARBITRAGE_ENABLED:-false}
       MOTOR_2_SPORTSBOOK_ENABLED: ${MOTOR_2_SPORTSBOOK_ENABLED:-false}
       MOTOR_3_CLV_ENABLED: ${MOTOR_3_CLV_ENABLED:-false}
+      # Ejecución de Motor 3 desacoplada del trading global (consenso de 2 flags). En false
+      # corre en SHADOW aunque TRADING_ENABLED=true → se valida sin vender de verdad.
+      MOTOR_3_EXECUTION_ENABLED: ${MOTOR_3_EXECUTION_ENABLED:-false}
       USE_ORDERBOOK_MANAGER_V2: ${USE_ORDERBOOK_MANAGER_V2:-false}
 
       # Motor REST (shadow/live). MOTOR_REST_ENABLED=true + TRADING_ENABLED=false = shadow.
       MOTOR_REST_ENABLED: ${MOTOR_REST_ENABLED:-false}
+      # Ejecución de Motor REST desacoplada del trading global (consenso de 2 flags). En
+      # false corre en SHADOW (detecta + log de intención hard-first) aunque TRADING_ENABLED
+      # =true → se valida el guardarraíl sin ejecutar ni apagar a Motor 2.
+      MOTOR_REST_EXECUTION_ENABLED: ${MOTOR_REST_EXECUTION_ENABLED:-false}
       MOTOR_REST_MIN_EDGE_CENTS: ${MOTOR_REST_MIN_EDGE_CENTS:-1}
       MOTOR_REST_MIN_DEPTH: ${MOTOR_REST_MIN_DEPTH:-2}
       # Umbral FINO de ejecución (% del capital comprometido); calibrable desde Coolify.
