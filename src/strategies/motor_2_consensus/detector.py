@@ -244,9 +244,13 @@ def find_signals(
             # los dos sets canónicos → se ve EXACTO qué alias falta agregar a TEAM_ALIASES.
             if best_reason in ("names", "cardinality") and best_pair and name_debug_budget > 0:
                 name_debug_budget -= 1
+                k_set, o_set = best_pair
+                # El DIFF de sets muestra EXACTO qué nombre sobra de cada lado → el alias a
+                # agregar es kalshi_solo[i] → odds_solo[i] (ej. 'turkiye' → 'turkey').
                 logger.info(
                     f"motor2.name_debug reason={best_reason} "
-                    f"kalshi={sorted(best_pair[0])} odds={sorted(best_pair[1])}"
+                    f"kalshi_solo={sorted(k_set - o_set)} odds_solo={sorted(o_set - k_set)} "
+                    f"(kalshi={sorted(k_set)} odds={sorted(o_set)})"
                 )
     return signals
 
