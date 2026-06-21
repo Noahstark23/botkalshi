@@ -12,6 +12,9 @@ services:
       dockerfile: Dockerfile
     container_name: kalshi-bot
     restart: unless-stopped
+    # Margen para shutdown limpio (alert_shutdown + cierre de DB/WS) antes del SIGKILL.
+    # Default Docker = 10s; lo subimos para que el SIGTERM del redeploy cierre ordenado.
+    stop_grace_period: 30s
 
     # Variables de entorno - Coolify las inyecta desde su panel
     # En .env vacíos por default para que Coolify las defina

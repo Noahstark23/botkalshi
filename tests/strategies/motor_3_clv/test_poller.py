@@ -41,7 +41,7 @@ async def test_parses_position_fp_and_persists(monkeypatch):
             {
                 "ticker": "KXWCGAME-26JUN26NZLBEL-BEL",
                 "position_fp": "-1.00",
-                "market_exposure_fp": "22.00",
+                "market_exposure_dollars": "0.22",  # dinero = string USD → 22¢
             }
         ]
     )
@@ -54,7 +54,7 @@ async def test_parses_position_fp_and_persists(monkeypatch):
     assert len(rows) == 1
     assert rows[0].ticker == "KXWCGAME-26JUN26NZLBEL-BEL"
     assert rows[0].side == "no" and rows[0].count == 1
-    assert rows[0].exposure_cents == 22
+    assert rows[0].exposure_cents == 22  # market_exposure_dollars "0.22" → 22¢
     assert rows[0].close_time is not None  # resolvió close_time vía get_market
 
 
@@ -83,4 +83,20 @@ async def test_plain_position_fallback(monkeypatch):
     assert n == 1
     rows = _positions()
     assert rows[0].side == "yes" and rows[0].count == 3
-    assert rows[0].exposure_cents == 150
+    assert rows[0].exposure_cents == 150  # market_exposure plano (centavos) → 150
+
+
+@pytest.mark.asyncio
+async def test_exposure_none_when_field_absent_persists_position(monkeypatch):
+    """Sin ningún campo de exposición conocido → exposure_cents None, pero la posición
+    igual se persiste (el bug que arregla esto era cosmético: no debe tirar el poller)."""
+    monkeypatch.setattr("src.strategies.motor_3_clv.poller.asyncio.sleep", AsyncMock())
+    client = _client([{"ticker": "T-NOEXP", "position_fp": "2.00"}])  # sin market_exposure*
+    poller = PortfolioPoller(client_factory=lambda: client)
+
+    n = await poller.sync_once()
+
+    assert n == 1
+    rows = _positions()
+    assert rows[0].side == "yes" and rows[0].count == 2
+    assert rows[0].exposure_cents is None  # ausente → None, sin crash
