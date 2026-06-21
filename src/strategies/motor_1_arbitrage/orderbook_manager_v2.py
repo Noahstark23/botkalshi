@@ -268,8 +268,11 @@ class OrderbookManagerV2:
     async def _start_recovery(self, sid: int) -> None:
         """Mark all tickers in sid as stale and send WS get_snapshot command."""
         tickers = list(self._tickers_by_sid.get(sid, set()))
-        logger.critical(
-            f"Sid {sid} gap detected. Marking {len(tickers)} tickers stale, "
+        # Gap individual = evento benigno AUTO-RECUPERADO (resync por snapshot) → INFO, no
+        # CRITICAL (era ruido: ~32/día). La escalada por FRECUENCIA anormal sigue intacta
+        # vía _record_gap_and_should_alert (Telegram sid_gap_warning/critical a umbrales).
+        logger.info(
+            f"Sid {sid} gap detected (auto-recovery). Marking {len(tickers)} tickers stale, "
             "requesting WS recovery snapshot."
         )
 

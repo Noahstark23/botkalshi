@@ -42,6 +42,24 @@ def _as_int(value: object) -> int | None:
     return None
 
 
+def _money_to_cents(position: dict, name: str) -> int | None:
+    """
+    Lee un campo de DINERO de una posición Kalshi y lo devuelve en CENTAVOS.
+
+    Convención Kalshi: el dinero viene como `<name>_dollars` (string USD fixed-point, ej.
+    "0.22") y/o `<name>` (entero en centavos, histórico). El sufijo `_fp` es para CONTEOS
+    de contratos, NO para dinero — por eso `market_exposure_fp` nunca existió y exposure_cents
+    quedaba None. Devuelve None si no aparece en ningún shape conocido.
+    """
+    dollars = position.get(f"{name}_dollars")
+    if dollars is not None:
+        try:
+            return int(round(float(dollars) * 100))
+        except (TypeError, ValueError):
+            pass
+    return _as_int(position.get(name, position.get(f"{name}_cents")))
+
+
 def _parse_close_time(raw: object) -> datetime | None:
     """ISO 8601 ('...Z') → datetime NAIVE UTC. None si ausente/inválido (fail-safe)."""
     if not raw or not isinstance(raw, str):
@@ -67,6 +85,9 @@ class PortfolioPoller:
         self, *, client_factory: Callable[[], KalshiRestClient] = KalshiRestClient
     ) -> None:
         self._client_factory = client_factory
+        # Diagnóstico one-shot: si el campo de exposición no se resuelve en ningún shape
+        # conocido, se loguean las keys crudas UNA vez (para descubrir el nombre real).
+        self._exposure_keys_logged = False
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Loop supervisado: un fallo de tick se registra y el loop SIGUE."""
@@ -107,7 +128,14 @@ class PortfolioPoller:
                 if not ticker or pos is None or pos == 0:
                     continue  # sin posición abierta en este market
                 side = "yes" if pos > 0 else "no"
-                exposure = _as_int(p.get("market_exposure_fp", p.get("market_exposure")))
+                exposure = _money_to_cents(p, "market_exposure")
+                if exposure is None and not self._exposure_keys_logged:
+                    self._exposure_keys_logged = True
+                    logger.info(
+                        f"motor3.poller.exposure_unresolved ticker={ticker} "
+                        f"keys={sorted(p.keys())} (campo de exposición ausente en shapes "
+                        "conocidos → agregar el nombre real)"
+                    )
                 open_now[ticker] = (side, abs(pos), exposure)
 
             # close_time: reusar el cacheado; solo get_market para los que falten.
