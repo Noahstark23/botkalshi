@@ -69,6 +69,9 @@ services:
       # Umbral FINO de ejecución (% del capital comprometido); calibrable desde Coolify.
       MOTOR_REST_EXECUTION_EDGE_PCT: ${MOTOR_REST_EXECUTION_EDGE_PCT:-1.5}
 
+      # Reportes (advisory-only, no tradean)
+      DAILY_PNL_REPORT_ENABLED: ${DAILY_PNL_REPORT_ENABLED:-false}
+
       # Optional
       SENTRY_DSN: ${SENTRY_DSN:-}
 

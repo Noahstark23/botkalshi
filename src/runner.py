@@ -310,6 +310,22 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_daily_pnl(self) -> None:
+        """
+        Daily P&L digest — gateado por DAILY_PNL_REPORT_ENABLED. ADVISORY ONLY: una vez/día
+        agrega el P&L realizado por motor, lo persiste en DailyPnL y manda el digest a
+        Telegram. NUNCA tradea ni toca capital. Best-effort: si cae, se registra y termina.
+        """
+        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        try:
+            from src.analytics.daily_pnl import DailyPnLLoop
+
+            await DailyPnLLoop().run(self._stop_event)
+        except Exception as e:
+            msg = f"daily_pnl runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _run_analyst_loop(self) -> None:
         """
         Analyst Loop (loop engineering) — gateado por ANALYST_LOOP_ENABLED. ADVISORY ONLY:
@@ -409,6 +425,8 @@ class ProductionRunner:
             ]
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
+            if self.settings.DAILY_PNL_REPORT_ENABLED:
+                tasks.append(asyncio.create_task(self._run_daily_pnl(), name="daily_pnl"))
             if self.settings.MOTOR_3_CLV_ENABLED:
                 tasks.append(asyncio.create_task(self._run_motor3_clv(), name="motor3_clv"))
             if self.settings.MOTOR_1_ARBITRAGE_ENABLED:

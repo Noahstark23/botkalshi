@@ -176,6 +176,14 @@ class Settings(BaseSettings):
         default=24, ge=1, description="Ventana de agregación del veredicto (horas)"
     )
 
+    # Resumen diario de P&L por Telegram (advisory-only). Una vez/día computa el P&L
+    # REALIZADO del día UTC anterior por motor, lo persiste en DailyPnL (memoria + /health
+    # + check_portfolio) y manda el digest. Default off. NO tradea ni toca capital.
+    DAILY_PNL_REPORT_ENABLED: bool = False
+    DAILY_PNL_REPORT_INTERVAL_SEC: float = Field(
+        default=3600.0, ge=300.0, description="Intervalo del check del reporte diario (s)"
+    )
+
     # ---- Validators ----
 
     @field_validator("KALSHI_PRIVATE_KEY_PATH")
