@@ -326,6 +326,30 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_balance_refresh(self) -> None:
+        """
+        C-01 — sincroniza el capital base del RiskManager con el balance REAL de Kalshi (cash
+        disponible): al arrancar y cada BALANCE_REFRESH_SECONDS. Read-only (GET balance),
+        corre FUERA del _check_lock (no bloquea el gatekeeper). Best-effort: si la API falla
+        se mantiene el último valor (el RiskManager cae a ACTIVE_CAPITAL_USD si nunca hubo
+        uno). NO tira el bot si revienta.
+        """
+        from src.risk.manager import RiskManager
+
+        await asyncio.sleep(5)  # dejar que el boot termine; trae el balance temprano
+        interval = self.settings.BALANCE_REFRESH_SECONDS
+        while not self._stop_event.is_set():
+            try:
+                await RiskManager.refresh_capital_from_balance()
+            except Exception as e:
+                # refresh ya es best-effort por dentro; este guard es la red final.
+                logger.warning(f"balance_refresh tick: {type(e).__name__}: {e}")
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                return  # stop solicitado
+            except TimeoutError:
+                pass
+
     async def _run_analyst_loop(self) -> None:
         """
         Analyst Loop (loop engineering) — gateado por ANALYST_LOOP_ENABLED. ADVISORY ONLY:
@@ -422,6 +446,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_data_capture(), name="capture"),
                 asyncio.create_task(self._run_settlement(), name="settlement"),
                 asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
+                asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
             ]
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))

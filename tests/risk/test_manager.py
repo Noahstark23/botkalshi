@@ -31,6 +31,18 @@ def reset_botstate():
     BotState.pause_reason = None
 
 
+@pytest.fixture(autouse=True)
+def reset_capital_cache():
+    """C-01: la caché de capital es de CLASE → resetear entre tests para no filtrarla."""
+    RiskManager._cached_capital_usd = None
+    RiskManager._last_balance_at = None
+    RiskManager._capital_fallback_warned = False
+    yield
+    RiskManager._cached_capital_usd = None
+    RiskManager._last_balance_at = None
+    RiskManager._capital_fallback_warned = False
+
+
 @pytest.fixture
 def mock_settings():
     with patch("src.risk.manager.get_settings") as m:
@@ -229,6 +241,96 @@ async def test_zero_cost_legs_rejected(mock_session, risk_manager):
     decision = await risk_manager.check_pre_trade(opp)
     assert decision.approved is False
     assert "inválidos" in decision.reason
+
+
+# =========================================================
+# C-01 — capital base = balance real de Kalshi
+# =========================================================
+
+
+def _balance_factory(*, balance=None, raises=None):
+    """Factory que devuelve un client mock (async CM) con get_balance configurable."""
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    if raises is not None:
+        client.get_balance = AsyncMock(side_effect=raises)
+    else:
+        client.get_balance = AsyncMock(return_value={"balance": balance})
+    return lambda: client
+
+
+@pytest.mark.asyncio
+async def test_refresh_reads_balance_cents_to_usd(mock_settings):
+    """get_balance {'balance': 300000} → capital efectivo $3000.00 (cents→USD)."""
+    usd = await RiskManager.refresh_capital_from_balance(
+        client_factory=_balance_factory(balance=300000)
+    )
+    assert usd == 3000.0
+    assert RiskManager._cached_capital_usd == 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 3000.0
+    assert RiskManager._last_balance_at is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_updates_cached_value(mock_settings):
+    """Un segundo refresh con balance distinto actualiza la caché."""
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=100000))
+    assert RiskManager._cached_capital_usd == 1000.0
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=305000))
+    assert RiskManager._cached_capital_usd == 3050.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_last_known_on_api_failure(mock_settings):
+    """Si get_balance falla pero ya había un balance, se MANTIENE el último conocido."""
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=300000))
+    result = await RiskManager.refresh_capital_from_balance(
+        client_factory=_balance_factory(raises=TimeoutError("kalshi down"))
+    )
+    assert RiskManager._cached_capital_usd == 3000.0  # NO se pisó con el fallo
+    assert result == 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 3000.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_active_capital_when_never_fetched(mock_settings):
+    """Sin balance previo y la API falla → capital efectivo = ACTIVE_CAPITAL_USD (piso)."""
+    result = await RiskManager.refresh_capital_from_balance(
+        client_factory=_balance_factory(raises=RuntimeError("auth 401"))
+    )
+    assert result is None  # falló y no había previo
+    assert RiskManager._cached_capital_usd is None
+    # _get_effective_capital_usd cae al piso de seguridad (4000 del mock_settings).
+    assert RiskManager()._get_effective_capital_usd() == 4000.0
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_sizing_uses_effective_capital_not_config(mock_session, mock_settings):
+    """El sizing usa el balance REAL cacheado ($100), NO el ACTIVE_CAPITAL_USD de config ($4000)."""
+    RiskManager._cached_capital_usd = 100.0  # balance real, distinto del config
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]  # sin stop-loss, sin exposición previa
+
+    leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=50, count=15, available_size=100)
+    leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=40, count=15, available_size=100)
+    opp = ArbOpportunity(
+        legs=(leg1, leg2),
+        count=15,
+        gross_profit_cents=150,
+        fees_cents=4,
+        net_profit_cents=146,
+        edge_pct=16.0,
+    )
+
+    decision = await RiskManager().check_pre_trade(opp)
+
+    assert decision.approved is True
+    # capital $100: max_trade=5%·100=$5; cost/unit=90¢ → int(5*100)//90 = 5 contratos.
+    # (Con el $4000 de config darían 15 — prueba que NO se usa el estático.)
+    assert decision.max_allowed_count == 5
 
 
 # =========================================================
