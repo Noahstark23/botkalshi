@@ -330,8 +330,21 @@ class KalshiWebSocket:
             *[h(msg) for h in handlers],
             return_exceptions=True,
         )
-        for r in results:
-            if isinstance(r, Exception):
+        exceptions = [r for r in results if isinstance(r, Exception)]
+        if not exceptions:
+            return
+        # Distinguir eventos de orderbook AUTO-RECUPERADOS (gap/desync) de fallos inesperados.
+        # SidGapError / OrderbookDesyncError heredan de OrderbookError y el manager YA inició el
+        # recovery (+ logueó "auto-recovery") ANTES del raise → log limpio INFO sin traceback
+        # (antes: un traceback completo en ERROR por cada gap, ~32/día = ruido que tapaba lo
+        # real). La escalada por FRECUENCIA anormal sigue en el manager (_record_gap_and_should_
+        # alert → Telegram). Import lazy: no acopla el cliente WS (capa baja) a strategies.
+        from src.strategies.motor_1_arbitrage.orderbook import OrderbookError
+
+        for r in exceptions:
+            if isinstance(r, OrderbookError):
+                logger.info(f"orderbook recovery event en {msg_type}: {r}")
+            else:
                 logger.opt(exception=r).error(f"Handler exception en {msg_type}: {r}")
 
 
