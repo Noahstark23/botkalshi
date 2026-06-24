@@ -55,8 +55,83 @@ class RiskManager:
     # leer-exposición→aprobar de dos checks simultáneos.
     _check_lock: asyncio.Lock = asyncio.Lock()
 
+    # ── C-01: capital base EFECTIVO = balance REAL de Kalshi (cash disponible) ──────────
+    # Cacheado a nivel de CLASE (compartido por todas las instancias, igual que _check_lock):
+    # lo refresca una tarea de fondo del runner al arrancar + cada BALANCE_REFRESH_SECONDS,
+    # SIEMPRE FUERA del _check_lock (no bloquear el gatekeeper con I/O de red). Es CASH
+    # DISPONIBLE, NO equity total (no incluye el valor de las posiciones abiertas).
+    _cached_capital_usd: float | None = None
+    _last_balance_at: datetime | None = None
+    _capital_fallback_warned: bool = False
+
     def __init__(self) -> None:
         self.settings = get_settings()
+
+    # =========================================================
+    # C-01 — Capital base efectivo (balance real de Kalshi)
+    # =========================================================
+
+    def _get_effective_capital_usd(self) -> float:
+        """
+        Capital base efectivo en USD para los techos de riesgo. **Fuente única de verdad**
+        (C-02/C-03 derivarán de acá — este es el punto de extensión).
+
+        Devuelve el último balance REAL de Kalshi cacheado (cash disponible, NO equity). Si
+        NUNCA se obtuvo balance (la tarea de refresh no corrió o la API falla desde el
+        arranque), cae a `settings.ACTIVE_CAPITAL_USD` como PISO DE SEGURIDAD y loguea WARNING
+        una vez. NUNCA devuelve 0 por un fallo de red (eso congelaría el bot).
+        """
+        cached = RiskManager._cached_capital_usd
+        if cached is not None:
+            return cached
+        if not RiskManager._capital_fallback_warned:
+            RiskManager._capital_fallback_warned = True
+            logger.warning(
+                "risk.capital: sin balance real de Kalshi todavía → fallback a "
+                f"ACTIVE_CAPITAL_USD=${self.settings.ACTIVE_CAPITAL_USD:.2f} (piso de seguridad)"
+            )
+        return self.settings.ACTIVE_CAPITAL_USD
+
+    @classmethod
+    async def refresh_capital_from_balance(
+        cls, *, client_factory: object | None = None
+    ) -> float | None:
+        """
+        Trae el balance REAL de Kalshi (cash disponible) y actualiza la caché de CLASE.
+
+        Corre FUERA del _check_lock (tarea de fondo del runner). **Best-effort:** si
+        `get_balance()` falla (timeout/auth/5xx) NO crashea ni pisa la caché — mantiene el
+        ÚLTIMO valor conocido y loguea WARNING. Devuelve el capital efectivo en USD, o None si
+        falló y aún no había uno previo (los checks usarán ACTIVE_CAPITAL_USD como piso).
+        """
+        from src.clients.kalshi_rest import KalshiRestClient
+
+        factory = client_factory or KalshiRestClient
+        try:
+            async with factory() as client:  # type: ignore[operator]
+                data = await client.get_balance()
+            cents = data.get("balance") if isinstance(data, dict) else None
+            if cents is None:
+                raise ValueError(f"get_balance sin campo 'balance': {data!r}")
+            usd = int(round(float(cents))) / 100.0  # {'balance': cents:int} → USD
+            cls._cached_capital_usd = usd
+            cls._last_balance_at = datetime.now(UTC).replace(tzinfo=None)
+            cls._capital_fallback_warned = False  # ya hay balance real → re-habilita el WARNING
+            logger.info(f"risk.capital: balance real de Kalshi = ${usd:.2f} (cash disponible)")
+            return usd
+        except Exception as exc:
+            last = cls._cached_capital_usd
+            if last is not None:
+                logger.warning(
+                    f"risk.capital: get_balance falló ({type(exc).__name__}: {exc}) → se "
+                    f"mantiene el último balance conocido ${last:.2f}"
+                )
+            else:
+                logger.warning(
+                    f"risk.capital: get_balance falló ({type(exc).__name__}: {exc}) y no hay "
+                    "balance previo → los checks usarán ACTIVE_CAPITAL_USD (piso de seguridad)"
+                )
+            return last
 
     async def check_pre_trade(self, opp: ArbOpportunity) -> TradeDecision:
         """Gatekeeper crítico. Debe llamarse con await desde el executor.
@@ -81,10 +156,10 @@ class RiskManager:
                 max_allowed_count=0,
             )
 
+        # C-01: capital base = balance REAL de Kalshi (no el ACTIVE_CAPITAL_USD estático).
+        capital_usd = self._get_effective_capital_usd()
         current_exposure_usd = self._get_current_exposure_usd()
-        max_total_exposure_usd = self.settings.ACTIVE_CAPITAL_USD * (
-            self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0
-        )
+        max_total_exposure_usd = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
         remaining_exposure_usd = max_total_exposure_usd - current_exposure_usd
         if remaining_exposure_usd <= 0:
             return TradeDecision(
@@ -94,9 +169,7 @@ class RiskManager:
                 0,
             )
 
-        max_trade_usd = self.settings.ACTIVE_CAPITAL_USD * (
-            self.settings.MAX_TRADE_SIZE_PCT / 100.0
-        )
+        max_trade_usd = capital_usd * (self.settings.MAX_TRADE_SIZE_PCT / 100.0)
         # Cap ABSOLUTO anti-slippage: el USD comprometido por orden nunca supera
         # MAX_TRADE_SIZE_USD ($200), sin importar % ni capital. Combinado con
         # remaining_exposure y opp.count (liquidez real del book) abajo, el size final es
@@ -231,8 +304,10 @@ class RiskManager:
             ("Mensual", monthly_pnl_usd, self.settings.MAX_MONTHLY_LOSS_PCT),
         ]
 
+        # C-01: stop-losses sobre el capital base REAL (balance de Kalshi), no el estático.
+        capital_usd = self._get_effective_capital_usd()
         for period_name, pnl_usd, max_pct in limits:
-            max_loss_usd = self.settings.ACTIVE_CAPITAL_USD * (max_pct / 100.0)
+            max_loss_usd = capital_usd * (max_pct / 100.0)
             if pnl_usd < 0 and abs(pnl_usd) >= max_loss_usd:
                 await self._trigger_kill_switch(
                     f"Stop-Loss {period_name} superado: PnL=${pnl_usd:.2f}, "

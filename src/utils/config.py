@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # === Capital ===
     # Bankroll base. Stop-losses (-3/-8/-15%) se derivan de acá → -$120/-$320/-$600 a $4k.
     ACTIVE_CAPITAL_USD: float = Field(4000.0, gt=0, le=100_000)
+    # C-01: cada cuántos segundos el RiskManager refresca el balance REAL de Kalshi (cash) que
+    # usa como capital base. ACTIVE_CAPITAL_USD pasa a ser solo el PISO de seguridad (fallback
+    # si la API nunca respondió). Mín 30s para no martillar la API.
+    BALANCE_REFRESH_SECONDS: int = Field(
+        default=300, ge=30, description="Refresh del balance real (s)"
+    )
     # Bankroll inicial REAL en USD para la reconciliación de balance del dashboard
     # (scripts/check_portfolio.py). Solo lectura/observabilidad — NO afecta sizing ni riesgo.
     # 0.0 = sin setear → el dashboard usa DailyPnL.starting_capital si existe, o lo omite.
