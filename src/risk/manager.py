@@ -186,7 +186,10 @@ class RiskManager:
         if allowed_count <= 0:
             return TradeDecision(
                 False,
-                f"Sizing final 0 contratos. usable=${usable_usd:.2f}, cost/unit={total_cost_per_unit_cents}c",
+                f"Sizing final 0 contratos. usable=${usable_usd:.2f}, "
+                f"cost/unit={total_cost_per_unit_cents}c, "
+                f"exposición: actual=${current_exposure_usd:.2f}, "
+                f"max=${max_total_exposure_usd:.2f}, restante=${remaining_exposure_usd:.2f}",
                 0,
             )
 

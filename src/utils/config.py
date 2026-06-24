@@ -190,6 +190,18 @@ class Settings(BaseSettings):
         default=3600.0, ge=300.0, description="Intervalo del check del reporte diario (s)"
     )
 
+    # Monitor de memoria (advisory-only): lee el uso real del cgroup y avisa por Telegram
+    # cuando cruza el umbral del límite del contenedor. Aviso temprano de crecimiento
+    # orgánico del baseline (más mercados → más working-set) ANTES del OOM kill, en vez de
+    # enterarse por los reinicios. NUNCA tradea ni toca capital.
+    MEMORY_MONITOR_ENABLED: bool = True
+    MEMORY_MONITOR_THRESHOLD_PCT: float = Field(
+        default=80.0, gt=0, le=100, description="Umbral de uso de memoria para alertar (%)"
+    )
+    MEMORY_MONITOR_INTERVAL_SEC: int = Field(
+        default=60, ge=10, description="Intervalo del monitor de memoria (s)"
+    )
+
     # ---- Validators ----
 
     @field_validator("KALSHI_PRIVATE_KEY_PATH")
