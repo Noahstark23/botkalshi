@@ -81,13 +81,31 @@ class OrderbookManagerV2:
         # Then start ws.run()
     """
 
-    def __init__(self, ws: KalshiWebSocket) -> None:
+    # Watchdog de recovery (anti-leak): una recovery que nunca completa (snapshot perdido
+    # en un feed degradado, ticker settled que no devuelve snapshot) dejaría el sid en
+    # _recovering PARA SIEMPRE, y _pending_deltas[sid] crecería a la tasa del feed sin
+    # límite → OOM. El watchdog aborta una recovery atascada por TIMEOUT o por TAMAÑO de
+    # buffer, descarta lo encolado (logueando sid + cuántos mensajes) y RE-PIDE el snapshot.
+    DEFAULT_RECOVERY_TIMEOUT_SEC = 30.0
+    DEFAULT_MAX_RECOVERY_BUFFER = 5000
+
+    def __init__(
+        self,
+        ws: KalshiWebSocket,
+        *,
+        recovery_timeout_sec: float = DEFAULT_RECOVERY_TIMEOUT_SEC,
+        max_recovery_buffer: int = DEFAULT_MAX_RECOVERY_BUFFER,
+    ) -> None:
         self._ws = ws
+        self._recovery_timeout_sec = recovery_timeout_sec
+        self._max_recovery_buffer = max_recovery_buffer
         self._books: dict[str, OrderbookState] = {}
         self._last_seq_by_sid: dict[int, int] = {}
         self._tickers_by_sid: dict[int, set[str]] = {}
         self._recovering: set[int] = set()
         self._pending_deltas: dict[int, list[dict]] = {}
+        # sid → time.monotonic() de inicio de la recovery EN CURSO (para el watchdog).
+        self._recovery_started_at: dict[int, float] = {}
         # Deltas que llegan antes del snapshot inicial de un ticker (bootstrap).
         # Se encolan por ticker y se drenan en _drain_bootstrap_buffer al llegar
         # el snapshot, en vez de descartarse (causa del desync de attempt #3).
@@ -160,6 +178,10 @@ class OrderbookManagerV2:
 
         # Buffer all messages while sid is recovering
         if sid in self._recovering:
+            # Watchdog anti-leak: si la recovery lleva demasiado tiempo o el buffer creció
+            # demasiado, está atascada (snapshot perdido en feed degradado) → abortar y
+            # reintentar ANTES de seguir encolando, para que el buffer no crezca sin límite.
+            await self._guard_stuck_recovery(sid)
             self._pending_deltas.setdefault(sid, []).append(raw_msg)
             return
 
@@ -206,6 +228,7 @@ class OrderbookManagerV2:
             "initialized_tickers": sum(1 for b in self._books.values() if b.is_initialized),
             "stale_tickers": sum(1 for b in self._books.values() if b.is_stale),
             "recovering_sids": list(self._recovering),
+            "pending_buffer_msgs": sum(len(b) for b in self._pending_deltas.values()),
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
             "gaps_last_60s": gaps_last_60s,
@@ -278,6 +301,7 @@ class OrderbookManagerV2:
 
         self._recovering.add(sid)
         self._pending_deltas[sid] = []
+        self._recovery_started_at[sid] = time.monotonic()
 
         for ticker in tickers:
             if ticker in self._books:
@@ -293,6 +317,50 @@ class OrderbookManagerV2:
         )
         self._pending_snapshot_requests[req_id] = (sid, set(tickers))
 
+    async def _guard_stuck_recovery(self, sid: int) -> None:
+        """
+        Watchdog anti-leak: aborta+reintenta una recovery atascada del sid.
+
+        Se llama por cada mensaje que se encolaría durante recovery. Dispara si la recovery
+        excede `recovery_timeout_sec`, O si el buffer ya alcanzó `max_recovery_buffer`. Sin
+        esto, una recovery que nunca recibe su snapshot (feed degradado / ticker settled)
+        deja el sid en _recovering para siempre y _pending_deltas[sid] crece sin tope → OOM.
+        """
+        started = self._recovery_started_at.get(sid)
+        timed_out = (
+            started is not None and (time.monotonic() - started) >= self._recovery_timeout_sec
+        )
+        overflow = len(self._pending_deltas.get(sid, [])) >= self._max_recovery_buffer
+        if timed_out or overflow:
+            await self._abort_and_restart_recovery(
+                sid, "timeout" if timed_out else "buffer_overflow"
+            )
+
+    async def _abort_and_restart_recovery(self, sid: int, reason: str) -> None:
+        """
+        Tira la recovery atascada del sid (descarta el buffer) y arranca una nueva.
+
+        Loguea WARNING con el sid y CUÁNTOS mensajes se descartaron: si esto se dispara
+        seguido en producción, es la señal de que el feed está degradado y hay que mirar la
+        causa upstream (no es un fix de raíz, es la red de seguridad anti-OOM). Re-pide el
+        snapshot vía _start_recovery → buffer y timer frescos, así el watchdog vuelve a
+        acotar el próximo intento (cada ciclo queda bounded por timeout/tamaño).
+        """
+        discarded = len(self._pending_deltas.get(sid, []))
+        # Limpiar requests de snapshot viejos de este sid (un snapshot tardío del intento
+        # abortado NO debe drenar el buffer del intento nuevo).
+        stale_reqs = [r for r, (s, _) in self._pending_snapshot_requests.items() if s == sid]
+        for r in stale_reqs:
+            del self._pending_snapshot_requests[r]
+        self._recovering.discard(sid)
+        self._pending_deltas.pop(sid, None)
+        self._recovery_started_at.pop(sid, None)
+        logger.warning(
+            f"v2.recovery_aborted sid={sid} reason={reason} discarded_msgs={discarded} → "
+            "reintentando snapshot. Si se repite seguido = feed degradado (mirar upstream)."
+        )
+        await self._start_recovery(sid)
+
     async def _handle_recovery_snapshot(self, raw_msg: dict, req_id: int) -> None:
         """Apply a recovery snapshot. Drain buffer when all tickers in the sid recovered."""
         sid, tickers_pending = self._pending_snapshot_requests[req_id]
@@ -304,6 +372,7 @@ class OrderbookManagerV2:
         if not tickers_pending:
             del self._pending_snapshot_requests[req_id]
             self._recovering.discard(sid)
+            self._recovery_started_at.pop(sid, None)
             self._drain_buffer(sid)
 
     def _drain_buffer(self, sid: int) -> None:
