@@ -367,6 +367,25 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_memory_monitor(self) -> None:
+        """
+        Monitor de memoria — gateado por MEMORY_MONITOR_ENABLED. ADVISORY ONLY: lee el uso
+        real del cgroup y avisa por Telegram cuando cruza MEMORY_MONITOR_THRESHOLD_PCT del
+        límite del contenedor (aviso temprano de crecimiento del baseline antes del OOM).
+        NUNCA tradea ni reinicia nada. Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.MEMORY_MONITOR_ENABLED:
+            return  # opt-out; default on → no-op si se desactiva
+        await asyncio.sleep(10)  # dejar que el boot termine
+        try:
+            from src.monitoring.memory_monitor import MemoryMonitor
+
+            await MemoryMonitor().run(self._stop_event)
+        except Exception as e:
+            msg = f"memory_monitor runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -447,6 +466,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_settlement(), name="settlement"),
                 asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
                 asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
+                asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
             ]
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
