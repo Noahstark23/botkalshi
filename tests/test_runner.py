@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlmodel import Session, SQLModel, create_engine
 
 from src.monitoring.health import BotState
 from src.runner import ProductionRunner
@@ -15,9 +16,11 @@ def reset_botstate():
     BotState.last_error = None
     BotState.last_error_at = None
     BotState.is_paused = False
+    BotState.pause_reason = None
     yield
     BotState.last_error = None
     BotState.is_paused = False
+    BotState.pause_reason = None
 
 
 @pytest.fixture
@@ -208,3 +211,45 @@ async def test_reconcile_network_error_does_not_crash_boot(mock_runner_settings)
         await runner._reconcile_on_boot()
 
         assert BotState.last_error is not None
+
+
+@pytest.mark.asyncio
+async def test_rehydrate_kill_switch_restores_pause_from_db(mock_runner_settings, monkeypatch):
+    """
+    FASE 0.2: un kill-switch persistente (OperationalState 'engaged') restaura la pausa
+    al boot. Confirma que la supervivencia a reinicios vive en OperationalState — el
+    RiskEvent de FASE 0.2 es SOLO auditoría, no el mecanismo de restore.
+    """
+    import src.storage.models as models
+
+    engine = create_engine("sqlite:///:memory:")
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(models, "get_session", lambda: Session(engine))
+
+    models.engage_kill_switch("Stop-Loss Diario superado: PnL=$-130.00")
+
+    runner = ProductionRunner()
+    with patch("src.runner.send_alert", new_callable=AsyncMock) as mock_alert:
+        await runner._rehydrate_kill_switch()
+
+    assert BotState.is_paused is True
+    assert BotState.pause_reason is not None
+    assert "Stop-Loss Diario" in BotState.pause_reason
+    mock_alert.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rehydrate_kill_switch_noop_when_not_engaged(mock_runner_settings, monkeypatch):
+    """Sin kill-switch engaged → boot NO queda pausado (no falso-positivo)."""
+    import src.storage.models as models
+
+    engine = create_engine("sqlite:///:memory:")
+    SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(models, "get_session", lambda: Session(engine))
+
+    runner = ProductionRunner()
+    with patch("src.runner.send_alert", new_callable=AsyncMock) as mock_alert:
+        await runner._rehydrate_kill_switch()
+
+    assert BotState.is_paused is False
+    mock_alert.assert_not_awaited()

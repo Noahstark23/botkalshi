@@ -14,7 +14,7 @@ from sqlmodel import col, select
 from src.math.arbitrage import ArbOpportunity
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
-from src.storage.models import Trade, engage_kill_switch, get_session
+from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
 from src.strategies.motor_rest_arb.settlement import arb_group_key
 from src.utils.config import get_settings
 
@@ -407,6 +407,22 @@ class RiskManager:
             engage_kill_switch(reason)
         except Exception:
             logger.exception("risk.kill_switch.persist_failed")
+        # Auditoría: dejar rastro en risk_events (estaba vacío pese a las pausas). La
+        # supervivencia a reinicios la da engage_kill_switch (OperationalState); esto es
+        # SOLO el log de eventos. Best-effort independiente: su fallo no frena la alerta.
+        try:
+            with get_session() as s:
+                s.add(
+                    RiskEvent(
+                        event_type="kill_switch",
+                        severity="critical",
+                        message=reason[:1000],
+                        capital_at_event=self._get_effective_capital_usd(),
+                    )
+                )
+                s.commit()
+        except Exception:
+            logger.exception("risk.kill_switch.risk_event_persist_failed")
         msg = f"KILL SWITCH: {reason}. Bot en pausa. Requiere intervención manual."
         logger.critical(msg)
         await alert_risk_event("kill_switch", msg)

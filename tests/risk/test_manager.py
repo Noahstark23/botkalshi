@@ -13,12 +13,12 @@ from datetime import UTC, datetime, time, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.monitoring.health import BotState
 from src.risk.manager import RiskManager
-from src.storage.models import Trade
+from src.storage.models import RiskEvent, Trade
 
 
 @pytest.fixture(autouse=True)
@@ -822,3 +822,64 @@ async def test_c02_fallback_also_clamped_in_prod(mock_settings):
     )
     RiskManager._cached_capital_usd = None  # sin cash real → fallback
     assert RiskManager()._get_effective_capital_usd() == 5000.0
+
+
+# =========================================================
+# FASE 0.2 — Auditoría RiskEvent al pausar por stop-loss
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_trigger_kill_switch_persists_risk_event_e2e(
+    risk_manager, real_db_engine, monkeypatch
+):
+    """
+    FASE 0.2: al pausar por stop-loss se escribe UNA fila RiskEvent de auditoría.
+
+    risk_events estaba vacío pese a las pausas. La supervivencia a reinicios la da
+    engage_kill_switch (OperationalState) — aquí lo aislamos (patch) para verificar
+    SOLO el nuevo rastro de auditoría contra el schema real.
+    """
+    import src.risk.manager as rm_module
+
+    monkeypatch.setattr(rm_module, "get_session", lambda: Session(real_db_engine))
+
+    reason = "Stop-Loss Diario superado: PnL=$-130.00, límite=$-120.00 (3.0%)"
+    with (
+        patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock),
+        patch("src.risk.manager.engage_kill_switch"),  # aislar OperationalState
+    ):
+        await risk_manager._trigger_kill_switch(reason)
+
+    with Session(real_db_engine) as s:
+        events = list(s.exec(select(RiskEvent)))
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.event_type == "kill_switch"
+    assert ev.severity == "critical"
+    assert "Stop-Loss Diario" in ev.message
+    assert ev.capital_at_event is not None
+
+
+@pytest.mark.asyncio
+async def test_trigger_kill_switch_idempotent_no_duplicate_risk_event(
+    risk_manager, real_db_engine, monkeypatch
+):
+    """Idempotencia: si ya está pausado, no re-escribe RiskEvent (no spamea risk_events)."""
+    import src.risk.manager as rm_module
+
+    monkeypatch.setattr(rm_module, "get_session", lambda: Session(real_db_engine))
+
+    with (
+        patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock),
+        patch("src.risk.manager.engage_kill_switch"),
+    ):
+        await risk_manager._trigger_kill_switch("primer disparo")
+        await risk_manager._trigger_kill_switch("segundo disparo (ya pausado)")
+
+    with Session(real_db_engine) as s:
+        events = list(s.exec(select(RiskEvent)))
+
+    assert len(events) == 1
+    assert "primer disparo" in events[0].message
