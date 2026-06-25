@@ -299,7 +299,12 @@ class ProductionRunner:
             # place_order es la defensa final aunque algo llegara a colarse).
             if self.settings.TRADING_ENABLED:
                 async with KalshiRestClient() as client:
-                    executor = Motor2Executor(client, RiskManager())
+                    executor = Motor2Executor(
+                        client,
+                        RiskManager(),
+                        min_entry_cents=self.settings.MOTOR_2_MIN_ENTRY_CENTS,
+                        underdog_filter_enabled=self.settings.MOTOR_2_UNDERDOG_FILTER_ENABLED,
+                    )
                     poller = Motor2ShadowPoller(
                         kalshi_source, odds_source, min_edge=min_edge, executor=executor
                     )

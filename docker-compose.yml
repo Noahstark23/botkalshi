@@ -52,6 +52,10 @@ services:
       TRADING_ENABLED: ${TRADING_ENABLED:-false}
       MOTOR_1_ARBITRAGE_ENABLED: ${MOTOR_1_ARBITRAGE_ENABLED:-false}
       MOTOR_2_SPORTSBOOK_ENABLED: ${MOTOR_2_SPORTSBOOK_ENABLED:-false}
+      # Filtro underdog Motor 2 (FASE 3). ENABLED off = shadow (loguea lo que bloquearía pero
+      # igual entra); on = bloquea entradas <MIN_ENTRY_CENTS (sangraron −$110,77 históricos).
+      MOTOR_2_MIN_ENTRY_CENTS: ${MOTOR_2_MIN_ENTRY_CENTS:-40}
+      MOTOR_2_UNDERDOG_FILTER_ENABLED: ${MOTOR_2_UNDERDOG_FILTER_ENABLED:-false}
       MOTOR_3_CLV_ENABLED: ${MOTOR_3_CLV_ENABLED:-false}
       # Ejecución de Motor 3 desacoplada del trading global (consenso de 2 flags). En false
       # corre en SHADOW aunque TRADING_ENABLED=true → se valida sin vender de verdad.

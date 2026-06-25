@@ -79,15 +79,37 @@ class Motor2Executor:
     bloquea cualquier buy con TRADING_ENABLED=false (lo trata como no-fill limpio).
     """
 
-    def __init__(self, client: KalshiRestClient, risk_manager: RiskManager) -> None:
+    def __init__(
+        self,
+        client: KalshiRestClient,
+        risk_manager: RiskManager,
+        *,
+        min_entry_cents: int = 1,
+        underdog_filter_enabled: bool = False,
+    ) -> None:
         self.client = client
         self.risk = risk_manager
+        # Filtro underdog (FASE 3): las entradas <40c sangraron −$110,77 en el histórico
+        # (17 de 21 perdedoras). min_entry_cents=1 + filter off = no-op (default seguro).
+        self._min_entry_cents = min_entry_cents
+        self._underdog_filter_enabled = underdog_filter_enabled
 
     async def execute(self, signal: ConsensusSignal) -> Motor2ExecutionOutcome:
         side = signal.kalshi_side.lower()  # ConsensusSignal usa "YES"/"NO"
         price = signal.kalshi_price_cents
         if side not in ("yes", "no") or not (1 <= price <= 99):
             return Motor2ExecutionOutcome(False, False, reason="señal fuera de rango")
+
+        # Filtro underdog: SHADOW intra-live → con el flag off LOGUEA lo que bloquearía pero
+        # igual entra; con el flag on, bloquea. (El executor solo existe con TRADING_ENABLED,
+        # así que el "shadow" del filtro es este, no la Capa A global.)
+        if price < self._min_entry_cents:
+            logger.info(
+                f"motor2.exec.underdog_skip ticker={signal.market_ticker} side={side} "
+                f"price={price}c < {self._min_entry_cents}c enabled={self._underdog_filter_enabled}"
+            )
+            if self._underdog_filter_enabled:
+                return Motor2ExecutionOutcome(False, False, reason="underdog_filter")
 
         # Sizing deseado desde el ¼-Kelly del detector; el RiskManager es la autoridad
         # final (cap por trade + exposición) y puede recortarlo.
