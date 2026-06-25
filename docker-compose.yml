@@ -56,6 +56,10 @@ services:
       # Ejecución de Motor 3 desacoplada del trading global (consenso de 2 flags). En false
       # corre en SHADOW aunque TRADING_ENABLED=true → se valida sin vender de verdad.
       MOTOR_3_EXECUTION_ENABLED: ${MOTOR_3_EXECUTION_ENABLED:-false}
+      # Take-profit por precio (FASE 1). ENABLED gatea detección+log; la venta sigue gateada
+      # por MOTOR_3_EXECUTION_ENABLED. Shadow = TAKE_PROFIT_ENABLED=true + EXECUTION=false.
+      MOTOR_3_TAKE_PROFIT_ENABLED: ${MOTOR_3_TAKE_PROFIT_ENABLED:-false}
+      MOTOR_3_TAKE_PROFIT_CENTS: ${MOTOR_3_TAKE_PROFIT_CENTS:-90}
       USE_ORDERBOOK_MANAGER_V2: ${USE_ORDERBOOK_MANAGER_V2:-false}
 
       # Motor REST (shadow/live). MOTOR_REST_ENABLED=true + TRADING_ENABLED=false = shadow.

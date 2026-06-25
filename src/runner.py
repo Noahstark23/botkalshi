@@ -193,7 +193,9 @@ class ProductionRunner:
             await Motor3Engine(
                 trading_enabled=(
                     self.settings.TRADING_ENABLED and self.settings.MOTOR_3_EXECUTION_ENABLED
-                )
+                ),
+                take_profit_enabled=self.settings.MOTOR_3_TAKE_PROFIT_ENABLED,
+                tp_threshold=self.settings.MOTOR_3_TAKE_PROFIT_CENTS,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"

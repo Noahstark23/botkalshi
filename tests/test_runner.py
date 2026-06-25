@@ -110,6 +110,8 @@ async def test_motor3_execution_requires_both_flags(
     s.MOTOR_3_CLV_ENABLED = True
     s.TRADING_ENABLED = trading
     s.MOTOR_3_EXECUTION_ENABLED = execution
+    s.MOTOR_3_TAKE_PROFIT_ENABLED = False
+    s.MOTOR_3_TAKE_PROFIT_CENTS = 90
 
     mock_engine = MagicMock()
     mock_engine.run = AsyncMock()
@@ -122,8 +124,36 @@ async def test_motor3_execution_requires_both_flags(
         runner = ProductionRunner()
         await runner._run_motor3_clv()
 
-    mock_cls.assert_called_once_with(trading_enabled=expected)
+    # trading_enabled mantiene el consenso de 2 flags; el take-profit se pasa aparte.
+    assert mock_cls.call_args.kwargs["trading_enabled"] is expected
     mock_engine.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_motor3_take_profit_flags_passed_to_engine(mock_runner_settings):
+    """FASE 1: los flags de take-profit (ENABLED + umbral) se cablean al Motor3Engine."""
+    s = mock_runner_settings
+    s.MOTOR_3_CLV_ENABLED = True
+    s.TRADING_ENABLED = False  # shadow
+    s.MOTOR_3_EXECUTION_ENABLED = False
+    s.MOTOR_3_TAKE_PROFIT_ENABLED = True
+    s.MOTOR_3_TAKE_PROFIT_CENTS = 85
+
+    mock_engine = MagicMock()
+    mock_engine.run = AsyncMock()
+    with (
+        patch(
+            "src.strategies.motor_3_clv.engine.Motor3Engine", return_value=mock_engine
+        ) as mock_cls,
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+    ):
+        runner = ProductionRunner()
+        await runner._run_motor3_clv()
+
+    kwargs = mock_cls.call_args.kwargs
+    assert kwargs["take_profit_enabled"] is True
+    assert kwargs["tp_threshold"] == 85
+    assert kwargs["trading_enabled"] is False  # shadow: detecta+loguea, no vende
 
 
 @pytest.mark.asyncio
