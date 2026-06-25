@@ -62,6 +62,20 @@ class Settings(BaseSettings):
     BALANCE_REFRESH_SECONDS: int = Field(
         default=300, ge=30, description="Refresh del balance real (s)"
     )
+    # C-02: factor de seguridad sobre el cash real. El capital base de riesgo pasa a ser
+    # min(cash_real × este %, hard cap de prod $5k). Colchón anti-desfase: nunca arriesgar
+    # el 100% del cash (slippage, fills parciales, el balance se mueve entre refresh). SOLO
+    # aplica al cash REAL; el fallback ACTIVE_CAPITAL_USD ya es un piso conservador, no se
+    # factoriza. 100% = usar el cash completo (sin colchón).
+    CAPITAL_SAFETY_FACTOR_PCT: float = Field(
+        default=90.0, gt=0, le=100, description="% del cash real usable como capital base"
+    )
+    # C-03: si |cash real − ACTIVE_CAPITAL_USD| supera este % del config, alerta por Telegram
+    # (desfase entre el param de Coolify y el cash real). Advisory: NO cambia el sizing, solo
+    # avisa para que actualices el config o investigues el movimiento de cash.
+    CAPITAL_DRIFT_ALERT_PCT: float = Field(
+        default=25.0, gt=0, description="Umbral de desfase config↔cash real para alertar (%)"
+    )
     # Bankroll inicial REAL en USD para la reconciliación de balance del dashboard
     # (scripts/check_portfolio.py). Solo lectura/observabilidad — NO afecta sizing ni riesgo.
     # 0.0 = sin setear → el dashboard usa DailyPnL.starting_capital si existe, o lo omite.

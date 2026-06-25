@@ -13,7 +13,7 @@ from sqlmodel import col, select
 
 from src.math.arbitrage import ArbOpportunity
 from src.monitoring.health import BotState
-from src.monitoring.telegram_alerts import alert_risk_event
+from src.monitoring.telegram_alerts import alert_risk_event, send_alert
 from src.storage.models import Trade, engage_kill_switch, get_session
 from src.strategies.motor_rest_arb.settlement import arb_group_key
 from src.utils.config import get_settings
@@ -63,6 +63,15 @@ class RiskManager:
     _cached_capital_usd: float | None = None
     _last_balance_at: datetime | None = None
     _capital_fallback_warned: bool = False
+    # C-03: histéresis del alert de desfase config↔cash real (no spamear cada refresh).
+    _drift_alerted: bool = False
+
+    # C-02: techo duro de capital en PRODUCCIÓN — espejo del validator _production_safety
+    # (config.py), que rechaza ACTIVE_CAPITAL_USD > $5k en prod. El capital derivado del cash
+    # real DEBE respetar el mismo techo: aunque el cash sea $10k, no operamos como si lo fuera.
+    PROD_CAPITAL_HARD_CAP_USD: float = 5000.0
+    # C-03: margen de histéresis para re-armar el alert de desfase (puntos % de drift).
+    _DRIFT_REARM_MARGIN_PCT: float = 5.0
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -73,24 +82,41 @@ class RiskManager:
 
     def _get_effective_capital_usd(self) -> float:
         """
-        Capital base efectivo en USD para los techos de riesgo. **Fuente única de verdad**
-        (C-02/C-03 derivarán de acá — este es el punto de extensión).
+        Capital base efectivo en USD para TODOS los techos de riesgo (sizing por trade,
+        exposición simultánea y stop-losses diario/semanal/mensual). **Fuente única de verdad.**
 
-        Devuelve el último balance REAL de Kalshi cacheado (cash disponible, NO equity). Si
-        NUNCA se obtuvo balance (la tarea de refresh no corrió o la API falla desde el
-        arranque), cae a `settings.ACTIVE_CAPITAL_USD` como PISO DE SEGURIDAD y loguea WARNING
-        una vez. NUNCA devuelve 0 por un fallo de red (eso congelaría el bot).
+        C-02: cuando hay balance REAL cacheado (cash disponible, NO equity), el capital base =
+        `min(cash_real × CAPITAL_SAFETY_FACTOR_PCT, PROD_CAPITAL_HARD_CAP_USD en prod)`. El
+        factor es un colchón anti-desfase (slippage, fills parciales, el cash se mueve entre
+        refresh); el clamp respeta el mismo techo de $5k que el validator de producción.
+
+        Decisión explícita: los STOP-LOSSES también se derivan de este capital efectivo (no del
+        ACTIVE_CAPITAL_USD estático) — coherencia: todos los techos salen del mismo "dinero que
+        me permito arriesgar". Es ligeramente MÁS conservador (umbrales menores), nunca menos.
+
+        Fallback (C-01): si NUNCA se obtuvo balance (refresh no corrió o la API falla desde el
+        arranque), cae a `settings.ACTIVE_CAPITAL_USD` SIN factorizar — ese valor ya es un piso
+        de seguridad conservador. Loguea WARNING una vez. NUNCA devuelve 0 por un fallo de red.
         """
         cached = RiskManager._cached_capital_usd
-        if cached is not None:
-            return cached
-        if not RiskManager._capital_fallback_warned:
-            RiskManager._capital_fallback_warned = True
-            logger.warning(
-                "risk.capital: sin balance real de Kalshi todavía → fallback a "
-                f"ACTIVE_CAPITAL_USD=${self.settings.ACTIVE_CAPITAL_USD:.2f} (piso de seguridad)"
-            )
-        return self.settings.ACTIVE_CAPITAL_USD
+        if cached is None:
+            if not RiskManager._capital_fallback_warned:
+                RiskManager._capital_fallback_warned = True
+                logger.warning(
+                    "risk.capital: sin balance real de Kalshi todavía → fallback a "
+                    f"ACTIVE_CAPITAL_USD=${self.settings.ACTIVE_CAPITAL_USD:.2f} (piso de seguridad)"
+                )
+            base = self.settings.ACTIVE_CAPITAL_USD
+        else:
+            # C-02: cash real × factor de seguridad.
+            base = cached * (self.settings.CAPITAL_SAFETY_FACTOR_PCT / 100.0)
+
+        # C-02: clamp ÚNICO al hard cap en producción — cubre AMBOS paths (cash real Y
+        # fallback). Hoy el fallback ya respeta el techo vía el validator de config, pero
+        # clampear acá lo hace robusto si alguien sube ese límite (no depende de otro archivo).
+        if self.settings.KALSHI_ENV == "production":
+            base = min(base, RiskManager.PROD_CAPITAL_HARD_CAP_USD)
+        return base
 
     @classmethod
     async def refresh_capital_from_balance(
@@ -118,6 +144,7 @@ class RiskManager:
             cls._last_balance_at = datetime.now(UTC).replace(tzinfo=None)
             cls._capital_fallback_warned = False  # ya hay balance real → re-habilita el WARNING
             logger.info(f"risk.capital: balance real de Kalshi = ${usd:.2f} (cash disponible)")
+            await cls._check_capital_drift(usd)
             return usd
         except Exception as exc:
             last = cls._cached_capital_usd
@@ -132,6 +159,53 @@ class RiskManager:
                     "balance previo → los checks usarán ACTIVE_CAPITAL_USD (piso de seguridad)"
                 )
             return last
+
+    @classmethod
+    async def _check_capital_drift(cls, real_usd: float) -> None:
+        """
+        C-03 — alerta (advisory) si el ACTIVE_CAPITAL_USD configurado en Coolify se desfasa del
+        cash REAL de Kalshi. Es la señal de que el param quedó viejo (causa raíz del "no apuesta
+        porque el cap no coincide con el cash"). NO cambia el sizing — solo avisa.
+
+        Edge-triggered con histéresis: alerta al CRUZAR el umbral hacia arriba y se re-arma sólo
+        cuando el desfase baja por debajo de (umbral − margen). Best-effort: corre en el refresh
+        de fondo (fuera del _check_lock); cualquier fallo se loguea y NO rompe el refresh.
+        """
+        try:
+            settings = get_settings()
+            configured = settings.ACTIVE_CAPITAL_USD
+            threshold = settings.CAPITAL_DRIFT_ALERT_PCT
+            if configured <= 0:
+                return
+            drift_pct = abs(real_usd - configured) / configured * 100.0
+            if drift_pct >= threshold:
+                if not cls._drift_alerted:
+                    cls._drift_alerted = True
+                    direction = "MÁS" if real_usd > configured else "MENOS"
+                    msg = (
+                        f"*Desfase de capital*: cash real ${real_usd:.2f} vs "
+                        f"ACTIVE_CAPITAL_USD=${configured:.2f} ({direction} cash, "
+                        f"{drift_pct:.0f}% de desfase ≥ {threshold:.0f}%). "
+                        "Actualizá el param en Coolify o revisá el movimiento de cash. "
+                        "El sizing YA usa el cash real (C-01/C-02); esto es solo aviso."
+                    )
+                    logger.warning(
+                        f"risk.capital.drift: real=${real_usd:.2f} config=${configured:.2f} "
+                        f"drift={drift_pct:.1f}% ≥ {threshold:.0f}% → alerta"
+                    )
+                    await send_alert(msg, urgent=False)
+                return
+            # Histéresis robusta para cualquier umbral: el nivel de re-arme siempre queda en
+            # (0, threshold) — con un umbral chico (ej. 3%) un margen fijo de 5 lo volvería
+            # negativo y el alert jamás se re-armaría.
+            rearm_level = threshold - min(cls._DRIFT_REARM_MARGIN_PCT, threshold / 2.0)
+            if cls._drift_alerted and drift_pct < rearm_level:
+                cls._drift_alerted = False
+                logger.info(
+                    f"risk.capital.drift: desfase {drift_pct:.1f}% volvió bajo el umbral → re-armado"
+                )
+        except Exception as exc:
+            logger.warning(f"risk.capital.drift: chequeo falló ({type(exc).__name__}: {exc})")
 
     async def check_pre_trade(self, opp: ArbOpportunity) -> TradeDecision:
         """Gatekeeper crítico. Debe llamarse con await desde el executor.

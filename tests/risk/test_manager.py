@@ -37,10 +37,12 @@ def reset_capital_cache():
     RiskManager._cached_capital_usd = None
     RiskManager._last_balance_at = None
     RiskManager._capital_fallback_warned = False
+    RiskManager._drift_alerted = False
     yield
     RiskManager._cached_capital_usd = None
     RiskManager._last_balance_at = None
     RiskManager._capital_fallback_warned = False
+    RiskManager._drift_alerted = False
 
 
 @pytest.fixture
@@ -55,6 +57,13 @@ def mock_settings():
         s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # → $1000
         s.MAX_TRADE_SIZE_PCT = 5.0  # 5% de $4k = $200
         s.MAX_TRADE_SIZE_USD = 200.0  # cap absoluto anti-slippage
+        # C-02/C-03 neutralizados por default para no alterar la semántica de los tests C-01:
+        # factor 100% (efectivo == cache), demo (sin clamp), umbral de drift alto (no alerta),
+        # telegram off (send_alert no-op, sin red). Los tests C-02/C-03 los overridean.
+        s.KALSHI_ENV = "demo"
+        s.CAPITAL_SAFETY_FACTOR_PCT = 100.0
+        s.CAPITAL_DRIFT_ALERT_PCT = 1000.0
+        s.telegram_configured = False
         m.return_value = s
         yield s
 
@@ -628,3 +637,188 @@ async def test_daily_breach_priority_over_weekly_monthly(
     assert decision.approved is False
     assert "Diario" in decision.reason
     assert BotState.is_paused is True
+
+
+# =========================================================
+# C-02 — Capital base = cash real × factor de seguridad (clamp prod)
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_c02_safety_factor_applied(mock_settings):
+    """Factor 90% aplicado: cash $3000 → capital efectivo $2700."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 2700.0
+
+
+@pytest.mark.asyncio
+async def test_c02_clamp_hard_cap_in_prod(mock_settings):
+    """En prod, cash $6000 × 90% = $5400 → clampeado al hard cap $5000 (no rompe el validator)."""
+    mock_settings.KALSHI_ENV = "production"
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 6000.0
+    assert RiskManager()._get_effective_capital_usd() == 5000.0
+
+
+@pytest.mark.asyncio
+async def test_c02_demo_no_clamp(mock_settings):
+    """En demo NO se clampea (dinero fake): cash $6000 × 90% = $5400."""
+    mock_settings.KALSHI_ENV = "demo"
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 6000.0
+    assert RiskManager()._get_effective_capital_usd() == 5400.0
+
+
+@pytest.mark.asyncio
+async def test_c02_factor_100_uses_full_cash(mock_settings):
+    """Factor 100% = sin colchón: capital efectivo == cash real completo."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 100.0
+    RiskManager._cached_capital_usd = 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 3000.0
+
+
+@pytest.mark.asyncio
+async def test_c02_fallback_is_unfactored(mock_settings):
+    """Sin cash real (cache None), el fallback ACTIVE_CAPITAL_USD NO se factoriza (ya es piso)."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.ACTIVE_CAPITAL_USD = 4000.0
+    RiskManager._cached_capital_usd = None
+    assert RiskManager()._get_effective_capital_usd() == 4000.0  # NO 3600
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_c02_low_cash_yields_zero_contracts(mock_session, mock_settings):
+    """Edge cash bajo ($10 × 90% = $9): usable $0.45 → 0 contratos, rechazo limpio (sin crash)."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 10.0
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]
+    leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=50, count=10, available_size=100)
+    leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=40, count=10, available_size=100)
+    opp = ArbOpportunity(
+        legs=(leg1, leg2),
+        count=10,
+        gross_profit_cents=100,
+        fees_cents=4,
+        net_profit_cents=96,
+        edge_pct=10.0,
+    )
+    decision = await RiskManager().check_pre_trade(opp)
+    assert decision.approved is False
+    assert decision.max_allowed_count == 0
+    assert "Sizing final 0" in decision.reason
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_c02_cap_chain_200usd_still_binds(mock_session, mock_settings):
+    """Con cash grande, el cap absoluto MAX_TRADE_SIZE_USD ($200) sigue acotando sobre el techo nuevo."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.KALSHI_ENV = "demo"  # sin clamp, deja crecer el cash
+    RiskManager._cached_capital_usd = 100_000.0  # $100k fake (demo)
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]
+    # cost/unit = 50¢, opp.count grande → el binding es usable=$200 → int(200*100)//50 = 400.
+    leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=30, count=1000, available_size=5000)
+    leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=20, count=1000, available_size=5000)
+    opp = ArbOpportunity(
+        legs=(leg1, leg2),
+        count=1000,
+        gross_profit_cents=50_000,
+        fees_cents=100,
+        net_profit_cents=49_900,
+        edge_pct=10.0,
+    )
+    decision = await RiskManager().check_pre_trade(opp)
+    assert decision.approved is True
+    assert decision.max_allowed_count == 400
+
+
+# =========================================================
+# C-03 — Alerta de desfase config ↔ cash real
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_c03_drift_alert_fires_when_over_threshold(mock_settings):
+    """cash $3000 vs config $1000 (200% ≥ 25%) → alerta + marca _drift_alerted."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3000.0)
+    send.assert_awaited_once()
+    assert RiskManager._drift_alerted is True
+
+
+@pytest.mark.asyncio
+async def test_c03_no_alert_within_threshold(mock_settings):
+    """cash $3200 vs config $3000 (~6.7% < 25%) → no alerta."""
+    mock_settings.ACTIVE_CAPITAL_USD = 3000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3200.0)
+    send.assert_not_called()
+    assert RiskManager._drift_alerted is False
+
+
+@pytest.mark.asyncio
+async def test_c03_edge_triggered_no_duplicate(mock_settings):
+    """Dos lecturas con desfase alto seguidas → una sola alerta (edge-triggered)."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3000.0)
+        await RiskManager._check_capital_drift(3100.0)
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_c03_rearm_after_realign(mock_settings):
+    """Tras alertar, re-arma sólo cuando el desfase baja con margen, y vuelve a alertar."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3000.0)  # 200% → alerta
+        await RiskManager._check_capital_drift(1050.0)  # 5% < 20 (25-5) → re-arma
+        assert RiskManager._drift_alerted is False
+        await RiskManager._check_capital_drift(3000.0)  # alerta de nuevo
+    assert send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_c03_check_swallows_errors(mock_settings):
+    """Best-effort: un fallo del alert NO propaga (no rompe el refresh de fondo)."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch(
+        "src.risk.manager.send_alert", new=AsyncMock(side_effect=RuntimeError("telegram boom"))
+    ):
+        await RiskManager._check_capital_drift(3000.0)  # no debe levantar
+
+
+@pytest.mark.asyncio
+async def test_c03_refresh_triggers_drift_alert(mock_settings):
+    """El refresh real engancha el chequeo de drift (cash $3000 vs config $1000)."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager.refresh_capital_from_balance(
+            client_factory=_balance_factory(balance=300000)
+        )
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_c02_fallback_also_clamped_in_prod(mock_settings):
+    """Robustez C-02: aun por el fallback, en prod el capital base respeta el hard cap $5k
+    (no depende sólo del validator de config)."""
+    mock_settings.KALSHI_ENV = "production"
+    mock_settings.ACTIVE_CAPITAL_USD = (
+        8000.0  # validator real lo rechazaría; acá mockeado a propósito
+    )
+    RiskManager._cached_capital_usd = None  # sin cash real → fallback
+    assert RiskManager()._get_effective_capital_usd() == 5000.0
