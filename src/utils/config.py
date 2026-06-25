@@ -115,6 +115,19 @@ class Settings(BaseSettings):
         default=False,
         description="Si es True (y TRADING_ENABLED es True), Motor 3 VENDERÁ posiciones. Si es False, solo detecta y loguea (shadow).",
     )
+    # FASE 1 — Take-profit por precio (salida por bid≥umbral, junto a la salida por tiempo
+    # T-30min). TAKE_PROFIT_ENABLED gatea la DETECCIÓN (+log shadow); la EJECUCIÓN la sigue
+    # gateando MOTOR_3_EXECUTION_ENABLED (misma Capa A). Shadow = ENABLED True + EXECUTION False.
+    MOTOR_3_TAKE_PROFIT_ENABLED: bool = Field(
+        default=False,
+        description="Si es True, Motor 3 detecta+loguea take-profit (bid≥umbral). La venta real sigue gateada por MOTOR_3_EXECUTION_ENABLED.",
+    )
+    MOTOR_3_TAKE_PROFIT_CENTS: int = Field(
+        default=90,
+        ge=1,
+        le=99,
+        description="Umbral del bid (cents) del lado abierto para el take-profit de Motor 3",
+    )
     USE_ORDERBOOK_MANAGER_V2: bool = Field(
         default=False, description="Enable WS-based recovery (OrderbookManagerV2)"
     )
@@ -182,6 +195,18 @@ class Settings(BaseSettings):
     # al borde. NO confundir con MIN_EDGE_PCT (ese es de Motor 1; Motor 2 usa SOLO este).
     MOTOR_2_MIN_EDGE_PCT: float = Field(
         default=3.0, ge=0.0, description="Edge neto post-fee mínimo de Motor 2 (pp)"
+    )
+    # Filtro underdog (FASE 3): las entradas <40c sangraron −$110,77 en el histórico. ENABLED
+    # off = SHADOW intra-live (loguea lo que bloquearía pero igual entra); on = bloquea.
+    MOTOR_2_MIN_ENTRY_CENTS: int = Field(
+        default=40,
+        ge=1,
+        le=99,
+        description="Precio mínimo (cents) para ejecutar Motor 2 (underdog filter)",
+    )
+    MOTOR_2_UNDERDOG_FILTER_ENABLED: bool = Field(
+        default=False,
+        description="Si es True, Motor 2 BLOQUEA entradas <MOTOR_2_MIN_ENTRY_CENTS. Si es False, solo loguea (shadow).",
     )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===

@@ -193,7 +193,9 @@ class ProductionRunner:
             await Motor3Engine(
                 trading_enabled=(
                     self.settings.TRADING_ENABLED and self.settings.MOTOR_3_EXECUTION_ENABLED
-                )
+                ),
+                take_profit_enabled=self.settings.MOTOR_3_TAKE_PROFIT_ENABLED,
+                tp_threshold=self.settings.MOTOR_3_TAKE_PROFIT_CENTS,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"
@@ -297,7 +299,12 @@ class ProductionRunner:
             # place_order es la defensa final aunque algo llegara a colarse).
             if self.settings.TRADING_ENABLED:
                 async with KalshiRestClient() as client:
-                    executor = Motor2Executor(client, RiskManager())
+                    executor = Motor2Executor(
+                        client,
+                        RiskManager(),
+                        min_entry_cents=self.settings.MOTOR_2_MIN_ENTRY_CENTS,
+                        underdog_filter_enabled=self.settings.MOTOR_2_UNDERDOG_FILTER_ENABLED,
+                    )
                     poller = Motor2ShadowPoller(
                         kalshi_source, odds_source, min_edge=min_edge, executor=executor
                     )

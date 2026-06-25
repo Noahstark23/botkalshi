@@ -40,16 +40,30 @@ def _patch_db(positions: list[PortfolioPosition]):
     )
 
 
+def _fake_client_ctx():
+    """KalshiRestClient como async context manager fake (devuelve un cliente MagicMock)."""
+    fake_client = MagicMock()
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=fake_client)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    return ctx, fake_client
+
+
 @pytest.mark.asyncio
-async def test_capa_a_no_rest_client_nor_executor_when_trading_disabled():
-    """TRADING_ENABLED=false → NO se construye KalshiRestClient (órdenes) ni executor."""
+async def test_capa_a_no_executor_when_trading_disabled():
+    """
+    TRADING_ENABLED=false → NO se construye el executor (Capa A intacta: imposible vender).
+
+    FASE 1: el cliente REST SÍ se abre ahora (read-only) porque el take-profit necesita leer
+    el orderbook aun en shadow; la protección es la ausencia del executor, no la del cliente.
+    """
     stop = asyncio.Event()
     stop.set()  # salir del loop inmediatamente
     eng = Motor3Engine(trading_enabled=False)
-    with patch("src.strategies.motor_3_clv.engine.KalshiRestClient") as mock_client:
+    ctx, _ = _fake_client_ctx()
+    with patch("src.strategies.motor_3_clv.engine.KalshiRestClient", return_value=ctx):
         await eng.run(stop)
-    assert eng._executor is None
-    mock_client.assert_not_called()  # jamás se instanció el cliente de órdenes
+    assert eng._executor is None  # nunca hay executor → imposible vender en shadow
 
 
 @pytest.mark.asyncio
@@ -122,3 +136,105 @@ async def test_partial_fill_reattempts_remainder_next_tick():
     await eng._tick()  # vende parcial → posición queda en 6
     await eng._tick()  # reintenta el remanente
     assert seen_counts == [10, 6]  # segundo intento sobre los 6 restantes
+
+
+# =========================================================
+# FASE 1 — Take-profit por precio
+# =========================================================
+
+
+def _far_pos(ticker: str = "KXTP", *, count: int = 10, side: str = "yes") -> PortfolioPosition:
+    """Posición FUERA de la ventana de tiempo (2h al cierre) → solo el take-profit puede salir."""
+    close = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=2)
+    return PortfolioPosition(ticker=ticker, side=side, count=count, close_time=close)
+
+
+def _orderbook(side: str, bid_cents: int):
+    """Orderbook mínimo con un bid en el lado dado (formato [["0.95","100"], ...])."""
+    return {"orderbook": {side: [[f"0.{bid_cents:02d}", "100.00"]]}}
+
+
+@pytest.mark.asyncio
+async def test_take_profit_shadow_detects_but_never_sells():
+    """TP en shadow (executor None): bid≥umbral LOGUEA [MOTOR 3 TP SHADOW] pero no vende."""
+    eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=90)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 95))
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        with _patch_db([_far_pos("KXTP")]):
+            await eng._tick()
+    finally:
+        logger.remove(sink)
+
+    assert any("[MOTOR 3 TP SHADOW]" in m and "KXTP" in m for m in captured)
+    assert eng._executor is None  # imposible vender
+
+
+@pytest.mark.asyncio
+async def test_take_profit_below_threshold_no_trigger():
+    """bid < umbral → no se loguea TP ni se vende (aunque haya executor)."""
+    eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=90)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 80))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+
+    with _patch_db([_far_pos("KXLOW")]):
+        await eng._tick()
+
+    eng._executor.exit_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_take_profit_executes_when_executor_present():
+    """Con executor (trading on): bid≥umbral → exit_position se invoca para la posición TP."""
+    eng = Motor3Engine(trading_enabled=True, take_profit_enabled=True, tp_threshold=90)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 92))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+
+    with _patch_db([_far_pos("KXSELL")]):
+        await eng._tick()
+
+    eng._executor.exit_position.assert_awaited_once()
+    assert eng._executor.exit_position.call_args.args[0].ticker == "KXSELL"
+
+
+@pytest.mark.asyncio
+async def test_take_profit_dedupes_with_time_exit():
+    """Una posición debida por tiempo Y por take-profit se liquida UNA sola vez (dedup)."""
+    eng = Motor3Engine(trading_enabled=True, take_profit_enabled=True, tp_threshold=90)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 95))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+
+    # _due_pos está en la ventana de tiempo (29 min) Y su bid (95) supera el umbral.
+    with _patch_db([_due_pos("KXBOTH")]):
+        await eng._tick()
+
+    eng._executor.exit_position.assert_awaited_once()  # NO dos veces
+
+
+@pytest.mark.asyncio
+async def test_take_profit_orderbook_error_is_failsafe():
+    """Lección 7: un error de orderbook loguea y NO rompe el tick ni dispara la salida."""
+    eng = Motor3Engine(trading_enabled=True, take_profit_enabled=True, tp_threshold=90)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(side_effect=RuntimeError("kalshi down"))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+
+    with _patch_db([_far_pos("KXERR")]):
+        await eng._tick()  # no debe levantar
+
+    eng._executor.exit_position.assert_not_called()  # bid None → no salida
