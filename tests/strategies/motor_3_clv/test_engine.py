@@ -17,7 +17,7 @@ import pytest
 from loguru import logger
 from sqlmodel import select
 
-from src.storage.models import PortfolioPosition, get_session
+from src.storage.models import PortfolioPosition, Trade, get_session
 from src.strategies.motor_3_clv.engine import Motor3Engine
 
 
@@ -238,3 +238,126 @@ async def test_take_profit_orderbook_error_is_failsafe():
         await eng._tick()  # no debe levantar
 
     eng._executor.exit_position.assert_not_called()  # bid None → no salida
+
+
+# =========================================================
+# FASE 2 — Trailing stop (DB real del conftest: _entry_bid_for/_persist_peak consultan get_session)
+# =========================================================
+
+
+def _seed_position(ticker: str, *, side="yes", count=10, peak=None, minutes_to_close=120) -> None:
+    close = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=minutes_to_close)
+    with get_session() as s:
+        s.add(
+            PortfolioPosition(
+                ticker=ticker, side=side, count=count, close_time=close, peak_bid_cents=peak
+            )
+        )
+        s.commit()
+
+
+def _seed_entry(ticker: str, *, side="yes", price=60) -> None:
+    with get_session() as s:
+        s.add(
+            Trade(
+                client_order_id=f"{ticker}-buy",
+                ticker=ticker,
+                side=side,
+                action="buy",
+                count=10,
+                price_cents=price,
+                fill_price_cents=price,
+                strategy="motor_2_consensus",
+                status="filled",
+            )
+        )
+        s.commit()
+
+
+@pytest.mark.asyncio
+async def test_trailing_shadow_detects_but_never_sells():
+    """Shadow (executor None): pico 90, bid 84 (retroceso 6≥5) → [MOTOR 3 TRAIL SHADOW], no vende."""
+    eng = Motor3Engine(trading_enabled=False, trailing_enabled=True, trailing_drop=5)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 84))
+    _seed_position("KXTR", peak=90)
+    _seed_entry("KXTR", price=60)
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        await eng._tick()
+    finally:
+        logger.remove(sink)
+
+    assert any("[MOTOR 3 TRAIL SHADOW]" in m and "KXTR" in m for m in captured)
+    assert eng._executor is None
+
+
+@pytest.mark.asyncio
+async def test_trailing_persists_peak_between_ticks():
+    """El pico se persiste en portfolio_positions: bid 80 sin pico previo → peak_bid_cents=80."""
+    eng = Motor3Engine(trading_enabled=False, trailing_enabled=True, trailing_drop=5)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 80))
+    _seed_position("KXPK", peak=None)
+    _seed_entry("KXPK", price=60)
+
+    await eng._tick()
+
+    with get_session() as s:
+        row = s.exec(select(PortfolioPosition).where(PortfolioPosition.ticker == "KXPK")).first()
+    assert row.peak_bid_cents == 80  # max(entry 60, bid 80) → persistido
+
+
+@pytest.mark.asyncio
+async def test_trailing_entry_none_does_not_arm():
+    """Fail-safe: sin pata BUY filled → entry None → trailing NO se arma (no vende)."""
+    eng = Motor3Engine(trading_enabled=True, trailing_enabled=True, trailing_drop=5)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 84))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+    _seed_position("KXNOENTRY", peak=90)  # pico alto pero SIN trade de entrada
+
+    await eng._tick()
+
+    eng._executor.exit_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_trailing_executes_when_executor_present():
+    """Con executor: pico 90, bid 84 (retroceso ≥drop) → exit_position de esa posición."""
+    eng = Motor3Engine(trading_enabled=True, trailing_enabled=True, trailing_drop=5)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 84))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+    _seed_position("KXTSELL", peak=90)
+    _seed_entry("KXTSELL", price=60)
+
+    await eng._tick()
+
+    eng._executor.exit_position.assert_awaited_once()
+    assert eng._executor.exit_position.call_args.args[0].ticker == "KXTSELL"
+
+
+@pytest.mark.asyncio
+async def test_trailing_dedupes_with_time_exit():
+    """Posición debida por tiempo Y por trailing → una sola salida (dedup por el dict exits)."""
+    eng = Motor3Engine(trading_enabled=True, trailing_enabled=True, trailing_drop=5)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 84))
+    eng._executor = MagicMock()
+    eng._executor.exit_position = AsyncMock()
+    _seed_position("KXTB", peak=90, minutes_to_close=29)  # en ventana [28,30] Y trailing-due
+    _seed_entry("KXTB", price=60)
+
+    await eng._tick()
+
+    eng._executor.exit_position.assert_awaited_once()

@@ -131,6 +131,9 @@ class PortfolioPosition(SQLModel, table=True):
     exposure_cents: int | None = None  # market_exposure de Kalshi (capital en riesgo)
     close_time: datetime | None = None  # cierre del mercado (NAIVE UTC) — gate del CLV
     synced_at: datetime = Field(default_factory=_naive_utc_now, index=True)
+    # FASE 2 (trailing stop): máximo bid observado del lado abierto desde el entry. Lo persiste
+    # el engine entre ticks; el trailing cierra si el bid retrocede drop_cents desde acá.
+    peak_bid_cents: int | None = None
 
 
 class RiskEvent(SQLModel, table=True):
@@ -351,6 +354,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("edge_windows", "edge_pct", "FLOAT"),
     ("edge_windows", "kind", "VARCHAR(20)"),  # P3: binary | multi_outcome
     ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
+    ("portfolio_positions", "peak_bid_cents", "INTEGER"),  # Motor 3 FASE 2: trailing stop
 ]
 
 

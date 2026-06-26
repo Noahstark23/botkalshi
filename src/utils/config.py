@@ -128,6 +128,18 @@ class Settings(BaseSettings):
         le=99,
         description="Umbral del bid (cents) del lado abierto para el take-profit de Motor 3",
     )
+    # FASE 2 — Trailing stop (salida por retroceso del bid desde su pico, solo en ganancia).
+    # ENABLED gatea la detección (+log shadow); la venta la sigue gateando MOTOR_3_EXECUTION_ENABLED.
+    MOTOR_3_TRAILING_ENABLED: bool = Field(
+        default=False,
+        description="Si es True, Motor 3 detecta+loguea trailing stop (retroceso del bid). La venta real sigue gateada por MOTOR_3_EXECUTION_ENABLED.",
+    )
+    MOTOR_3_TRAILING_DROP_CENTS: int = Field(
+        default=5,
+        ge=1,
+        le=99,
+        description="Retroceso (cents) desde el pico que dispara el trailing stop",
+    )
     USE_ORDERBOOK_MANAGER_V2: bool = Field(
         default=False, description="Enable WS-based recovery (OrderbookManagerV2)"
     )

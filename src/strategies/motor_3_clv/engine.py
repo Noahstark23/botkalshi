@@ -15,16 +15,25 @@ import asyncio
 import contextlib
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState
-from src.storage.models import PortfolioPosition, _naive_utc_now, get_session
+from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
 from src.strategies.data_capture import _top_bid
 from src.strategies.motor_3_clv.detector import detect_and_log, summarize_exits
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.poller import PortfolioPoller
 from src.strategies.motor_3_clv.take_profit import DEFAULT_TAKE_PROFIT_CENTS, take_profit_due
+from src.strategies.motor_3_clv.trailing_stop import (
+    DEFAULT_TRAILING_DROP_CENTS,
+    next_peak_bid,
+    trailing_stop_due,
+)
+
+# Estrategias de las patas BUY que un exit cierra (= _settle_originals). El entry del trailing
+# se deriva del primer BUY filled de estas (FIFO).
+_ENTRY_ORIGIN = ("motor_2_consensus", "motor_rest_arb")
 
 
 class Motor3Engine:
@@ -38,18 +47,23 @@ class Motor3Engine:
         trading_enabled: bool = False,
         take_profit_enabled: bool = False,
         tp_threshold: int = DEFAULT_TAKE_PROFIT_CENTS,
+        trailing_enabled: bool = False,
+        trailing_drop: int = DEFAULT_TRAILING_DROP_CENTS,
     ) -> None:
         self._poller = PortfolioPoller()
         self._trading_enabled = trading_enabled
         self._take_profit_enabled = take_profit_enabled
         self._tp_threshold = tp_threshold
+        self._trailing_enabled = trailing_enabled
+        self._trailing_drop = trailing_drop
         self._executor: Motor3ExitExecutor | None = None
         self._client: KalshiRestClient | None = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
         logger.info(
             f"motor3.engine started (trading_enabled={self._trading_enabled} "
-            f"take_profit_enabled={self._take_profit_enabled} tp_threshold={self._tp_threshold}c)"
+            f"take_profit_enabled={self._take_profit_enabled} tp_threshold={self._tp_threshold}c "
+            f"trailing_enabled={self._trailing_enabled} trailing_drop={self._trailing_drop}c)"
         )
         # El cliente REST se abre SIEMPRE: el take-profit necesita leer el orderbook
         # (bid del lado abierto) aun en shadow. La venta sigue gateada por la EXISTENCIA del
@@ -95,9 +109,71 @@ class Motor3Engine:
                     )
                     exits.setdefault(p.ticker, p)
 
+        # FASE 2 — Trailing stop. Reusa bid_cache y el dict `exits` (mismo dedup por ticker que
+        # TP/tiempo). Solo se arma como protección de ganancia: el entry sale de la pata BUY
+        # (None → no se arma). El peak se persiste entre ticks. Fail-safe por posición.
+        if self._trailing_enabled:
+            for p in positions:
+                entry = self._entry_bid_for(p)
+                if entry is None:
+                    continue
+                bid = await self._current_bid(p, bid_cache)
+                if bid is None:
+                    continue
+                peak = next_peak_bid(p.peak_bid_cents, bid, entry)
+                if peak != p.peak_bid_cents:
+                    self._persist_peak(p, peak)
+                if trailing_stop_due(p, peak, bid, entry, self._trailing_drop):
+                    logger.info(
+                        f"[MOTOR 3 TRAIL SHADOW] {p.ticker} {p.count}c side={p.side} "
+                        f"peak={peak}c bid={bid}c entry={entry}c drop={self._trailing_drop}c "
+                        f"-> cerraría"
+                    )
+                    exits.setdefault(p.ticker, p)
+
         if self._executor is not None:
             for position in exits.values():
                 await self._executor.exit_position(position)
+
+    def _entry_bid_for(self, position: PortfolioPosition) -> int | None:
+        """Entry del lado abierto = primer BUY filled (FIFO por placed_at), igual criterio que
+        _settle_originals. None si no hay pata BUY (→ el trailing no se arma; fail-safe). Best-
+        effort: un fallo de DB loguea y devuelve None (no rompe el tick — Lección 7)."""
+        try:
+            with get_session() as s:
+                buy = s.exec(
+                    select(Trade)
+                    .where(
+                        Trade.ticker == position.ticker,
+                        Trade.side == position.side,
+                        Trade.action == "buy",
+                        Trade.status == "filled",
+                        col(Trade.strategy).in_(_ENTRY_ORIGIN),
+                    )
+                    .order_by(col(Trade.placed_at))
+                ).first()
+        except Exception as exc:
+            logger.warning(f"motor3.trail.entry_error ticker={position.ticker}: {exc}")
+            return None
+        if buy is None:
+            return None
+        return buy.fill_price_cents or buy.price_cents
+
+    def _persist_peak(self, position: PortfolioPosition, peak: int) -> None:
+        """Persiste el nuevo pico en portfolio_positions (UPDATE por ticker, único). Refleja el
+        valor en el objeto en memoria del tick. Best-effort: un fallo loguea y sigue."""
+        try:
+            with get_session() as s:
+                row = s.exec(
+                    select(PortfolioPosition).where(PortfolioPosition.ticker == position.ticker)
+                ).first()
+                if row is not None:
+                    row.peak_bid_cents = peak
+                    s.add(row)
+                    s.commit()
+            position.peak_bid_cents = peak
+        except Exception as exc:
+            logger.warning(f"motor3.trail.persist_peak_error ticker={position.ticker}: {exc}")
 
     async def _current_bid(
         self, position: PortfolioPosition, cache: dict[str, int | None]
