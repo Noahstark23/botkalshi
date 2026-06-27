@@ -207,6 +207,9 @@ async def status() -> dict[str, Any]:
             "last_gap_at": s.get("last_gap_at"),
         }
 
+    # Local: el RiskManager importa BotState de este módulo → import diferido evita el ciclo.
+    from src.risk.manager import RiskManager
+
     return {
         "bot": {
             "started_at": BotState.started_at.isoformat(),
@@ -237,6 +240,7 @@ async def status() -> dict[str, Any]:
                 "motor_3_clv": settings.MOTOR_3_CLV_ENABLED,
             },
         },
+        "capital": RiskManager.capital_status(),
         "today": {
             "trades_count": len(trades_today),
             "winning": sum(1 for t in trades_today if t.pnl_cents and t.pnl_cents > 0),

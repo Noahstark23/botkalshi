@@ -76,6 +76,35 @@ class Settings(BaseSettings):
     CAPITAL_DRIFT_ALERT_PCT: float = Field(
         default=25.0, gt=0, description="Umbral de desfase config↔cash real para alertar (%)"
     )
+    # === Capital dinámico (extensión sobre C-01/02/03) ===
+    # Master toggle: False → el RiskManager IGNORA el cash real y usa ACTIVE_CAPITAL_USD fijo
+    # (escudo / dry-run en staging). La reserva sigue siendo CAPITAL_SAFETY_FACTOR_PCT y el
+    # intervalo de refresh BALANCE_REFRESH_SECONDS — no se duplican.
+    DYNAMIC_CAPITAL_ENABLED: bool = Field(
+        default=True,
+        description="Usar el balance real de Kalshi como capital base (False = ACTIVE_CAPITAL_USD fijo)",
+    )
+    # Piso absoluto en USD: el capital efectivo nunca baja de acá (la matemática de riesgo no
+    # se rompe), pero por debajo del piso se PAUSAN las NUEVAS entradas (can_open_new_positions
+    # = False) mientras la gestión/cierre de lo abierto sigue operando.
+    CAPITAL_FLOOR_USD: float = Field(
+        default=100.0,
+        gt=0,
+        description="Piso de capital efectivo (USD); debajo pausa nuevas entradas",
+    )
+    # Techo configurable en USD sobre el capital derivado del cash real (además del hard cap de
+    # prod $5k, que sigue como backstop). Acota el riesgo aunque el cash crezca.
+    CAPITAL_CAP_USD: float = Field(
+        default=2000.0, gt=0, description="Techo de capital efectivo (USD) sobre el cash real"
+    )
+    # Anti-churn: si el capital objetivo cambia menos que esta fracción vs el último, se ignora
+    # (no actualiza la caché de riesgo). 0.05 = 5%. 0 = sin suavizado (siempre actualiza).
+    CAPITAL_SMOOTHING_PCT: float = Field(
+        default=0.05,
+        ge=0,
+        le=1,
+        description="Fracción mínima de cambio para refrescar el capital (anti-churn)",
+    )
     # Bankroll inicial REAL en USD para la reconciliación de balance del dashboard
     # (scripts/check_portfolio.py). Solo lectura/observabilidad — NO afecta sizing ni riesgo.
     # 0.0 = sin setear → el dashboard usa DailyPnL.starting_capital si existe, o lo omite.
