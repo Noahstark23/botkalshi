@@ -132,6 +132,13 @@ class RiskManager:
             base = min(base, RiskManager.PROD_CAPITAL_HARD_CAP_USD)
         return base
 
+    def effective_capital_usd(self) -> float:
+        """Capital base efectivo en USD (API pública de `_get_effective_capital_usd`): la fuente
+        ÚNICA de los techos de riesgo, derivada del cash REAL de Kalshi (capital dinámico) o del
+        fallback estático. La consume p.ej. el poller de Motor 2 para dimensionar contra el
+        bankroll real por ciclo (refleja depósitos/retiros) en vez de ACTIVE_CAPITAL_USD fijo."""
+        return self._get_effective_capital_usd()
+
     def can_open_new_positions(self) -> bool:
         """True si se permiten NUEVAS entradas. False = capital (cash real × factor, pre-piso)
         bajo CAPITAL_FLOOR_USD → se pausan las entradas, pero la GESTIÓN/CIERRE de posiciones

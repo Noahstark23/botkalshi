@@ -299,11 +299,15 @@ class ProductionRunner:
             # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
             # queda None → el poller jamás intenta apostar (y el muro Capa C de
             # place_order es la defensa final aunque algo llegara a colarse).
+            # RiskManager para el sizing: el poller le pide el capital EFECTIVO (dinámico) por
+            # ciclo. Lee el cache de CLASE que refresca _run_balance_refresh → cualquier instancia
+            # ve el mismo cash real. En la rama de trading es el MISMO RM que usa el executor.
+            risk = RiskManager()
             if self.settings.TRADING_ENABLED:
                 async with KalshiRestClient() as client:
                     executor = Motor2Executor(
                         client,
-                        RiskManager(),
+                        risk,
                         min_entry_cents=self.settings.MOTOR_2_MIN_ENTRY_CENTS,
                         underdog_filter_enabled=self.settings.MOTOR_2_UNDERDOG_FILTER_ENABLED,
                     )
@@ -313,6 +317,7 @@ class ProductionRunner:
                         min_edge=min_edge,
                         one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                         max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
+                        risk_manager=risk,
                         executor=executor,
                     )
                     await poller.run(self._stop_event)
@@ -323,6 +328,7 @@ class ProductionRunner:
                     min_edge=min_edge,
                     one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                     max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
+                    risk_manager=risk,
                 )
                 await poller.run(self._stop_event)
         except Exception as e:

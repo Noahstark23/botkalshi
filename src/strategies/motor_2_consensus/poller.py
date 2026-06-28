@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
@@ -24,6 +25,9 @@ from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSig
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
 from src.utils.config import get_settings
+
+if TYPE_CHECKING:
+    from src.risk.manager import RiskManager
 
 
 class Motor2ShadowPoller:
@@ -46,13 +50,17 @@ class Motor2ShadowPoller:
         min_edge: float | None = None,
         one_per_event: bool = True,
         max_stake_pct: float = 0.0,
+        risk_manager: RiskManager | None = None,
         executor: Motor2Executor | None = None,
     ):
         self._kalshi = kalshi_source
         self._odds = odds_source
         self._interval = interval_sec if interval_sec is not None else self.DEFAULT_INTERVAL_SEC
-        # Capital real del bot para el sizing (¼ Kelly); en prod-shadow es chico ($5).
-        self._capital_usd = (
+        # Capital base del sizing. Con un RiskManager, se toma su capital EFECTIVO por ciclo
+        # (dinámico: cash real de Kalshi × factor, con piso/techo — refleja depósitos/retiros sin
+        # tocar variables). `capital_usd` queda como fallback ESTÁTICO (tests / sin RM).
+        self._risk = risk_manager
+        self._capital_usd_static = (
             capital_usd if capital_usd is not None else get_settings().ACTIVE_CAPITAL_USD
         )
         # Umbral de edge NETO como FRACCIÓN (0.03 = 3pp). Default = el del detector; el
@@ -66,6 +74,14 @@ class Motor2ShadowPoller:
         self._max_stake_pct = max_stake_pct
         # Presente SOLO con TRADING_ENABLED=true (lo construye el runner, Capa A). None = shadow.
         self._executor = executor
+
+    def _capital_for_cycle(self) -> float:
+        """Capital base del sizing ESTE ciclo: el efectivo del RiskManager (dinámico) si hay RM;
+        si no, el estático. Por-ciclo a propósito: el bankroll cambia con depósitos/retiros y con
+        el refresh del cash real, así el sizing flat sigue el capital vivo sin reconstruir nada."""
+        if self._risk is not None:
+            return self._risk.effective_capital_usd()
+        return self._capital_usd_static
 
     async def poll_once(self) -> list[ConsensusSignal]:
         """Un ciclo: extrae, cruza, detecta, (persiste + apuesta si live). Devuelve las señales."""
@@ -81,7 +97,7 @@ class Motor2ShadowPoller:
         signals = find_signals(
             kalshi_events,
             odds_events,
-            capital_usd=self._capital_usd,
+            capital_usd=self._capital_for_cycle(),
             min_edge=self._min_edge,
             diag=diag,
             one_per_event=self._one_per_event,
@@ -201,9 +217,11 @@ class Motor2ShadowPoller:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Loop supervisado hasta stop_event. Cada ciclo es best-effort."""
+        cap_src = "effective(RM)" if self._risk is not None else "static"
         logger.info(
             f"motor2.shadow arrancado (interval={self._interval}s, "
-            f"odds={'LIVE' if self._odds.is_live else 'FAKE'}, capital=${self._capital_usd})"
+            f"odds={'LIVE' if self._odds.is_live else 'FAKE'}, "
+            f"capital=${self._capital_for_cycle():.2f} [{cap_src}])"
         )
         while not stop_event.is_set():
             try:
