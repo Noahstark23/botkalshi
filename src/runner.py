@@ -319,6 +319,34 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_motor2_exits(self) -> None:
+        """
+        Motor 2 — cierre de posiciones (take-profit/trailing). Gateado por
+        MOTOR_2_SPORTSBOOK_ENABLED (corre junto al shadow poller, gestionando lo que ya hay
+        abierto). CAPA A: el executor (que vende) solo se construye con TRADING_ENABLED=true Y
+        MOTOR_2_EXECUTION_ENABLED=true — en shadow detecta y loguea [MOTOR 2 TP SHADOW] con net
+        de fees pero NUNCA vende. Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        await asyncio.sleep(25)  # dejar que init_db / boot terminen
+        try:
+            from src.strategies.motor_2_consensus.exit_engine import Motor2ExitEngine
+
+            await Motor2ExitEngine(
+                trading_enabled=(
+                    self.settings.TRADING_ENABLED and self.settings.MOTOR_2_EXECUTION_ENABLED
+                ),
+                take_profit_enabled=self.settings.MOTOR_2_TAKE_PROFIT_ENABLED,
+                tp_threshold=self.settings.MOTOR_2_TAKE_PROFIT_CENTS,
+                trailing_enabled=self.settings.MOTOR_2_TRAILING_ENABLED,
+                trailing_drop=self.settings.MOTOR_2_TRAILING_DROP_CENTS,
+            ).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor2_exits runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _run_daily_pnl(self) -> None:
         """
         Daily P&L digest — gateado por DAILY_PNL_REPORT_ENABLED. ADVISORY ONLY: una vez/día
@@ -474,6 +502,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_data_capture(), name="capture"),
                 asyncio.create_task(self._run_settlement(), name="settlement"),
                 asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
+                asyncio.create_task(self._run_motor2_exits(), name="motor2_exits"),
                 asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
                 asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
             ]

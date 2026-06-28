@@ -169,6 +169,35 @@ class Settings(BaseSettings):
         le=99,
         description="Retroceso (cents) desde el pico que dispara el trailing stop",
     )
+    # Motor 2 — cierre de posiciones (take-profit / trailing), espejo del de Motor 3. Motor 2
+    # SOLO abría posiciones (ride-to-settlement) → PnL histórico negativo por asimetría
+    # (avg_loss ≫ avg_win). Mismo esquema de dos capas: ENABLED gatea la DETECCIÓN (+log
+    # [MOTOR 2 TP SHADOW] con net de fees); la VENTA real la gatea MOTOR_2_EXECUTION_ENABLED.
+    # Shadow = TAKE_PROFIT_ENABLED True + EXECUTION_ENABLED False.
+    MOTOR_2_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="Si es True (y TRADING_ENABLED es True), Motor 2 VENDERÁ posiciones al disparar take-profit/trailing. Si es False, solo detecta y loguea (shadow).",
+    )
+    MOTOR_2_TAKE_PROFIT_ENABLED: bool = Field(
+        default=False,
+        description="Si es True, Motor 2 detecta+loguea take-profit (bid≥umbral) sobre sus posiciones abiertas. La venta real sigue gateada por MOTOR_2_EXECUTION_ENABLED.",
+    )
+    MOTOR_2_TAKE_PROFIT_CENTS: int = Field(
+        default=90,
+        ge=1,
+        le=99,
+        description="Umbral del bid (cents) del lado abierto para el take-profit de Motor 2 (calibrable; backtest MLB ≈62)",
+    )
+    MOTOR_2_TRAILING_ENABLED: bool = Field(
+        default=False,
+        description="Si es True, Motor 2 detecta+loguea trailing stop (retroceso del bid). La venta real sigue gateada por MOTOR_2_EXECUTION_ENABLED.",
+    )
+    MOTOR_2_TRAILING_DROP_CENTS: int = Field(
+        default=5,
+        ge=1,
+        le=99,
+        description="Retroceso (cents) desde el pico que dispara el trailing stop de Motor 2",
+    )
     USE_ORDERBOOK_MANAGER_V2: bool = Field(
         default=False, description="Enable WS-based recovery (OrderbookManagerV2)"
     )

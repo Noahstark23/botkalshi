@@ -53,8 +53,13 @@ class Motor3ExitOutcome:
 class Motor3ExitExecutor:
     """Liquida posiciones con SELL IOC al bid. Lock por-ticker anti doble-venta concurrente."""
 
-    def __init__(self, client: KalshiRestClient) -> None:
+    def __init__(self, client: KalshiRestClient, *, strategy: str = STRATEGY) -> None:
         self.client = client
+        # Estrategia con la que se audita la fila SELL del exit. Default motor_3_clv; Motor 2
+        # reusa este executor pasando "motor_2_consensus" para que el audit quede atribuido al
+        # motor que disparó el cierre (las patas BUY que cierra _settle_originals ya se marcan
+        # closed_by_clv por su propia strategy, sin importar este tag).
+        self._strategy = strategy
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _lock_for(self, ticker: str) -> asyncio.Lock:
@@ -160,7 +165,7 @@ class Motor3ExitExecutor:
                         action="sell",
                         count=fill_count,
                         price_cents=price,
-                        strategy=STRATEGY,
+                        strategy=self._strategy,
                         status="settled",
                         kalshi_order_id=order_id,
                         fill_price_cents=price,
