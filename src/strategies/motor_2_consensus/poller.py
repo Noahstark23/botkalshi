@@ -44,7 +44,7 @@ class Motor2ShadowPoller:
         interval_sec: float | None = None,
         capital_usd: float | None = None,
         min_edge: float | None = None,
-        block_both_sides: bool = True,
+        one_per_event: bool = True,
         executor: Motor2Executor | None = None,
     ):
         self._kalshi = kalshi_source
@@ -57,9 +57,9 @@ class Motor2ShadowPoller:
         # Umbral de edge NETO como FRACCIÓN (0.03 = 3pp). Default = el del detector; el
         # runner lo pasa desde config (MOTOR_2_MIN_EDGE_PCT / 100).
         self._min_edge = min_edge if min_edge is not None else MIN_EDGE_PCT
-        # Mutua exclusión por market (no abrir YES y NO del mismo market). El runner lo pasa
-        # desde config (MOTOR_2_BLOCK_BOTH_SIDES); default True = seguro.
-        self._block_both_sides = block_both_sides
+        # Mutua exclusión por EVENTO (una sola apuesta direccional por partido). El runner lo
+        # pasa desde config (MOTOR_2_ONE_BET_PER_EVENT); default True = seguro.
+        self._one_per_event = one_per_event
         # Presente SOLO con TRADING_ENABLED=true (lo construye el runner, Capa A). None = shadow.
         self._executor = executor
 
@@ -80,7 +80,7 @@ class Motor2ShadowPoller:
             capital_usd=self._capital_usd,
             min_edge=self._min_edge,
             diag=diag,
-            block_both_sides=self._block_both_sides,
+            one_per_event=self._one_per_event,
         )
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "

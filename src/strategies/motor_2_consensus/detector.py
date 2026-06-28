@@ -159,7 +159,7 @@ def find_signals(
     min_edge: float = MIN_EDGE_PCT,
     now: datetime | None = None,
     diag: dict[str, float] | None = None,
-    block_both_sides: bool = True,
+    one_per_event: bool = True,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -232,16 +232,16 @@ def find_signals(
             matched = True
             if diag is not None:
                 diag["events_matched"] += 1.0
+            # Candidatos de TODOS los outcomes del partido (cada uno en su market_ticker), luego
+            # colapsados a UNA apuesta direccional por evento (_collapse_event_signals).
+            event_signals: list[ConsensusSignal] = []
             for q in ke.outcomes:
                 cn = canonical_name(q.outcome_name)
                 fp = fair.get(cn)
                 if fp is None:
                     continue
-                signals.extend(
-                    _signals_for_outcome(
-                        q, fp, capital_usd, min_edge, diag, block_both_sides=block_both_sides
-                    )
-                )
+                event_signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
+            signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
             break  # ya emparejado este evento Kalshi
         if not matched and diag is not None:
             diag["reject_" + best_reason] = diag.get("reject_" + best_reason, 0.0) + 1.0
@@ -289,17 +289,13 @@ def _signals_for_outcome(
     capital_usd: float,
     min_edge: float,
     diag: dict[str, float] | None = None,
-    *,
-    block_both_sides: bool = True,
 ) -> list[ConsensusSignal]:
-    """Evalúa YES (prob justa) y NO (complemento) para un outcome; emite el/los que superen el edge.
+    """Candidatos YES (prob justa) y NO (complemento) de UN outcome con edge neto > umbral.
 
-    MUTUA EXCLUSIÓN POR MARKET (block_both_sides): Motor 2 es DIRECCIONAL — nunca debe abrir YES
-    y NO del MISMO market. Hacerlo paga doble fee y una pata siempre liquida en 0; si encima
-    yes_ask+no_ask<100 sería un ARBITRAJE (dominio de Motor 1, no de un direccional). Cuando ambos
-    lados superan el umbral, lo resuelve _resolve_both_sides (descarta ambos si no hay neto
-    combinado real, o emite SOLO el de mayor edge). Esto evita el patrón doble-lado que sangró en
-    producción (KXMLBGAME-26JUN271610P: YES+NO del mismo market liquidados al settlement)."""
+    Genera SOLO candidatos; la mutua exclusión la aplica find_signals a nivel EVENTO
+    (_collapse_event_signals) sobre el conjunto del partido — no acá, porque las patas
+    correlacionadas viven en market_tickers DISTINTOS (ej. yes@-PHI y no@-NYM son la misma
+    dirección 'PHI gana') y este helper solo ve un market a la vez."""
     out: list[ConsensusSignal] = []
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
     yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
@@ -309,13 +305,6 @@ def _signals_for_outcome(
         # Mejor edge NETO visto (aunque no supere el umbral) → distingue "mercado eficiente"
         # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
         diag["best_net_edge"] = max(diag.get("best_net_edge", -1.0), yes_edge, no_edge)
-
-    yes_pass = min_edge < yes_edge <= MAX_PLAUSIBLE_EDGE
-    no_pass = min_edge < no_edge <= MAX_PLAUSIBLE_EDGE
-    if block_both_sides and yes_pass and no_pass:
-        _resolve_both_sides(out, q, fair_prob, yes_edge, no_edge, capital_usd, min_edge)
-        return out
-
     _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     _emit_if_plausible(
         out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
@@ -323,43 +312,32 @@ def _signals_for_outcome(
     return out
 
 
-def _resolve_both_sides(
-    out: list[ConsensusSignal],
-    q: KalshiQuote,
-    fair_prob: float,
-    yes_edge: float,
-    no_edge: float,
-    capital_usd: float,
-    min_edge: float,
-) -> None:
-    """YES y NO del MISMO market superan el umbral (patológico para un direccional). Resuelve:
+def _collapse_event_signals(
+    event_signals: list[ConsensusSignal], one_per_event: bool, event_key: str
+) -> list[ConsensusSignal]:
+    """Mutua exclusión POR EVENTO (no por market). Un partido tiene outcomes mutuamente
+    excluyentes en market_tickers DISTINTOS (ej. ...-PHI y ...-NYM). Apostar yes en el market de
+    un equipo y no en el del otro = MISMA dirección → doble exposición correlacionada al mismo
+    resultado (el caso que sangró −$218: PHI con yes@-PHI + no@-NYM, ambos 'PHI gana'). Un dedup
+    por market_ticker NO lo agarra; por eso se colapsa a nivel EVENTO.
 
-    (1) Guardarraíl de arbitraje inverso: si comprar AMBAS patas no deja neto positivo tras fees
-        (yes_ask + no_ask + fees >= 100), NO existe edge combinado real → descartar AMBAS y loguear
-        discarded_both_sides (mismo estilo que discarded_suspicious). Es la condición de "no hay
-        arbitraje posible": el edge aparente de cada lado es un artefacto.
-    (2) Si hay neto combinado (yes_ask+no_ask<100, un near-arb), Motor 2 NO arbitra → emite SOLO
-        la pata de mayor edge neto (mutua exclusión)."""
-    fee_y = kalshi_fee_cents(1, q.yes_ask_cents)
-    fee_n = kalshi_fee_cents(1, q.no_ask_cents)
-    combined_post_fee = q.yes_ask_cents + q.no_ask_cents + fee_y + fee_n
-    if combined_post_fee >= 100:
-        logger.warning(
-            f"motor2.signal.discarded_both_sides ticker={q.market_ticker} "
-            f"yes_ask={q.yes_ask_cents}c no_ask={q.no_ask_cents}c "
-            f"combined_post_fee={combined_post_fee}c (>=100 → sin edge combinado real)"
-        )
-        return
-    side, fp, ask, edge = (
-        ("YES", fair_prob, q.yes_ask_cents, yes_edge)
-        if yes_edge >= no_edge
-        else ("NO", 1.0 - fair_prob, q.no_ask_cents, no_edge)
+    Motor 2 es DIRECCIONAL → UNA sola apuesta por evento: se queda con la de MAYOR edge neto y
+    descarta el resto. Esto además acota la EXPOSICIÓN por partido a un solo trade (ya capeado al
+    5% por _size_usd), en vez de sumar stake sobre varias patas del mismo evento."""
+    if not one_per_event or len(event_signals) <= 1:
+        return event_signals
+    best = max(event_signals, key=lambda s: s.edge_pct)
+    dropped = [
+        f"{s.market_ticker}/{s.kalshi_side}@{s.edge_pct:.3f}"
+        for s in event_signals
+        if s is not best
+    ]
+    logger.warning(
+        f"motor2.signal.event_collapsed event={event_key} "
+        f"kept={best.market_ticker}/{best.kalshi_side}@{best.edge_pct:.3f} dropped={dropped} "
+        "(1 apuesta direccional por evento → exposición del partido capeada a un trade)"
     )
-    logger.info(
-        f"motor2.signal.both_sides_collapsed ticker={q.market_ticker} kept={side} "
-        f"yes_edge={yes_edge:.3f} no_edge={no_edge:.3f}"
-    )
-    _emit_if_plausible(out, q, side, fp, ask, edge, capital_usd, min_edge)
+    return [best]
 
 
 def _build(

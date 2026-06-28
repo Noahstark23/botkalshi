@@ -311,7 +311,7 @@ class ProductionRunner:
                         kalshi_source,
                         odds_source,
                         min_edge=min_edge,
-                        block_both_sides=self.settings.MOTOR_2_BLOCK_BOTH_SIDES,
+                        one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                         executor=executor,
                     )
                     await poller.run(self._stop_event)
@@ -320,7 +320,7 @@ class ProductionRunner:
                     kalshi_source,
                     odds_source,
                     min_edge=min_edge,
-                    block_both_sides=self.settings.MOTOR_2_BLOCK_BOTH_SIDES,
+                    one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                 )
                 await poller.run(self._stop_event)
         except Exception as e:

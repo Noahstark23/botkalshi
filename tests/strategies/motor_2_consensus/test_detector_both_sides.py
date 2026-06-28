@@ -1,13 +1,13 @@
 """
-Mutua exclusión por market en el detector de Motor 2 (fix del patrón doble-lado).
+Mutua exclusión por EVENTO en el detector de Motor 2 (fix de la doble exposición correlacionada).
 
-Motor 2 es DIRECCIONAL: nunca debe emitir YES y NO del MISMO market. Antes los evaluaba
-independiente y emitía ambos cuando yes_ask+no_ask era bajo → abría las dos patas (doble fee,
-una liquida en 0). Estos tests fijan el comportamiento nuevo:
-  (a) ambos lados con edge y combinado <100 → emite SOLO el de mayor edge;
-  (b) combinado >=100 (sin neto real) → descarta AMBOS + log discarded_both_sides;
-  (c) un solo lado con edge (mercado normal) → no se ve afectado;
-  (d) block_both_sides=False → restaura el comportamiento previo (emite los dos).
+Motor 2 es DIRECCIONAL: una sola apuesta por partido. El bug de prod (−$218, PHI vs NYM) fue
+apostar `yes@...-PHI` + `no@...-NYM`: dos market_tickers DISTINTOS, ambos = "PHI gana". Un dedup
+por market_ticker no lo agarra; hay que colapsar a nivel EVENTO. Estos tests fijan:
+  (a) yes@equipoA + no@equipoB del mismo partido → UNA sola señal (la de mayor edge);
+  (b) la exposición por evento queda en un solo trade (size <= cap 5%);
+  (c) partidos distintos siguen generando señales independientes;
+  (d) one_per_event=False → restaura el comportamiento previo (una señal por outcome/lado).
 """
 
 from __future__ import annotations
@@ -21,12 +21,12 @@ from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 from src.strategies.motor_2_consensus.detector import (
     KalshiEventQuotes,
     KalshiQuote,
-    _resolve_both_sides,
-    _signals_for_outcome,
+    _collapse_event_signals,
     find_signals,
 )
 
 CAPITAL = 300.0
+CAP_USD = CAPITAL * 0.05  # 5% = $15.00
 
 
 @contextlib.contextmanager
@@ -39,86 +39,164 @@ def _capture_logs():
         logger.remove(sink)
 
 
-# =====================================================
-# (a) ambos lados con edge, combinado <100 → SOLO el de mayor edge
-# =====================================================
-
-
-def test_both_sides_collapse_to_higher_edge():
-    """fair=0.51, yes/no_ask=44 → yes_edge 0.06 > no_edge 0.04, combinado 90 → SOLO YES."""
-    q = KalshiQuote("KXMLB-T", "Team", yes_ask_cents=44, no_ask_cents=44)
-    out = _signals_for_outcome(q, 0.51, CAPITAL, 0.03)
-    assert len(out) == 1
-    assert out[0].kalshi_side == "YES"
-
-
-def test_find_signals_emits_single_side_for_cheap_market():
-    """E2E: market 2-way con yes_ask+no_ask<100 y ambos con edge → find_signals emite UNA señal."""
+def _phi_nym_event(*, phi_price: float = 1.72, nym_price: float = 2.38) -> OddsEvent:
+    """OddsEvent PHI vs NYM (h2h). Default → fair PHI ≈ 0.58."""
     market = Market(
         key="h2h",
         outcomes=(
-            Outcome(name="Los Angeles Lakers", price=2.0),
-            Outcome(name="Boston Celtics", price=2.0),
+            Outcome(name="Philadelphia Phillies", price=phi_price),
+            Outcome(name="New York Mets", price=nym_price),
         ),
     )
-    odds = OddsEvent(
-        id="e1",
+    return OddsEvent(
+        id="phinym",
+        sport_key="baseball_mlb",
+        commence_time=datetime.now(UTC) + timedelta(hours=2),
+        home_team="Philadelphia Phillies",
+        away_team="New York Mets",
+        bookmakers=(Bookmaker(key="pinnacle", title="Pinnacle", markets=(market,)),),
+    )
+
+
+def _phi_nym_kalshi(*, phi_yes: int, phi_no: int, nym_yes: int, nym_no: int) -> KalshiEventQuotes:
+    """Las DOS patas del partido, cada una en su market_ticker (...-PHI y ...-NYM)."""
+    return KalshiEventQuotes(
+        event_key="KXMLBGAME-26JUN271610PHINYM",
+        outcomes=(
+            KalshiQuote(
+                "KXMLBGAME-26JUN271610PHINYM-PHI",
+                "Philadelphia Phillies",
+                yes_ask_cents=phi_yes,
+                no_ask_cents=phi_no,
+            ),
+            KalshiQuote(
+                "KXMLBGAME-26JUN271610PHINYM-NYM",
+                "New York Mets",
+                yes_ask_cents=nym_yes,
+                no_ask_cents=nym_no,
+            ),
+        ),
+    )
+
+
+# =====================================================
+# (a) yes@PHI + no@NYM (misma dirección, tickers distintos) → UNA señal
+# =====================================================
+
+
+def test_same_event_correlated_legs_emit_single_signal():
+    """fair PHI≈0.58. yes@-PHI (ask48) y no@-NYM (ask47) ambos 'PHI gana' con edge → UNA señal."""
+    odds = _phi_nym_event()
+    # yes@-PHI: edge sobre fair 0.58. no@-NYM: edge sobre 1-0.42=0.58. Los lados contrarios
+    # (no@-PHI, yes@-NYM) con ask alto → sin edge.
+    ke = _phi_nym_kalshi(phi_yes=48, phi_no=90, nym_yes=90, nym_no=47)
+
+    with _capture_logs() as cap:
+        signals = find_signals([ke], [odds], capital_usd=CAPITAL)
+
+    assert len(signals) == 1  # NO dos patas correlacionadas
+    assert any("motor2.signal.event_collapsed" in m for m in cap)
+
+
+# =====================================================
+# (b) exposición por evento acotada a un solo trade (cap 5%)
+# =====================================================
+
+
+def test_event_exposure_capped_to_single_trade():
+    """La única señal emitida por evento respeta el cap de tamaño por trade (5%)."""
+    odds = _phi_nym_event()
+    ke = _phi_nym_kalshi(phi_yes=48, phi_no=90, nym_yes=90, nym_no=47)
+    signals = find_signals([ke], [odds], capital_usd=CAPITAL)
+    assert len(signals) == 1
+    assert signals[0].recommended_size_usd <= CAP_USD
+
+
+# =====================================================
+# (c) partidos distintos → señales independientes
+# =====================================================
+
+
+def test_distinct_events_independent_signals():
+    """Dos partidos distintos con edge → una señal por cada uno (no se colapsan entre sí)."""
+    odds_phi = _phi_nym_event()
+    odds_lal = OddsEvent(
+        id="lalbos",
         sport_key="basketball_nba",
         commence_time=datetime.now(UTC) + timedelta(hours=2),
         home_team="Los Angeles Lakers",
         away_team="Boston Celtics",
-        bookmakers=(Bookmaker(key="pinnacle", title="Pinnacle", markets=(market,)),),
+        bookmakers=(
+            Bookmaker(
+                key="pinnacle",
+                title="Pinnacle",
+                markets=(
+                    Market(
+                        key="h2h",
+                        outcomes=(
+                            Outcome(name="Los Angeles Lakers", price=1.72),
+                            Outcome(name="Boston Celtics", price=2.38),
+                        ),
+                    ),
+                ),
+            ),
+        ),
     )
-    ke = KalshiEventQuotes(
-        event_key="NBA-LAL-BOS",
+    ke_phi = _phi_nym_kalshi(phi_yes=48, phi_no=90, nym_yes=90, nym_no=47)
+    ke_lal = KalshiEventQuotes(
+        event_key="KXNBA-LAL-BOS",
         outcomes=(
-            KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=44, no_ask_cents=44),
+            KalshiQuote("KXNBA-LAL", "Los Angeles Lakers", yes_ask_cents=48, no_ask_cents=90),
             KalshiQuote("KXNBA-BOS", "Boston Celtics", yes_ask_cents=90, no_ask_cents=90),
         ),
     )
-    signals = find_signals([ke], [odds], capital_usd=CAPITAL)
-    lal = [s for s in signals if s.market_ticker == "KXNBA-LAL"]
-    assert len(lal) == 1  # NO ambos lados
-    assert lal[0].kalshi_side == "YES"
+    signals = find_signals([ke_phi, ke_lal], [odds_phi, odds_lal], capital_usd=CAPITAL)
+    tickers = {s.market_ticker for s in signals}
+    assert len(signals) == 2  # un trade por partido
+    assert any(t.startswith("KXMLBGAME") for t in tickers)
+    assert any(t.startswith("KXNBA") for t in tickers)
 
 
 # =====================================================
-# (b) combinado >=100 → descarta AMBOS + log
+# (d) escape hatch: one_per_event=False restaura el comportamiento previo
 # =====================================================
 
 
-def test_resolve_discards_both_when_no_combined_edge():
-    """yes_ask+no_ask+fees >= 100 → no hay arbitraje posible → descarta AMBOS + log."""
-    q = KalshiQuote("KXMLB-X", "Team", yes_ask_cents=60, no_ask_cents=60)
-    out: list = []
+def test_one_per_event_disabled_keeps_all_legs():
+    """Con one_per_event=False, el evento vuelve a emitir todas las patas con edge."""
+    odds = _phi_nym_event()
+    ke = _phi_nym_kalshi(phi_yes=48, phi_no=90, nym_yes=90, nym_no=47)
+    signals = find_signals([ke], [odds], capital_usd=CAPITAL, one_per_event=False)
+    assert len(signals) == 2  # yes@-PHI y no@-NYM, ambas
+
+
+# =====================================================
+# Unidad: _collapse_event_signals
+# =====================================================
+
+
+def test_collapse_keeps_highest_edge():
+    """_collapse_event_signals deja solo la señal de mayor edge del evento + loguea."""
+    from src.strategies.motor_2_consensus.detector import ConsensusSignal
+
+    a = ConsensusSignal(
+        market_ticker="EVT-A",
+        kalshi_side="YES",
+        odds_api_fair_prob=0.58,
+        kalshi_price_cents=48,
+        edge_pct=0.09,
+        recommended_size_usd=10.0,
+    )
+    b = ConsensusSignal(
+        market_ticker="EVT-B",
+        kalshi_side="NO",
+        odds_api_fair_prob=0.58,
+        kalshi_price_cents=47,
+        edge_pct=0.11,
+        recommended_size_usd=10.0,
+    )
     with _capture_logs() as cap:
-        _resolve_both_sides(
-            out, q, 0.5, yes_edge=0.05, no_edge=0.05, capital_usd=CAPITAL, min_edge=0.03
-        )
-    assert out == []
-    assert any("motor2.signal.discarded_both_sides" in m and "KXMLB-X" in m for m in cap)
-
-
-# =====================================================
-# (c) un solo lado con edge (mercado normal) → sin cambios
-# =====================================================
-
-
-def test_single_side_signal_unaffected():
-    """Mercado normal (yes_ask+no_ask=105): solo YES tiene edge → se emite igual que antes."""
-    q = KalshiQuote("KXNBA-LAL", "Team", yes_ask_cents=40, no_ask_cents=65)
-    out = _signals_for_outcome(q, 0.50, CAPITAL, 0.03)
+        out = _collapse_event_signals([a, b], one_per_event=True, event_key="EVT")
     assert len(out) == 1
-    assert out[0].kalshi_side == "YES"
-
-
-# =====================================================
-# (d) escape hatch: block_both_sides=False restaura el comportamiento previo
-# =====================================================
-
-
-def test_block_disabled_emits_both_sides():
-    """Con block_both_sides=False, el detector vuelve a emitir AMBOS lados (comportamiento previo)."""
-    q = KalshiQuote("KXMLB-T", "Team", yes_ask_cents=44, no_ask_cents=44)
-    out = _signals_for_outcome(q, 0.51, CAPITAL, 0.03, block_both_sides=False)
-    assert {s.kalshi_side for s in out} == {"YES", "NO"}
+    assert out[0] is b  # mayor edge
+    assert any("motor2.signal.event_collapsed" in m and "EVT" in m for m in cap)
