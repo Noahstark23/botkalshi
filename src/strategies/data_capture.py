@@ -147,6 +147,9 @@ class DataCaptureService:
         self._delta_shape_logged = False
         self._snapshot_shape_logged = False
         self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
+        # close_time (ISO) por ticker desde discovery → se alimenta al v2_manager para que la
+        # recovery NO pida snapshot de mercados settled (causa del loop de code 15).
+        self._market_close_times: dict[str, str] = {}
         self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
         # Cliente REST persistente inyectado por el runner SOLO con TRADING_ENABLED=true.
         # None en shadow. La Capa 2 lo pasará al RestExecutor del Motor REST.
@@ -350,6 +353,7 @@ class DataCaptureService:
                                 status = market.get("status", "")
                                 if ticker and status in ("open", "active"):
                                     self._tracked_tickers.add(ticker)
+                                    self._market_close_times[ticker] = market.get("close_time")
                                     per_series[prefix] = per_series.get(prefix, 0) + 1
                         except Exception as e:
                             logger.warning(
@@ -362,6 +366,9 @@ class DataCaptureService:
 
         if errors_by_prefix:
             logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
+        # Alimentar close_time al v2_manager (si ya existe) para purgar settled de la recovery.
+        if self._v2_manager is not None:
+            self._v2_manager.set_close_times(self._market_close_times)
         new_tickers = self._tracked_tickers - before
         BotState.tracked_markets_count = len(self._tracked_tickers)
         logger.success(
@@ -709,6 +716,11 @@ class DataCaptureService:
             return
 
         self._register_ws_handlers()
+
+        # El v2_manager recién se creó en _register_ws_handlers → empujarle los close_time ya
+        # descubiertos al boot (la discovery previa corrió sin manager).
+        if self._v2_manager is not None:
+            self._v2_manager.set_close_times(self._market_close_times)
 
         # Encolar suscripciones (se aplicaran al conectar el WS)
         ticker_list = list(self._tracked_tickers)

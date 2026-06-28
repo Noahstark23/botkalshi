@@ -88,6 +88,11 @@ class OrderbookManagerV2:
     # buffer, descarta lo encolado (logueando sid + cuántos mensajes) y RE-PIDE el snapshot.
     DEFAULT_RECOVERY_TIMEOUT_SEC = 30.0
     DEFAULT_MAX_RECOVERY_BUFFER = 5000
+    # Circuit breaker: tras N fallos CONSECUTIVOS de recovery de un sid (code 15 "Action
+    # required" sobre el get_snapshot, o timeouts/overflow seguidos), se DESHABILITA la recovery
+    # de ese sid (book queda stale + alerta) en vez del loop infinito (incidente: ~6764 fallos/día).
+    # El contador se resetea cuando una recovery del sid completa OK.
+    MAX_RECOVERY_FAILURES = 5
 
     def __init__(
         self,
@@ -112,6 +117,14 @@ class OrderbookManagerV2:
         self._bootstrap_buffer: dict[str, list[dict]] = {}
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
+        # Tickers que NO se vuelven a pedir en recovery: settled/expirados (close_time vencido,
+        # alimentado por set_close_times desde discovery) o marcados muertos por un rechazo de
+        # Kalshi que los nombró. Evita pedir snapshot de mercados cerrados → code 15.
+        self._close_time_by_ticker: dict[str, datetime] = {}
+        self._dead_tickers: set[str] = set()
+        # Circuit breaker por sid: fallos consecutivos de recovery + sids deshabilitados.
+        self._recovery_failures_by_sid: dict[int, int] = {}
+        self._recovery_disabled_sids: set[int] = set()
         # Gap rate tracking (monotonic timestamps within last 60s)
         self._gap_timestamps: list[float] = []
         self._consecutive_warning: int = 0
@@ -149,6 +162,13 @@ class OrderbookManagerV2:
         if msg_type == "error":
             code = raw_msg.get("code", "?")
             err_text = raw_msg.get("msg", "")
+            req_id = raw_msg.get("id")
+            # code 15 "Action required" sobre un get_snapshot de recovery PENDIENTE: NO es ruido
+            # genérico — es la request RECHAZADA. Se maneja explícito (purga + circuit breaker) en
+            # vez de dejar que el watchdog re-pida el set completo a ciegas (loop de 6764/día).
+            if code == 15 and isinstance(req_id, int) and req_id in self._pending_snapshot_requests:
+                await self._handle_recovery_rejected(req_id, raw_msg)
+                return
             logger.error(f"WS error code={code}: {err_text}")
             BotState.record_error(f"WS error code={code}: {err_text}")
             return
@@ -201,8 +221,16 @@ class OrderbookManagerV2:
         if sid in self._last_seq_by_sid:
             expected_seq = self._last_seq_by_sid[sid] + 1
             if new_seq != expected_seq:
+                # Circuit breaker activo para este sid: ya se dio por vencido (book stale + alerta).
+                # Avanzar el baseline y salir silencioso — ni recovery ni buffer ni spam de gaps.
+                if sid in self._recovery_disabled_sids:
+                    self._last_seq_by_sid[sid] = new_seq
+                    return
                 await self._start_recovery(sid)
-                self._pending_deltas[sid].append(raw_msg)
+                # Solo bufferear si la recovery ARRANCÓ (no si _start_recovery la deshabilitó por
+                # quedarse sin tickers vivos → el sid no entra en _recovering).
+                if sid in self._recovering:
+                    self._pending_deltas[sid].append(raw_msg)
                 alert_args = self._record_gap_and_should_alert()
                 if alert_args:
                     asyncio.create_task(self._fire_alert(*alert_args))
@@ -300,34 +328,64 @@ class OrderbookManagerV2:
     # Recovery
     # =====================================================
 
+    def set_close_times(self, close_times: dict[str, str | None]) -> None:
+        """Alimenta los close_time (ISO 8601) por ticker desde discovery (data_capture). Los
+        markets ya VENCIDOS se excluyen de los get_snapshot de recovery: pedir snapshot de un
+        mercado cerrado/settled es lo que Kalshi rechaza con code 15 (causa del loop). Best-effort:
+        un close_time inválido se ignora (ese ticker no se filtra por tiempo)."""
+        for ticker, raw in close_times.items():
+            parsed = _parse_iso_naive_utc(raw) if raw else None
+            if parsed is not None:
+                self._close_time_by_ticker[ticker] = parsed
+
+    def _is_unrecoverable(self, ticker: str) -> bool:
+        """True si NO tiene sentido pedir snapshot de este ticker: marcado muerto, o con close_time
+        ya vencido (settled). None/desconocido → recuperable (no sobre-filtrar)."""
+        if ticker in self._dead_tickers:
+            return True
+        close_time = self._close_time_by_ticker.get(ticker)
+        return close_time is not None and close_time <= datetime.now(UTC).replace(tzinfo=None)
+
     async def _start_recovery(self, sid: int) -> None:
-        """Mark all tickers in sid as stale and send WS get_snapshot command."""
-        tickers = list(self._tickers_by_sid.get(sid, set()))
-        # Gap individual = evento benigno AUTO-RECUPERADO (resync por snapshot) → INFO, no
-        # CRITICAL (era ruido: ~32/día). La escalada por FRECUENCIA anormal sigue intacta
-        # vía _record_gap_and_should_alert (Telegram sid_gap_warning/critical a umbrales).
+        """Marca los tickers del sid stale y pide get_snapshot SOLO de los recuperables.
+
+        FIX 1 (purga): excluye tickers settled/dead — pedir snapshot de un mercado cerrado dispara
+        code 15. Si NO queda ninguno vivo, el sid entero está cerrado → circuit breaker (no se pide
+        nada, no se entra en _recovering, no hay loop)."""
+        if sid in self._recovery_disabled_sids:
+            return  # ya deshabilitado (circuit breaker) → no reintentar
+
+        all_tickers = self._tickers_by_sid.get(sid, set())
+        live = [t for t in all_tickers if not self._is_unrecoverable(t)]
+        purged = len(all_tickers) - len(live)
+        # Gap individual = evento benigno AUTO-RECUPERADO → INFO (la escalada por FRECUENCIA sigue
+        # en _record_gap_and_should_alert).
         logger.info(
-            f"Sid {sid} gap detected (auto-recovery). Marking {len(tickers)} tickers stale, "
-            "requesting WS recovery snapshot."
+            f"Sid {sid} gap detected (auto-recovery). live={len(live)} purged={purged} "
+            f"(settled/dead) — requesting WS recovery snapshot."
         )
+        for ticker in all_tickers:
+            if ticker in self._books:
+                self._books[ticker].mark_stale()
+
+        if not live:
+            logger.warning(
+                f"v2.recovery_all_settled sid={sid}: los {len(all_tickers)} tickers están "
+                "settled/dead → circuit breaker (no se pide snapshot)."
+            )
+            await self._disable_recovery(sid, "all_tickers_settled")
+            return
 
         self._recovering.add(sid)
         self._pending_deltas[sid] = []
         self._recovery_started_at[sid] = time.monotonic()
 
-        for ticker in tickers:
-            if ticker in self._books:
-                self._books[ticker].mark_stale()
-
-        if not tickers:
-            return
-
         req_id = await self._ws.send_command(
             "update_subscription",
             action="get_snapshot",
-            params={"market_tickers": tickers, "sids": [sid]},
+            params={"market_tickers": live, "sids": [sid]},
         )
-        self._pending_snapshot_requests[req_id] = (sid, set(tickers))
+        self._pending_snapshot_requests[req_id] = (sid, set(live))
 
     async def _guard_stuck_recovery(self, sid: int) -> None:
         """
@@ -348,29 +406,74 @@ class OrderbookManagerV2:
                 sid, "timeout" if timed_out else "buffer_overflow"
             )
 
-    async def _abort_and_restart_recovery(self, sid: int, reason: str) -> None:
-        """
-        Tira la recovery atascada del sid (descarta el buffer) y arranca una nueva.
-
-        Loguea WARNING con el sid y CUÁNTOS mensajes se descartaron: si esto se dispara
-        seguido en producción, es la señal de que el feed está degradado y hay que mirar la
-        causa upstream (no es un fix de raíz, es la red de seguridad anti-OOM). Re-pide el
-        snapshot vía _start_recovery → buffer y timer frescos, así el watchdog vuelve a
-        acotar el próximo intento (cada ciclo queda bounded por timeout/tamaño).
-        """
-        discarded = len(self._pending_deltas.get(sid, []))
-        # Limpiar requests de snapshot viejos de este sid (un snapshot tardío del intento
-        # abortado NO debe drenar el buffer del intento nuevo).
+    def _cleanup_recovery(self, sid: int) -> None:
+        """Limpia el estado de recovery EN CURSO del sid (pending requests, buffer, timer, flag).
+        Un snapshot tardío del intento abortado NO debe drenar el buffer de un intento nuevo."""
         stale_reqs = [r for r, (s, _) in self._pending_snapshot_requests.items() if s == sid]
         for r in stale_reqs:
             del self._pending_snapshot_requests[r]
         self._recovering.discard(sid)
         self._pending_deltas.pop(sid, None)
         self._recovery_started_at.pop(sid, None)
+
+    async def _register_failure_and_maybe_break(self, sid: int, reason: str) -> bool:
+        """Contabiliza un fallo de recovery del sid. Si llega a MAX_RECOVERY_FAILURES consecutivos,
+        DESHABILITA la recovery del sid (circuit breaker) y devuelve True (el caller NO reintenta).
+        El contador se resetea cuando una recovery completa OK (_handle_recovery_snapshot)."""
+        self._recovery_failures_by_sid[sid] = self._recovery_failures_by_sid.get(sid, 0) + 1
+        if self._recovery_failures_by_sid[sid] >= self.MAX_RECOVERY_FAILURES:
+            await self._disable_recovery(sid, f"{reason}_x{self._recovery_failures_by_sid[sid]}")
+            return True
+        return False
+
+    async def _disable_recovery(self, sid: int, reason: str) -> None:
+        """Circuit breaker: deja de reintentar la recovery de este sid (book queda stale) y ALERTA.
+        Evita el loop infinito cuando la causa es persistente (cuenta en 'Action required', sid
+        entero settled). Se re-habilita solo si una recovery del sid vuelve a completar OK."""
+        self._cleanup_recovery(sid)
+        self._recovery_disabled_sids.add(sid)
+        fails = self._recovery_failures_by_sid.get(sid, 0)
+        msg = f"sid={sid} recovery DESHABILITADA ({reason}, {fails} fallos) — book stale, sin reintentos"
+        logger.critical(f"v2.recovery_disabled {msg}")
+        BotState.record_error(f"v2.recovery_disabled {msg}")
+        await self._fire_alert("recovery_disabled", msg)
+
+    async def _handle_recovery_rejected(self, req_id: int, raw_msg: dict) -> None:
+        """FIX 2 — code 15 sobre un get_snapshot pendiente: la request fue RECHAZADA. En vez de
+        re-pedir el set completo a ciegas: si Kalshi nombra un ticker, marcarlo muerto; limpiar la
+        recovery; contar el fallo (circuit breaker); y si no se rompió, reintentar con el set ya
+        FILTRADO (sin settled/dead)."""
+        sid, tickers = self._pending_snapshot_requests[req_id]
+        bad = raw_msg.get("market_ticker")
+        if isinstance(bad, str):
+            self._dead_tickers.add(bad)
+        self._cleanup_recovery(sid)
+        logger.warning(
+            f"v2.recovery_rejected sid={sid} code=15 req_id={req_id} tickers={len(tickers)} "
+            f"bad={bad} (fix: purga + circuit breaker, NO re-pide el set completo)"
+        )
+        BotState.record_error(f"v2 recovery rechazada (code 15) sid={sid}")
+        if await self._register_failure_and_maybe_break(sid, "code15"):
+            return
+        await self._start_recovery(sid)
+
+    async def _abort_and_restart_recovery(self, sid: int, reason: str) -> None:
+        """
+        Tira la recovery atascada del sid (descarta el buffer) y arranca una nueva — salvo que el
+        circuit breaker se dispare (N fallos consecutivos → se deshabilita y NO reintenta).
+
+        Loguea WARNING con el sid y CUÁNTOS mensajes se descartaron: si se dispara seguido es feed
+        degradado (mirar upstream). Re-pide el snapshot vía _start_recovery (buffer/timer frescos,
+        bounded por timeout/tamaño) hasta que el breaker corte.
+        """
+        discarded = len(self._pending_deltas.get(sid, []))
+        self._cleanup_recovery(sid)
         logger.warning(
             f"v2.recovery_aborted sid={sid} reason={reason} discarded_msgs={discarded} → "
-            "reintentando snapshot. Si se repite seguido = feed degradado (mirar upstream)."
+            "reintentando snapshot (acotado por circuit breaker)."
         )
+        if await self._register_failure_and_maybe_break(sid, reason):
+            return
         await self._start_recovery(sid)
 
     def _pending_req_id_for_sid(self, sid: int) -> int | None:
@@ -393,6 +496,9 @@ class OrderbookManagerV2:
             del self._pending_snapshot_requests[req_id]
             self._recovering.discard(sid)
             self._recovery_started_at.pop(sid, None)
+            # Recovery OK → resetea el circuit breaker del sid (y lo re-habilita si estaba off).
+            self._recovery_failures_by_sid.pop(sid, None)
+            self._recovery_disabled_sids.discard(sid)
             self._drain_buffer(sid)
 
     def _drain_buffer(self, sid: int) -> None:
@@ -549,6 +655,18 @@ class OrderbookManagerV2:
 # =====================================================
 # Module helpers
 # =====================================================
+
+
+def _parse_iso_naive_utc(value: str) -> datetime | None:
+    """ISO 8601 (con o sin 'Z'/offset) → datetime NAIVE en UTC, para comparar con
+    datetime.now(UTC).replace(tzinfo=None). None si no parsea (best-effort)."""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
 
 
 def _parse_fp_levels(
