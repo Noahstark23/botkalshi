@@ -142,6 +142,30 @@ async def test_code15_cleans_up_and_retries_filtered(mock_ws):
     assert mock_ws.send_command.await_count == before + 1  # reintentó (set filtrado)
 
 
+async def test_code15_logs_close_time_diag(mock_ws):
+    """El log del rechazo incluye el diagnóstico de close_time (known + sample) para ver por
+    qué la purga no eliminó el ticker (NO_CLOSE_TIME = discovery no lo pasó)."""
+    from loguru import logger
+
+    manager = OrderbookManagerV2(mock_ws)
+    await manager.handle_message(make_snapshot("TICK", sid=1, seq=1))
+    with pytest.raises(SidGapError):
+        await manager.handle_message(make_delta("TICK", sid=1, seq=99))
+    req_id = manager._pending_req_id_for_sid(1)
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="WARNING")
+    try:
+        await manager.handle_message(error_code15(req_id))
+    finally:
+        logger.remove(sink)
+
+    blob = "".join(captured)
+    line = next(m for m in captured if "v2.recovery_rejected" in m)
+    assert "close_times_known=0/1" in line  # TICK sin close_time
+    assert "NO_CLOSE_TIME" in blob
+
+
 async def test_code15_marks_named_ticker_dead(mock_ws):
     """Si el error code 15 nombra un ticker, se marca muerto (no se vuelve a pedir)."""
     manager = OrderbookManagerV2(mock_ws)
