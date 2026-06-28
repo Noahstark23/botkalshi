@@ -159,6 +159,7 @@ def find_signals(
     min_edge: float = MIN_EDGE_PCT,
     now: datetime | None = None,
     diag: dict[str, float] | None = None,
+    block_both_sides: bool = True,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -236,7 +237,11 @@ def find_signals(
                 fp = fair.get(cn)
                 if fp is None:
                     continue
-                signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
+                signals.extend(
+                    _signals_for_outcome(
+                        q, fp, capital_usd, min_edge, diag, block_both_sides=block_both_sides
+                    )
+                )
             break  # ya emparejado este evento Kalshi
         if not matched and diag is not None:
             diag["reject_" + best_reason] = diag.get("reject_" + best_reason, 0.0) + 1.0
@@ -284,8 +289,17 @@ def _signals_for_outcome(
     capital_usd: float,
     min_edge: float,
     diag: dict[str, float] | None = None,
+    *,
+    block_both_sides: bool = True,
 ) -> list[ConsensusSignal]:
-    """Evalúa YES (prob justa) y NO (complemento) para un outcome; emite el/los que superen el edge."""
+    """Evalúa YES (prob justa) y NO (complemento) para un outcome; emite el/los que superen el edge.
+
+    MUTUA EXCLUSIÓN POR MARKET (block_both_sides): Motor 2 es DIRECCIONAL — nunca debe abrir YES
+    y NO del MISMO market. Hacerlo paga doble fee y una pata siempre liquida en 0; si encima
+    yes_ask+no_ask<100 sería un ARBITRAJE (dominio de Motor 1, no de un direccional). Cuando ambos
+    lados superan el umbral, lo resuelve _resolve_both_sides (descarta ambos si no hay neto
+    combinado real, o emite SOLO el de mayor edge). Esto evita el patrón doble-lado que sangró en
+    producción (KXMLBGAME-26JUN271610P: YES+NO del mismo market liquidados al settlement)."""
     out: list[ConsensusSignal] = []
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
     yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
@@ -295,11 +309,57 @@ def _signals_for_outcome(
         # Mejor edge NETO visto (aunque no supere el umbral) → distingue "mercado eficiente"
         # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
         diag["best_net_edge"] = max(diag.get("best_net_edge", -1.0), yes_edge, no_edge)
+
+    yes_pass = min_edge < yes_edge <= MAX_PLAUSIBLE_EDGE
+    no_pass = min_edge < no_edge <= MAX_PLAUSIBLE_EDGE
+    if block_both_sides and yes_pass and no_pass:
+        _resolve_both_sides(out, q, fair_prob, yes_edge, no_edge, capital_usd, min_edge)
+        return out
+
     _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     _emit_if_plausible(
         out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
     )
     return out
+
+
+def _resolve_both_sides(
+    out: list[ConsensusSignal],
+    q: KalshiQuote,
+    fair_prob: float,
+    yes_edge: float,
+    no_edge: float,
+    capital_usd: float,
+    min_edge: float,
+) -> None:
+    """YES y NO del MISMO market superan el umbral (patológico para un direccional). Resuelve:
+
+    (1) Guardarraíl de arbitraje inverso: si comprar AMBAS patas no deja neto positivo tras fees
+        (yes_ask + no_ask + fees >= 100), NO existe edge combinado real → descartar AMBAS y loguear
+        discarded_both_sides (mismo estilo que discarded_suspicious). Es la condición de "no hay
+        arbitraje posible": el edge aparente de cada lado es un artefacto.
+    (2) Si hay neto combinado (yes_ask+no_ask<100, un near-arb), Motor 2 NO arbitra → emite SOLO
+        la pata de mayor edge neto (mutua exclusión)."""
+    fee_y = kalshi_fee_cents(1, q.yes_ask_cents)
+    fee_n = kalshi_fee_cents(1, q.no_ask_cents)
+    combined_post_fee = q.yes_ask_cents + q.no_ask_cents + fee_y + fee_n
+    if combined_post_fee >= 100:
+        logger.warning(
+            f"motor2.signal.discarded_both_sides ticker={q.market_ticker} "
+            f"yes_ask={q.yes_ask_cents}c no_ask={q.no_ask_cents}c "
+            f"combined_post_fee={combined_post_fee}c (>=100 → sin edge combinado real)"
+        )
+        return
+    side, fp, ask, edge = (
+        ("YES", fair_prob, q.yes_ask_cents, yes_edge)
+        if yes_edge >= no_edge
+        else ("NO", 1.0 - fair_prob, q.no_ask_cents, no_edge)
+    )
+    logger.info(
+        f"motor2.signal.both_sides_collapsed ticker={q.market_ticker} kept={side} "
+        f"yes_edge={yes_edge:.3f} no_edge={no_edge:.3f}"
+    )
+    _emit_if_plausible(out, q, side, fp, ask, edge, capital_usd, min_edge)
 
 
 def _build(

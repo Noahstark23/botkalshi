@@ -278,6 +278,14 @@ class Settings(BaseSettings):
         default=False,
         description="Si es True, Motor 2 BLOQUEA entradas <MOTOR_2_MIN_ENTRY_CENTS. Si es False, solo loguea (shadow).",
     )
+    # Mutua exclusión por market: con True (default) Motor 2 NUNCA emite YES y NO del mismo
+    # market — si ambos lados superan el edge, emite solo el de mayor edge (o descarta ambos si
+    # no hay neto combinado real tras fees). Previene el patrón doble-lado (pérdida estructural:
+    # doble fee + una pata liquida en 0). Escape hatch: False restaura el comportamiento previo.
+    MOTOR_2_BLOCK_BOTH_SIDES: bool = Field(
+        default=True,
+        description="Si es True, Motor 2 no abre YES y NO del mismo market (mutua exclusión por edge).",
+    )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto

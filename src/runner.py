@@ -308,11 +308,20 @@ class ProductionRunner:
                         underdog_filter_enabled=self.settings.MOTOR_2_UNDERDOG_FILTER_ENABLED,
                     )
                     poller = Motor2ShadowPoller(
-                        kalshi_source, odds_source, min_edge=min_edge, executor=executor
+                        kalshi_source,
+                        odds_source,
+                        min_edge=min_edge,
+                        block_both_sides=self.settings.MOTOR_2_BLOCK_BOTH_SIDES,
+                        executor=executor,
                     )
                     await poller.run(self._stop_event)
             else:
-                poller = Motor2ShadowPoller(kalshi_source, odds_source, min_edge=min_edge)
+                poller = Motor2ShadowPoller(
+                    kalshi_source,
+                    odds_source,
+                    min_edge=min_edge,
+                    block_both_sides=self.settings.MOTOR_2_BLOCK_BOTH_SIDES,
+                )
                 await poller.run(self._stop_event)
         except Exception as e:
             msg = f"motor2 runner: {type(e).__name__}: {e}"
