@@ -361,3 +361,51 @@ async def test_trailing_dedupes_with_time_exit():
     await eng._tick()
 
     eng._executor.exit_position.assert_awaited_once()
+
+
+# =========================================================
+# Shadow PnL neto de fees (validación "contando fees reales")
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_tp_shadow_logs_net_pnl_with_fees():
+    """[MOTOR 3 TP SHADOW] incluye entry + net (PnL neto de fees) para validar contra el backtest."""
+    eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=62)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 62))
+    _seed_position("KXTPP", peak=None)
+    _seed_entry("KXTPP", price=54)  # entry 54¢, bid 62¢ → gross +0.80 sobre 10c, menos fees
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        await eng._tick()
+    finally:
+        logger.remove(sink)
+
+    line = next(m for m in captured if "[MOTOR 3 TP SHADOW]" in m and "KXTPP" in m)
+    assert "entry=54c" in line
+    assert "gross=$+0.80" in line
+    assert "net=$" in line  # neto de fees presente
+
+
+@pytest.mark.asyncio
+async def test_tp_shadow_pnl_handles_missing_entry():
+    """Sin pata BUY (entry None) → el log no rompe: muestra entry=? net_pnl=?."""
+    eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=62)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 62))
+    _seed_position("KXNOENT", peak=None)  # sin _seed_entry
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        await eng._tick()
+    finally:
+        logger.remove(sink)
+
+    line = next(m for m in captured if "[MOTOR 3 TP SHADOW]" in m and "KXNOENT" in m)
+    assert "entry=?" in line
