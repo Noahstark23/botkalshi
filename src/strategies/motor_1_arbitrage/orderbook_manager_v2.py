@@ -87,7 +87,11 @@ class OrderbookManagerV2:
     # límite → OOM. El watchdog aborta una recovery atascada por TIMEOUT o por TAMAÑO de
     # buffer, descarta lo encolado (logueando sid + cuántos mensajes) y RE-PIDE el snapshot.
     DEFAULT_RECOVERY_TIMEOUT_SEC = 30.0
-    DEFAULT_MAX_RECOVERY_BUFFER = 5000
+    # Subido 5000→25000: con UN solo sid de ~328 tickers, la recovery debe absorber el feed live
+    # de TODOS ellos mientras llegan los ~328 snapshots. A 5000 el buffer se llenaba antes de que
+    # la recovery completara → buffer_overflow_x5 → circuit breaker → books_initialized=0. Más
+    # headroom da tiempo a que completen los snapshots. Tuneable por env (ver runner/data_capture).
+    DEFAULT_MAX_RECOVERY_BUFFER = 25000
     # Circuit breaker: tras N fallos CONSECUTIVOS de recovery de un sid (code 15 "Action
     # required" sobre el get_snapshot, o timeouts/overflow seguidos), se DESHABILITA la recovery
     # de ese sid (book queda stale + alerta) en vez del loop infinito (incidente: ~6764 fallos/día).
@@ -409,6 +413,17 @@ class OrderbookManagerV2:
                 sid, "timeout" if timed_out else "buffer_overflow"
             )
 
+    def _recovery_progress(self, sid: int) -> str:
+        """Diagnóstico: cuántos tickers del sid YA recuperaron snapshot vs total, y hace cuánto
+        arrancó la recovery. recovered creciendo → los snapshots SÍ llegan (falta headroom de
+        buffer); recovered=0 → no llega ningún snapshot (causa de cuenta, no de buffer)."""
+        total = len(self._tickers_by_sid.get(sid, set()))
+        pending = sum(len(t) for s, t in self._pending_snapshot_requests.values() if s == sid)
+        recovered = total - pending
+        started = self._recovery_started_at.get(sid)
+        elapsed = f"{time.monotonic() - started:.1f}s" if started is not None else "?"
+        return f"recovered={recovered}/{total} elapsed={elapsed}"
+
     def _cleanup_recovery(self, sid: int) -> None:
         """Limpia el estado de recovery EN CURSO del sid (pending requests, buffer, timer, flag).
         Un snapshot tardío del intento abortado NO debe drenar el buffer de un intento nuevo."""
@@ -433,10 +448,14 @@ class OrderbookManagerV2:
         """Circuit breaker: deja de reintentar la recovery de este sid (book queda stale) y ALERTA.
         Evita el loop infinito cuando la causa es persistente (cuenta en 'Action required', sid
         entero settled). Se re-habilita solo si una recovery del sid vuelve a completar OK."""
+        progress = self._recovery_progress(sid)  # ANTES de cleanup
         self._cleanup_recovery(sid)
         self._recovery_disabled_sids.add(sid)
         fails = self._recovery_failures_by_sid.get(sid, 0)
-        msg = f"sid={sid} recovery DESHABILITADA ({reason}, {fails} fallos) — book stale, sin reintentos"
+        msg = (
+            f"sid={sid} recovery DESHABILITADA ({reason}, {fails} fallos, {progress}) — "
+            "book stale, sin reintentos"
+        )
         logger.critical(f"v2.recovery_disabled {msg}")
         BotState.record_error(f"v2.recovery_disabled {msg}")
         await self._fire_alert("recovery_disabled", msg)
@@ -480,10 +499,11 @@ class OrderbookManagerV2:
         bounded por timeout/tamaño) hasta que el breaker corte.
         """
         discarded = len(self._pending_deltas.get(sid, []))
+        progress = self._recovery_progress(sid)  # ANTES de cleanup (lee pending/timer)
         self._cleanup_recovery(sid)
         logger.warning(
-            f"v2.recovery_aborted sid={sid} reason={reason} discarded_msgs={discarded} → "
-            "reintentando snapshot (acotado por circuit breaker)."
+            f"v2.recovery_aborted sid={sid} reason={reason} {progress} discarded_msgs={discarded} "
+            "→ reintentando snapshot (acotado por circuit breaker)."
         )
         if await self._register_failure_and_maybe_break(sid, reason):
             return

@@ -201,6 +201,16 @@ class Settings(BaseSettings):
     USE_ORDERBOOK_MANAGER_V2: bool = Field(
         default=False, description="Enable WS-based recovery (OrderbookManagerV2)"
     )
+    # Headroom de la recovery de V2 (tuneable en vivo sin redeploy de código). Con UN solo sid de
+    # ~328 tickers, el buffer se llenaba a 5000 antes de que completara la recovery → overflow →
+    # circuit breaker → books_initialized=0. Subir si los logs muestran recovered creciendo pero
+    # el buffer se llena igual; el timeout acota el tiempo máximo de una recovery atascada.
+    ORDERBOOK_V2_MAX_RECOVERY_BUFFER: int = Field(
+        default=25000, ge=1000, description="Tope del buffer de recovery de OrderbookManagerV2"
+    )
+    ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC: float = Field(
+        default=30.0, gt=0, description="Timeout (s) de una recovery atascada de OrderbookManagerV2"
+    )
 
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,

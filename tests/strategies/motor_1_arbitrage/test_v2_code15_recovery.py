@@ -204,6 +204,7 @@ async def test_circuit_breaker_disables_after_n_failures(mock_ws):
     await manager.handle_message(make_delta("TICK", sid=1, seq=500))
     assert mock_ws.send_command.await_count == sends
     assert any(k == "recovery_disabled" for k, _ in alerts)
+    assert any("recovered=" in d for _, d in alerts)  # la alerta incluye el progreso
 
 
 async def test_successful_recovery_resets_breaker(mock_ws):
