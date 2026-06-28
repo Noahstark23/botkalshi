@@ -358,11 +358,14 @@ class OrderbookManagerV2:
         all_tickers = self._tickers_by_sid.get(sid, set())
         live = [t for t in all_tickers if not self._is_unrecoverable(t)]
         purged = len(all_tickers) - len(live)
+        # DIAG: cuántos tickers del sid tienen close_time conocido. Si known=0, los close_time NO
+        # están llegando desde discovery (get_event no trae el campo) → por eso purged=0 siempre.
+        known_ct = sum(1 for t in all_tickers if t in self._close_time_by_ticker)
         # Gap individual = evento benigno AUTO-RECUPERADO → INFO (la escalada por FRECUENCIA sigue
         # en _record_gap_and_should_alert).
         logger.info(
             f"Sid {sid} gap detected (auto-recovery). live={len(live)} purged={purged} "
-            f"(settled/dead) — requesting WS recovery snapshot."
+            f"close_times_known={known_ct}/{len(all_tickers)} — requesting WS recovery snapshot."
         )
         for ticker in all_tickers:
             if ticker in self._books:
@@ -448,9 +451,19 @@ class OrderbookManagerV2:
         if isinstance(bad, str):
             self._dead_tickers.add(bad)
         self._cleanup_recovery(sid)
+        # DIAG (por qué purged=0): para una muestra de los tickers RECHAZADOS, qué close_time
+        # tienen. NO_CLOSE_TIME → discovery no se lo pasó al manager (campo ausente en get_event);
+        # una fecha futura → no está settled (el code 15 NO es por ticker vencido, es otra causa,
+        # p.ej. cuenta). known=0/N confirma que el filtro de close_time nunca tuvo con qué purgar.
+        sample = {
+            t: (ct.isoformat() if (ct := self._close_time_by_ticker.get(t)) else "NO_CLOSE_TIME")
+            for t in list(tickers)[:5]
+        }
+        known_ct = sum(1 for t in tickers if t in self._close_time_by_ticker)
         logger.warning(
             f"v2.recovery_rejected sid={sid} code=15 req_id={req_id} tickers={len(tickers)} "
-            f"bad={bad} (fix: purga + circuit breaker, NO re-pide el set completo)"
+            f"bad={bad} close_times_known={known_ct}/{len(tickers)} sample={sample} "
+            "(purga + circuit breaker; NO re-pide el set completo)"
         )
         BotState.record_error(f"v2 recovery rechazada (code 15) sid={sid}")
         if await self._register_failure_and_maybe_break(sid, "code15"):

@@ -150,6 +150,7 @@ class DataCaptureService:
         # close_time (ISO) por ticker desde discovery → se alimenta al v2_manager para que la
         # recovery NO pida snapshot de mercados settled (causa del loop de code 15).
         self._market_close_times: dict[str, str] = {}
+        self._market_keys_logged = False  # DIAG: loguear una vez qué campos trae get_event
         self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
         # Cliente REST persistente inyectado por el runner SOLO con TRADING_ENABLED=true.
         # None en shadow. La Capa 2 lo pasará al RestExecutor del Motor REST.
@@ -351,6 +352,15 @@ class DataCaptureService:
                             for market in markets:
                                 ticker = market.get("ticker")
                                 status = market.get("status", "")
+                                # DIAG (una vez): qué campos trae el market de get_event — confirma
+                                # si 'close_time' está presente (si no, el filtro de purga nunca
+                                # tiene con qué marcar settled → purged=0).
+                                if not self._market_keys_logged and ticker:
+                                    self._market_keys_logged = True
+                                    logger.info(
+                                        f"v2.discovery market keys={sorted(market.keys())} "
+                                        f"close_time={market.get('close_time')!r}"
+                                    )
                                 if ticker and status in ("open", "active"):
                                     self._tracked_tickers.add(ticker)
                                     self._market_close_times[ticker] = market.get("close_time")
