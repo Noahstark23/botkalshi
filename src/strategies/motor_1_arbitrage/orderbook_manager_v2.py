@@ -176,6 +176,18 @@ class OrderbookManagerV2:
                 await self._handle_recovery_snapshot(raw_msg, req_id)
                 return
 
+        # Fallback por ticker/sid (incidente 2026-05-28): un orderbook_snapshot para un sid EN
+        # recovery que NO trae el id del comando (Kalshi puede omitirlo o eco-devolver uno viejo
+        # en reconnects) igual COMPLETA la recovery — se rutea por ticker/sid, no solo por id.
+        # Sin esto el snapshot caería al buffer de abajo y el sid quedaría atascado en _recovering
+        # (book stale + buffer creciendo hasta que aborta el watchdog). La invariante "el snapshot
+        # siempre eco-devuelve el id" no está garantizada por los docs públicos.
+        if msg_type == "orderbook_snapshot" and sid in self._recovering:
+            req_id = self._pending_req_id_for_sid(sid)
+            if req_id is not None:
+                await self._handle_recovery_snapshot(raw_msg, req_id)
+                return
+
         # Buffer all messages while sid is recovering
         if sid in self._recovering:
             # Watchdog anti-leak: si la recovery lleva demasiado tiempo o el buffer creció
@@ -360,6 +372,14 @@ class OrderbookManagerV2:
             "reintentando snapshot. Si se repite seguido = feed degradado (mirar upstream)."
         )
         await self._start_recovery(sid)
+
+    def _pending_req_id_for_sid(self, sid: int) -> int | None:
+        """req_id de la solicitud de snapshot EN CURSO para este sid (para completar la recovery
+        de un snapshot sin id/ id que no coincide). None si el sid no tiene request pendiente."""
+        for req_id, (req_sid, _tickers) in self._pending_snapshot_requests.items():
+            if req_sid == sid:
+                return req_id
+        return None
 
     async def _handle_recovery_snapshot(self, raw_msg: dict, req_id: int) -> None:
         """Apply a recovery snapshot. Drain buffer when all tickers in the sid recovered."""
