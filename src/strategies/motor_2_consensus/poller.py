@@ -45,6 +45,7 @@ class Motor2ShadowPoller:
         capital_usd: float | None = None,
         min_edge: float | None = None,
         one_per_event: bool = True,
+        max_stake_pct: float = 0.0,
         executor: Motor2Executor | None = None,
     ):
         self._kalshi = kalshi_source
@@ -60,6 +61,9 @@ class Motor2ShadowPoller:
         # Mutua exclusión por EVENTO (una sola apuesta direccional por partido). El runner lo
         # pasa desde config (MOTOR_2_ONE_BET_PER_EVENT); default True = seguro.
         self._one_per_event = one_per_event
+        # Sizing flat (% del capital por trade, desacoplado de Kelly). El runner lo pasa desde
+        # config (MOTOR_2_MAX_STAKE_PCT); 0 = ¼ Kelly previo.
+        self._max_stake_pct = max_stake_pct
         # Presente SOLO con TRADING_ENABLED=true (lo construye el runner, Capa A). None = shadow.
         self._executor = executor
 
@@ -81,6 +85,7 @@ class Motor2ShadowPoller:
             min_edge=self._min_edge,
             diag=diag,
             one_per_event=self._one_per_event,
+            max_stake_pct=self._max_stake_pct,
         )
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "

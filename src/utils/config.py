@@ -288,6 +288,17 @@ class Settings(BaseSettings):
         default=True,
         description="Si es True, Motor 2 emite una sola apuesta (mayor edge) por evento/partido.",
     )
+    # Sizing FLAT: con > 0, el stake de cada señal de Motor 2 = capital × pct/100 (fracción fija),
+    # DESACOPLADO del edge. Kelly escala el stake con (true_prob − ask) y sobre-apuesta donde el
+    # edge está sobreestimado (consenso ruidoso, MLB con pocas casas) → asimetría que sangró −19%
+    # ROI (sim sobre 141 settled: flat constante +22.9%). Default 1.0% conservador. 0 = ¼ Kelly
+    # (comportamiento previo). El RiskManager re-capea aguas abajo (capital efectivo + cap absoluto).
+    MOTOR_2_MAX_STAKE_PCT: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=5.0,
+        description="Stake flat por trade de Motor 2 (% del capital). 0 = ¼ Kelly (previo).",
+    )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
