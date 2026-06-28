@@ -63,6 +63,9 @@ class RiskManager:
     _cached_capital_usd: float | None = None
     _last_balance_at: datetime | None = None
     _capital_fallback_warned: bool = False
+    # Último cash real crudo (sin factor/clamp) — solo para /status. Se actualiza en CADA
+    # refresh exitoso; _cached_capital_usd puede quedar atrás por el suavizado (anti-churn).
+    _last_raw_balance_usd: float | None = None
     # C-03: histéresis del alert de desfase config↔cash real (no spamear cada refresh).
     _drift_alerted: bool = False
 
@@ -97,7 +100,16 @@ class RiskManager:
         Fallback (C-01): si NUNCA se obtuvo balance (refresh no corrió o la API falla desde el
         arranque), cae a `settings.ACTIVE_CAPITAL_USD` SIN factorizar — ese valor ya es un piso
         de seguridad conservador. Loguea WARNING una vez. NUNCA devuelve 0 por un fallo de red.
+
+        Capital dinámico: DYNAMIC_CAPITAL_ENABLED=False fuerza el estático ACTIVE_CAPITAL_USD
+        (escudo / dry-run). Sobre el cash real se aplica techo configurable (CAPITAL_CAP_USD) y
+        piso (CAPITAL_FLOOR_USD) — el efectivo nunca baja del piso para no romper la matemática
+        de riesgo; la PAUSA de nuevas entradas la decide can_open_new_positions().
         """
+        # Toggle maestro: dynamic off → capital estático (ignora el cash real).
+        if not self.settings.DYNAMIC_CAPITAL_ENABLED:
+            return self.settings.ACTIVE_CAPITAL_USD
+
         cached = RiskManager._cached_capital_usd
         if cached is None:
             if not RiskManager._capital_fallback_warned:
@@ -108,8 +120,10 @@ class RiskManager:
                 )
             base = self.settings.ACTIVE_CAPITAL_USD
         else:
-            # C-02: cash real × factor de seguridad.
+            # C-02: cash real × factor de seguridad, con techo y piso configurables.
             base = cached * (self.settings.CAPITAL_SAFETY_FACTOR_PCT / 100.0)
+            base = min(base, self.settings.CAPITAL_CAP_USD)
+            base = max(base, self.settings.CAPITAL_FLOOR_USD)
 
         # C-02: clamp ÚNICO al hard cap en producción — cubre AMBOS paths (cash real Y
         # fallback). Hoy el fallback ya respeta el techo vía el validator de config, pero
@@ -117,6 +131,43 @@ class RiskManager:
         if self.settings.KALSHI_ENV == "production":
             base = min(base, RiskManager.PROD_CAPITAL_HARD_CAP_USD)
         return base
+
+    def can_open_new_positions(self) -> bool:
+        """True si se permiten NUEVAS entradas. False = capital (cash real × factor, pre-piso)
+        bajo CAPITAL_FLOOR_USD → se pausan las entradas, pero la GESTIÓN/CIERRE de posiciones
+        abiertas sigue (Motor 3 no pasa por este gate). En modo estático o sin balance real
+        todavía, NO bloquea (el sizing/exposición ya protegen)."""
+        if not self.settings.DYNAMIC_CAPITAL_ENABLED:
+            return True
+        cached = RiskManager._cached_capital_usd
+        if cached is None:
+            return True
+        capped = min(
+            cached * (self.settings.CAPITAL_SAFETY_FACTOR_PCT / 100.0),
+            self.settings.CAPITAL_CAP_USD,
+        )
+        return capped >= self.settings.CAPITAL_FLOOR_USD
+
+    @classmethod
+    def capital_status(cls) -> dict:
+        """Resumen del capital para el endpoint /status: mode/raw/effective/paused. Best-effort:
+        /status NUNCA debe 500 por el cálculo de capital → ante cualquier fallo, dict degradado."""
+        try:
+            rm = cls()
+            return {
+                "mode": "dynamic" if rm.settings.DYNAMIC_CAPITAL_ENABLED else "fixed",
+                "raw_balance_usd": cls._last_raw_balance_usd,
+                "effective_usd": round(rm._get_effective_capital_usd(), 2),
+                "is_paused": not rm.can_open_new_positions(),
+            }
+        except Exception as exc:
+            logger.warning(f"risk.capital_status falló: {type(exc).__name__}: {exc}")
+            return {
+                "mode": "unknown",
+                "raw_balance_usd": cls._last_raw_balance_usd,
+                "effective_usd": None,
+                "is_paused": False,
+            }
 
     @classmethod
     async def refresh_capital_from_balance(
@@ -132,6 +183,10 @@ class RiskManager:
         """
         from src.clients.kalshi_rest import KalshiRestClient
 
+        # Capital estático: no consultamos la API (dry-run / escudo). El check usa ACTIVE_CAPITAL_USD.
+        if not get_settings().DYNAMIC_CAPITAL_ENABLED:
+            return cls._cached_capital_usd
+
         factory = client_factory or KalshiRestClient
         try:
             async with factory() as client:  # type: ignore[operator]
@@ -140,7 +195,18 @@ class RiskManager:
             if cents is None:
                 raise ValueError(f"get_balance sin campo 'balance': {data!r}")
             usd = int(round(float(cents))) / 100.0  # {'balance': cents:int} → USD
-            cls._cached_capital_usd = usd
+            cls._last_raw_balance_usd = usd  # crudo, siempre (para /status)
+            # Suavizado anti-churn: ignorar cambios menores al umbral (no actualizar la caché de
+            # riesgo). Primer balance (prev None) o prev<=0 siempre actualiza.
+            prev = cls._cached_capital_usd
+            smoothing = get_settings().CAPITAL_SMOOTHING_PCT
+            if prev is None or prev <= 0 or abs(usd - prev) / prev >= smoothing:
+                cls._cached_capital_usd = usd
+            else:
+                logger.info(
+                    f"risk.capital: cambio {abs(usd - prev) / prev * 100:.1f}% < suavizado "
+                    f"({smoothing * 100:.0f}%) → se mantiene ${prev:.2f}"
+                )
             cls._last_balance_at = datetime.now(UTC).replace(tzinfo=None)
             cls._capital_fallback_warned = False  # ya hay balance real → re-habilita el WARNING
             logger.info(f"risk.capital: balance real de Kalshi = ${usd:.2f} (cash disponible)")
@@ -228,6 +294,17 @@ class RiskManager:
                 approved=False,
                 reason=f"Stop-Loss {breached_period} superado",
                 max_allowed_count=0,
+            )
+
+        # Capital dinámico: si el cash real cayó bajo el piso, se PAUSAN las nuevas entradas
+        # (la gestión/cierre de lo abierto NO pasa por este gate — Motor 3 no llama check_pre_trade).
+        # Gate NUEVO e independiente: no toca el stop-loss ni el kill-switch.
+        if not self.can_open_new_positions():
+            return TradeDecision(
+                False,
+                f"Capital bajo el piso (${self.settings.CAPITAL_FLOOR_USD:.2f}): "
+                "nuevas entradas en pausa",
+                0,
             )
 
         # C-01: capital base = balance REAL de Kalshi (no el ACTIVE_CAPITAL_USD estático).

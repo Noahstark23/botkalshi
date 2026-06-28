@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.monitoring.health import BotState, app
+from src.risk.manager import RiskManager
 
 
 @pytest.fixture(autouse=True)
@@ -116,3 +117,36 @@ def test_status_handles_missing_manager_gracefully(client):
     # BotState.record_error must have been called
     assert BotState.last_error is not None
     assert "missing" in BotState.last_error
+
+
+def test_status_includes_capital_block(client):
+    """El /status incluye el bloque capital (mode/raw/effective/is_paused)."""
+    cap_settings = mock_settings(v2_enabled=False)
+    cap_settings.DYNAMIC_CAPITAL_ENABLED = True
+    cap_settings.ACTIVE_CAPITAL_USD = 300.0
+    cap_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    cap_settings.CAPITAL_FLOOR_USD = 100.0
+    cap_settings.CAPITAL_CAP_USD = 2000.0
+
+    session = mock_db_session()
+    RiskManager._cached_capital_usd = None  # sin balance real → effective = ACTIVE_CAPITAL_USD
+    RiskManager._last_raw_balance_usd = None
+    try:
+        with (
+            patch(
+                "src.monitoring.health.get_settings",
+                return_value=mock_settings(v2_enabled=False),
+            ),
+            patch("src.monitoring.health.get_session", return_value=session),
+            patch("src.risk.manager.get_settings", return_value=cap_settings),
+        ):
+            resp = client.get("/status")
+    finally:
+        RiskManager._cached_capital_usd = None
+        RiskManager._last_raw_balance_usd = None
+
+    assert resp.status_code == 200
+    cap = resp.json()["capital"]
+    assert cap["mode"] == "dynamic"
+    assert cap["effective_usd"] == 300.0  # fallback a ACTIVE_CAPITAL_USD (sin cash real aún)
+    assert cap["is_paused"] is False

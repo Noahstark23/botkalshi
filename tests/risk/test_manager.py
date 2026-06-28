@@ -38,11 +38,13 @@ def reset_capital_cache():
     RiskManager._last_balance_at = None
     RiskManager._capital_fallback_warned = False
     RiskManager._drift_alerted = False
+    RiskManager._last_raw_balance_usd = None
     yield
     RiskManager._cached_capital_usd = None
     RiskManager._last_balance_at = None
     RiskManager._capital_fallback_warned = False
     RiskManager._drift_alerted = False
+    RiskManager._last_raw_balance_usd = None
 
 
 @pytest.fixture
@@ -64,6 +66,12 @@ def mock_settings():
         s.CAPITAL_SAFETY_FACTOR_PCT = 100.0
         s.CAPITAL_DRIFT_ALERT_PCT = 1000.0
         s.telegram_configured = False
+        # Capital dinámico neutralizado por default (los tests dedicados lo overridean):
+        # dynamic on (path C-01/02 activo), piso bajo y techo alto (no bindean), sin suavizado.
+        s.DYNAMIC_CAPITAL_ENABLED = True
+        s.CAPITAL_FLOOR_USD = 1.0
+        s.CAPITAL_CAP_USD = 100_000.0
+        s.CAPITAL_SMOOTHING_PCT = 0.0
         m.return_value = s
         yield s
 
@@ -883,3 +891,137 @@ async def test_trigger_kill_switch_idempotent_no_duplicate_risk_event(
 
     assert len(events) == 1
     assert "primer disparo" in events[0].message
+
+
+# =========================================================
+# CAPITAL DINÁMICO (extensión) — toggle, floor/cap, pausa de entradas, suavizado, status
+# =========================================================
+
+
+def test_dynamic_disabled_uses_static_capital(mock_settings):
+    """DYNAMIC_CAPITAL_ENABLED=False → ignora el cash real, usa ACTIVE_CAPITAL_USD fijo."""
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    mock_settings.ACTIVE_CAPITAL_USD = 4000.0
+    RiskManager._cached_capital_usd = 9999.0  # habría dado otro número si dynamic estuviera on
+    assert RiskManager()._get_effective_capital_usd() == 4000.0
+
+
+def test_capital_cap_clamps_effective(mock_settings):
+    """Techo configurable: cash $5000 × 100% = $5000 → clampeado a CAPITAL_CAP_USD=$2000."""
+    mock_settings.CAPITAL_CAP_USD = 2000.0
+    RiskManager._cached_capital_usd = 5000.0
+    assert RiskManager()._get_effective_capital_usd() == 2000.0
+
+
+def test_capital_floor_clamps_effective(mock_settings):
+    """Piso: cash $50 → efectivo nunca baja de CAPITAL_FLOOR_USD=$100 (matemática de riesgo segura)."""
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0
+    assert RiskManager()._get_effective_capital_usd() == 100.0
+
+
+def test_can_open_new_positions_above_floor(mock_settings):
+    """cash $500 × 90% = $450 ≥ piso $100 → permite nuevas entradas."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 500.0
+    assert RiskManager().can_open_new_positions() is True
+
+
+def test_can_open_new_positions_below_floor(mock_settings):
+    """cash $50 × 90% = $45 < piso $100 → PAUSA de nuevas entradas."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0
+    assert RiskManager().can_open_new_positions() is False
+
+
+def test_can_open_when_dynamic_disabled(mock_settings):
+    """Modo estático → nunca pausa por piso (el cash real no se mira)."""
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 1.0
+    assert RiskManager().can_open_new_positions() is True
+
+
+def test_can_open_when_no_balance_yet(mock_settings):
+    """Sin balance real todavía (cache None) → no bloquea (el sizing/exposición protegen)."""
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = None
+    assert RiskManager().can_open_new_positions() is True
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_check_pre_trade_pauses_entries_below_floor(mock_session, mock_settings, sample_opp):
+    """El gate de piso rechaza NUEVAS entradas (no toca stop-loss/kill-switch)."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.return_value = []  # sin trades → sin stop-loss ni exposición
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0  # $45 efectivo < piso
+
+    decision = await RiskManager().check_pre_trade(sample_opp)
+    assert decision.approved is False
+    assert "bajo el piso" in decision.reason
+    assert decision.max_allowed_count == 0
+
+
+@pytest.mark.asyncio
+async def test_smoothing_ignores_small_change(mock_settings):
+    """Cambio <5% no actualiza la caché de riesgo, pero sí el raw para /status."""
+    mock_settings.CAPITAL_SMOOTHING_PCT = 0.05
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=100000))
+    assert RiskManager._cached_capital_usd == 1000.0
+    # +2% (<5%): se mantiene la caché, el raw refleja lo nuevo.
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=102000))
+    assert RiskManager._cached_capital_usd == 1000.0
+    assert RiskManager._last_raw_balance_usd == 1020.0
+
+
+@pytest.mark.asyncio
+async def test_smoothing_allows_large_change(mock_settings):
+    """Cambio ≥5% sí actualiza la caché."""
+    mock_settings.CAPITAL_SMOOTHING_PCT = 0.05
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=100000))
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=110000))
+    assert RiskManager._cached_capital_usd == 1100.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_skipped_when_dynamic_disabled(mock_settings):
+    """Modo estático → no consulta la API (factory no se invoca)."""
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    called = {"n": 0}
+
+    def _factory():
+        called["n"] += 1
+        return _balance_factory(balance=100000)()
+
+    await RiskManager.refresh_capital_from_balance(client_factory=_factory)
+    assert called["n"] == 0
+
+
+def test_capital_status_dynamic(mock_settings):
+    """/status: modo dynamic, raw y effective presentes, is_paused=False sobre el piso."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 1000.0
+    RiskManager._last_raw_balance_usd = 1000.0
+    st = RiskManager.capital_status()
+    assert st["mode"] == "dynamic"
+    assert st["raw_balance_usd"] == 1000.0
+    assert st["effective_usd"] == 900.0  # 1000 × 90%
+    assert st["is_paused"] is False
+
+
+def test_capital_status_paused_below_floor(mock_settings):
+    """/status: is_paused=True cuando el cash real está bajo el piso."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0
+    RiskManager._last_raw_balance_usd = 50.0
+    st = RiskManager.capital_status()
+    assert st["is_paused"] is True
+    assert st["effective_usd"] == 100.0  # floored
