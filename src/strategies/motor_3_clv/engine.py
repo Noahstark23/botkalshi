@@ -18,6 +18,7 @@ from loguru import logger
 from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiRestClient
+from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
 from src.strategies.data_capture import _top_bid
@@ -103,9 +104,11 @@ class Motor3Engine:
             for p in positions:
                 bid = await self._current_bid(p, bid_cache)
                 if take_profit_due(p, bid, self._tp_threshold):
+                    entry = self._entry_bid_for(p)
                     logger.info(
                         f"[MOTOR 3 TP SHADOW] take_profit {p.ticker} {p.count}c "
-                        f"side={p.side} bid={bid}c >= {self._tp_threshold}c"
+                        f"side={p.side} bid={bid}c >= {self._tp_threshold}c "
+                        f"{self._shadow_pnl_str(p, bid, entry)}"
                     )
                     exits.setdefault(p.ticker, p)
 
@@ -127,7 +130,7 @@ class Motor3Engine:
                     logger.info(
                         f"[MOTOR 3 TRAIL SHADOW] {p.ticker} {p.count}c side={p.side} "
                         f"peak={peak}c bid={bid}c entry={entry}c drop={self._trailing_drop}c "
-                        f"-> cerraría"
+                        f"-> cerraría {self._shadow_pnl_str(p, bid, entry)}"
                     )
                     exits.setdefault(p.ticker, p)
 
@@ -158,6 +161,21 @@ class Motor3Engine:
         if buy is None:
             return None
         return buy.fill_price_cents or buy.price_cents
+
+    def _shadow_pnl_str(self, position: PortfolioPosition, bid: int, entry: int | None) -> str:
+        """PnL realizado NETO de fees si la posición se cerrara al bid ahora — para validar el
+        shadow contra el backtest 'contando fees reales' antes de prender la venta. Usa el entry
+        de la pata BUY (FIFO) y kalshi_fee_cents en ambos lados (igual que _settle_originals).
+        Si no hay entry, no se puede calcular."""
+        if entry is None:
+            return "entry=? net_pnl=?"
+        gross_cents = position.count * (bid - entry)
+        fees_cents = kalshi_fee_cents(position.count, bid) + kalshi_fee_cents(position.count, entry)
+        net_cents = gross_cents - fees_cents
+        return (
+            f"entry={entry}c gross=${gross_cents / 100:+.2f} "
+            f"fees=${fees_cents / 100:.2f} net=${net_cents / 100:+.2f}"
+        )
 
     def _persist_peak(self, position: PortfolioPosition, peak: int) -> None:
         """Persiste el nuevo pico en portfolio_positions (UPDATE por ticker, único). Refleja el
