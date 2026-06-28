@@ -625,7 +625,11 @@ class DataCaptureService:
         if self.settings.USE_ORDERBOOK_MANAGER_V2 or self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
 
-            self._v2_manager = OrderbookManagerV2(self.ws)
+            self._v2_manager = OrderbookManagerV2(
+                self.ws,
+                recovery_timeout_sec=self.settings.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC,
+                max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
+            )
             BotState.v2_manager = self._v2_manager
             self.ws.on("orderbook_delta", self._v2_manager.handle_message)
             self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)

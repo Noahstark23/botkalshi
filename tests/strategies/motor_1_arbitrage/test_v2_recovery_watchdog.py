@@ -124,6 +124,31 @@ async def test_abort_clears_stale_snapshot_request(mock_ws):
     assert 43 in manager._pending_snapshot_requests
 
 
+async def test_abort_logs_recovery_progress(mock_ws):
+    """El log de abort reporta recovered=X/N — el diagnóstico clave: ¿llegan los snapshots?
+    (recovered creciendo → falta buffer; recovered=0 → no llega ningún snapshot, causa de cuenta)."""
+    from loguru import logger
+
+    manager = OrderbookManagerV2(mock_ws, recovery_timeout_sec=30.0)
+    await manager.handle_message(make_snapshot("A", sid=1, seq=1))
+    await manager.handle_message(make_snapshot("B", sid=1, seq=2))  # sid 1 tiene {A, B}
+    with pytest.raises(SidGapError):
+        await manager.handle_message(make_delta("A", sid=1, seq=99))  # gap → recovery de A y B
+    # Llega el snapshot de recovery de A (req_id=42) → A recuperado, B aún pendiente.
+    await manager.handle_message(make_snapshot("A", sid=1, seq=100, req_id=42))
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="WARNING")
+    try:
+        manager._recovery_started_at[1] = time.monotonic() - 100.0  # forzar timeout
+        await manager.handle_message(make_delta("B", sid=1, seq=200))
+    finally:
+        logger.remove(sink)
+
+    line = next(m for m in captured if "v2.recovery_aborted" in m)
+    assert "recovered=1/2" in line  # A recuperó snapshot, B no
+
+
 async def test_happy_path_recovery_still_completes(mock_ws):
     """Sin atasco, una recovery normal completa y limpia el timer (no rompimos el flujo)."""
     manager = OrderbookManagerV2(mock_ws)
