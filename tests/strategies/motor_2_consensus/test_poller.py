@@ -83,7 +83,10 @@ async def test_poll_once_emits_signals_for_matched_event():
         capital_usd=300.0,
     )
     signals = await poller.poll_once()
-    assert any(s.market_ticker == f"{EV}-ARG" and s.kalshi_side == "YES" for s in signals)
+    # Con one_per_event (default), el evento colapsa a UNA sola apuesta direccional (la de
+    # mayor edge neto) — antes emitía una por cada outcome/lado con edge.
+    assert len(signals) == 1
+    assert signals[0].market_ticker.startswith(EV)
 
 
 @pytest.mark.asyncio

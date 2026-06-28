@@ -159,6 +159,7 @@ def find_signals(
     min_edge: float = MIN_EDGE_PCT,
     now: datetime | None = None,
     diag: dict[str, float] | None = None,
+    one_per_event: bool = True,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -231,12 +232,16 @@ def find_signals(
             matched = True
             if diag is not None:
                 diag["events_matched"] += 1.0
+            # Candidatos de TODOS los outcomes del partido (cada uno en su market_ticker), luego
+            # colapsados a UNA apuesta direccional por evento (_collapse_event_signals).
+            event_signals: list[ConsensusSignal] = []
             for q in ke.outcomes:
                 cn = canonical_name(q.outcome_name)
                 fp = fair.get(cn)
                 if fp is None:
                     continue
-                signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
+                event_signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
+            signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
             break  # ya emparejado este evento Kalshi
         if not matched and diag is not None:
             diag["reject_" + best_reason] = diag.get("reject_" + best_reason, 0.0) + 1.0
@@ -285,7 +290,12 @@ def _signals_for_outcome(
     min_edge: float,
     diag: dict[str, float] | None = None,
 ) -> list[ConsensusSignal]:
-    """Evalúa YES (prob justa) y NO (complemento) para un outcome; emite el/los que superen el edge."""
+    """Candidatos YES (prob justa) y NO (complemento) de UN outcome con edge neto > umbral.
+
+    Genera SOLO candidatos; la mutua exclusión la aplica find_signals a nivel EVENTO
+    (_collapse_event_signals) sobre el conjunto del partido — no acá, porque las patas
+    correlacionadas viven en market_tickers DISTINTOS (ej. yes@-PHI y no@-NYM son la misma
+    dirección 'PHI gana') y este helper solo ve un market a la vez."""
     out: list[ConsensusSignal] = []
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
     yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
@@ -300,6 +310,34 @@ def _signals_for_outcome(
         out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
     )
     return out
+
+
+def _collapse_event_signals(
+    event_signals: list[ConsensusSignal], one_per_event: bool, event_key: str
+) -> list[ConsensusSignal]:
+    """Mutua exclusión POR EVENTO (no por market). Un partido tiene outcomes mutuamente
+    excluyentes en market_tickers DISTINTOS (ej. ...-PHI y ...-NYM). Apostar yes en el market de
+    un equipo y no en el del otro = MISMA dirección → doble exposición correlacionada al mismo
+    resultado (el caso que sangró −$218: PHI con yes@-PHI + no@-NYM, ambos 'PHI gana'). Un dedup
+    por market_ticker NO lo agarra; por eso se colapsa a nivel EVENTO.
+
+    Motor 2 es DIRECCIONAL → UNA sola apuesta por evento: se queda con la de MAYOR edge neto y
+    descarta el resto. Esto además acota la EXPOSICIÓN por partido a un solo trade (ya capeado al
+    5% por _size_usd), en vez de sumar stake sobre varias patas del mismo evento."""
+    if not one_per_event or len(event_signals) <= 1:
+        return event_signals
+    best = max(event_signals, key=lambda s: s.edge_pct)
+    dropped = [
+        f"{s.market_ticker}/{s.kalshi_side}@{s.edge_pct:.3f}"
+        for s in event_signals
+        if s is not best
+    ]
+    logger.warning(
+        f"motor2.signal.event_collapsed event={event_key} "
+        f"kept={best.market_ticker}/{best.kalshi_side}@{best.edge_pct:.3f} dropped={dropped} "
+        "(1 apuesta direccional por evento → exposición del partido capeada a un trade)"
+    )
+    return [best]
 
 
 def _build(

@@ -278,6 +278,16 @@ class Settings(BaseSettings):
         default=False,
         description="Si es True, Motor 2 BLOQUEA entradas <MOTOR_2_MIN_ENTRY_CENTS. Si es False, solo loguea (shadow).",
     )
+    # Mutua exclusión por EVENTO: con True (default) Motor 2 emite UNA sola apuesta direccional
+    # por partido (la de mayor edge neto), aunque el edge aparezca en varios outcomes/markets del
+    # mismo evento. Previene la doble exposición correlacionada que sangró −$218 (yes en el market
+    # de un equipo + no en el del otro = misma dirección, en market_tickers distintos → un dedup
+    # por ticker no lo agarra). Acota además la exposición por partido a un solo trade. Escape
+    # hatch: False restaura el comportamiento previo (una señal por cada outcome/lado con edge).
+    MOTOR_2_ONE_BET_PER_EVENT: bool = Field(
+        default=True,
+        description="Si es True, Motor 2 emite una sola apuesta (mayor edge) por evento/partido.",
+    )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
