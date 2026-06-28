@@ -312,6 +312,7 @@ class ProductionRunner:
                         odds_source,
                         min_edge=min_edge,
                         one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
+                        max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
                         executor=executor,
                     )
                     await poller.run(self._stop_event)
@@ -321,6 +322,7 @@ class ProductionRunner:
                     odds_source,
                     min_edge=min_edge,
                     one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
+                    max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
                 )
                 await poller.run(self._stop_event)
         except Exception as e:

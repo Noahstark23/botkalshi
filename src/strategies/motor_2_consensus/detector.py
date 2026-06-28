@@ -109,10 +109,12 @@ def _consensus_fair_probs(odds_event: OddsEvent) -> dict[str, float]:
     """
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}
+    book_keys: set[str] = set()
     for bk in odds_event.bookmakers:
         for mk in bk.markets:
             if mk.key != "h2h":
                 continue
+            book_keys.add(bk.key)
             for o in mk.outcomes:
                 cn = canonical_name(o.name)
                 try:
@@ -126,6 +128,13 @@ def _consensus_fair_probs(odds_event: OddsEvent) -> dict[str, float]:
     names = list(sums)
     avg_implied = [sums[n] / counts[n] for n in names]
     fair = remove_vig_multiplicative(avg_implied)
+    # n_books = cuántas casas formaron el consenso. POCAS casas → fair ruidoso/sesgado: es el
+    # input que infla el sizing en mercados de edge sobreestimado (correlacionar después con el
+    # PnL). MLB en The Odds API suele traer menos casas que fútbol → más riesgo de sobre-edge.
+    logger.info(
+        f"motor2.consensus event={getattr(odds_event, 'id', '?')} n_books={len(book_keys)} "
+        f"outcomes={len(names)} fair={ {n: round(p, 4) for n, p in zip(names, fair, strict=True)} }"
+    )
     return dict(zip(names, fair, strict=True))
 
 
@@ -142,8 +151,21 @@ def _net_edge_pct(fair_prob: float, ask_cents: int) -> float:
     return net_ev_cents / 100.0
 
 
-def _size_usd(true_prob: float, ask_cents: int, capital_usd: float) -> float:
-    """¼ Kelly con cap 5% del capital → USD recomendados. El cap lo aplica quarter_kelly_size."""
+def _size_usd(
+    true_prob: float, ask_cents: int, capital_usd: float, *, max_stake_pct: float = 0.0
+) -> float:
+    """Stake recomendado en USD para UNA señal.
+
+    max_stake_pct > 0 → FLAT: fracción FIJA del bankroll por trade (capital_usd * pct/100),
+    DESACOPLADA del edge. Kelly escala el stake con (true_prob − ask); si el `true_prob` está
+    sobreestimado (consenso ruidoso, MLB con pocas casas), Kelly sobre-apuesta justo donde el edge
+    es falso → la asimetría que sangró −19% ROI (sim sobre 141 settled: flat constante +22.9%).
+    El flat corta ese acoplamiento. El count entero lo deriva el executor (size·100/price) y el
+    RiskManager lo re-capea aguas abajo (capital efectivo + MAX_TRADE_SIZE_USD).
+
+    max_stake_pct == 0 → fallback ¼ Kelly con cap 5% (comportamiento previo)."""
+    if max_stake_pct > 0:
+        return round(capital_usd * max_stake_pct / 100.0, 2)
     bankroll_cents = int(capital_usd * 100)
     count = quarter_kelly_size(
         true_prob, ask_cents, bankroll_cents, kelly_fraction=0.25, max_pct=SIZING_MAX_PCT
@@ -160,6 +182,7 @@ def find_signals(
     now: datetime | None = None,
     diag: dict[str, float] | None = None,
     one_per_event: bool = True,
+    max_stake_pct: float = 0.0,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -240,7 +263,11 @@ def find_signals(
                 fp = fair.get(cn)
                 if fp is None:
                     continue
-                event_signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
+                event_signals.extend(
+                    _signals_for_outcome(
+                        q, fp, capital_usd, min_edge, diag, max_stake_pct=max_stake_pct
+                    )
+                )
             signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
             break  # ya emparejado este evento Kalshi
         if not matched and diag is not None:
@@ -269,6 +296,7 @@ def _emit_if_plausible(
     edge: float,
     capital_usd: float,
     min_edge: float,
+    max_stake_pct: float = 0.0,
 ) -> None:
     """Emite la señal si min_edge < edge ≤ MAX_PLAUSIBLE_EDGE; un edge monstruoso se descarta."""
     if edge <= min_edge:
@@ -280,7 +308,9 @@ def _emit_if_plausible(
             f"edge={edge:.3f} (> {MAX_PLAUSIBLE_EDGE} → artefacto probable: mercado stale/in-play)"
         )
         return
-    out.append(_build(q, side, fair_prob, ask_cents, edge, capital_usd))
+    out.append(
+        _build(q, side, fair_prob, ask_cents, edge, capital_usd, max_stake_pct=max_stake_pct)
+    )
 
 
 def _signals_for_outcome(
@@ -289,6 +319,8 @@ def _signals_for_outcome(
     capital_usd: float,
     min_edge: float,
     diag: dict[str, float] | None = None,
+    *,
+    max_stake_pct: float = 0.0,
 ) -> list[ConsensusSignal]:
     """Candidatos YES (prob justa) y NO (complemento) de UN outcome con edge neto > umbral.
 
@@ -305,9 +337,11 @@ def _signals_for_outcome(
         # Mejor edge NETO visto (aunque no supere el umbral) → distingue "mercado eficiente"
         # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
         diag["best_net_edge"] = max(diag.get("best_net_edge", -1.0), yes_edge, no_edge)
-    _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     _emit_if_plausible(
-        out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
+        out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge, max_stake_pct
+    )
+    _emit_if_plausible(
+        out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge, max_stake_pct
     )
     return out
 
@@ -341,7 +375,14 @@ def _collapse_event_signals(
 
 
 def _build(
-    q: KalshiQuote, side: str, fair_prob: float, ask_cents: int, edge: float, capital_usd: float
+    q: KalshiQuote,
+    side: str,
+    fair_prob: float,
+    ask_cents: int,
+    edge: float,
+    capital_usd: float,
+    *,
+    max_stake_pct: float = 0.0,
 ) -> ConsensusSignal:
     fee_cents = kalshi_fee_cents(1, ask_cents)
     gross_edge_cents = int(round(fair_prob * 100.0 - ask_cents))
@@ -351,7 +392,9 @@ def _build(
         odds_api_fair_prob=round(fair_prob, 4),
         kalshi_price_cents=ask_cents,
         edge_pct=edge,
-        recommended_size_usd=_size_usd(fair_prob, ask_cents, capital_usd),
+        recommended_size_usd=_size_usd(
+            fair_prob, ask_cents, capital_usd, max_stake_pct=max_stake_pct
+        ),
         gross_edge_cents=gross_edge_cents,
         fee_cents=fee_cents,
     )
@@ -359,6 +402,7 @@ def _build(
         f"motor2.signal ticker={sig.market_ticker} side={sig.kalshi_side} "
         f"fair_prob={sig.odds_api_fair_prob} kalshi={sig.kalshi_price_cents}c "
         f"gross={gross_edge_cents}c fee={fee_cents}c edge={sig.edge_pct:.3f} "
-        f"size=${sig.recommended_size_usd}"
+        f"sizing={'flat' if max_stake_pct > 0 else 'kelly'} "
+        f"recommended_size_usd=${sig.recommended_size_usd}"
     )
     return sig
