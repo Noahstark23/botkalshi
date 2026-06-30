@@ -66,6 +66,10 @@ class MotorPnL:
     losses: int  # pnl_cents < 0
     contracts: int
     fees_cents: int
+    # Derivados (read-only, NO cambian los totales): ticket promedio ganador/perdedor en cents.
+    # avg_loss_cents es negativo (promedio de los pnl < 0). Revela la asimetría avg_loss ≫ avg_win.
+    avg_win_cents: float = 0.0
+    avg_loss_cents: float = 0.0
 
     @property
     def win_rate_pct(self) -> float:
@@ -111,15 +115,19 @@ def aggregate_daily_pnl(session: Session, day_start: datetime, day_end: datetime
     motors: list[MotorPnL] = []
     for strategy, trades in by_strategy.items():
         pnls = [t.pnl_cents or 0 for t in trades]
+        wins_p = [p for p in pnls if p > 0]
+        losses_p = [p for p in pnls if p < 0]
         motors.append(
             MotorPnL(
                 strategy=strategy,
                 pnl_cents=sum(pnls),
                 n_trades=len(trades),
-                wins=sum(1 for p in pnls if p > 0),
-                losses=sum(1 for p in pnls if p < 0),
+                wins=len(wins_p),
+                losses=len(losses_p),
                 contracts=sum(t.count for t in trades),
                 fees_cents=sum(t.fees_cents or 0 for t in trades),
+                avg_win_cents=(sum(wins_p) / len(wins_p)) if wins_p else 0.0,
+                avg_loss_cents=(sum(losses_p) / len(losses_p)) if losses_p else 0.0,
             )
         )
 
