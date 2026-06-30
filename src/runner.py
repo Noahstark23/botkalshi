@@ -364,6 +364,25 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_telegram_commands(self) -> None:
+        """
+        Dashboard on-demand por Telegram (/dashboard) — gateado por TELEGRAM_DASHBOARD_ENABLED.
+        READ-ONLY/ADVISORY: long-polling de getUpdates que responde el dashboard SOLO al chat
+        autorizado. NUNCA tradea ni toca capital. No-op si Telegram no está configurado.
+        Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.TELEGRAM_DASHBOARD_ENABLED:
+            return  # default on; se apaga por config
+        await asyncio.sleep(8)  # dejar que init_db / boot terminen
+        try:
+            from src.monitoring.dashboard import TelegramCommandLoop
+
+            await TelegramCommandLoop().run(self._stop_event)
+        except Exception as e:
+            msg = f"telegram_commands runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _run_daily_pnl(self) -> None:
         """
         Daily P&L digest — gateado por DAILY_PNL_REPORT_ENABLED. ADVISORY ONLY: una vez/día
@@ -520,6 +539,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_settlement(), name="settlement"),
                 asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
                 asyncio.create_task(self._run_motor2_exits(), name="motor2_exits"),
+                asyncio.create_task(self._run_telegram_commands(), name="telegram_commands"),
                 asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
                 asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
             ]

@@ -113,6 +113,15 @@ class Settings(BaseSettings):
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    # Dashboard on-demand por Telegram (/dashboard). Long-polling read-only; solo responde al
+    # TELEGRAM_CHAT_ID autorizado. No-op si Telegram no está configurado. Default on (advisory).
+    TELEGRAM_DASHBOARD_ENABLED: bool = Field(
+        default=True, description="Habilita el comando /dashboard de Telegram (read-only)"
+    )
+    # Envío AUTOMÁTICO del dashboard cada N segundos (0 = solo on-demand). Reusa el mismo builder.
+    TELEGRAM_DASHBOARD_INTERVAL_SEC: float = Field(
+        default=0.0, ge=0.0, description="Auto-envío del dashboard cada N s (0 = off)"
+    )
 
     # === Health server ===
     HEALTH_HOST: str = "0.0.0.0"
