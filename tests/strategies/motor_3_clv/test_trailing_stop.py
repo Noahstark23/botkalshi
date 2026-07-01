@@ -109,3 +109,27 @@ def test_peak_then_trailing_flow():
 )
 def test_decide_exit_precedence(tp, trail, time, expected):
     assert decide_exit(take_profit_due=tp, trailing_due=trail, time_due=time) == expected
+
+
+# =====================================================
+# Fix auditoría 2026-07-01: armado con margen — nunca stop-loss encubierto
+# =====================================================
+
+
+def test_trailing_not_armed_when_peak_barely_above_entry():
+    """peak = entry+1 con drop=5 permitía vender hasta entry−4 (stop-loss encubierto,
+    contradiciendo el docstring del módulo). El armado exige peak >= entry + drop:
+    el precio de disparo (peak − drop) nunca queda debajo del entry."""
+    assert (
+        trailing_stop_due(_pos(), peak_bid=61, current_bid=56, entry_bid=60, drop_cents=5) is False
+    )
+
+
+def test_trailing_armed_at_exact_margin_triggers_at_breakeven_or_better():
+    # peak = entry + drop → precio de disparo = entry (break-even bruto, nunca debajo)
+    assert (
+        trailing_stop_due(_pos(), peak_bid=65, current_bid=60, entry_bid=60, drop_cents=5) is True
+    )
+    assert (
+        trailing_stop_due(_pos(), peak_bid=64, current_bid=59, entry_bid=60, drop_cents=5) is False
+    )

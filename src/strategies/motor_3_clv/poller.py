@@ -187,6 +187,13 @@ class PortfolioPoller:
                     row = existing.get(ticker)
                     if row is None:
                         row = PortfolioPosition(ticker=ticker, side=side, count=count)
+                    if row.side != side:
+                        # Flip de side entre polls (yes→no sin pasar por 0 en un snapshot):
+                        # es una posición de identidad NUEVA — el peak del episodio
+                        # anterior no puede armar el trailing de esta (fix auditoría
+                        # 2026-07-01: un peak=80 del lado viejo contra un entry nuevo de
+                        # 25 vendía la posición nueva al primer tick).
+                        row.peak_bid_cents = None
                     row.side = side
                     row.count = count
                     row.exposure_cents = exposure

@@ -100,3 +100,44 @@ async def test_exposure_none_when_field_absent_persists_position(monkeypatch):
     rows = _positions()
     assert rows[0].side == "yes" and rows[0].count == 2
     assert rows[0].exposure_cents is None  # ausente → None, sin crash
+
+
+# =====================================================
+# Fix auditoría 2026-07-01: peak_bid_cents no sobrevive a un flip de side
+# =====================================================
+
+
+def test_upsert_resets_peak_on_side_flip():
+    """La posición flipea de side entre polls (yes→no sin pasar por 0 en un snapshot): el
+    peak del episodio ANTERIOR no puede quedar pegado a la posición NUEVA — un peak=80 del
+    lado yes contra una posición no con entry 25 disparaba el trailing al primer tick
+    (venta espuria, potencialmente en pérdida)."""
+    with models.get_session() as s:
+        s.add(models.PortfolioPosition(ticker="KXFLIP", side="yes", count=5, peak_bid_cents=80))
+        s.commit()
+
+    poller = PortfolioPoller()
+    poller._persist({"KXFLIP": ("no", 3, None)}, {"KXFLIP": None})
+
+    with models.get_session() as s:
+        row = s.exec(
+            select(models.PortfolioPosition).where(models.PortfolioPosition.ticker == "KXFLIP")
+        ).first()
+    assert row.side == "no" and row.count == 3
+    assert row.peak_bid_cents is None  # peak reseteado: posición de identidad nueva
+
+
+def test_upsert_preserves_peak_same_side():
+    """Update normal (mismo side): el peak del trailing se PRESERVA entre syncs."""
+    with models.get_session() as s:
+        s.add(models.PortfolioPosition(ticker="KXKEEP", side="yes", count=5, peak_bid_cents=77))
+        s.commit()
+
+    poller = PortfolioPoller()
+    poller._persist({"KXKEEP": ("yes", 8, None)}, {"KXKEEP": None})
+
+    with models.get_session() as s:
+        row = s.exec(
+            select(models.PortfolioPosition).where(models.PortfolioPosition.ticker == "KXKEEP")
+        ).first()
+    assert row.count == 8 and row.peak_bid_cents == 77
