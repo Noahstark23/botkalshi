@@ -98,6 +98,24 @@ class Motor3ExitExecutor:
         aunque la PortfolioPosition (cache de 60s) o el agregado de Motor 2 estén stale —
         se skipea en vez de re-vender. La venta se CAPEA al total abierto atribuible.
         """
+        # DECISIÓN DE POLÍTICA (fix auditoría 2026-07-01): pausa/kill-switch bloquea
+        # TAMBIÉN las ventas. El runbook del kill-switch (clear_kill_switch.py) exige
+        # reconciliación MANUAL con el bot quieto — un exit automático en esa ventana
+        # puede duplicar la venta manual del operador (V2: el exceso abre posición
+        # contraria) y mantiene el "posiciones != 0" que aborta la limpieza en loop.
+        # La detección/shadow logging del engine sigue corriendo; solo la orden se frena.
+        try:
+            from src.monitoring.health import BotState
+
+            if BotState.is_paused:
+                logger.warning(
+                    f"motor3.exit.paused ticker={position.ticker} "
+                    f"(is_paused=True — sin ventas hasta despausar: {BotState.pause_reason})"
+                )
+                return Motor3ExitOutcome(False, False, reason="paused")
+        except Exception:  # pragma: no cover - el gate nunca debe romper el tick
+            logger.exception("motor3.exit.pause_check_failed")
+            return Motor3ExitOutcome(False, False, reason="pause_check_failed")
         lock = self._lock_for(position.ticker)
         if lock.locked():
             logger.info(f"motor3.exit.skip_busy ticker={position.ticker}")

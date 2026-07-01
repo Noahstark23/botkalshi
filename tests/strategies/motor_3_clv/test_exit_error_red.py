@@ -228,3 +228,30 @@ async def test_db_failure_after_real_fill_engages_preventive_pause(monkeypatch):
             for row in s.exec(select(models.OperationalState)):
                 s.delete(row)
             s.commit()
+
+
+# =====================================================
+# Fix auditoría 2026-07-01 (bloqueante #4): pausa/kill-switch bloquea TAMBIÉN las ventas
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_paused_bot_never_sells():
+    """DECISIÓN DE POLÍTICA (2026-07-01): con BotState.is_paused (kill-switch engaged o
+    pausa preventiva) los exits NO venden. El runbook del kill-switch exige reconciliación
+    manual con el bot quieto — una venta automática durante esa ventana puede duplicar la
+    venta manual del operador (V2: el exceso abre posición contraria)."""
+    from src.monitoring.health import BotState
+
+    _seed_buy()
+    client = _client()
+    ex = _ex(client)
+    BotState.is_paused = True
+    try:
+        out = await ex.exit_position(_pos())
+    finally:
+        BotState.is_paused = False
+
+    assert not out.placed and out.reason == "paused"
+    client.place_order.assert_not_called()
+    assert _sells() == []  # ni siquiera intent: el bot está quieto

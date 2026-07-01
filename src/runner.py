@@ -523,8 +523,11 @@ class ProductionRunner:
 
             # Rehidratar el kill-switch PERSISTENTE: si quedó engaged (un kill-switch
             # previo + restart de Coolify), arrancar PAUSADO. La pausa en memoria no
-            # sobrevive restarts; esta sí. check_pre_trade corta vía BotState.is_paused y
-            # la Capa A no construye el executor. Despausa SOLO manual (clear_kill_switch.py).
+            # sobrevive restarts; esta sí. Entradas: check_pre_trade corta vía
+            # BotState.is_paused. Salidas: Motor3ExitExecutor.exit_position chequea
+            # is_paused por venta (fix auditoría 2026-07-01 — antes los exits ignoraban
+            # la pausa y podían duplicar la venta manual del runbook de reconciliación).
+            # Despausa SOLO manual (clear_kill_switch.py).
             await self._rehydrate_kill_switch()
 
             # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
