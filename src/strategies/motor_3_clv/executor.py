@@ -246,6 +246,17 @@ class Motor3ExitExecutor:
                 logger.critical(f"motor3.exit.persist_after_fill_failed coid={coid}")
                 self._engage_preventive_pause(coid)
             logger.info(f"motor3.exit.filled ticker={ticker} side={side} sold={fill_count}@{bid}c")
+            # Alerta Telegram de la venta REAL (deuda auditoría 2026-07-01: el operador se
+            # enteraba solo por logs/digest). Best-effort: jamás rompe el exit.
+            try:
+                from src.monitoring.telegram_alerts import send_alert
+
+                await send_alert(
+                    f"💸 Exit {self._strategy}: vendidos {fill_count}c {side.upper()} "
+                    f"de {ticker} @ {bid}c"
+                )
+            except Exception:  # pragma: no cover - visibilidad best-effort
+                logger.exception("motor3.exit.telegram_alert_failed")
             return Motor3ExitOutcome(
                 True, True, filled_count=fill_count, sell_price_cents=bid, client_order_id=coid
             )

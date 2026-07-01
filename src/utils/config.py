@@ -379,19 +379,31 @@ class Settings(BaseSettings):
                     f"ACTIVE_CAPITAL_USD={self.ACTIVE_CAPITAL_USD} excede límite de seguridad ($5k). "
                     "Si quieres operar con más capital, modifica este check explícitamente."
                 )
+            # Solo los flags que ARRANCAN un motor cuentan (deuda auditoría 2026-07-01:
+            # los *_EXECUTION_ENABLED no arrancan nada por sí solos — contaban como
+            # "motor habilitado" y el boot pasaba la validación sin ningún motor corriendo).
             if self.TRADING_ENABLED and not any(
                 [
                     self.MOTOR_1_ARBITRAGE_ENABLED,
                     self.MOTOR_2_SPORTSBOOK_ENABLED,
                     self.MOTOR_3_CLV_ENABLED,
-                    self.MOTOR_3_EXECUTION_ENABLED,
                     self.MOTOR_REST_ENABLED,
-                    self.MOTOR_REST_EXECUTION_ENABLED,
                 ]
             ):
                 raise ValueError(
                     "TRADING_ENABLED=true pero ningún motor está habilitado. "
-                    "Activa al menos un MOTOR_X_*_ENABLED."
+                    "Activa al menos un MOTOR_X_ENABLED (los *_EXECUTION_ENABLED "
+                    "no arrancan motores por sí solos)."
+                )
+            if self.MOTOR_3_EXECUTION_ENABLED and not self.MOTOR_3_CLV_ENABLED:
+                raise ValueError(
+                    "MOTOR_3_EXECUTION_ENABLED=true requiere MOTOR_3_CLV_ENABLED=true "
+                    "(la ejecución sin el motor corriendo es un no-op engañoso)."
+                )
+            if self.MOTOR_REST_EXECUTION_ENABLED and not self.MOTOR_REST_ENABLED:
+                raise ValueError(
+                    "MOTOR_REST_EXECUTION_ENABLED=true requiere MOTOR_REST_ENABLED=true "
+                    "(la ejecución sin el motor corriendo es un no-op engañoso)."
                 )
         return self
 

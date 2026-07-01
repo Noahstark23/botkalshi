@@ -71,10 +71,16 @@ def build_dashboard_text(now: datetime | None = None) -> str:
 
     paused = BotState.is_paused
     estado = "⏸️ EN PAUSA" if paused else "▶️ Corriendo"
+
+    # 🔴=vende de verdad (EXECUTION on) / ✅=corriendo en shadow / ⬜=apagado — sin esto
+    # era imposible distinguir shadow de live desde el monitoreo (deuda auditoría).
+    def _motor_icon(enabled: bool, execution: bool) -> str:
+        return "🔴 LIVE" if (enabled and execution) else ("✅" if enabled else "⬜")
+
     motors = (
-        f"M1 {'✅' if settings.MOTOR_1_ARBITRAGE_ENABLED else '⬜'} · "
-        f"M2 {'✅' if settings.MOTOR_2_SPORTSBOOK_ENABLED else '⬜'} · "
-        f"M3 {'✅' if settings.MOTOR_3_CLV_ENABLED else '⬜'}"
+        f"M1 {_motor_icon(settings.MOTOR_1_ARBITRAGE_ENABLED, False)} · "
+        f"M2 {_motor_icon(settings.MOTOR_2_SPORTSBOOK_ENABLED, settings.MOTOR_2_EXECUTION_ENABLED)} · "
+        f"M3 {_motor_icon(settings.MOTOR_3_CLV_ENABLED, settings.MOTOR_3_EXECUTION_ENABLED)}"
     )
 
     lines: list[str] = [

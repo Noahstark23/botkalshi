@@ -237,7 +237,9 @@ async def status() -> dict[str, Any]:
             "motors_enabled": {
                 "motor_1_arbitrage": settings.MOTOR_1_ARBITRAGE_ENABLED,
                 "motor_2_sportsbook": settings.MOTOR_2_SPORTSBOOK_ENABLED,
+                "motor_2_execution": settings.MOTOR_2_EXECUTION_ENABLED,
                 "motor_3_clv": settings.MOTOR_3_CLV_ENABLED,
+                "motor_3_execution": settings.MOTOR_3_EXECUTION_ENABLED,
             },
         },
         "capital": RiskManager.capital_status(),
