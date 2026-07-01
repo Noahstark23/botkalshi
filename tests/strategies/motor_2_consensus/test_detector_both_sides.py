@@ -18,6 +18,12 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
+from src.strategies.motor_2_consensus.detector import (
+    KalshiEventQuotes,
+    KalshiQuote,
+    _collapse_event_signals,
+    find_signals,
+)
 from src.strategies.motor_2_consensus.matcher import start_time_et
 
 # El matching exige coherencia fecha(event_key) ↔ commence_time (ET); se derivan juntos.
@@ -31,13 +37,6 @@ def _key_datestamp(dt) -> str:
 
 
 _PHINYM_EVENT_KEY = f"KXMLBGAME-{_key_datestamp(_COMMENCE)}PHINYM"
-
-from src.strategies.motor_2_consensus.detector import (
-    KalshiEventQuotes,
-    KalshiQuote,
-    _collapse_event_signals,
-    find_signals,
-)
 
 CAPITAL = 300.0
 CAP_USD = CAPITAL * 0.05  # 5% = $15.00

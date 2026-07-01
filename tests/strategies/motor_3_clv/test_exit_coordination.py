@@ -22,7 +22,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlmodel import select
 
-import src.storage.models as models
 from src.storage.models import PortfolioPosition, Trade, get_session
 from src.strategies.motor_3_clv.engine import Motor3Engine
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
