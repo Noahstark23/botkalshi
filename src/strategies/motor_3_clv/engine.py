@@ -91,7 +91,17 @@ class Motor3Engine:
 
     async def _tick(self) -> None:
         """Un ciclo: refresca cartera, detecta salidas (tiempo + take-profit), y liquida."""
-        await self._poller.sync_once()
+        try:
+            await self._poller.sync_once()
+        except Exception as exc:
+            # Deuda auditoría 2026-07-01: el aislamiento "un fallo se registra y el loop
+            # sigue" vivía en poller.run(), que producción NO usa. Un outage de la API en
+            # la ventana T-30 abortaba el tick entero y costaba la salida. El tick sigue
+            # con el cache de PortfolioPosition en DB (stale de <=60s, decidible igual).
+            logger.warning(
+                f"motor3.engine.sync_failed {type(exc).__name__}: {exc} → tick con cache"
+            )
+            BotState.record_error(f"motor3.poller: {type(exc).__name__}: {exc}")
         now = _naive_utc_now()
         with get_session() as s:
             positions = list(s.exec(select(PortfolioPosition)))

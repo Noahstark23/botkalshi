@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 from sqlmodel import select
@@ -50,6 +50,9 @@ def _money_to_cents(position: dict, name: str) -> int | None:
     "0.22") y/o `<name>` (entero en centavos, histórico). El sufijo `_fp` es para CONTEOS
     de contratos, NO para dinero — por eso `market_exposure_fp` nunca existió y exposure_cents
     quedaba None. Devuelve None si no aparece en ningún shape conocido.
+
+    Coalesce por `is not None` (deuda auditoría 2026-07-01): antes `get(name, get(name_cents))`
+    solo caía al `_cents` si la key plana estaba AUSENTE — presente con None la enmascaraba.
     """
     dollars = position.get(f"{name}_dollars")
     if dollars is not None:
@@ -57,7 +60,10 @@ def _money_to_cents(position: dict, name: str) -> int | None:
             return int(round(float(dollars) * 100))
         except (TypeError, ValueError):
             pass
-    return _as_int(position.get(name, position.get(f"{name}_cents")))
+    flat = _as_int(position.get(name))
+    if flat is not None:
+        return flat
+    return _as_int(position.get(f"{name}_cents"))
 
 
 def _parse_close_time(raw: object) -> datetime | None:
@@ -79,7 +85,16 @@ class PortfolioPoller:
     """Sincroniza posiciones abiertas → PortfolioPosition. NO toca capital."""
 
     POLL_INTERVAL_SEC = 60.0
-    _GET_MARKET_PAUSE_SEC = 0.3  # cortesía entre get_market (solo para posiciones sin close_time)
+    _GET_MARKET_PAUSE_SEC = 0.3  # cortesía entre get_market (solo cuando hay que consultarlo)
+    # Refresh del close_time cerca del cierre (deuda auditoría 2026-07-01): NO es estático
+    # — Kalshi extiende mercados (prórrogas) y cierra anticipado (determinación temprana).
+    # Lejos del cierre el cache vale; dentro de esta ventana se re-consulta para que la
+    # ventana de salida T-30 se calcule sobre el close REAL.
+    _CLOSE_REFRESH_WINDOW = timedelta(minutes=45)
+    # Guard de purga (deuda auditoría): una respuesta 200 "vacía" (shape-drift / respuesta
+    # parcial) borraría TODAS las filas de golpe y el trailing perdería sus peaks. Un
+    # resultado vacío con filas existentes se confirma en el tick siguiente antes de purgar.
+    _MAX_PAGES = 20  # tope defensivo de paginación (~2000 posiciones; hoy son <100)
 
     def __init__(
         self, *, client_factory: Callable[[], KalshiRestClient] = KalshiRestClient
@@ -88,6 +103,8 @@ class PortfolioPoller:
         # Diagnóstico one-shot: si el campo de exposición no se resuelve en ningún shape
         # conocido, se loguean las keys crudas UNA vez (para descubrir el nombre real).
         self._exposure_keys_logged = False
+        # Guard de purga total: nº de syncs consecutivos con resultado vacío.
+        self._empty_syncs = 0
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Loop supervisado: un fallo de tick se registra y el loop SIGUE."""
@@ -107,7 +124,9 @@ class PortfolioPoller:
 
     async def sync_once(self) -> int:
         """Un tick: trae posiciones, resuelve close_time, upsert + purga. Devuelve nº abiertas."""
-        # close_time cacheado: es ESTÁTICO por market → no re-consultar get_market si ya lo tenemos.
+        # close_time cacheado: vale mientras el cierre esté LEJOS; dentro de la ventana de
+        # refresh se re-consulta (el close_time de deportes cambia: prórroga/early close).
+        now = _naive_utc_now()
         with get_session() as s:
             cached_close = {
                 p.ticker: p.close_time
@@ -138,38 +157,56 @@ class PortfolioPoller:
                     )
                 open_now[ticker] = (side, abs(pos), exposure)
 
-            # close_time: reusar el cacheado; solo get_market para los que falten.
+            # close_time: reusar el cacheado salvo que esté dentro de la ventana de refresh.
             close_times: dict[str, datetime | None] = {}
             for ticker in open_now:
-                if ticker in cached_close:
-                    close_times[ticker] = cached_close[ticker]
+                cached = cached_close.get(ticker)
+                if cached is not None and cached - now > self._CLOSE_REFRESH_WINDOW:
+                    close_times[ticker] = cached
                     continue
                 try:
                     resp = await client.get_market(ticker)
                     market = resp.get("market", resp) if isinstance(resp, dict) else {}
-                    close_times[ticker] = _parse_close_time(market.get("close_time"))
+                    fresh = _parse_close_time(market.get("close_time"))
+                    # Fail-safe: si el refresh no resuelve, conservar el cacheado.
+                    close_times[ticker] = fresh if fresh is not None else cached
+                    if fresh is not None and cached is not None and fresh != cached:
+                        logger.warning(
+                            f"motor3.poller.close_time_moved ticker={ticker} "
+                            f"{cached.isoformat()} -> {fresh.isoformat()} "
+                            "(prórroga/early close: la ventana T-30 se recalcula)"
+                        )
                 except Exception as e:
                     logger.warning(
                         f"motor3.poller.get_market({ticker}) error: {type(e).__name__}: {e}"
                     )
-                    close_times[ticker] = None
+                    close_times[ticker] = cached
                 await asyncio.sleep(self._GET_MARKET_PAUSE_SEC)
 
         self._persist(open_now, close_times)
         return len(open_now)
 
     async def _fetch_all_positions(self, client: KalshiRestClient) -> list[dict]:
-        """Todas las market_positions, paginando por cursor (defensivo; normalmente 1 página)."""
+        """Todas las market_positions, paginando por cursor. Tope de páginas + detección de
+        cursor repetido (deuda auditoría: un cursor pegado colgaba el tick para siempre)."""
         out: list[dict] = []
         cursor: str | None = None
-        while True:
+        seen_cursors: set[str] = set()
+        for _page in range(self._MAX_PAGES):
             resp = await client.get_positions(limit=100, cursor=cursor)
             if not isinstance(resp, dict):
                 break
             out.extend(resp.get("market_positions", resp.get("positions", [])) or [])
             cursor = resp.get("cursor") or None
             if not cursor:
-                break
+                return out
+            if cursor in seen_cursors:
+                logger.warning("motor3.poller.cursor_repetido — corto la paginación")
+                return out
+            seen_cursors.add(cursor)
+        logger.warning(
+            f"motor3.poller.max_pages alcanzado ({self._MAX_PAGES}) — resultado truncado"
+        )
         return out
 
     def _persist(
@@ -177,11 +214,27 @@ class PortfolioPoller:
         open_now: dict[str, tuple[str, int, int | None]],
         close_times: dict[str, datetime | None],
     ) -> None:
-        """UPSERT de las posiciones abiertas + PURGA de las que ya no lo están. Best-effort."""
+        """UPSERT de las posiciones abiertas + PURGA de las que ya no lo están. Best-effort.
+
+        GUARD DE PURGA TOTAL: un resultado vacío con filas existentes NO purga en el primer
+        sync (puede ser shape-drift/respuesta parcial "200 OK"); se purga recién con el
+        SEGUNDO vacío consecutivo. Un cierre real de todas las posiciones se refleja con
+        un tick (60s) de retraso — aceptable; perder los peaks del trailing por un blip, no.
+        """
         now = _naive_utc_now()
         try:
             with get_session() as s:
                 existing = {p.ticker: p for p in s.exec(select(PortfolioPosition))}
+                if not open_now and existing:
+                    self._empty_syncs += 1
+                    if self._empty_syncs < 2:
+                        logger.warning(
+                            f"motor3.poller.purge_deferred filas={len(existing)} "
+                            "(resultado vacío — se confirma en el próximo sync antes de purgar)"
+                        )
+                        return
+                else:
+                    self._empty_syncs = 0
                 # Upsert
                 for ticker, (side, count, exposure) in open_now.items():
                     row = existing.get(ticker)

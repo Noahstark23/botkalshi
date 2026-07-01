@@ -7,6 +7,7 @@ cantidad de la posición en `position_fp` (fixed-point string, ej. "-1.00"), NO 
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -141,3 +142,93 @@ def test_upsert_preserves_peak_same_side():
             select(models.PortfolioPosition).where(models.PortfolioPosition.ticker == "KXKEEP")
         ).first()
     assert row.count == 8 and row.peak_bid_cents == 77
+
+
+# =====================================================
+# Deudas auditoría 2026-07-01: robustez del poller
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_purge_deferred_on_first_empty_result(monkeypatch):
+    """Respuesta vacía con filas existentes → NO purga al primer sync (puede ser
+    shape-drift '200 OK'); purga recién con el segundo vacío consecutivo."""
+    monkeypatch.setattr("src.strategies.motor_3_clv.poller.asyncio.sleep", AsyncMock())
+    with models.get_session() as s:
+        s.add(models.PortfolioPosition(ticker="KXG", side="yes", count=5, peak_bid_cents=88))
+        s.commit()
+
+    client = _client([])  # respuesta vacía
+    poller = PortfolioPoller(client_factory=lambda: client)
+
+    await poller.sync_once()
+    rows = _positions()
+    assert len(rows) == 1 and rows[0].peak_bid_cents == 88  # el peak sobrevive al blip
+
+    await poller.sync_once()  # segundo vacío consecutivo → confirmado, purga
+    assert _positions() == []
+
+
+@pytest.mark.asyncio
+async def test_close_time_refreshed_near_close(monkeypatch):
+    """close_time cacheado DENTRO de la ventana de refresh (45 min) → se re-consulta
+    get_market (prórroga/early close mueven el close real y con él la ventana T-30)."""
+    monkeypatch.setattr("src.strategies.motor_3_clv.poller.asyncio.sleep", AsyncMock())
+    from src.strategies.motor_3_clv.poller import _naive_utc_now
+
+    near_close = _naive_utc_now() + timedelta(minutes=30)
+    with models.get_session() as s:
+        s.add(models.PortfolioPosition(ticker="KXNEAR", side="yes", count=5, close_time=near_close))
+        s.commit()
+
+    moved = (_naive_utc_now() + timedelta(minutes=90)).replace(microsecond=0)
+    client = _client([{"ticker": "KXNEAR", "position_fp": "5.00"}])
+    client.get_market = AsyncMock(return_value={"market": {"close_time": moved.isoformat() + "Z"}})
+    poller = PortfolioPoller(client_factory=lambda: client)
+
+    await poller.sync_once()
+
+    client.get_market.assert_awaited()  # cache invalidado por cercanía al cierre
+    rows = _positions()
+    assert rows[0].close_time == moved  # prórroga aplicada
+
+
+@pytest.mark.asyncio
+async def test_close_time_cached_when_far_from_close(monkeypatch):
+    """Lejos del cierre el cache vale: NO se re-consulta get_market."""
+    monkeypatch.setattr("src.strategies.motor_3_clv.poller.asyncio.sleep", AsyncMock())
+    from src.strategies.motor_3_clv.poller import _naive_utc_now
+
+    far_close = _naive_utc_now() + timedelta(hours=5)
+    with models.get_session() as s:
+        s.add(models.PortfolioPosition(ticker="KXFAR", side="yes", count=5, close_time=far_close))
+        s.commit()
+
+    client = _client([{"ticker": "KXFAR", "position_fp": "5.00"}])
+    poller = PortfolioPoller(client_factory=lambda: client)
+
+    await poller.sync_once()
+    client.get_market.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cursor_stops_pagination(monkeypatch):
+    """Cursor pegado (mismo valor en cada página) → la paginación corta en vez de
+    colgar el tick para siempre."""
+    monkeypatch.setattr("src.strategies.motor_3_clv.poller.asyncio.sleep", AsyncMock())
+    client = _client([])
+    client.get_positions = AsyncMock(return_value={"market_positions": [], "cursor": "STUCK"})
+    poller = PortfolioPoller(client_factory=lambda: client)
+
+    await poller.sync_once()  # sin guard, esto no retornaba nunca
+    assert client.get_positions.await_count <= 3
+
+
+def test_money_to_cents_coalesces_none_present():
+    """Key plana PRESENTE con None ya no enmascara el fallback `_cents`."""
+    from src.strategies.motor_3_clv.poller import _money_to_cents
+
+    assert (
+        _money_to_cents({"market_exposure": None, "market_exposure_cents": 150}, "market_exposure")
+        == 150
+    )
