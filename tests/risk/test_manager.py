@@ -507,6 +507,50 @@ async def test_weekly_pnl_breach_triggers_killswitch_e2e(
 
 
 @pytest.mark.asyncio
+async def test_weekly_stoploss_counts_across_month_boundary(
+    risk_manager, sample_opp, real_db_engine, monkeypatch
+):
+    """Borde de mes: una pérdida de ESTA semana pero del MES ANTERIOR debe contar para el stop-loss
+    SEMANAL. Antes se subcontaba (weekly ⊆ monthly, y el rango base arrancaba en month_start) →
+    protección semanal más débil justo tras el rollover de mes. Determinístico con freezegun:
+    hoy=2026-07-01 (miércoles) → week_start 2026-06-29; la pérdida cae el 2026-06-30 (esta semana,
+    mes anterior). Capital $4000, weekly cap $320; pérdida $321 debe disparar el stop-loss."""
+    from freezegun import freeze_time
+
+    import src.risk.manager as rm_module
+
+    monkeypatch.setattr(rm_module, "get_session", lambda: Session(real_db_engine))
+
+    with Session(real_db_engine) as s:
+        s.add(
+            Trade(
+                client_order_id="test-cross-month",
+                ticker="KX-TEST",
+                side="yes",
+                action="buy",
+                count=100,
+                price_cents=50,
+                strategy="motor_1_arbitrage",
+                status="settled",
+                pnl_cents=-32100,  # -$321 > weekly cap $320
+                placed_at=datetime(2026, 6, 30, 12, 0),
+                filled_at=datetime(2026, 6, 30, 12, 0),
+                settled_at=datetime(2026, 6, 30, 12, 0),  # martes: esta semana, mes ANTERIOR
+            )
+        )
+        s.commit()
+
+    with (
+        freeze_time("2026-07-01 10:00:00"),
+        patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock),
+    ):
+        decision = await risk_manager.check_pre_trade(sample_opp)
+
+    assert decision.approved is False
+    assert "Stop-Loss" in decision.reason
+
+
+@pytest.mark.asyncio
 async def test_weekly_pnl_old_trades_outside_window_dont_count(
     risk_manager, sample_opp, real_db_engine, monkeypatch
 ):

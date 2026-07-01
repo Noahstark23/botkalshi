@@ -443,17 +443,23 @@ class RiskManager:
         # Día 1 de este mes a las 00:00 UTC
         month_start = datetime.combine(now.date().replace(day=1), time.min)
 
+        # BUG FIX (borde de mes): en los primeros días de un mes, el LUNES de esta semana cae en
+        # el MES ANTERIOR (ej. hoy 2026-07-01 → week_start 2026-06-29 < month_start 2026-07-01). Si
+        # el rango base arrancara en month_start, el stop-loss SEMANAL se computaba sobre un set que
+        # ya excluía esos días → SUBCONTABA la pérdida de la semana → protección semanal más débil
+        # justo tras el rollover de mes. El rango base debe cubrir TODA la ventana (la más antigua).
+        range_start = min(month_start, week_start)
         with get_session() as s:
-            # Traer todos los trades del mes actual (rango más amplio)
             stmt = select(Trade).where(
                 Trade.status == "settled",
-                col(Trade.settled_at) >= month_start,
+                col(Trade.settled_at) >= range_start,
             )
-            monthly_trades = list(s.exec(stmt))
+            all_trades = list(s.exec(stmt))
 
-        # Filtrar trades para cada timeframe en memoria
-        weekly_trades = [t for t in monthly_trades if t.settled_at and t.settled_at >= week_start]
-        daily_trades = [t for t in weekly_trades if t.settled_at and t.settled_at >= today_start]
+        # Filtrar cada timeframe en memoria desde el set completo (cada ventana, independiente).
+        monthly_trades = [t for t in all_trades if t.settled_at and t.settled_at >= month_start]
+        weekly_trades = [t for t in all_trades if t.settled_at and t.settled_at >= week_start]
+        daily_trades = [t for t in all_trades if t.settled_at and t.settled_at >= today_start]
 
         monthly_pnl_usd = sum((t.pnl_cents or 0) for t in monthly_trades) / 100.0
         weekly_pnl_usd = sum((t.pnl_cents or 0) for t in weekly_trades) / 100.0
