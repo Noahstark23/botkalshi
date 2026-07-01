@@ -165,3 +165,51 @@ async def test_report_pending_days_reports_yesterday_once():
     assert n1 == 1 and n2 == 0
     with models.get_session() as s:
         assert s.exec(select(DailyPnL).where(DailyPnL.date == yesterday.isoformat())).first()
+
+
+def test_exit_sell_fees_counted_in_fees_line():
+    """Deuda auditoría 2026-07-01: la fila SELL de audit de un exit (settled, pnl None,
+    fees seteadas) suma al renglón de fees SIN tocar el PnL ni el conteo de trades."""
+    mid = datetime(2026, 6, 21, 12, 0)
+    day_start, day_end = _day_window(mid)
+    with models.get_session() as s:
+        s.add(
+            models.Trade(
+                client_order_id="buy-closed",
+                ticker="KXF",
+                side="yes",
+                action="buy",
+                count=10,
+                price_cents=45,
+                strategy="motor_2_consensus",
+                status="settled",
+                closed_by_clv=True,
+                pnl_cents=120,
+                fees_cents=18,
+                settled_at=mid,
+            )
+        )
+        s.add(
+            models.Trade(
+                client_order_id="sell-audit",
+                ticker="KXF",
+                side="yes",
+                action="sell",
+                count=10,
+                price_cents=60,
+                strategy="motor_2_consensus",
+                status="settled",
+                pnl_cents=None,  # audit: el PnL vive en la BUY
+                fees_cents=17,
+                settled_at=mid,
+            )
+        )
+        s.commit()
+
+    with models.get_session() as s:
+        agg = aggregate_daily_pnl(s, day_start, day_end)
+    m = next(mm for mm in agg.by_motor if mm.strategy == "motor_2_consensus")
+    assert m.pnl_cents == 120  # el PnL no cambia
+    assert m.n_trades == 1  # la fila SELL no cuenta como trade
+    assert m.fees_cents == 18 + 17  # entrada + salida
+    assert agg.total_fees_cents == 35

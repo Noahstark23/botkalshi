@@ -458,6 +458,11 @@ class Motor3ExitExecutor:
                     )
                 )
                 remaining = filled_count
+                # Fee del EXIT asignada por tramo ACUMULATIVO (deuda auditoría 2026-07-01):
+                # sumar ceil(fee(closed)) por pata sobre-cobraba hasta (n_patas−1)¢ y no
+                # cuadraba con la fila SELL. cumfee(k)−cumfee(k_prev) suma EXACTO el fee
+                # real del fill total.
+                closed_so_far = 0
                 for b in buys:
                     if remaining <= 0:
                         break
@@ -465,12 +470,12 @@ class Motor3ExitExecutor:
                         continue
                     buy_price = b.fill_price_cents or b.price_cents
                     closed = min(b.count, remaining)
+                    exit_fee_tramo = kalshi_fee_cents(
+                        closed_so_far + closed, exit_price
+                    ) - kalshi_fee_cents(closed_so_far, exit_price)
+                    entry_fee_tramo = kalshi_fee_cents(closed, buy_price)
                     # PnL realizado del tramo cerrado: (salida − entrada) − fees de ambos lados.
-                    pnl = (
-                        closed * (exit_price - buy_price)
-                        - kalshi_fee_cents(closed, exit_price)
-                        - kalshi_fee_cents(closed, buy_price)
-                    )
+                    pnl = closed * (exit_price - buy_price) - exit_fee_tramo - entry_fee_tramo
                     if closed == b.count:
                         b.status = "settled"
                         b.closed_by_clv = True
@@ -481,6 +486,11 @@ class Motor3ExitExecutor:
                     else:
                         # Partial: reduce el original (remanente sigue abierto) + hija settled.
                         b.count = b.count - closed
+                        if b.fees_cents is not None:
+                            # Prorratear las fees de ENTRADA al remanente (deuda auditoría:
+                            # dejar el fee del count original hacía que _leg_pnl_cents las
+                            # restara DOS veces cuando el remanente settlea por resolución).
+                            b.fees_cents = max(0, b.fees_cents - entry_fee_tramo)
                         s.add(b)
                         s.add(
                             Trade(
@@ -496,10 +506,12 @@ class Motor3ExitExecutor:
                                 closed_by_clv=True,
                                 settled_at=now,
                                 pnl_cents=pnl,
+                                fees_cents=entry_fee_tramo,
                                 notes="closed_by_clv split",
                             )
                         )
                     remaining -= closed
+                    closed_so_far += closed
                 s.commit()
         except Exception:
             logger.exception(f"motor3.exit.settle_originals_failed ticker={ticker}")
