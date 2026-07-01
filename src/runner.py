@@ -291,7 +291,9 @@ class ProductionRunner:
                     f"motor2 odds=LIVE sports={sport_keys} regions={self.settings.ODDS_API_REGIONS}"
                 )
             else:
-                odds_source = FakeOddsSource(world_cup_demo_fixture())
+                odds_source = FakeOddsSource(
+                    world_cup_demo_fixture
+                )  # factory: fechas frescas por fetch
                 logger.info("motor2 odds=FAKE (ODDS_API_KEY no seteada → shadow con fixture)")
 
             # Umbral de edge tuneable por config (pp → fracción), una sola fuente de verdad.
