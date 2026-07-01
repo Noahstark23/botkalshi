@@ -112,8 +112,10 @@ class Motor3Engine:
         if self._take_profit_enabled:
             for p in positions:
                 bid = await self._current_bid(p, bid_cache)
-                if take_profit_due(p, bid, self._tp_threshold):
-                    entry = self._entry_bid_for(p)
+                # El entry se resuelve ANTES del check: el TP solo asegura ganancia neta
+                # sobre el entry (nunca liquida en pérdida una entrada cara).
+                entry = self._entry_bid_for(p)
+                if take_profit_due(p, bid, self._tp_threshold, entry_cents=entry):
                     logger.info(
                         f"[MOTOR 3 TP SHADOW] take_profit {p.ticker} {p.count}c "
                         f"side={p.side} bid={bid}c >= {self._tp_threshold}c "

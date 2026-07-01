@@ -185,6 +185,7 @@ async def test_take_profit_shadow_detects_but_never_sells():
     eng._poller.sync_once = AsyncMock()
     eng._client = MagicMock()
     eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 95))
+    eng._entry_bid_for = lambda p: 60  # entry rentable: el TP exige ganancia neta vs entry
 
     captured: list[str] = []
     sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
@@ -221,6 +222,7 @@ async def test_take_profit_executes_when_executor_present():
     eng._poller.sync_once = AsyncMock()
     eng._client = MagicMock()
     eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 92))
+    eng._entry_bid_for = lambda p: 60  # entry rentable: el TP exige ganancia neta vs entry
     eng._executor = MagicMock()
     eng._executor.exit_position = AsyncMock()
 
@@ -238,6 +240,7 @@ async def test_take_profit_dedupes_with_time_exit():
     eng._poller.sync_once = AsyncMock()
     eng._client = MagicMock()
     eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 95))
+    eng._entry_bid_for = lambda p: 60  # entry rentable: el TP exige ganancia neta vs entry
     eng._executor = MagicMock()
     eng._executor.exit_position = AsyncMock()
 
@@ -416,15 +419,15 @@ async def test_tp_shadow_logs_net_pnl_with_fees():
 
 
 @pytest.mark.asyncio
-async def test_tp_shadow_pnl_handles_missing_entry():
-    """Sin pata BUY (entry None) → el log no rompe: muestra entry=? net_pnl=?."""
+async def test_tp_does_not_trigger_when_entry_unknown():
+    """Entry no derivable (p.ej. error de DB en _entry_bid_for) → el TP NO dispara
+    (fail-safe del fix auditoría 2026-07-01: sin entry no hay forma de garantizar que la
+    venta asegura ganancia — no se vende a ciegas)."""
     eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=62)
     eng._poller.sync_once = AsyncMock()
     eng._client = MagicMock()
     eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 62))
     _seed_position("KXNOENT", peak=None)
-    # Atribuible (tiene pata BUY) pero el entry no se pudo derivar (p.ej. error de DB en
-    # _entry_bid_for): el log del TP shadow debe degradar a entry=? sin romper.
     _seed_entry("KXNOENT", price=60)
     eng._entry_bid_for = lambda p: None
 
@@ -435,5 +438,4 @@ async def test_tp_shadow_pnl_handles_missing_entry():
     finally:
         logger.remove(sink)
 
-    line = next(m for m in captured if "[MOTOR 3 TP SHADOW]" in m and "KXNOENT" in m)
-    assert "entry=?" in line
+    assert not any("[MOTOR 3 TP SHADOW]" in m and "KXNOENT" in m for m in captured)

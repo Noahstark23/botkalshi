@@ -140,7 +140,9 @@ class Motor2ExitEngine:
         exits: list[Motor2Position] = []
         for pos in positions:
             bid = await self._current_bid(pos.ticker, pos.side, bid_cache)
-            tp_due = self._take_profit_enabled and take_profit_due(pos, bid, self._tp_threshold)
+            tp_due = self._take_profit_enabled and take_profit_due(
+                pos, bid, self._tp_threshold, entry_cents=pos.entry_cents
+            )
 
             trail_due = False
             peak: int | None = None
