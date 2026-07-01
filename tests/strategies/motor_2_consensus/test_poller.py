@@ -29,6 +29,7 @@ def _key_datestamp(dt) -> str:
     et = start_time_et(dt)
     return f"{et.year % 100:02d}{_KEY_MONTHS[et.month - 1]}{et.day:02d}"
 
+
 _COMMENCE = datetime.now(UTC) + timedelta(hours=2)
 EV = f"KXWCGAME-{_key_datestamp(_COMMENCE)}JORARG"
 

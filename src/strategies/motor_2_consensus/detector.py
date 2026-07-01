@@ -295,9 +295,7 @@ def find_signals(
                     )
                 for es in event_signals:
                     es.event_key = ke.event_key  # para el dedup cross-ciclo del executor
-                signals.extend(
-                    _collapse_event_signals(event_signals, one_per_event, ke.event_key)
-                )
+                signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
         if not matched and diag is not None:
             reason = select_reject or best_reason
             diag["reject_" + reason] = diag.get("reject_" + reason, 0.0) + 1.0
@@ -356,7 +354,10 @@ def _select_candidate(
                 timed = [
                     oe
                     for oe in dated
-                    if (start_time_et(oe.commence_time).hour, start_time_et(oe.commence_time).minute)
+                    if (
+                        start_time_et(oe.commence_time).hour,
+                        start_time_et(oe.commence_time).minute,
+                    )
                     == key_hhmm
                 ]
             if len(timed) != 1:

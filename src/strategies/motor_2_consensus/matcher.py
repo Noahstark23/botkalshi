@@ -78,6 +78,7 @@ def start_time_et(commence_time: datetime) -> datetime:
         commence_time = commence_time.replace(tzinfo=UTC)
     return commence_time.astimezone(ET)
 
+
 # Alias conocidos (clave = nombre YA normalizado por normalize_name → valor canónico).
 # Resuelve discrepancias Odds API ↔ Kalshi sin matchear por error. Curada y extensible.
 TEAM_ALIASES: dict[str, str] = {
