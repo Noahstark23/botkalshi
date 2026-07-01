@@ -52,8 +52,9 @@ class ProductionRunner:
     # DB tracking
     # =====================================================
 
-    def _record_run_start(self) -> None:
-        """Registra arranque en DB para auditoría."""
+    def _record_run_start(self, capital_usd: float | None = None) -> None:
+        """Registra arranque en DB para auditoría. `capital_usd`: capital efectivo REAL
+        si el boot lo pudo traer; None → param estático (fallback)."""
         motors_enabled = []
         if self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             motors_enabled.append("motor_1_arbitrage")
@@ -67,7 +68,9 @@ class ProductionRunner:
                 environment=self.settings.KALSHI_ENV,
                 trading_enabled=self.settings.TRADING_ENABLED,
                 motors_enabled=json.dumps(motors_enabled),
-                capital_at_start=self.settings.ACTIVE_CAPITAL_USD,
+                capital_at_start=(
+                    capital_usd if capital_usd is not None else self.settings.ACTIVE_CAPITAL_USD
+                ),
             )
             s.add(run)
             s.commit()
@@ -516,7 +519,7 @@ class ProductionRunner:
         try:
             # Inicialización
             logger.info(f"🚀 Bot arrancando en {self.settings.KALSHI_ENV.upper()}")
-            logger.info(f"Capital activo: ${self.settings.ACTIVE_CAPITAL_USD}")
+            logger.info(f"Capital (config/fallback): ${self.settings.ACTIVE_CAPITAL_USD}")
             logger.info(f"Trading enabled: {self.settings.TRADING_ENABLED}")
 
             init_db()
@@ -535,8 +538,21 @@ class ProductionRunner:
             # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
             await self._reconcile_on_boot()
 
-            self._record_run_start()
-            await alert_startup()
+            # Capital REAL temprano (best-effort, fix 2026-07-01): las señales de
+            # arranque (log, Telegram, bot_runs) muestran el cash efectivo de Kalshi,
+            # no el param estático — que con capital dinámico es solo fallback de boot.
+            boot_capital: float | None = None
+            try:
+                fetched = await asyncio.wait_for(
+                    RiskManager.refresh_capital_from_balance(), timeout=15
+                )
+                if fetched is not None:
+                    boot_capital = RiskManager().effective_capital_usd()
+                    logger.info(f"Capital efectivo (cash real): ${boot_capital:.2f}")
+            except Exception as e:
+                logger.warning(f"boot: balance real no disponible aún ({e}) → señales con config")
+            self._record_run_start(boot_capital)
+            await alert_startup(boot_capital)
 
             # Lanzar servicios concurrentemente
             tasks = [

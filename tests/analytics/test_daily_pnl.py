@@ -213,3 +213,25 @@ def test_exit_sell_fees_counted_in_fees_line():
     assert m.n_trades == 1  # la fila SELL no cuenta como trade
     assert m.fees_cents == 18 + 17  # entrada + salida
     assert agg.total_fees_cents == 35
+
+
+def test_loop_capital_defaults_to_effective_per_report(monkeypatch):
+    """Fix 2026-07-01 (capital adaptativo): sin override, el digest usa el capital
+    EFECTIVO real por reporte — no el param estático (con cash real $561 y config
+    $1200, el retorno % quedaba subestimado ~2×)."""
+    from src.risk.manager import RiskManager
+
+    monkeypatch.setattr(RiskManager, "__init__", lambda self: None)  # sin Settings reales
+    monkeypatch.setattr(RiskManager, "effective_capital_usd", lambda self: 561.55)
+    loop = DailyPnLLoop(interval_sec=1.0)
+    assert loop._capital == 561.55
+
+    # Y sigue al cash si cambia entre reportes (depósito/retiro).
+    monkeypatch.setattr(RiskManager, "effective_capital_usd", lambda self: 900.0)
+    assert loop._capital == 900.0
+
+
+def test_loop_capital_override_wins():
+    """El override explícito (tests / dry-run) sigue mandando."""
+    loop = DailyPnLLoop(interval_sec=1.0, capital_usd=300.0)
+    assert loop._capital == 300.0

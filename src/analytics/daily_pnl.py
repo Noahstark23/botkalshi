@@ -198,11 +198,22 @@ class DailyPnLLoop:
     def __init__(
         self, *, interval_sec: float | None = None, capital_usd: float | None = None
     ) -> None:
-        s = get_settings() if (interval_sec is None or capital_usd is None) else None
+        s = get_settings() if interval_sec is None else None
         self._interval = (
             interval_sec if interval_sec is not None else s.DAILY_PNL_REPORT_INTERVAL_SEC
         )
-        self._capital = capital_usd if capital_usd is not None else s.ACTIVE_CAPITAL_USD
+        # None → capital EFECTIVO real por reporte (fix 2026-07-01: el retorno % se
+        # calculaba sobre el param estático — con cash real $561 y config $1200, el %
+        # del digest quedaba subestimado ~2×). El override explícito queda para tests.
+        self._capital_override = capital_usd
+
+    @property
+    def _capital(self) -> float:
+        if self._capital_override is not None:
+            return self._capital_override
+        from src.risk.manager import RiskManager
+
+        return RiskManager().effective_capital_usd()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         logger.info(f"daily_pnl loop started interval={self._interval:.0f}s")

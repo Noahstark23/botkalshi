@@ -57,13 +57,22 @@ async def send_alert(message: str, *, urgent: bool = False) -> bool:
         return False
 
 
-async def alert_startup() -> None:
-    """Notifica que el bot arrancó."""
+async def alert_startup(capital_usd: float | None = None) -> None:
+    """Notifica que el bot arrancó.
+
+    `capital_usd`: capital EFECTIVO real (cash de Kalshi ya factorizado) si el runner lo
+    pudo traer antes de la alerta. None → fallback al param estático, ETIQUETADO como
+    config (fix 2026-07-01: 'Capital: $1200' con cash real $561 era engañoso — el sizing
+    no usa ese número)."""
     settings = get_settings()
+    if capital_usd is not None:
+        capital_line = f"Capital: `${capital_usd:.2f}` (cash real)"
+    else:
+        capital_line = f"Capital: `${settings.ACTIVE_CAPITAL_USD}` (config, fallback)"
     msg = (
         f"*Kalshi Bot iniciado*\n"
         f"Env: `{settings.KALSHI_ENV}`\n"
-        f"Capital: `${settings.ACTIVE_CAPITAL_USD}`\n"
+        f"{capital_line}\n"
         f"Trading: `{settings.TRADING_ENABLED}`"
     )
     await send_alert(msg)
