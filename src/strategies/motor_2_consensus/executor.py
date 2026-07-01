@@ -144,21 +144,23 @@ class Motor2Executor:
             return Motor2ExecutionOutcome(False, False, reason="stake_below_one_contract")
 
         opp = self._as_single_leg_opp(signal, side, price, desired)
-        decision = await self.risk.check_pre_trade(opp)
+        # A.1 — intent PRE-red, ahora BAJO EL MISMO LOCK que el check (deuda auditoría
+        # 2026-07-01: con la fila escrita después de soltar el lock, dos motores podían
+        # aprobarse contra la misma exposición leída). bet_id (uuid) como prefijo del
+        # coid; NO se marca 'arb_id=' en notes (direccional: el RiskManager lo cuenta
+        # ENTERO, sin descuento de hedge). Si el persist falla → ABORT sin colocar.
+        bet_id = str(uuid.uuid4())
+        coid = f"{bet_id}-{side}"
+        decision = await self.risk.check_and_reserve(
+            opp,
+            lambda d: self._persist_intent(signal, side, price, d.max_allowed_count, coid),
+        )
         if not decision.approved:
             logger.info(
                 f"motor2.exec.rejected ticker={signal.market_ticker} reason={decision.reason}"
             )
             return Motor2ExecutionOutcome(False, False, reason=decision.reason)
         count = decision.max_allowed_count
-
-        # A.1 — intent PRE-red. bet_id (uuid) como prefijo del coid; NO se marca como
-        # 'arb_id=' en notes (es direccional: el RiskManager debe contarlo ENTERO, sin
-        # descuento de hedge). Si el persist falla → ABORT sin colocar (fail-safe).
-        bet_id = str(uuid.uuid4())
-        coid = f"{bet_id}-{side}"
-        if not self._persist_intent(signal, side, price, count, coid):
-            return Motor2ExecutionOutcome(False, False, reason="persist_intent_failed")
 
         try:
             resp = await self.client.place_order(

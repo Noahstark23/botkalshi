@@ -167,8 +167,10 @@ async def test_sizing_cap_strictly_applied(mock_session, risk_manager):
 
     decision = await risk_manager.check_pre_trade(opp)
     assert decision.approved is True
-    # usable=$200 (min de 5%·$4k=$200 y cap absoluto $200), cost/unit=90¢ → 20000//90 = 222
-    assert decision.max_allowed_count == 222
+    # usable=$200 (min de 5%·$4k=$200 y cap absoluto $200), cost/unit=90¢ + fees/unit
+    # 4¢ (fee(1,50)=2 + fee(1,40)=2; deuda auditoría: el USD comprometido incluye la
+    # comisión) → 20000 // 94 = 212
+    assert decision.max_allowed_count == 212
 
 
 @pytest.mark.asyncio
@@ -231,10 +233,10 @@ async def test_absolute_usd_cap_binds_when_pct_would_exceed(mock_session):
         )
         decision = await rm.check_pre_trade(opp)
 
-    # usable = min(5%·$5000=$250, remaining $1250, cap $200) = $200 → 20000//100 = 200
-    # Sin el cap absoluto serían 250 → el cap recortó 50 contratos.
+    # usable = min(5%·$5000=$250, remaining $1250, cap $200) = $200; cost/unit=100¢ +
+    # fees/unit 4¢ → 20000 // 104 = 192. Sin el cap absoluto serían ~240 → el cap recorta.
     assert decision.approved is True
-    assert decision.max_allowed_count == 200
+    assert decision.max_allowed_count == 192
 
 
 @pytest.mark.asyncio
@@ -774,7 +776,7 @@ async def test_c02_cap_chain_200usd_still_binds(mock_session, mock_settings):
     mock_db = MagicMock()
     mock_session.return_value.__enter__.return_value = mock_db
     mock_db.exec.side_effect = [[], []]
-    # cost/unit = 50¢, opp.count grande → el binding es usable=$200 → int(200*100)//50 = 400.
+    # cost/unit = 50¢ + fees/unit 4¢ (fee(1,30)=2, fee(1,20)=2) → 20000 // 54 = 370.
     leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=30, count=1000, available_size=5000)
     leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=20, count=1000, available_size=5000)
     opp = ArbOpportunity(
@@ -787,7 +789,7 @@ async def test_c02_cap_chain_200usd_still_binds(mock_session, mock_settings):
     )
     decision = await RiskManager().check_pre_trade(opp)
     assert decision.approved is True
-    assert decision.max_allowed_count == 400
+    assert decision.max_allowed_count == 370
 
 
 # =========================================================

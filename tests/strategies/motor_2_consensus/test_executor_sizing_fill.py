@@ -43,6 +43,12 @@ class _FakeRisk:
         self.last_opp = opp
         return TradeDecision(True, "Aprobado", opp.count)
 
+    async def check_and_reserve(self, opp, persist_intent):
+        d = await self.check_pre_trade(opp)
+        if d.approved and not persist_intent(d):
+            return TradeDecision(False, "persist_intent_failed", 0)
+        return d
+
 
 class _FakeClient:
     def __init__(self, resp):

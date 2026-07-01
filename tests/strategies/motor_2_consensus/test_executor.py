@@ -47,6 +47,12 @@ class _FakeRisk:
         self.last_opp = opp
         return self._decision
 
+    async def check_and_reserve(self, opp, persist_intent):
+        d = await self.check_pre_trade(opp)
+        if d.approved and not persist_intent(d):
+            return TradeDecision(False, "persist_intent_failed", 0)
+        return d
+
 
 class _FakeClient:
     """KalshiRestClient falso: place_order configurable (resp dict o excepción)."""
