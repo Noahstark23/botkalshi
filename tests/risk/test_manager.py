@@ -799,9 +799,12 @@ async def test_c02_cap_chain_200usd_still_binds(mock_session, mock_settings):
 
 @pytest.mark.asyncio
 async def test_c03_drift_alert_fires_when_over_threshold(mock_settings):
-    """cash $3000 vs config $1000 (200% ≥ 25%) → alerta + marca _drift_alerted."""
+    """cash $3000 vs config $1000 (200% ≥ 25%) con dynamic OFF (el param maneja el
+    sizing) → alerta + marca _drift_alerted. Con dynamic ON ya no alerta (ver
+    test_c03_dynamic_on_drift_logs_but_does_not_alert)."""
     mock_settings.ACTIVE_CAPITAL_USD = 1000.0
     mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
     with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
         await RiskManager._check_capital_drift(3000.0)
     send.assert_awaited_once()
@@ -821,9 +824,11 @@ async def test_c03_no_alert_within_threshold(mock_settings):
 
 @pytest.mark.asyncio
 async def test_c03_edge_triggered_no_duplicate(mock_settings):
-    """Dos lecturas con desfase alto seguidas → una sola alerta (edge-triggered)."""
+    """Dos lecturas con desfase alto seguidas → una sola alerta (edge-triggered).
+    dynamic OFF: es el modo donde la alerta Telegram existe."""
     mock_settings.ACTIVE_CAPITAL_USD = 1000.0
     mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
     with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
         await RiskManager._check_capital_drift(3000.0)
         await RiskManager._check_capital_drift(3100.0)
@@ -832,9 +837,11 @@ async def test_c03_edge_triggered_no_duplicate(mock_settings):
 
 @pytest.mark.asyncio
 async def test_c03_rearm_after_realign(mock_settings):
-    """Tras alertar, re-arma sólo cuando el desfase baja con margen, y vuelve a alertar."""
+    """Tras alertar, re-arma sólo cuando el desfase baja con margen, y vuelve a alertar.
+    dynamic OFF: es el modo donde la alerta Telegram existe."""
     mock_settings.ACTIVE_CAPITAL_USD = 1000.0
     mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
     with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
         await RiskManager._check_capital_drift(3000.0)  # 200% → alerta
         await RiskManager._check_capital_drift(1050.0)  # 5% < 20 (25-5) → re-arma
@@ -856,14 +863,17 @@ async def test_c03_check_swallows_errors(mock_settings):
 
 @pytest.mark.asyncio
 async def test_c03_refresh_triggers_drift_alert(mock_settings):
-    """El refresh real engancha el chequeo de drift (cash $3000 vs config $1000)."""
+    """El refresh real engancha el chequeo de drift (cash $3000 vs config $1000).
+    Con dynamic ON (necesario para que el refresh consulte la API), el chequeo corre
+    pero NO alerta por Telegram (informativo one-shot) — el estado marca el edge."""
     mock_settings.ACTIVE_CAPITAL_USD = 1000.0
     mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
     with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
         await RiskManager.refresh_capital_from_balance(
             client_factory=_balance_factory(balance=300000)
         )
-    send.assert_awaited_once()
+    send.assert_not_called()
+    assert RiskManager._drift_alerted is True  # el chequeo SÍ corrió (one-shot marcado)
 
 
 @pytest.mark.asyncio
@@ -1071,3 +1081,28 @@ def test_capital_status_paused_below_floor(mock_settings):
     st = RiskManager.capital_status()
     assert st["is_paused"] is True
     assert st["effective_usd"] == 100.0  # floored
+
+
+@pytest.mark.asyncio
+async def test_c03_dynamic_on_drift_logs_but_does_not_alert(mock_settings):
+    """Fix screenshot 2026-07-01: con DYNAMIC_CAPITAL_ENABLED el param NO maneja el sizing
+    (es solo fallback de boot) → el desfase config↔cash es esperado e informativo. Nada de
+    Telegram pidiendo 'actualizá el param en Coolify' — log INFO one-shot y listo."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1200.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = True
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(561.55)  # 53% de desfase
+    send.assert_not_called()
+    assert RiskManager._drift_alerted is True  # one-shot: no re-loguea cada refresh
+
+
+@pytest.mark.asyncio
+async def test_c03_dynamic_off_drift_still_alerts(mock_settings):
+    """Con dynamic OFF el param SÍ maneja el sizing → el desfase es accionable: Telegram."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1200.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(561.55)
+    send.assert_awaited_once()

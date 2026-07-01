@@ -256,16 +256,29 @@ class RiskManager:
                 if not cls._drift_alerted:
                     cls._drift_alerted = True
                     direction = "MÁS" if real_usd > configured else "MENOS"
+                    # ADAPTATIVO (fix 2026-07-01, screenshot del operador): con
+                    # DYNAMIC_CAPITAL_ENABLED el param NO maneja el sizing (es solo el
+                    # fallback de boot) → el desfase config↔cash es ESPERADO y no exige
+                    # mantenimiento manual: log INFO one-shot, sin Telegram. La alerta
+                    # accionable queda para dynamic OFF, donde el param SÍ dimensiona.
+                    if settings.DYNAMIC_CAPITAL_ENABLED:
+                        logger.info(
+                            f"risk.capital.drift: cash real ${real_usd:.2f} vs config "
+                            f"${configured:.2f} ({direction} cash, {drift_pct:.0f}%). "
+                            "Informativo: el sizing usa el cash real; ACTIVE_CAPITAL_USD "
+                            "es solo fallback de boot (actualizarlo es opcional)."
+                        )
+                        return
                     msg = (
                         f"*Desfase de capital*: cash real ${real_usd:.2f} vs "
                         f"ACTIVE_CAPITAL_USD=${configured:.2f} ({direction} cash, "
                         f"{drift_pct:.0f}% de desfase ≥ {threshold:.0f}%). "
-                        "Actualizá el param en Coolify o revisá el movimiento de cash. "
-                        "El sizing YA usa el cash real (C-01/C-02); esto es solo aviso."
+                        "DYNAMIC_CAPITAL_ENABLED=False: el sizing usa ESTE param — "
+                        "actualizalo en Coolify o revisá el movimiento de cash."
                     )
                     logger.warning(
                         f"risk.capital.drift: real=${real_usd:.2f} config=${configured:.2f} "
-                        f"drift={drift_pct:.1f}% ≥ {threshold:.0f}% → alerta"
+                        f"drift={drift_pct:.1f}% ≥ {threshold:.0f}% → alerta (dynamic OFF)"
                     )
                     await send_alert(msg, urgent=False)
                 return
