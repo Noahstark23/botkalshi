@@ -7,7 +7,7 @@ por-ticker que descarta una venta concurrente. `place_order` mockeado (no toca r
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -55,8 +55,7 @@ async def test_no_bid_does_not_place():
     """Orderbook sin bids en nuestro lado → no hay con quién cerrar → no se coloca orden."""
     _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(_client({"orderbook": {"yes": [], "no": []}}))
-    with patch.object(ex, "_record_exit"):
-        out = await ex.exit_position(_pos("yes"))
+    out = await ex.exit_position(_pos("yes"))
     assert out.reason == "no_bid" and out.placed is False
     ex.client.place_order.assert_not_called()
 
@@ -70,8 +69,7 @@ async def test_filled_sells_at_bid_with_ioc():
     )
     _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
-    with patch.object(ex, "_record_exit"):
-        out = await ex.exit_position(_pos("yes", count=10))
+    out = await ex.exit_position(_pos("yes", count=10))
 
     assert out.filled is True and out.filled_count == 10 and out.sell_price_cents == 60
     kwargs = c.place_order.call_args.kwargs
@@ -92,8 +90,7 @@ async def test_no_side_uses_no_price():
     )
     _seed_open_buy(side="no", count=5)
     ex = Motor3ExitExecutor(c)
-    with patch.object(ex, "_record_exit"):
-        out = await ex.exit_position(_pos("no", count=5))
+    out = await ex.exit_position(_pos("no", count=5))
     assert out.filled is True and out.sell_price_cents == 40
     kwargs = c.place_order.call_args.kwargs
     assert kwargs["side"] == "no" and kwargs["no_price"] == 40 and kwargs["yes_price"] is None

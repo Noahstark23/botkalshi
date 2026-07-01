@@ -32,7 +32,13 @@ from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.math.fees import kalshi_fee_cents
-from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
+from src.storage.models import (
+    PortfolioPosition,
+    Trade,
+    _naive_utc_now,
+    engage_kill_switch,
+    get_session,
+)
 from src.strategies.data_capture import _top_bid
 from src.strategies.motor_3_clv.poller import _as_int
 
@@ -92,11 +98,35 @@ class Motor3ExitExecutor:
         aunque la PortfolioPosition (cache de 60s) o el agregado de Motor 2 estén stale —
         se skipea en vez de re-vender. La venta se CAPEA al total abierto atribuible.
         """
+        # DECISIÓN DE POLÍTICA (fix auditoría 2026-07-01): pausa/kill-switch bloquea
+        # TAMBIÉN las ventas. El runbook del kill-switch (clear_kill_switch.py) exige
+        # reconciliación MANUAL con el bot quieto — un exit automático en esa ventana
+        # puede duplicar la venta manual del operador (V2: el exceso abre posición
+        # contraria) y mantiene el "posiciones != 0" que aborta la limpieza en loop.
+        # La detección/shadow logging del engine sigue corriendo; solo la orden se frena.
+        try:
+            from src.monitoring.health import BotState
+
+            if BotState.is_paused:
+                logger.warning(
+                    f"motor3.exit.paused ticker={position.ticker} "
+                    f"(is_paused=True — sin ventas hasta despausar: {BotState.pause_reason})"
+                )
+                return Motor3ExitOutcome(False, False, reason="paused")
+        except Exception:  # pragma: no cover - el gate nunca debe romper el tick
+            logger.exception("motor3.exit.pause_check_failed")
+            return Motor3ExitOutcome(False, False, reason="pause_check_failed")
         lock = self._lock_for(position.ticker)
         if lock.locked():
             logger.info(f"motor3.exit.skip_busy ticker={position.ticker}")
             return Motor3ExitOutcome(False, False, reason="busy")
         async with lock:
+            # RECONCILE (fix auditoría 2026-07-01): si un sell previo quedó en ERROR_RED
+            # (intent 'pending'), resolverlo contra get_orders ANTES de vender de nuevo.
+            # Si llenó, re-vender abriría posición contraria (V2 no rechaza el exceso);
+            # si no se puede resolver, este tick NO vende (ante la duda, ninguna orden).
+            if not await self._reconcile_pending_sells(position.ticker, position.side):
+                return Motor3ExitOutcome(False, False, reason="pending_sell_unresolved")
             open_count = self._open_attributable_count(position.ticker, position.side)
             if open_count <= 0:
                 logger.info(
@@ -146,6 +176,15 @@ class Motor3ExitExecutor:
 
         # Vender al bid (cruza con el mejor bid). IOC: toma lo que haya, cancela el resto.
         coid = f"{uuid.uuid4()}-clvexit"
+        # INTENT PRE-RED (fix auditoría 2026-07-01, patrón A.1 de los otros executors):
+        # la fila SELL 'pending' se escribe ANTES de tocar la red. Si la respuesta se
+        # pierde (ERROR_RED), queda el rastro para que _reconcile_pending_sells lo
+        # resuelva por coid — sin esto, un fill no registrado terminaba en re-venta
+        # fantasma (posición contraria) + PnL doble vía settlement. Nota: mientras esté
+        # 'pending' cuenta en la exposición del RiskManager (su query no filtra por
+        # action) — sobrestima temporal y conservador.
+        if not self._persist_sell_intent(coid, ticker, side, count, bid):
+            return Motor3ExitOutcome(False, False, reason="persist_intent_failed")
         try:
             resp = await self.client.place_order(
                 ticker=ticker,
@@ -161,18 +200,35 @@ class Motor3ExitExecutor:
         except TradingDisabledError:
             # No debería pasar (sell no se bloquea); defensa por si la invariante cambiara.
             logger.warning(f"motor3.exit.trading_disabled ticker={ticker}")
+            self._update_sell_intent(
+                coid, critical=False, status="cancelled", notes_append="trading_disabled"
+            )
             return Motor3ExitOutcome(False, False, reason="trading_disabled", client_order_id=coid)
         except KalshiClientError as exc:
+            # 4xx determinístico: la orden NO entró — sin posición, intent liberado.
             logger.warning(
                 f"motor3.exit.client_error ticker={ticker} status={exc.status_code}: {exc}"
+            )
+            self._update_sell_intent(
+                coid,
+                critical=False,
+                status="cancelled",
+                notes_append=f"client_error_{exc.status_code}",
             )
             return Motor3ExitOutcome(
                 True, False, reason=f"client_error_{exc.status_code}", client_order_id=coid
             )
         except Exception as exc:
-            # ERROR_RED: el sell pudo llegar o no. La fila se registra; el poller re-sincroniza
-            # la posición real en el próximo ciclo (si quedó abierta, se reintenta).
+            # ERROR_RED: el sell pudo llegar y LLENAR. El intent queda 'pending' — el
+            # próximo exit_position lo reconcilia por coid contra get_orders antes de
+            # intentar cualquier venta nueva (nunca re-vender a ciegas).
             logger.warning(f"motor3.exit.error_red ticker={ticker}: {exc}")
+            try:
+                from src.monitoring.health import BotState
+
+                BotState.record_error(f"motor3.exit error_red ticker={ticker} coid={coid}")
+            except Exception:  # pragma: no cover - visibilidad best-effort
+                pass
             return Motor3ExitOutcome(True, False, reason="error_red", client_order_id=coid)
 
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
@@ -180,30 +236,41 @@ class Motor3ExitExecutor:
         fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
 
         if fill_count > 0:
-            # Audit del SELL (status=settled → realizado, NO cuenta como exposición) +
-            # FASE 2: cierre de la pata original para que el SettlementPoller no la liquide
-            # de nuevo por resolución (anti doble-conteo de PnL).
-            self._record_exit(coid, ticker, side, fill_count, bid, order_id)
-            self._settle_originals(ticker, side, bid, fill_count)
+            # Fill REAL: intent→settled + cierre de las patas BUY. CRÍTICO: si la
+            # persistencia falla, el sistema queda ciego a una venta real (re-venta
+            # fantasma + PnL doble) → pausa preventiva persistente, como en los otros
+            # executors. La venta ya ocurrió: el outcome la reporta igual.
+            try:
+                self._finalize_fill(coid, ticker, side, fill_count, bid, order_id)
+            except Exception:
+                logger.critical(f"motor3.exit.persist_after_fill_failed coid={coid}")
+                self._engage_preventive_pause(coid)
             logger.info(f"motor3.exit.filled ticker={ticker} side={side} sold={fill_count}@{bid}c")
+            # Alerta Telegram de la venta REAL (deuda auditoría 2026-07-01: el operador se
+            # enteraba solo por logs/digest). Best-effort: jamás rompe el exit.
+            try:
+                from src.monitoring.telegram_alerts import send_alert
+
+                await send_alert(
+                    f"💸 Exit {self._strategy}: vendidos {fill_count}c {side.upper()} "
+                    f"de {ticker} @ {bid}c"
+                )
+            except Exception:  # pragma: no cover - visibilidad best-effort
+                logger.exception("motor3.exit.telegram_alert_failed")
             return Motor3ExitOutcome(
                 True, True, filled_count=fill_count, sell_price_cents=bid, client_order_id=coid
             )
+        self._update_sell_intent(
+            coid, critical=False, status="cancelled", notes_append="ioc_no_fill"
+        )
         logger.info(f"motor3.exit.no_fill ticker={ticker} (IOC sin cruce al bid)")
         return Motor3ExitOutcome(True, False, reason="ioc_no_fill", client_order_id=coid)
 
-    def _record_exit(
-        self, coid: str, ticker: str, side: str, fill_count: int, price: int, order_id: str | None
-    ) -> None:
-        """
-        Registra el SELL del exit como fila Trade de AUDITORÍA. Best-effort.
-
-        status='settled' a propósito: un SELL llenado es una salida YA realizada — así NO
-        cuenta como exposición (la query del RiskManager es pending/filled) ni dobla el PnL
-        (pnl_cents queda en None aquí; el PnL realizado vive en la pata BUY que settlea
-        `_settle_originals`).
-        """
-        now = _naive_utc_now()
+    def _persist_sell_intent(
+        self, coid: str, ticker: str, side: str, count: int, price: int
+    ) -> bool:
+        """Escribe la fila SELL 'pending' ANTES de tocar la red (patrón A.1). False si falla
+        (→ el caller ABORTA sin vender: sin rastro no hay reconciliación posible)."""
         try:
             with get_session() as s:
                 s.add(
@@ -212,21 +279,164 @@ class Motor3ExitExecutor:
                         ticker=ticker,
                         side=side,
                         action="sell",
-                        count=fill_count,
+                        count=count,
                         price_cents=price,
                         strategy=self._strategy,
-                        status="settled",
-                        kalshi_order_id=order_id,
-                        fill_price_cents=price,
-                        fees_cents=kalshi_fee_cents(fill_count, price),
-                        filled_at=now,
-                        settled_at=now,
-                        notes="clv_exit",
+                        status="pending",
+                        notes="clv_exit_intent",
                     )
                 )
                 s.commit()
+            return True
         except Exception:
-            logger.exception(f"motor3.exit.record_failed coid={coid}")
+            logger.critical(
+                f"motor3.exit.persist_intent_failed coid={coid} → ABORT (sin rastro no se vende)"
+            )
+            return False
+
+    def _update_sell_intent(
+        self, coid: str, *, critical: bool, notes_append: str | None = None, **fields: object
+    ) -> None:
+        """Actualiza la fila SELL del intent. critical=True (fill real): la excepción ESCALA
+        al caller (que engancha la pausa preventiva); critical=False: best-effort."""
+        try:
+            with get_session() as s:
+                t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
+                if t is None:
+                    logger.warning(f"motor3.exit.update_intent.missing coid={coid}")
+                    return
+                for k, v in fields.items():
+                    setattr(t, k, v)
+                if notes_append:
+                    t.notes = f"{t.notes or ''} {notes_append}".strip()[:500]
+                s.add(t)
+                s.commit()
+        except Exception:
+            logger.exception(f"motor3.exit.update_intent_failed coid={coid} critical={critical}")
+            if critical:
+                raise
+
+    def _finalize_fill(
+        self, coid: str, ticker: str, side: str, fill_count: int, price: int, order_id: str | None
+    ) -> None:
+        """Registra un fill REAL de venta: intent→'settled' + cierre de las patas BUY.
+
+        status='settled' en el SELL a propósito: una salida YA realizada no cuenta como
+        exposición (la query del RiskManager es pending/filled) ni dobla el PnL
+        (pnl_cents queda None; el PnL realizado vive en las BUY que settlea
+        `_settle_originals`). CRÍTICO: cualquier excepción acá escala al caller, que
+        engancha la pausa preventiva — un fill real sin registrar deja al sistema ciego.
+        """
+        now = _naive_utc_now()
+        self._update_sell_intent(
+            coid,
+            critical=True,
+            status="settled",
+            count=fill_count,
+            fill_price_cents=price,
+            fees_cents=kalshi_fee_cents(fill_count, price),
+            kalshi_order_id=order_id,
+            filled_at=now,
+            settled_at=now,
+            notes_append="clv_exit_filled",
+        )
+        self._settle_originals(ticker, side, price, fill_count)
+
+    async def _reconcile_pending_sells(self, ticker: str, side: str) -> bool:
+        """Resuelve intents SELL 'pending' (ERROR_RED previo) contra get_orders, por coid.
+
+        Devuelve True si el camino quedó limpio para una venta nueva. False si algún
+        intent sigue irresoluble (la orden no aparece / la API falla / la persistencia del
+        fill reconciliado falla) → el caller NO vende este tick.
+
+        - executed / fill_count>0 → _finalize_fill con el fill real (sin re-vender).
+        - canceled / fill 0 → intent 'cancelled' (IOC nunca descansa: no hay resting).
+        """
+        try:
+            with get_session() as s:
+                pending = list(
+                    s.exec(
+                        select(Trade).where(
+                            Trade.ticker == ticker,
+                            Trade.side == side,
+                            Trade.action == "sell",
+                            Trade.status == "pending",
+                            Trade.strategy == self._strategy,
+                        )
+                    )
+                )
+        except Exception:
+            logger.exception(f"motor3.exit.reconcile_load_failed ticker={ticker}")
+            return False
+        if not pending:
+            return True
+        try:
+            resp = await self.client.get_orders(ticker=ticker)
+        except Exception as exc:
+            logger.warning(f"motor3.exit.reconcile_get_orders_failed ticker={ticker}: {exc}")
+            return False
+        orders = {
+            str(o.get("client_order_id", "")): o
+            for o in (resp.get("orders", []) if isinstance(resp, dict) else [])
+            if isinstance(o, dict)
+        }
+        clear = True
+        for t in pending:
+            o = orders.get(t.client_order_id)
+            if o is None:
+                logger.warning(
+                    f"motor3.exit.reconcile_unresolved coid={t.client_order_id} "
+                    "(no aparece en get_orders — sin veredicto, no se vende este tick)"
+                )
+                clear = False
+                continue
+            status = str(o.get("status", ""))
+            fill = _as_int(o.get("fill_count", o.get("fill_count_fp")))
+            if fill is None and status == "executed":
+                fill = t.count  # executed sin fill_count legible → IOC lleno completo
+            fill = fill or 0
+            if fill > 0:
+                try:
+                    self._finalize_fill(
+                        t.client_order_id,
+                        ticker,
+                        side,
+                        fill,
+                        t.price_cents,
+                        str(o.get("order_id", "")) or None,
+                    )
+                    logger.info(
+                        f"motor3.exit.reconciled_filled coid={t.client_order_id} fill={fill} "
+                        "(el sell del error_red SÍ llenó — no se re-vende)"
+                    )
+                except Exception:
+                    logger.critical(
+                        f"motor3.exit.reconcile_persist_failed coid={t.client_order_id}"
+                    )
+                    self._engage_preventive_pause(t.client_order_id)
+                    clear = False
+            else:
+                self._update_sell_intent(
+                    t.client_order_id,
+                    critical=False,
+                    status="cancelled",
+                    notes_append=f"reconciled_{status or 'unknown'}",
+                )
+        return clear
+
+    def _engage_preventive_pause(self, coid: str) -> None:
+        """Fill real de venta que no se pudo registrar → kill-switch persistente (el sistema
+        quedaría ciego: re-venta fantasma + PnL doble). Mismo patrón que los otros executors."""
+        msg = f"motor3.exit: persist post-fill falló (coid={coid}) — venta real sin registrar"
+        logger.critical(f"motor3.exit.preventive_pause {msg}")
+        try:
+            from src.monitoring.health import BotState
+
+            BotState.is_paused = True
+            BotState.pause_reason = msg
+            engage_kill_switch(msg)
+        except Exception:  # pragma: no cover - último recurso
+            logger.exception("motor3.exit.preventive_pause_failed")
 
     def _settle_originals(self, ticker: str, side: str, exit_price: int, filled_count: int) -> None:
         """
@@ -236,7 +446,10 @@ class Motor3ExitExecutor:
 
         Parcial: si el fill cubre solo parte de una pata, esa pata se PARTE — el remanente
         sigue 'filled' (abierto, el poller lo re-sincroniza y se reintenta) y se crea una
-        hija 'settled' por la porción cerrada. Best-effort: un fallo se loguea, no rompe.
+        hija 'settled' por la porción cerrada.
+
+        CRÍTICO (fix auditoría 2026-07-01): un fallo acá ESCALA al caller (antes era
+        best-effort → BUYs 'filled' para siempre = re-venta fantasma + settlement doble).
         """
         origin = self._entry_origin
         now = _naive_utc_now()
@@ -256,6 +469,11 @@ class Motor3ExitExecutor:
                     )
                 )
                 remaining = filled_count
+                # Fee del EXIT asignada por tramo ACUMULATIVO (deuda auditoría 2026-07-01):
+                # sumar ceil(fee(closed)) por pata sobre-cobraba hasta (n_patas−1)¢ y no
+                # cuadraba con la fila SELL. cumfee(k)−cumfee(k_prev) suma EXACTO el fee
+                # real del fill total.
+                closed_so_far = 0
                 for b in buys:
                     if remaining <= 0:
                         break
@@ -263,12 +481,12 @@ class Motor3ExitExecutor:
                         continue
                     buy_price = b.fill_price_cents or b.price_cents
                     closed = min(b.count, remaining)
+                    exit_fee_tramo = kalshi_fee_cents(
+                        closed_so_far + closed, exit_price
+                    ) - kalshi_fee_cents(closed_so_far, exit_price)
+                    entry_fee_tramo = kalshi_fee_cents(closed, buy_price)
                     # PnL realizado del tramo cerrado: (salida − entrada) − fees de ambos lados.
-                    pnl = (
-                        closed * (exit_price - buy_price)
-                        - kalshi_fee_cents(closed, exit_price)
-                        - kalshi_fee_cents(closed, buy_price)
-                    )
+                    pnl = closed * (exit_price - buy_price) - exit_fee_tramo - entry_fee_tramo
                     if closed == b.count:
                         b.status = "settled"
                         b.closed_by_clv = True
@@ -279,6 +497,11 @@ class Motor3ExitExecutor:
                     else:
                         # Partial: reduce el original (remanente sigue abierto) + hija settled.
                         b.count = b.count - closed
+                        if b.fees_cents is not None:
+                            # Prorratear las fees de ENTRADA al remanente (deuda auditoría:
+                            # dejar el fee del count original hacía que _leg_pnl_cents las
+                            # restara DOS veces cuando el remanente settlea por resolución).
+                            b.fees_cents = max(0, b.fees_cents - entry_fee_tramo)
                         s.add(b)
                         s.add(
                             Trade(
@@ -294,10 +517,13 @@ class Motor3ExitExecutor:
                                 closed_by_clv=True,
                                 settled_at=now,
                                 pnl_cents=pnl,
+                                fees_cents=entry_fee_tramo,
                                 notes="closed_by_clv split",
                             )
                         )
                     remaining -= closed
+                    closed_so_far += closed
                 s.commit()
         except Exception:
             logger.exception(f"motor3.exit.settle_originals_failed ticker={ticker}")
+            raise

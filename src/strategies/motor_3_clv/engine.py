@@ -91,7 +91,17 @@ class Motor3Engine:
 
     async def _tick(self) -> None:
         """Un ciclo: refresca cartera, detecta salidas (tiempo + take-profit), y liquida."""
-        await self._poller.sync_once()
+        try:
+            await self._poller.sync_once()
+        except Exception as exc:
+            # Deuda auditoría 2026-07-01: el aislamiento "un fallo se registra y el loop
+            # sigue" vivía en poller.run(), que producción NO usa. Un outage de la API en
+            # la ventana T-30 abortaba el tick entero y costaba la salida. El tick sigue
+            # con el cache de PortfolioPosition en DB (stale de <=60s, decidible igual).
+            logger.warning(
+                f"motor3.engine.sync_failed {type(exc).__name__}: {exc} → tick con cache"
+            )
+            BotState.record_error(f"motor3.poller: {type(exc).__name__}: {exc}")
         now = _naive_utc_now()
         with get_session() as s:
             positions = list(s.exec(select(PortfolioPosition)))
@@ -112,8 +122,10 @@ class Motor3Engine:
         if self._take_profit_enabled:
             for p in positions:
                 bid = await self._current_bid(p, bid_cache)
-                if take_profit_due(p, bid, self._tp_threshold):
-                    entry = self._entry_bid_for(p)
+                # El entry se resuelve ANTES del check: el TP solo asegura ganancia neta
+                # sobre el entry (nunca liquida en pérdida una entrada cara).
+                entry = self._entry_bid_for(p)
+                if take_profit_due(p, bid, self._tp_threshold, entry_cents=entry):
                     logger.info(
                         f"[MOTOR 3 TP SHADOW] take_profit {p.ticker} {p.count}c "
                         f"side={p.side} bid={bid}c >= {self._tp_threshold}c "

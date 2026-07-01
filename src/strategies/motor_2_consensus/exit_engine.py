@@ -128,6 +128,12 @@ class Motor2ExitEngine:
     async def _tick(self) -> None:
         """Un ciclo: agrega posiciones abiertas de Motor 2, detecta salidas y (liquida)."""
         positions = self._load_open_positions()
+        # Higiene del trailing (deuda auditoría 2026-07-01): podar los peaks de posiciones
+        # que ya no existen. Sin esto, una posición cerrada y re-abierta en el mismo
+        # (ticker, side) heredaba el peak del episodio anterior → trailing prematuro
+        # (venta espuria de una posición recién abierta).
+        alive = {(p.ticker, p.side) for p in positions}
+        self._peaks = {k: v for k, v in self._peaks.items() if k in alive}
         logger.info(
             f"[MOTOR 2 EXIT DIAG] open_positions={len(positions)} "
             f"tp_enabled={self._take_profit_enabled} trail_enabled={self._trailing_enabled} "
@@ -140,7 +146,9 @@ class Motor2ExitEngine:
         exits: list[Motor2Position] = []
         for pos in positions:
             bid = await self._current_bid(pos.ticker, pos.side, bid_cache)
-            tp_due = self._take_profit_enabled and take_profit_due(pos, bid, self._tp_threshold)
+            tp_due = self._take_profit_enabled and take_profit_due(
+                pos, bid, self._tp_threshold, entry_cents=pos.entry_cents
+            )
 
             trail_due = False
             peak: int | None = None
