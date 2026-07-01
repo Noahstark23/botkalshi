@@ -9,6 +9,7 @@ ejecuta capital; el loop respeta stop_event.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlmodel import select
@@ -16,9 +17,20 @@ from sqlmodel import select
 import src.storage.models as models
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 from src.strategies.motor_2_consensus.detector import KalshiEventQuotes, KalshiQuote
+from src.strategies.motor_2_consensus.matcher import start_time_et
 from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
 
-EV = "KXWCGAME-26JUN27JORARG"
+# El matching ahora exige que la fecha del event_key coincida con el commence_time (en ET);
+# el datestamp se deriva del commence del test para que la coherencia se mantenga sola.
+_KEY_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
+def _key_datestamp(dt) -> str:
+    et = start_time_et(dt)
+    return f"{et.year % 100:02d}{_KEY_MONTHS[et.month - 1]}{et.day:02d}"
+
+_COMMENCE = datetime.now(UTC) + timedelta(hours=2)
+EV = f"KXWCGAME-{_key_datestamp(_COMMENCE)}JORARG"
 
 
 class _FakeKalshiSource:

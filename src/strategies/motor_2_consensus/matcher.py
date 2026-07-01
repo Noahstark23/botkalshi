@@ -26,6 +26,57 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
+
+# Convención de fechas de Kalshi (exchange US): el datestamp del event_key es la fecha
+# LOCAL del Este. Un juego a las 10pm ET es "hoy" en el key aunque en UTC ya sea mañana.
+ET = ZoneInfo("America/New_York")
+
+_KEY_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}  # fmt: skip
+
+# Segmento fecha del event_key: "26JUN27..." = 2026-06-27; los doubleheaders de MLB
+# agregan la hora ET: "26JUN271610..." = 2026-06-27 16:10 ET.
+_EVENT_KEY_START_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})(\d{4})?")
+
+
+def parse_event_key_start(event_key: str) -> tuple[date, tuple[int, int] | None] | None:
+    """Fecha (y hora ET opcional, doubleheaders) embebida en el event_key de Kalshi.
+
+    "KXMLBGAME-26JUN27NYMPHI"      → (date(2026, 6, 27), None)
+    "KXMLBGAME-26JUN271610PHINYM"  → (date(2026, 6, 27), (16, 10))
+    Key sin datestamp parseable → None (el caller cae al matching sin fecha).
+    """
+    parts = event_key.split("-")
+    if len(parts) < 2:
+        return None
+    m = _EVENT_KEY_START_RE.match(parts[1])
+    if m is None:
+        return None
+    yy, mon, dd, hhmm = m.group(1), m.group(2), m.group(3), m.group(4)
+    month = _KEY_MONTHS.get(mon)
+    if month is None:
+        return None
+    try:
+        d = date(2000 + int(yy), month, int(dd))
+    except ValueError:
+        return None
+    start: tuple[int, int] | None = None
+    if hhmm is not None:
+        hh, mi = int(hhmm[:2]), int(hhmm[2:])
+        if hh < 24 and mi < 60:
+            start = (hh, mi)
+    return d, start
+
+
+def start_time_et(commence_time: datetime) -> datetime:
+    """`commence_time` (aware, o naive asumido UTC) convertido a hora del Este."""
+    if commence_time.tzinfo is None:
+        commence_time = commence_time.replace(tzinfo=UTC)
+    return commence_time.astimezone(ET)
 
 # Alias conocidos (clave = nombre YA normalizado por normalize_name → valor canónico).
 # Resuelve discrepancias Odds API ↔ Kalshi sin matchear por error. Curada y extensible.

@@ -18,6 +18,20 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
+from src.strategies.motor_2_consensus.matcher import start_time_et
+
+# El matching exige coherencia fecha(event_key) ↔ commence_time (ET); se derivan juntos.
+_KEY_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+_COMMENCE = datetime.now(UTC) + timedelta(hours=2)
+
+
+def _key_datestamp(dt) -> str:
+    et = start_time_et(dt)
+    return f"{et.year % 100:02d}{_KEY_MONTHS[et.month - 1]}{et.day:02d}"
+
+
+_PHINYM_EVENT_KEY = f"KXMLBGAME-{_key_datestamp(_COMMENCE)}PHINYM"
+
 from src.strategies.motor_2_consensus.detector import (
     KalshiEventQuotes,
     KalshiQuote,
@@ -51,7 +65,7 @@ def _phi_nym_event(*, phi_price: float = 1.72, nym_price: float = 2.38) -> OddsE
     return OddsEvent(
         id="phinym",
         sport_key="baseball_mlb",
-        commence_time=datetime.now(UTC) + timedelta(hours=2),
+        commence_time=_COMMENCE,
         home_team="Philadelphia Phillies",
         away_team="New York Mets",
         bookmakers=(Bookmaker(key="pinnacle", title="Pinnacle", markets=(market,)),),
@@ -61,16 +75,16 @@ def _phi_nym_event(*, phi_price: float = 1.72, nym_price: float = 2.38) -> OddsE
 def _phi_nym_kalshi(*, phi_yes: int, phi_no: int, nym_yes: int, nym_no: int) -> KalshiEventQuotes:
     """Las DOS patas del partido, cada una en su market_ticker (...-PHI y ...-NYM)."""
     return KalshiEventQuotes(
-        event_key="KXMLBGAME-26JUN271610PHINYM",
+        event_key=_PHINYM_EVENT_KEY,
         outcomes=(
             KalshiQuote(
-                "KXMLBGAME-26JUN271610PHINYM-PHI",
+                _PHINYM_EVENT_KEY + "-PHI",
                 "Philadelphia Phillies",
                 yes_ask_cents=phi_yes,
                 no_ask_cents=phi_no,
             ),
             KalshiQuote(
-                "KXMLBGAME-26JUN271610PHINYM-NYM",
+                _PHINYM_EVENT_KEY + "-NYM",
                 "New York Mets",
                 yes_ask_cents=nym_yes,
                 no_ask_cents=nym_no,
@@ -123,7 +137,7 @@ def test_distinct_events_independent_signals():
     odds_lal = OddsEvent(
         id="lalbos",
         sport_key="basketball_nba",
-        commence_time=datetime.now(UTC) + timedelta(hours=2),
+        commence_time=_COMMENCE,
         home_team="Los Angeles Lakers",
         away_team="Boston Celtics",
         bookmakers=(
