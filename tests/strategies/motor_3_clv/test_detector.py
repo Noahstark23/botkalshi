@@ -33,12 +33,17 @@ def _pos(ticker: str, *, minutes_to_close: float | None, count: int = 10) -> Por
 @pytest.mark.parametrize(
     ("minutes_to_close", "expected"),
     [
-        (29.0, True),  # dentro de [28, 30] → dispara
+        (29.0, True),  # dentro de la ventana nominal [28, 30] → dispara
         (30.0, True),  # borde superior exacto → dispara
-        (28.0, True),  # borde inferior exacto → dispara
+        (28.0, True),  # borde inferior nominal → dispara
         (30.1, False),  # aún lejos del cierre (>30) → no
-        (27.9, False),  # ya pasó la ventana (<28) → no re-dispara
-        (5.0, False),  # muy cerca del cierre pero fuera de ventana → no
+        # FALLBACK (fix auditoría 2026-07-01): antes <28 devolvía False PARA SIEMPRE — un
+        # tick lento (>60s) o un outage que pisara la ventana abandonaba la posición a
+        # resolución (el destino que el motor existe para evitar). Ahora sigue debida
+        # hasta el cierre; el anti-spam vive en el nivel de LOG, no en la decisión.
+        (27.9, True),  # ventana nominal perdida → SIGUE debida (fallback)
+        (5.0, True),  # cerca del cierre sin haber salido → sigue debida
+        (0.0, False),  # cierre exacto → ya no hay con quién cruzar
         (-1.0, False),  # mercado YA cerrado (remaining negativo) → no
         (120.0, False),  # 2h al cierre → no
     ],
@@ -66,9 +71,10 @@ def test_scan_exits_filters_only_due():
         _pos("C", minutes_to_close=28.5),  # due
         _pos("D", minutes_to_close=None),  # sin close_time
         _pos("E", minutes_to_close=-3.0),  # ya cerrado
+        _pos("F", minutes_to_close=10.0),  # ventana nominal perdida → fallback: due
     ]
     due = scan_exits(positions, NOW)
-    assert {p.ticker for p in due} == {"A", "C"}
+    assert {p.ticker for p in due} == {"A", "C", "F"}
 
 
 def test_summarize_exits_classifies_every_bucket():
@@ -79,15 +85,15 @@ def test_summarize_exits_classifies_every_bucket():
         _pos("C", minutes_to_close=28.5),  # due
         _pos("D", minutes_to_close=None),  # sin close_time
         _pos("E", minutes_to_close=-3.0),  # past (ya cerrado)
-        _pos("F", minutes_to_close=10.0),  # past (<28)
+        _pos("F", minutes_to_close=10.0),  # fallback: sigue debida (ventana nominal perdida)
     ]
     s = summarize_exits(positions, NOW)
     assert s.total == 6
     assert s.with_close_time == 5
     assert s.without_close_time == 1
-    assert s.due == 2  # A, C
+    assert s.due == 3  # A, C, F
     assert s.pre_window == 1  # B
-    assert s.past_window == 2  # E, F
+    assert s.past_window == 1  # E (solo mercados ya cerrados)
     # cada posición-con-close_time cae en exactamente un bucket
     assert s.due + s.pre_window + s.past_window == s.with_close_time
 
