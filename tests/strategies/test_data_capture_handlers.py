@@ -29,6 +29,45 @@ def service():
         return svc
 
 
+def test_ensure_v2_manager_publishes_botstate_early_and_idempotent():
+    """_ensure_v2_manager crea la instancia + la publica en BotState ANTES del discovery (cierra la
+    carrera del /status instance=missing) y es idempotente."""
+    with (
+        patch("src.strategies.data_capture.get_settings") as gs,
+        patch("src.strategies.data_capture.KalshiWebSocket"),
+    ):
+        s = gs.return_value
+        s.USE_ORDERBOOK_MANAGER_V2 = True
+        s.MOTOR_1_ARBITRAGE_ENABLED = False
+        s.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC = 30.0
+        s.ORDERBOOK_V2_MAX_RECOVERY_BUFFER = 25000
+        svc = DataCaptureService()
+        assert svc._v2_manager is None
+
+        svc._ensure_v2_manager()
+        assert svc._v2_manager is not None
+        assert BotState.v2_manager is svc._v2_manager
+
+        first = svc._v2_manager
+        svc._ensure_v2_manager()  # idempotente: no recrea
+        assert svc._v2_manager is first
+    BotState.v2_manager = None  # limpieza (estado de CLASE)
+
+
+def test_ensure_v2_manager_noop_when_disabled():
+    """Con V2 y Motor 1 apagados, no se crea nada (path idéntico al previo)."""
+    with (
+        patch("src.strategies.data_capture.get_settings") as gs,
+        patch("src.strategies.data_capture.KalshiWebSocket"),
+    ):
+        s = gs.return_value
+        s.USE_ORDERBOOK_MANAGER_V2 = False
+        s.MOTOR_1_ARBITRAGE_ENABLED = False
+        svc = DataCaptureService()
+        svc._ensure_v2_manager()
+        assert svc._v2_manager is None
+
+
 # =====================================================
 # parse_price_to_cents
 # =====================================================
