@@ -29,6 +29,8 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
+from loguru import logger
+
 # Convención de fechas de Kalshi (exchange US): el datestamp del event_key es la fecha
 # LOCAL del Este. Un juego a las 10pm ET es "hoy" en el key aunque en UTC ya sea mañana.
 ET = ZoneInfo("America/New_York")
@@ -70,6 +72,44 @@ def parse_event_key_start(event_key: str) -> tuple[date, tuple[int, int] | None]
         if hh < 24 and mi < 60:
             start = (hh, mi)
     return d, start
+
+
+# Deporte por prefijo de serie Kalshi → prefijos de sport_key de The Odds API. El matcher
+# de nombres es global y los aliases ciudad→equipo son de MLB: sin este gate, onboardear
+# otro deporte "sin tocar código" (como invita la config) armaba el cross-match catastrófico
+# (NBA "Boston" canoniza a "boston red sox" y matchea el set MLB). Serie DESCONOCIDA → no
+# filtra (compat), pero se loguea one-shot para agregarla acá al onboardear.
+_SERIES_SPORT_PREFIXES: dict[str, tuple[str, ...]] = {
+    "KXMLBGAME": ("baseball",),
+    "KXWCGAME": ("soccer",),
+    "KXWCGROUPWIN": ("soccer",),
+    "KXMENWORLDCUP": ("soccer",),
+    "KXMWORLDCUP": ("soccer",),
+    "KXNBAGAME": ("basketball",),
+    "KXNBA": ("basketball",),
+    "KXNHLGAME": ("icehockey",),
+    "KXNHL": ("icehockey",),
+    "KXNFLGAME": ("americanfootball",),
+    "KXNFL": ("americanfootball",),
+}
+_unknown_series_logged: set[str] = set()
+
+
+def series_sport_compatible(event_key: str, sport_key: str) -> bool:
+    """False si la serie del event_key tiene deporte CONOCIDO y el sport_key del odds
+    event no le corresponde. Serie desconocida → True (no filtra; log one-shot)."""
+    prefix = event_key.split("-", 1)[0]
+    sports = _SERIES_SPORT_PREFIXES.get(prefix)
+    if sports is None:
+        if prefix not in _unknown_series_logged:
+            _unknown_series_logged.add(prefix)
+            logger.info(
+                f"motor2.matcher.serie_sin_deporte prefix={prefix} — agregar a "
+                "_SERIES_SPORT_PREFIXES al onboardear (sin el gate, los aliases de ciudad "
+                "pueden cruzar deportes)"
+            )
+        return True
+    return any(sport_key.startswith(sp) for sp in sports)
 
 
 def start_time_et(commence_time: datetime) -> datetime:
@@ -118,7 +158,13 @@ TEAM_ALIASES: dict[str, str] = {
     # hoy Motor 2 corre 1 sport_key a la vez, así que es seguro.
     "arizona": "arizona diamondbacks",
     "atlanta": "atlanta braves",
-    "as": "athletics",  # [verificar] Kalshi "A's"→'as'; Odds podría usar "Oakland/Sacramento Athletics"
+    # Athletics: la franquicia dejó Oakland (Sacramento 2025-27 → Las Vegas); The Odds
+    # API puede reportar cualquiera de las variantes con ciudad. Todas son EL MISMO
+    # equipo → cero riesgo de cross-match. Kalshi "A's" normaliza a 'as'.
+    "as": "athletics",
+    "oakland athletics": "athletics",
+    "sacramento athletics": "athletics",
+    "las vegas athletics": "athletics",
     "baltimore": "baltimore orioles",
     "boston": "boston red sox",
     "chicago c": "chicago cubs",

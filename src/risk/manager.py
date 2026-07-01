@@ -5,6 +5,7 @@ Motor de Gestión de Riesgo (Fase 2 Motor 1).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 
@@ -12,6 +13,7 @@ from loguru import logger
 from sqlmodel import col, select
 
 from src.math.arbitrage import ArbOpportunity
+from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
 from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
@@ -43,11 +45,10 @@ class RiskManager:
     - PnL realized-only: trades filled-no-settled no cuentan para stop-loss. Es una
       DECISIÓN de semántica financiera del owner, no un bug — el settlement (PR-B)
       la vuelve operativa (settled ahora existe), no la cambia.
-    - Residual del lock: la ventana check→persist-intents sigue abierta (el lock
-      cubre el CHECK, los intents los escribe el executor después). Peor caso con
-      N motores en el timing exacto: overshoot de N×MAX_TRADE_SIZE_PCT sobre el cap
-      de exposición (hoy N=1 motor con single-flight → residual teórico). Cierre
-      total = reserva transaccional en el check; anotado como mejora si N crece.
+    - Residual del lock (REDUCIDO 2026-07-01): check_and_reserve escribe el intent
+      bajo el MISMO lock y Motor 2 lo usa — su ventana check→persist quedó cerrada.
+      Motor REST sigue con check_pre_trade + _persist_intents fuera del lock
+      (migrarlo es un refactor de su engine/executor, anotado como mejora aparte).
     """
 
     # Lock de CLASE: serializa check_pre_trade entre TODAS las instancias (un
@@ -289,6 +290,30 @@ class RiskManager:
         async with RiskManager._check_lock:
             return await self._check_pre_trade_locked(opp)
 
+    async def check_and_reserve(
+        self, opp: ArbOpportunity, persist_intent: Callable[[TradeDecision], bool]
+    ) -> TradeDecision:
+        """Check + persistencia del intent bajo el MISMO lock (deuda auditoría 2026-07-01).
+
+        Cierra la ventana check→persist-intent para quien lo use: la fila intent queda
+        escrita ANTES de soltar el lock, así el próximo check (de este u otro motor) ya la
+        ve en la exposición. `persist_intent` recibe la decisión aprobada (para dimensionar
+        la fila con max_allowed_count) y devuelve False si no pudo escribir → la decisión
+        se degrada a rechazo (el caller NO debe operar sin rastro).
+
+        El callback es sincrónico y corto (un INSERT); no meter I/O de red acá — bloquea
+        el gatekeeper de todos los motores. Motor REST sigue usando check_pre_trade + su
+        propio _persist_intents fuera del lock (residual documentado en el docstring de
+        clase; migrarlo es un refactor aparte).
+        """
+        async with RiskManager._check_lock:
+            decision = await self._check_pre_trade_locked(opp)
+            if not decision.approved:
+                return decision
+            if not persist_intent(decision):
+                return TradeDecision(False, "persist_intent_failed", 0)
+            return decision
+
     async def _check_pre_trade_locked(self, opp: ArbOpportunity) -> TradeDecision:
         """Cuerpo del check (bajo lock). Lógica idéntica a la versión histórica."""
         if BotState.is_paused:
@@ -338,7 +363,13 @@ class RiskManager:
         if total_cost_per_unit_cents <= 0:
             return TradeDecision(False, "Costo de oportunidad <= 0 (datos inválidos)", 0)
 
-        max_count_by_capital = int(usable_usd * 100) // total_cost_per_unit_cents
+        # + fees por unidad (deuda auditoría 2026-07-01): el USD comprometido real incluye
+        # la comisión — sin esto el count aprobado podía exceder usable_usd por el monto de
+        # las fees. fee(1, p) por pata sobrestima por el ceil → dirección conservadora.
+        fees_per_unit_cents = sum(kalshi_fee_cents(1, leg.price_cents) for leg in opp.legs)
+        max_count_by_capital = int(usable_usd * 100) // (
+            total_cost_per_unit_cents + fees_per_unit_cents
+        )
         allowed_count = min(opp.count, max_count_by_capital)
 
         if allowed_count <= 0:

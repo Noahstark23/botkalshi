@@ -23,6 +23,7 @@ NO cablea ejecución: emite señales, no coloca órdenes. TRADING_ENABLED=false.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -37,6 +38,7 @@ from src.strategies.motor_2_consensus.matcher import (
     canonical_name,
     match_outcomes,
     parse_event_key_start,
+    series_sport_compatible,
     start_time_et,
 )
 
@@ -116,22 +118,39 @@ def _consensus_fair_probs(odds_event: OddsEvent) -> dict[str, float]:
     Probabilidad JUSTA por outcome canónico: promedia la prob implícita de cada
     bookmaker (consenso) y le quita el vig (multiplicativo). {} si no hay h2h usable.
     """
+    # Set de REFERENCIA: los outcomes canónicos del primer bookmaker con h2h. Cada casa
+    # entra al consenso solo con el set COMPLETO e IDÉNTICO (deuda auditoría 2026-07-01:
+    # agregar outcomes sueltos de casas parciales normalizaba el no-vig sobre el conjunto
+    # equivocado → fair inflado en los outcomes presentes, p.ej. un 1X2 sin Draw daba
+    # A=0.60/B=0.40 cuando el real era ~0.50/0.33/0.17 — edge fantasma de ~10pp).
+    reference = {canonical_name(n) for n in _h2h_outcome_names(odds_event)}
+    if len(reference) < 2:
+        return {}
     sums: dict[str, float] = {}
     counts: dict[str, int] = {}
     book_keys: set[str] = set()
+    skipped_books = 0
     for bk in odds_event.bookmakers:
         for mk in bk.markets:
             if mk.key != "h2h":
                 continue
-            book_keys.add(bk.key)
+            probs: dict[str, float] = {}
             for o in mk.outcomes:
-                cn = canonical_name(o.name)
-                try:
-                    p = implied_prob(o.price)
-                except ValueError:
-                    continue  # cuota inválida → ignorar ese outcome
+                # Cuota inválida → el set de esta casa queda incompleto → se descarta abajo.
+                with contextlib.suppress(ValueError):
+                    probs[canonical_name(o.name)] = implied_prob(o.price)
+            if set(probs) != reference:
+                skipped_books += 1
+                continue  # set distinto/incompleto → esta casa NO entra al consenso
+            book_keys.add(bk.key)
+            for cn, p in probs.items():
                 sums[cn] = sums.get(cn, 0.0) + p
                 counts[cn] = counts.get(cn, 0) + 1
+    if skipped_books:
+        logger.info(
+            f"motor2.consensus.books_descartadas event={getattr(odds_event, 'id', '?')} "
+            f"n={skipped_books} (set de outcomes distinto/incompleto vs referencia)"
+        )
     if len(sums) < 2:
         return {}
     names = list(sums)
@@ -245,6 +264,11 @@ def find_signals(
         # matcheara la línea pre-match del juego 2: precios en vivo vs línea de OTRO juego).
         candidates: list[OddsEvent] = []
         for oe in odds_events:
+            # Gate serie↔deporte (deuda auditoría 2026-07-01): los aliases de ciudad son
+            # MLB-scoped pero el matcher es global — sin esto, onboardear NBA cruzaba
+            # "Boston" (Celtics) contra el set canónico de los Red Sox.
+            if not series_sport_compatible(ke.event_key, oe.sport_key):
+                continue
             odds_names = _h2h_outcome_names(oe)
             if not odds_names:
                 continue

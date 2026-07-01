@@ -305,3 +305,77 @@ async def test_concurrent_checks_are_serialized_across_instances():
 
     assert overlap["max_seen"] == 1  # el lock de clase impidió el solape
     assert d1.approved is True and d2.approved is True
+
+
+# =====================================================
+# check_and_reserve (deuda auditoría 2026-07-01): check + intent bajo el MISMO lock
+# =====================================================
+
+
+def _persist_intent_row(count: int, *, price: int = 50, coid: str | None = None) -> bool:
+    with models.get_session() as s:
+        s.add(
+            models.Trade(
+                client_order_id=coid or str(uuid.uuid4()),
+                ticker="KXRSV",
+                side="yes",
+                action="buy",
+                count=count,
+                price_cents=price,
+                strategy="motor_2_consensus",
+                status="pending",
+            )
+        )
+        s.commit()
+    return True
+
+
+def _single_leg_opp(count: int, *, price: int = 50) -> ArbOpportunity:
+    leg = ArbLeg(
+        market_ticker="KXRSV", side="yes", price_cents=price, count=count, available_size=count
+    )
+    return ArbOpportunity(
+        legs=(leg,),
+        count=count,
+        gross_profit_cents=0,
+        fees_cents=0,
+        net_profit_cents=0,
+        edge_pct=5.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reserves_cannot_approve_against_same_exposure():
+    """Dos reservas CONCURRENTES: la segunda ya ve el intent de la primera (la fila se
+    escribe antes de soltar el lock). Antes, con el persist fuera del lock, ambas podían
+    aprobarse contra la misma exposición leída → overshoot de hasta 2× el cap por trade."""
+    # Exposición previa $800 → remaining $200 del cap de 25% ($1000).
+    _insert_trade(strategy="motor_2_consensus", status="filled", price=50, count=1600)
+    rm = _manager()
+
+    async def _reserve():
+        with patch("src.risk.manager.get_settings", return_value=_risk_settings()):
+            return await rm.check_and_reserve(
+                _single_leg_opp(400), lambda d: _persist_intent_row(d.max_allowed_count)
+            )
+
+    first, second = await asyncio.gather(_reserve(), _reserve())
+
+    assert first.approved and second.approved
+    # La primera toma casi todo el remaining; la segunda queda con las migas — NUNCA
+    # el mismo tamaño (eso sería la carrera vieja: dos aprobaciones por el mismo cupo).
+    counts = sorted((first.max_allowed_count, second.max_allowed_count), reverse=True)
+    assert counts[1] < counts[0]
+    # El total comprometido (previo + ambos intents, a 50c + fee/unit) respeta el cap de $1000.
+    total_usd = 800 + sum(c * 50 for c in counts) / 100
+    assert total_usd <= 1000.0
+
+
+@pytest.mark.asyncio
+async def test_reserve_persist_failure_degrades_to_rejection():
+    """Si el intent no se puede escribir, la decisión aprobada se degrada a rechazo
+    (el caller no debe operar sin rastro para el RiskManager)."""
+    rm = _manager()
+    with patch("src.risk.manager.get_settings", return_value=_risk_settings()):
+        decision = await rm.check_and_reserve(_single_leg_opp(10), lambda d: False)
+    assert not decision.approved and decision.reason == "persist_intent_failed"
