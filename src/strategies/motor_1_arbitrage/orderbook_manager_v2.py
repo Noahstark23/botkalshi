@@ -257,9 +257,13 @@ class OrderbookManagerV2:
         return frozenset(self._books.keys())
 
     def get_top_of_book(self, ticker: str, side: Literal["yes", "no"]) -> BookTop | None:
-        """Top of book. Returns None if ticker is unknown, stale, or uninitialized."""
+        """Top of book. Returns None if ticker is unknown, stale, or uninitialized.
+
+        El chequeo de is_stale faltaba (el docstring ya lo prometía): un book stale = esperando el
+        snapshot de recovery, sus datos están DESACTUALIZADOS. Servirlos daría un book incoherente
+        a quien lea (crítico para market making). None hasta que el snapshot lo re-basee."""
         state = self._books.get(ticker)
-        if state is None or not state.is_initialized:
+        if state is None or not state.is_initialized or state.is_stale:
             return None
         return state.top_of_book(side)
 
@@ -642,6 +646,14 @@ class OrderbookManagerV2:
             # aplicó. Un delta con seq > snapshot_seq es una actualización real que
             # se perdería si se descartara, dejando el book sub-construido.
             self._bootstrap_buffer.setdefault(ticker, []).append(raw_msg)
+            return False
+        if state.is_stale:
+            # CAUSA RAÍZ del desync constante (~10% de los logs): tras una recovery que NO completó
+            # (buffer overflow → circuit breaker → sid deshabilitado, o snapshots bloqueados por la
+            # cuenta), el book queda STALE pero los deltas seguían aplicándose sobre él → el estado
+            # divergía hasta qty<0 → OrderbookDesyncError, mensaje tras mensaje. NO se aplica sobre
+            # un book stale: se dropea el delta (se re-basea con el snapshot de recovery cuando
+            # llegue; hasta entonces get_top_of_book devuelve None → nadie lee un book corrupto).
             return False
 
         price_raw = msg.get("price_dollars") or msg.get("price")

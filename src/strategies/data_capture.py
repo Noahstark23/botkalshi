@@ -603,6 +603,27 @@ class DataCaptureService:
     # Lifecycle
     # =====================================================
 
+    def _ensure_v2_manager(self) -> None:
+        """Crea el OrderbookManagerV2 y lo publica en BotState. IDEMPOTENTE. Se llama TEMPRANO (en
+        run(), antes del discovery) para cerrar la condición de carrera del /status: el discovery
+        puede tardar minutos (o devolver 0 y reintentar), y hasta que corría _register_ws_handlers
+        el BotState.v2_manager quedaba None → /status reportaba instance=missing pese a estar
+        habilitado. Con la creación temprana, la instancia existe desde el arranque; los handlers
+        del WS se registran aparte en _register_ws_handlers."""
+        if self._v2_manager is not None:
+            return
+        if not (self.settings.USE_ORDERBOOK_MANAGER_V2 or self.settings.MOTOR_1_ARBITRAGE_ENABLED):
+            return
+        from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
+
+        self._v2_manager = OrderbookManagerV2(
+            self.ws,
+            recovery_timeout_sec=self.settings.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC,
+            max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
+        )
+        BotState.v2_manager = self._v2_manager
+        logger.info("OrderbookManagerV2 creado + publicado en BotState (pre-discovery)")
+
     def _register_ws_handlers(self) -> None:
         """
         Registra los handlers del WS. Separado de run() para testear el wiring.
@@ -617,20 +638,12 @@ class DataCaptureService:
         self.ws.on("ticker", self._on_ticker)
         self.ws.on("trade", self._on_trade)
 
-        # Orderbook manager — V2 cuando el flag V2 está on O Motor 1 está on. data_capture
-        # SIEMPRE construye el manager y registra sus 4 handlers en el WS (lifecycle del
-        # feed = del WS). Motor 1 lo LEE desde el servicio (self._v2_manager) y BotState;
-        # NO lo reconstruye. Con MOTOR_1_ARBITRAGE_ENABLED=False y V2=False no se construye
-        # nada (path idéntico al previo).
-        if self.settings.USE_ORDERBOOK_MANAGER_V2 or self.settings.MOTOR_1_ARBITRAGE_ENABLED:
-            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
-
-            self._v2_manager = OrderbookManagerV2(
-                self.ws,
-                recovery_timeout_sec=self.settings.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC,
-                max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
-            )
-            BotState.v2_manager = self._v2_manager
+        # Orderbook manager V2: la INSTANCIA ya se creó (idempotente) — típicamente en run() ANTES
+        # del discovery, para que /status no reporte instance=missing durante el arranque. Acá solo
+        # se registran sus 4 handlers en el WS (lifecycle del feed = del WS). Motor 1 lo LEE desde
+        # self._v2_manager / BotState; NO lo reconstruye.
+        self._ensure_v2_manager()
+        if self._v2_manager is not None:
             self.ws.on("orderbook_delta", self._v2_manager.handle_message)
             self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)
             self.ws.on("ok", self._v2_manager.handle_message)
@@ -703,6 +716,10 @@ class DataCaptureService:
 
     async def run(self) -> None:
         """Loop principal del servicio."""
+        # Publicar el OrderbookManagerV2 en BotState ANTES del discovery: el discovery puede tardar
+        # minutos (o devolver 0 y reintentar), y hasta que corría _register_ws_handlers el /status
+        # reportaba instance=missing por la carrera. Idempotente con el registro posterior.
+        self._ensure_v2_manager()
         # Discovery con retry: la primera llamada al arranque suele topar 429
         # si Kalshi tiene rate limit acumulado por deploys/restarts previos.
         backoff = 5.0
