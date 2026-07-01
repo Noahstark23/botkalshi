@@ -2,7 +2,7 @@
 Tests del Trailing-stop detector (Motor 3, FASE 2) — salida por retroceso pura.
 
 Cubre: trailing solo en ganancia (peak>entry), boundary del retroceso, defensa current>peak,
-None no decidible, count<=0, drop<=0; evolución del peak; y la precedencia de decide_exit.
+None no decidible, count<=0, drop<=0; y la evolución del peak.
 Lógica síncrona/pura (sin red ni await), igual que test_take_profit.py.
 """
 
@@ -13,7 +13,6 @@ import pytest
 from src.storage.models import PortfolioPosition
 from src.strategies.motor_3_clv.trailing_stop import (
     DEFAULT_TRAILING_DROP_CENTS,
-    decide_exit,
     next_peak_bid,
     trailing_stop_due,
 )
@@ -93,22 +92,6 @@ def test_peak_then_trailing_flow():
     peak = next_peak_bid(peak, 84, entry)  # se mantiene 90 (no baja)
     assert peak == 90
     assert trailing_stop_due(_pos(), peak, 84, entry, 5) is True
-
-
-# --- decide_exit ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("tp", "trail", "time", "expected"),
-    [
-        (True, True, True, "take_profit"),  # TP gana
-        (False, True, True, "trailing_stop"),  # trailing > tiempo
-        (False, False, True, "time"),
-        (False, False, False, None),
-    ],
-)
-def test_decide_exit_precedence(tp, trail, time, expected):
-    assert decide_exit(take_profit_due=tp, trailing_due=trail, time_due=time) == expected
 
 
 # =====================================================

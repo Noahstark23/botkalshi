@@ -58,18 +58,3 @@ def trailing_stop_due(
     if current_bid > peak_bid:
         return False
     return current_bid <= peak_bid - drop_cents
-
-
-def decide_exit(*, take_profit_due: bool, trailing_due: bool, time_due: bool) -> str | None:
-    """Precedencia de salida cuando varias condiciones coinciden: take-profit > trailing > tiempo.
-
-    Helper puro/testeable. En el engine el dedup equivalente lo da el dict `exits` (una salida por
-    ticker por tick); como exit_position no recibe `reason`, la precedencia solo importa para
-    logging/análisis, no cambia QUÉ se vende."""
-    if take_profit_due:
-        return "take_profit"
-    if trailing_due:
-        return "trailing_stop"
-    if time_due:
-        return "time"
-    return None
