@@ -34,10 +34,19 @@ def _fake_session(positions: list[PortfolioPosition]):
     yield s
 
 
+@contextmanager
 def _patch_db(positions: list[PortfolioPosition]):
-    return patch(
-        "src.strategies.motor_3_clv.engine.get_session", new=lambda: _fake_session(positions)
-    )
+    """Sesión fake + bypass del filtro de atribución: estos tests validan la MECÁNICA del
+    tick (shadow/Capa A/TP/dedup) con una sesión MagicMock que responde a cualquier query;
+    la atribución real (skip de legs rest_arb / posiciones ajenas) se testea aparte con DB
+    real en test_engine_attribution.py."""
+    with (
+        patch(
+            "src.strategies.motor_3_clv.engine.get_session", new=lambda: _fake_session(positions)
+        ),
+        patch.object(Motor3Engine, "_attributable_positions", new=lambda self, ps: ps),
+    ):
+        yield
 
 
 def _fake_client_ctx():
@@ -110,6 +119,21 @@ async def test_partial_fill_reattempts_remainder_next_tick():
     close = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=29)
     with get_session() as s:
         s.add(PortfolioPosition(ticker="KXP", side="yes", count=10, close_time=close))
+        # Pata BUY que respalda la posición: sin ella, el filtro de atribución la skipea
+        # (posiciones sin filas propias no se gestionan — fix auditoría 2026-07-01).
+        s.add(
+            Trade(
+                client_order_id="KXP-buy",
+                ticker="KXP",
+                side="yes",
+                action="buy",
+                count=10,
+                price_cents=50,
+                fill_price_cents=50,
+                strategy="motor_2_consensus",
+                status="filled",
+            )
+        )
         s.commit()
 
     eng = Motor3Engine(trading_enabled=False)
@@ -398,7 +422,11 @@ async def test_tp_shadow_pnl_handles_missing_entry():
     eng._poller.sync_once = AsyncMock()
     eng._client = MagicMock()
     eng._client.get_orderbook = AsyncMock(return_value=_orderbook("yes", 62))
-    _seed_position("KXNOENT", peak=None)  # sin _seed_entry
+    _seed_position("KXNOENT", peak=None)
+    # Atribuible (tiene pata BUY) pero el entry no se pudo derivar (p.ej. error de DB en
+    # _entry_bid_for): el log del TP shadow debe degradar a entry=? sin romper.
+    _seed_entry("KXNOENT", price=60)
+    eng._entry_bid_for = lambda p: None
 
     captured: list[str] = []
     sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
