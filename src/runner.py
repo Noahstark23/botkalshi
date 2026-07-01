@@ -310,6 +310,7 @@ class ProductionRunner:
                         risk,
                         min_entry_cents=self.settings.MOTOR_2_MIN_ENTRY_CENTS,
                         underdog_filter_enabled=self.settings.MOTOR_2_UNDERDOG_FILTER_ENABLED,
+                        one_bet_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                     )
                     poller = Motor2ShadowPoller(
                         kalshi_source,

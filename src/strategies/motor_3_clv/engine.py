@@ -34,7 +34,11 @@ from src.strategies.motor_3_clv.trailing_stop import (
 
 # Estrategias de las patas BUY que un exit cierra (= _settle_originals). El entry del trailing
 # se deriva del primer BUY filled de estas (FIFO).
-_ENTRY_ORIGIN = ("motor_2_consensus", "motor_rest_arb")
+# ⚠️ motor_rest_arb EXCLUIDO (fix auditoría 2026-07-01): una posición respaldada por una leg
+# de arb hedged NUNCA se liquida suelta — vender la leg ganadora (TP a bid≥90 o salida T-30)
+# rompe el hedge y convierte profit lockeado en pérdida realizada. Esas posiciones las
+# resuelve el SettlementPoller del Motor REST por resolución de mercado.
+_ENTRY_ORIGIN = ("motor_2_consensus",)
 
 
 class Motor3Engine:
@@ -72,7 +76,7 @@ class Motor3Engine:
         async with KalshiRestClient() as client:
             self._client = client
             if self._trading_enabled:
-                self._executor = Motor3ExitExecutor(client)
+                self._executor = Motor3ExitExecutor(client, entry_origin=_ENTRY_ORIGIN)
             await self._loop(stop_event)
 
     async def _loop(self, stop_event: asyncio.Event) -> None:
@@ -91,6 +95,11 @@ class Motor3Engine:
         now = _naive_utc_now()
         with get_session() as s:
             positions = list(s.exec(select(PortfolioPosition)))
+        # ATRIBUCIÓN (fix auditoría 2026-07-01): PortfolioPosition es la posición NETA de la
+        # CUENTA — no distingue qué motor la abrió. Motor 3 solo gestiona posiciones
+        # respaldadas por BUYs abiertos de _ENTRY_ORIGIN; una leg de arb REST o una posición
+        # manual del dueño NO se toca (ni siquiera en shadow logs — no son salidas nuestras).
+        positions = self._attributable_positions(positions)
         # DIAG: por qué dispara (o no) este tick — evita el silencio total cuando nada es debido.
         logger.info(f"[MOTOR 3 DIAG] {summarize_exits(positions, now).one_line()}")
         due = detect_and_log(positions, now)  # SHADOW: siempre loguea las salidas por tiempo
@@ -137,6 +146,56 @@ class Motor3Engine:
         if self._executor is not None:
             for position in exits.values():
                 await self._executor.exit_position(position)
+
+    def _attributable_positions(
+        self, positions: list[PortfolioPosition]
+    ) -> list[PortfolioPosition]:
+        """Filtra a las posiciones que Motor 3 tiene derecho a gestionar.
+
+        Reglas (fix auditoría 2026-07-01 — PortfolioPosition es la posición NETA de la
+        cuenta, sin atribución de origen):
+          - Ticker con CUALQUIER pata abierta de motor_rest_arb (cualquier side) → SKIP:
+            es (parte de) un arb hedged; venderla suelta rompe el hedge.
+          - (ticker, side) sin ningún BUY filled abierto de _ENTRY_ORIGIN → SKIP: posición
+            manual del dueño o de origen desconocido — Motor 3 no la abrió, no la vende.
+        Fail-safe: error de DB → lista vacía (ante la duda, este tick no gestiona nada).
+        """
+        if not positions:
+            return positions
+        try:
+            with get_session() as s:
+                open_buys = list(
+                    s.exec(
+                        select(Trade).where(
+                            Trade.action == "buy",
+                            Trade.status == "filled",
+                            col(Trade.closed_by_clv).is_(False),
+                        )
+                    )
+                )
+        except Exception as exc:
+            logger.warning(f"motor3.attribution.load_error: {exc} → tick sin posiciones")
+            return []
+        rest_tickers = {b.ticker for b in open_buys if b.strategy == "motor_rest_arb"}
+        attributable = {
+            (b.ticker, b.side) for b in open_buys if b.strategy in _ENTRY_ORIGIN and b.count > 0
+        }
+        kept: list[PortfolioPosition] = []
+        skipped_rest, skipped_foreign = 0, 0
+        for p in positions:
+            if p.ticker in rest_tickers:
+                skipped_rest += 1
+                continue
+            if (p.ticker, p.side) not in attributable:
+                skipped_foreign += 1
+                continue
+            kept.append(p)
+        if skipped_rest or skipped_foreign:
+            logger.info(
+                f"motor3.attribution kept={len(kept)} skip_rest_arb={skipped_rest} "
+                f"skip_foreign={skipped_foreign} (legs de arb hedged y posiciones ajenas no se gestionan)"
+            )
+        return kept
 
     def _entry_bid_for(self, position: PortfolioPosition) -> int | None:
         """Entry del lado abierto = primer BUY filled (FIFO por placed_at), igual criterio que

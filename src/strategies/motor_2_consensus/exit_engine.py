@@ -107,7 +107,12 @@ class Motor2ExitEngine:
         async with KalshiRestClient() as client:
             self._client = client
             if self._trading_enabled:
-                self._executor = Motor3ExitExecutor(client, strategy=STRATEGY)
+                # entry_origin SOLO motor_2: este exit dimensiona la venta con SUS filas
+                # (fix auditoría: cerrar FIFO cross-strategy podía settlear una pata de
+                # motor_rest_arb y dejar la de Motor 2 'filled' → re-venta + PnL mal atribuido).
+                self._executor = Motor3ExitExecutor(
+                    client, strategy=STRATEGY, entry_origin=(STRATEGY,)
+                )
             await self._loop(stop_event)
 
     async def _loop(self, stop_event: asyncio.Event) -> None:

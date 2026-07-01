@@ -33,7 +33,12 @@ from src.clients.odds_api import OddsEvent
 from src.math.fees import kalshi_fee_cents
 from src.math.kelly import quarter_kelly_size
 from src.math.no_vig import implied_prob, remove_vig_multiplicative
-from src.strategies.motor_2_consensus.matcher import canonical_name, match_outcomes
+from src.strategies.motor_2_consensus.matcher import (
+    canonical_name,
+    match_outcomes,
+    parse_event_key_start,
+    start_time_et,
+)
 
 MIN_EDGE_PCT = 0.03  # 3pp neto post-comisión
 SIZING_MAX_PCT = 5.0  # cap duro de exposición por trade (% del capital activo)
@@ -77,6 +82,10 @@ class ConsensusSignal(BaseModel):
     """Señal de edge Motor 2 (no ejecuta — registro analítico)."""
 
     market_ticker: str
+    # Evento Kalshi al que pertenece el market (ej. "KXMLBGAME-26JUN27NYMPHI").
+    # Lo estampa find_signals; el executor lo usa para el dedup cross-ciclo por evento
+    # ("" en señales construidas a mano → el dedup cae al scope por ticker).
+    event_key: str = ""
     kalshi_side: str  # "YES" | "NO"
     odds_api_fair_prob: float  # probabilidad JUSTA (post-no-vig) del lado señalado
     kalshi_price_cents: int  # ask de Kalshi del lado señalado
@@ -201,6 +210,9 @@ def find_signals(
       - reject_cardinality: mismo partido pero distinto nº de outcomes (2-way vs 3-way).
       - reject_names: mismo partido, set de nombres difiere → FIXABLE con alias (loguea ambos).
       - reject_no_fair: matcheó pero no hubo consenso usable.
+      - reject_date: candidatos por nombres pero ninguno en la fecha del event_key (serie).
+      - reject_ambiguous: >1 candidato sin desambiguar (doubleheader) → descarta.
+      - reject_started: el candidato correcto ya arrancó (in-play) → descarta.
     """
     now = now or datetime.now(UTC)
     if diag is not None:
@@ -213,6 +225,9 @@ def find_signals(
             reject_cardinality=0.0,
             reject_names=0.0,
             reject_no_fair=0.0,
+            reject_date=0.0,  # candidato(s) por nombres pero ninguno en la fecha del event_key
+            reject_ambiguous=0.0,  # >1 candidato sin desambiguar (doubleheader/serie) → descarta
+            reject_started=0.0,  # el candidato correcto ya arrancó (Kalshi in-play) → descarta
             best_net_edge=-1.0,  # fracción; -1 = no se evaluó ningún outcome
         )
     signals: list[ConsensusSignal] = []
@@ -224,54 +239,72 @@ def find_signals(
         best_overlap = -1
         best_reason = "absent"
         best_pair: tuple[set[str], set[str]] | None = None
+        # PASADA 1 — candidatos por NOMBRES. Incluye partidos YA INICIADOS a propósito: la
+        # fecha y la ambigüedad se resuelven en la selección (fix auditoría 2026-07-01 —
+        # ignorarlos acá permitía que el evento Kalshi in-play del juego 1 de un doubleheader
+        # matcheara la línea pre-match del juego 2: precios en vivo vs línea de OTRO juego).
+        candidates: list[OddsEvent] = []
         for oe in odds_events:
-            # PRE-MATCH ONLY: partido ya iniciado → comparación inválida, se saltea.
-            if oe.commence_time <= now:
-                continue
             odds_names = _h2h_outcome_names(oe)
             if not odds_names:
                 continue
-            o_canon = {canonical_name(n) for n in odds_names}
-            # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
-            overlap = len(k_canon & o_canon)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_pair = (k_canon, o_canon)
-                if overlap == 0:
-                    best_reason = "absent"
-                elif len(k_names) != len(odds_names):
-                    best_reason = "cardinality"
-                elif k_canon != o_canon:
-                    best_reason = "names"
-                else:
-                    best_reason = "no_fair"  # set igual → si no matchea/no fair, es esto
+            if oe.commence_time > now:
+                o_canon = {canonical_name(n) for n in odds_names}
+                # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
+                overlap = len(k_canon & o_canon)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_pair = (k_canon, o_canon)
+                    if overlap == 0:
+                        best_reason = "absent"
+                    elif len(k_names) != len(odds_names):
+                        best_reason = "cardinality"
+                    elif k_canon != o_canon:
+                        best_reason = "names"
+                    else:
+                        best_reason = "no_fair"  # set igual → si no matchea/no fair, es esto
             # Regla del matcher: cardinalidad + conjuntos exactos. None → no es el partido.
             if match_outcomes(k_names, odds_names) is None:
                 continue
-            fair = _consensus_fair_probs(oe)
+            candidates.append(oe)
+
+        # PASADA 2 — selección con fecha del event_key + "ambigüedad → descarta" (antes se
+        # tomaba el PRIMER candidato pre-match: en una serie MLB de 3-4 juegos del mismo
+        # par, el evento Kalshi del miércoles apostaba contra la línea del martes).
+        chosen, select_reject = _select_candidate(ke.event_key, candidates, now)
+        if chosen is not None:
+            fair = _consensus_fair_probs(chosen)
             if not fair:
                 best_reason = "no_fair"
-                continue
-            matched = True
-            if diag is not None:
-                diag["events_matched"] += 1.0
-            # Candidatos de TODOS los outcomes del partido (cada uno en su market_ticker), luego
-            # colapsados a UNA apuesta direccional por evento (_collapse_event_signals).
-            event_signals: list[ConsensusSignal] = []
-            for q in ke.outcomes:
-                cn = canonical_name(q.outcome_name)
-                fp = fair.get(cn)
-                if fp is None:
-                    continue
-                event_signals.extend(
-                    _signals_for_outcome(
-                        q, fp, capital_usd, min_edge, diag, max_stake_pct=max_stake_pct
+            else:
+                matched = True
+                if diag is not None:
+                    diag["events_matched"] += 1.0
+                # Candidatos de TODOS los outcomes del partido (cada uno en su market_ticker),
+                # luego colapsados a UNA apuesta direccional (_collapse_event_signals).
+                event_signals: list[ConsensusSignal] = []
+                for q in ke.outcomes:
+                    cn = canonical_name(q.outcome_name)
+                    fp = fair.get(cn)
+                    if fp is None:
+                        continue
+                    event_signals.extend(
+                        _signals_for_outcome(
+                            q, fp, capital_usd, min_edge, diag, max_stake_pct=max_stake_pct
+                        )
                     )
-                )
-            signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
-            break  # ya emparejado este evento Kalshi
+                for es in event_signals:
+                    es.event_key = ke.event_key  # para el dedup cross-ciclo del executor
+                signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
         if not matched and diag is not None:
-            diag["reject_" + best_reason] = diag.get("reject_" + best_reason, 0.0) + 1.0
+            reason = select_reject or best_reason
+            diag["reject_" + reason] = diag.get("reject_" + reason, 0.0) + 1.0
+            if select_reject in ("date", "ambiguous"):
+                logger.warning(
+                    f"motor2.match.rejected_{select_reject} event={ke.event_key} "
+                    f"candidatos={len(candidates)} (matching conservador: el partido "
+                    "equivocado es la falla catastrófica → descarta)"
+                )
             # name_debug SOLO para el caso fixable (mismo partido, nombres distintos): muestra
             # los dos sets canónicos → se ve EXACTO qué alias falta agregar a TEAM_ALIASES.
             if best_reason in ("names", "cardinality") and best_pair and name_debug_budget > 0:
@@ -285,6 +318,58 @@ def find_signals(
                     f"(kalshi={sorted(k_set)} odds={sorted(o_set)})"
                 )
     return signals
+
+
+def _select_candidate(
+    event_key: str, candidates: list[OddsEvent], now: datetime
+) -> tuple[OddsEvent | None, str | None]:
+    """Elige el ÚNICO odds event que corresponde al evento Kalshi, o (None, motivo).
+
+    Reglas conservadoras (emparejar el partido equivocado es la falla catastrófica):
+      1. Si el event_key trae fecha ("...-26JUN27..."), el candidato debe empezar ESE día
+         en hora del Este. Mata el bug de series MLB: el evento Kalshi del miércoles ya no
+         matchea la línea del martes.
+      2. >1 candidato en la fecha (doubleheader): desambigua por la hora ET embebida en el
+         key ("...1610..."); sin hora única que coincida → 'ambiguous' (descarta ambos).
+      3. Key sin fecha parseable: solo se acepta candidato ÚNICO; 2+ → 'ambiguous'.
+      4. El elegido debe ser PRE-MATCH (commence_time > now); si ya arrancó → 'started'
+         (precios in-play de Kalshi vs línea de odds = comparación inválida).
+
+    Motivos → embudo: reject_date | reject_ambiguous | reject_started. (None, None) si
+    no había candidatos (la clasificación cae al best_reason por overlap).
+    """
+    if not candidates:
+        return None, None
+    parsed = parse_event_key_start(event_key)
+    if parsed is not None:
+        key_date, key_hhmm = parsed
+        dated = [oe for oe in candidates if start_time_et(oe.commence_time).date() == key_date]
+        if not dated:
+            return None, "date"
+        if len(dated) == 1:
+            chosen = dated[0]
+        else:
+            timed = []
+            if key_hhmm is not None:
+                timed = [
+                    oe
+                    for oe in dated
+                    if (
+                        start_time_et(oe.commence_time).hour,
+                        start_time_et(oe.commence_time).minute,
+                    )
+                    == key_hhmm
+                ]
+            if len(timed) != 1:
+                return None, "ambiguous"
+            chosen = timed[0]
+    else:
+        if len(candidates) > 1:
+            return None, "ambiguous"
+        chosen = candidates[0]
+    if chosen.commence_time <= now:
+        return None, "started"
+    return chosen, None
 
 
 def _emit_if_plausible(

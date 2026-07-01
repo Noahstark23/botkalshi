@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from typing import ClassVar
 
 from loguru import logger
 from sqlmodel import col, select
@@ -53,29 +54,77 @@ class Motor3ExitOutcome:
 class Motor3ExitExecutor:
     """Liquida posiciones con SELL IOC al bid. Lock por-ticker anti doble-venta concurrente."""
 
-    def __init__(self, client: KalshiRestClient, *, strategy: str = STRATEGY) -> None:
+    # Locks POR TICKER compartidos a nivel PROCESO (ClassVar, fix auditoría 2026-07-01):
+    # Motor 2 exits y Motor 3 construyen instancias SEPARADAS de este executor; con locks
+    # por instancia, ambos motores podían vender la misma posición en la misma ventana —
+    # y en la API V2 la segunda venta no se rechaza: ABRE una posición contraria (yes+sell
+    # es el mismo book_side que no+buy).
+    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+
+    def __init__(
+        self,
+        client: KalshiRestClient,
+        *,
+        strategy: str = STRATEGY,
+        entry_origin: tuple[str, ...] = ("motor_2_consensus",),
+    ) -> None:
         self.client = client
         # Estrategia con la que se audita la fila SELL del exit. Default motor_3_clv; Motor 2
         # reusa este executor pasando "motor_2_consensus" para que el audit quede atribuido al
         # motor que disparó el cierre (las patas BUY que cierra _settle_originals ya se marcan
         # closed_by_clv por su propia strategy, sin importar este tag).
         self._strategy = strategy
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Estrategias cuyas patas BUY este exit puede cerrar (y contra las que se dimensiona
+        # la venta). motor_rest_arb NO va acá: una leg de arb hedged nunca se liquida suelta
+        # (vender la leg ganadora rompe el hedge → profit lockeado se vuelve pérdida).
+        self._entry_origin = entry_origin
 
     def _lock_for(self, ticker: str) -> asyncio.Lock:
-        return self._locks.setdefault(ticker, asyncio.Lock())
+        return type(self)._locks.setdefault(ticker, asyncio.Lock())
 
     async def exit_position(self, position: PortfolioPosition) -> Motor3ExitOutcome:
         """
         Vende la posición del lado abierto. Si OTRA ejecución ya está liquidando este
         ticker (lock tomado), se DESCARTA — no encolar (estaría stale) ni doble-vender.
+
+        DENTRO del lock se re-verifica contra las filas Trade (fuente de verdad sincrónica):
+        si otro exit engine acaba de vender y settlear, las filas ya están closed_by_clv
+        aunque la PortfolioPosition (cache de 60s) o el agregado de Motor 2 estén stale —
+        se skipea en vez de re-vender. La venta se CAPEA al total abierto atribuible.
         """
         lock = self._lock_for(position.ticker)
         if lock.locked():
             logger.info(f"motor3.exit.skip_busy ticker={position.ticker}")
             return Motor3ExitOutcome(False, False, reason="busy")
         async with lock:
-            return await self._exit_locked(position.ticker, position.side, position.count)
+            open_count = self._open_attributable_count(position.ticker, position.side)
+            if open_count <= 0:
+                logger.info(
+                    f"motor3.exit.already_closed ticker={position.ticker} side={position.side} "
+                    "(sin patas BUY abiertas atribuibles — otro exit ya cerró o posición ajena)"
+                )
+                return Motor3ExitOutcome(False, False, reason="already_closed")
+            count = min(position.count, open_count)
+            return await self._exit_locked(position.ticker, position.side, count)
+
+    def _open_attributable_count(self, ticker: str, side: str) -> int:
+        """Contratos BUY 'filled' aún abiertos (no closed_by_clv) de `entry_origin` para
+        (ticker, side). Fail-safe: error de DB → 0 (ante la duda, NO vender)."""
+        try:
+            with get_session() as s:
+                buys = s.exec(
+                    select(Trade).where(
+                        Trade.ticker == ticker,
+                        Trade.side == side,
+                        Trade.action == "buy",
+                        Trade.status == "filled",
+                        col(Trade.strategy).in_(self._entry_origin),
+                    )
+                )
+                return sum(b.count for b in buys if not b.closed_by_clv and b.count > 0)
+        except Exception:
+            logger.exception(f"motor3.exit.attributable_check_failed ticker={ticker}")
+            return 0
 
     async def _exit_locked(self, ticker: str, side: str, count: int) -> Motor3ExitOutcome:
         if side not in ("yes", "no") or count <= 0:
@@ -189,7 +238,7 @@ class Motor3ExitExecutor:
         sigue 'filled' (abierto, el poller lo re-sincroniza y se reintenta) y se crea una
         hija 'settled' por la porción cerrada. Best-effort: un fallo se loguea, no rompe.
         """
-        origin = ("motor_2_consensus", "motor_rest_arb")
+        origin = self._entry_origin
         now = _naive_utc_now()
         try:
             with get_session() as s:

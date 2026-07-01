@@ -11,12 +11,36 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import src.storage.models as models
 from src.storage.models import PortfolioPosition
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 
 
 def _pos(side: str = "yes", count: int = 10) -> PortfolioPosition:
     return PortfolioPosition(ticker="KXTEST", side=side, count=count)
+
+
+def _seed_open_buy(
+    *, side: str = "yes", count: int = 10, strategy: str = "motor_2_consensus"
+) -> None:
+    """Pata BUY filled que respalda la posición: el executor re-verifica DENTRO del lock
+    contra las filas Trade (atribución) y capea la venta al total abierto — sin respaldo,
+    exit_position devuelve already_closed (fix auditoría 2026-07-01)."""
+    with models.get_session() as s:
+        s.add(
+            models.Trade(
+                client_order_id=f"seed-{side}-{count}",
+                ticker="KXTEST",
+                side=side,
+                action="buy",
+                count=count,
+                price_cents=45,
+                fill_price_cents=45,
+                strategy=strategy,
+                status="filled",
+            )
+        )
+        s.commit()
 
 
 def _client(orderbook: dict, *, place_resp: dict | None = None) -> MagicMock:
@@ -29,6 +53,7 @@ def _client(orderbook: dict, *, place_resp: dict | None = None) -> MagicMock:
 @pytest.mark.asyncio
 async def test_no_bid_does_not_place():
     """Orderbook sin bids en nuestro lado → no hay con quién cerrar → no se coloca orden."""
+    _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(_client({"orderbook": {"yes": [], "no": []}}))
     with patch.object(ex, "_record_exit"):
         out = await ex.exit_position(_pos("yes"))
@@ -43,6 +68,7 @@ async def test_filled_sells_at_bid_with_ioc():
         {"orderbook": {"yes": [["0.55", "100"], ["0.60", "50"]], "no": []}},
         place_resp={"order": {"order_id": "o1", "fill_count": 10}},
     )
+    _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
     with patch.object(ex, "_record_exit"):
         out = await ex.exit_position(_pos("yes", count=10))
@@ -64,6 +90,7 @@ async def test_no_side_uses_no_price():
         {"orderbook": {"yes": [], "no": [["0.40", "30"]]}},
         place_resp={"order": {"fill_count": 5}},
     )
+    _seed_open_buy(side="no", count=5)
     ex = Motor3ExitExecutor(c)
     with patch.object(ex, "_record_exit"):
         out = await ex.exit_position(_pos("no", count=5))
@@ -80,6 +107,7 @@ async def test_lock_released_after_exit_allows_reattempt():
         {"orderbook": {"yes": [["0.60", "50"]], "no": []}},
         place_resp={"order": {"fill_count": 4}},  # parcial: vende 4 de 10
     )
+    _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
     pos = _pos("yes", count=10)
     out = await ex.exit_position(pos)

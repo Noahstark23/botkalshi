@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.math.arbitrage import ArbLeg, ArbOpportunity
@@ -86,9 +86,15 @@ class Motor2Executor:
         *,
         min_entry_cents: int = 1,
         underdog_filter_enabled: bool = False,
+        one_bet_per_event: bool = True,
     ) -> None:
         self.client = client
         self.risk = risk_manager
+        # Scope del dedup cross-ciclo (fix auditoría 2026-07-01): True → una posición
+        # abierta por EVENTO (la promesa del flag MOTOR_2_ONE_BET_PER_EVENT); False →
+        # por market_ticker. Sin esto, un edge de consenso persistente (dura horas) se
+        # re-apostaba cada ciclo de 5 min hasta chocar con el cap global de exposición.
+        self._one_bet_per_event = one_bet_per_event
         # Filtro underdog (FASE 3): las entradas <40c sangraron −$110,77 en el histórico
         # (17 de 21 perdedoras). min_entry_cents=1 + filter off = no-op (default seguro).
         self._min_entry_cents = min_entry_cents
@@ -110,6 +116,17 @@ class Motor2Executor:
             )
             if self._underdog_filter_enabled:
                 return Motor2ExecutionOutcome(False, False, reason="underdog_filter")
+
+        # DEDUP CROSS-CICLO: si ya hay una posición viva (pending/filled) de Motor 2 en
+        # este evento (o ticker), NO se re-apuesta el mismo edge en el próximo ciclo.
+        # Una fila 'settled' (resuelta o cerrada por exit) libera el evento de nuevo.
+        if self._open_position_exists(signal):
+            logger.info(
+                f"motor2.exec.dedup_skip ticker={signal.market_ticker} "
+                f"event={signal.event_key or '(sin event_key → scope ticker)'} "
+                "(posición abierta previa en el evento — no se re-apuesta)"
+            )
+            return Motor2ExecutionOutcome(False, False, reason="already_open")
 
         # Sizing deseado desde el ¼-Kelly del detector; el RiskManager es la autoridad
         # final (cap por trade + exposición) y puede recortarlo.
@@ -246,6 +263,32 @@ class Motor2Executor:
             net_profit_cents=0,
             edge_pct=signal.edge_pct,
         )
+
+    def _open_position_exists(self, signal: ConsensusSignal) -> bool:
+        """True si hay un Trade vivo (pending/filled) de Motor 2 en el evento/ticker.
+
+        Scope EVENTO (default, `one_bet_per_event=True`): cualquier market del mismo
+        evento bloquea (los outcomes de un partido viven en tickers DISTINTOS pero son
+        el mismo riesgo direccional — ver _collapse_event_signals). Scope TICKER si el
+        flag está off o la señal no trae event_key. Fail-safe: un error de DB bloquea
+        la apuesta (mejor perder una señal que apilar exposición sin saberlo).
+        """
+        try:
+            with get_session() as s:
+                stmt = select(Trade).where(
+                    Trade.strategy == STRATEGY,
+                    col(Trade.status).in_(("pending", "filled")),
+                )
+                if self._one_bet_per_event and signal.event_key:
+                    stmt = stmt.where(col(Trade.ticker).like(f"{signal.event_key}-%"))
+                else:
+                    stmt = stmt.where(Trade.ticker == signal.market_ticker)
+                return s.exec(stmt.limit(1)).first() is not None
+        except Exception:
+            logger.exception(
+                f"motor2.exec.dedup_check_failed ticker={signal.market_ticker} → skip conservador"
+            )
+            return True
 
     def _persist_intent(
         self, signal: ConsensusSignal, side: str, price: int, count: int, coid: str
