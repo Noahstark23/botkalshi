@@ -77,6 +77,10 @@ class ConsensusSignal(BaseModel):
     """Señal de edge Motor 2 (no ejecuta — registro analítico)."""
 
     market_ticker: str
+    # Evento Kalshi al que pertenece el market (ej. "KXMLBGAME-26JUN27NYMPHI").
+    # Lo estampa find_signals; el executor lo usa para el dedup cross-ciclo por evento
+    # ("" en señales construidas a mano → el dedup cae al scope por ticker).
+    event_key: str = ""
     kalshi_side: str  # "YES" | "NO"
     odds_api_fair_prob: float  # probabilidad JUSTA (post-no-vig) del lado señalado
     kalshi_price_cents: int  # ask de Kalshi del lado señalado
@@ -268,6 +272,8 @@ def find_signals(
                         q, fp, capital_usd, min_edge, diag, max_stake_pct=max_stake_pct
                     )
                 )
+            for es in event_signals:
+                es.event_key = ke.event_key  # para el dedup cross-ciclo del executor
             signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
             break  # ya emparejado este evento Kalshi
         if not matched and diag is not None:
