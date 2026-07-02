@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from src.storage.models import EdgeWindow, Motor2FunnelSnapshot, get_session
+from src.strategies.fair_value_book import FairValueBook
 from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
@@ -94,6 +95,7 @@ class Motor2ShadowPoller:
             return []
 
         diag: dict[str, float] = {}
+        fair_out: dict[str, float] = {}
         signals = find_signals(
             kalshi_events,
             odds_events,
@@ -102,7 +104,13 @@ class Motor2ShadowPoller:
             diag=diag,
             one_per_event=self._one_per_event,
             max_stake_pct=self._max_stake_pct,
+            fair_out=fair_out,
         )
+        # Canal Motor 5 (F1 shadow): publica el fair de todo outcome matcheado SOLO con
+        # odds reales — un fair del fixture fake no es precio de referencia para cotizar.
+        if self._odds.is_live and fair_out:
+            FairValueBook.publish(fair_out)
+            logger.info(f"motor2.fair_book publicados={len(fair_out)}")
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
             f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"

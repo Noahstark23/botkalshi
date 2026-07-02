@@ -211,6 +211,7 @@ def find_signals(
     diag: dict[str, float] | None = None,
     one_per_event: bool = True,
     max_stake_pct: float = 0.0,
+    fair_out: dict[str, float] | None = None,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -353,6 +354,12 @@ def find_signals(
                     fp = fair.get(cn)
                     if fp is None:
                         continue
+                    # Canal Motor 5 (plan MM §1.2): el fair de TODO outcome matcheado se
+                    # expone vía out-param (no solo los que superan el umbral de señal) —
+                    # el market maker cotiza alrededor del fair, no del edge. Puro: el
+                    # caller decide si publicarlo (el poller solo lo hace con odds LIVE).
+                    if fair_out is not None:
+                        fair_out[q.market_ticker] = fp
                     event_signals.extend(
                         _signals_for_outcome(
                             q, fp, capital_usd, min_edge, diag, max_stake_pct=max_stake_pct
