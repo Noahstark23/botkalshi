@@ -123,6 +123,7 @@ class Motor2ShadowPoller:
             f"rej_ambig={int(diag.get('reject_ambiguous', 0))} "
             f"rej_started={int(diag.get('reject_started', 0))} "
             f"skip_horizon={int(diag.get('skip_out_of_horizon', 0))} "
+            f"skip_multi={int(diag.get('skip_multi_outcome', 0))} "
             f"best_edge={best_pp:.2f}pp umbral={self._min_edge * 100:.1f}pp"
         )
         # GATE DE DINERO REAL: persistir/apostar SOLO con odds reales (nunca sobre el fixture).
