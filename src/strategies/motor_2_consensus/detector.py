@@ -232,6 +232,11 @@ def find_signals(
       - reject_date: candidatos por nombres pero ninguno en la fecha del event_key (serie).
       - reject_ambiguous: >1 candidato sin desambiguar (doubleheader) → descarta.
       - reject_started: el candidato correcto ya arrancó (in-play) → descarta.
+      - skip_out_of_horizon / skip_multi_outcome: PRE-funnel — el evento ni compite
+        (fecha sin cobertura del feed / >3 outcomes inmatchable contra h2h).
+    La clasificación por overlap solo considera candidatos del MISMO día ET que el
+    event_key (si trae fecha): un partido de otro día que comparte un equipo no es
+    evidencia de "falta un alias" sino de "este partido no está en el feed".
     """
     now = now or datetime.now(UTC)
     if diag is not None:
@@ -248,6 +253,7 @@ def find_signals(
             reject_ambiguous=0.0,  # >1 candidato sin desambiguar (doubleheader/serie) → descarta
             reject_started=0.0,  # el candidato correcto ya arrancó (Kalshi in-play) → descarta
             skip_out_of_horizon=0.0,  # la fecha del event_key ni siquiera está en el feed de odds
+            skip_multi_outcome=0.0,  # evento Kalshi >3 outcomes: inmatchable contra feed h2h
             best_net_edge=-1.0,  # fracción; -1 = no se evaluó ningún outcome
         )
     signals: list[ConsensusSignal] = []
@@ -257,7 +263,23 @@ def find_signals(
     # partidos de mañana pero la odds API solo los de hoy) no es un rechazo interesante —
     # antes inflaba reject_date/reject_absent y tapaba los mismatches reales del embudo.
     odds_dates = {start_time_et(oe.commence_time).date() for oe in odds_events}
+    multi_outcome_log_budget = 1  # un log por ciclo alcanza para el trend
     for ke in kalshi_events:
+        # FILTRO PRE-FUNNEL (medición post-deploy 2026-07-02): un evento Kalshi
+        # MULTI-OUTCOME (ganador de grupo/torneo, >3 outcomes) JAMÁS matchea un feed
+        # h2h (2-way / 1X2 = máx 3): match_outcomes exige igualdad exacta de conjuntos.
+        # Dejarlos entrar solo inflaba reject_cardinality/reject_names cada ciclo y el
+        # embudo señalaba "poblar aliases" donde no había nada que poblar.
+        if len(ke.outcomes) > 3:
+            if diag is not None:
+                diag["skip_multi_outcome"] = diag.get("skip_multi_outcome", 0.0) + 1.0
+            if multi_outcome_log_budget > 0:
+                multi_outcome_log_budget -= 1
+                logger.info(
+                    f"motor2.skip_multi_outcome event={ke.event_key} "
+                    f"n_outcomes={len(ke.outcomes)} (feed h2h es 2/3-way → fuera del funnel)"
+                )
+            continue
         parsed_key = parse_event_key_start(ke.event_key)
         if parsed_key is not None and odds_dates and parsed_key[0] not in odds_dates:
             if diag is not None:
@@ -283,7 +305,15 @@ def find_signals(
             odds_names = _h2h_outcome_names(oe)
             if not odds_names:
                 continue
-            if oe.commence_time > now:
+            if oe.commence_time > now and (
+                # Coherencia de FECHA del diagnóstico (medición post-deploy 2026-07-02): un
+                # candidato de OTRO día ET que comparte un equipo (rotación de series MLB:
+                # Cubs@Cardinals mañana vs Braves@Cardinals hoy) etiquetaba el rechazo como
+                # 'names' ("falta un alias") cuando la verdad es 'absent' ("el partido del
+                # key no está en el feed"). Solo el MISMO día ET del key califica para el
+                # diagnóstico; key sin fecha → sin restricción (legacy).
+                parsed_key is None or start_time_et(oe.commence_time).date() == parsed_key[0]
+            ):
                 o_canon = {canonical_name(n) for n in odds_names}
                 # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
                 overlap = len(k_canon & o_canon)
