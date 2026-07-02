@@ -447,15 +447,15 @@ class Settings(BaseSettings):
                     "MOTOR_REST_EXECUTION_ENABLED=true requiere MOTOR_REST_ENABLED=true "
                     "(la ejecución sin el motor corriendo es un no-op engañoso)."
                 )
-            # Motor 5 está en F1 (shadow): el executor NO existe. Un flag de ejecución
-            # prendido sería un no-op engañoso (parecería armado sin estarlo) → fail-loud.
-            # NOTA: MOTOR_MM_ENABLED tampoco cuenta como "motor habilitado" arriba — en F1
-            # no puede operar capital, igual que los *_EXECUTION_ENABLED (misma deuda).
+            # Motor 5: la ejecución real es F2 y corre SOLO contra demo. En PRODUCCIÓN el
+            # flag rompe el boot hasta F3 (smoke test + canonicalización + OK explícito de
+            # Noel — plan §5). NOTA: MOTOR_MM_ENABLED tampoco cuenta como "motor
+            # habilitado" arriba — shadow no opera capital (misma regla que *_EXECUTION).
             if self.MOTOR_MM_EXECUTION_ENABLED:
                 raise ValueError(
-                    "MOTOR_MM_EXECUTION_ENABLED=true pero Motor 5 está en F1 (shadow): "
-                    "no existe executor todavía. El flag se habilita recién en F2 "
-                    "(docs/motor_5_market_maker_plan_fases.md §4)."
+                    "MOTOR_MM_EXECUTION_ENABLED=true en PRODUCCIÓN: el Motor 5 está en "
+                    "F2 (demo only). La activación en producción es F3 y requiere smoke "
+                    "test + OK explícito (docs/motor_5_market_maker_plan_fases.md §5)."
                 )
         return self
 

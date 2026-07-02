@@ -133,17 +133,31 @@ def test_execution_without_engine_flag_rejected(fake_key: Path, monkeypatch):
         Settings()
 
 
-def test_motor_mm_execution_flag_rejected_in_production_f1(fake_key: Path, monkeypatch):
-    """Motor 5 está en F1 (shadow, sin executor): EXECUTION=true sería un no-op engañoso
-    que PARECE armado → fail-loud al boot hasta F2 (plan motor_5 §4)."""
+def test_motor_mm_execution_flag_rejected_in_production(fake_key: Path, monkeypatch):
+    """La ejecución del Motor 5 es F2 (demo only): en PRODUCCIÓN el flag rompe el boot
+    hasta F3 (smoke test + OK explícito, plan motor_5 §5)."""
     monkeypatch.setenv("KALSHI_ENV", "production")
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
     monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
     monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
 
-    with pytest.raises(ValidationError, match="F1"):
+    with pytest.raises(ValidationError, match="demo only"):
         Settings()
+
+
+def test_motor_mm_execution_allowed_in_demo(fake_key: Path, monkeypatch):
+    """F2: EXECUTION=true + ENABLED=true bootea contra DEMO (la validación de mecánica
+    del plan §4 corre ahí; producción sigue bloqueada hasta F3)."""
+    monkeypatch.setenv("KALSHI_ENV", "demo")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
+
+    s = Settings()
+    assert s.MOTOR_MM_EXECUTION_ENABLED and s.KALSHI_ENV == "demo"
 
 
 def test_motor_mm_alone_does_not_count_as_enabled_motor(fake_key: Path, monkeypatch):
