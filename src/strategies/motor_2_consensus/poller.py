@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from src.storage.models import EdgeWindow, Motor2FunnelSnapshot, get_session
+from src.strategies.fair_value_book import FairValueBook
 from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
@@ -50,6 +51,7 @@ class Motor2ShadowPoller:
         min_edge: float | None = None,
         one_per_event: bool = True,
         max_stake_pct: float = 0.0,
+        max_edge: float | None = None,
         risk_manager: RiskManager | None = None,
         executor: Motor2Executor | None = None,
     ):
@@ -66,6 +68,9 @@ class Motor2ShadowPoller:
         # Umbral de edge NETO como FRACCIÓN (0.03 = 3pp). Default = el del detector; el
         # runner lo pasa desde config (MOTOR_2_MIN_EDGE_PCT / 100).
         self._min_edge = min_edge if min_edge is not None else MIN_EDGE_PCT
+        # Techo de EJECUCIÓN (fracción; None = sin techo extra). El runner lo pasa desde
+        # MOTOR_2_MAX_EDGE_PCT/100 (anti-fantasma: los buckets 12-13% sangraron −$621).
+        self._max_edge = max_edge
         # Mutua exclusión por EVENTO (una sola apuesta direccional por partido). El runner lo
         # pasa desde config (MOTOR_2_ONE_BET_PER_EVENT); default True = seguro.
         self._one_per_event = one_per_event
@@ -94,6 +99,7 @@ class Motor2ShadowPoller:
             return []
 
         diag: dict[str, float] = {}
+        fair_out: dict[str, float] = {}
         signals = find_signals(
             kalshi_events,
             odds_events,
@@ -102,7 +108,14 @@ class Motor2ShadowPoller:
             diag=diag,
             one_per_event=self._one_per_event,
             max_stake_pct=self._max_stake_pct,
+            fair_out=fair_out,
+            max_edge=self._max_edge,
         )
+        # Canal Motor 5 (F1 shadow): publica el fair de todo outcome matcheado SOLO con
+        # odds reales — un fair del fixture fake no es precio de referencia para cotizar.
+        if self._odds.is_live and fair_out:
+            FairValueBook.publish(fair_out)
+            logger.info(f"motor2.fair_book publicados={len(fair_out)}")
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
             f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"
@@ -122,6 +135,7 @@ class Motor2ShadowPoller:
             f"rej_date={int(diag.get('reject_date', 0))} "
             f"rej_ambig={int(diag.get('reject_ambiguous', 0))} "
             f"rej_started={int(diag.get('reject_started', 0))} "
+            f"rej_high={int(diag.get('reject_high_edge', 0))} "
             f"skip_horizon={int(diag.get('skip_out_of_horizon', 0))} "
             f"skip_multi={int(diag.get('skip_multi_outcome', 0))} "
             f"best_edge={best_pp:.2f}pp umbral={self._min_edge * 100:.1f}pp"

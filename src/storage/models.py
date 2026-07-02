@@ -268,6 +268,71 @@ class Motor2FunnelSnapshot(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 
+class MMQuote(SQLModel, table=True):
+    """
+    Quote SHADOW emitida por el Motor 5 en un tick (F1 — cero órdenes, registro puro).
+
+    Es el tracker del gate F1→F2 (≥14 días): qué se cotizó, alrededor de qué fair, con
+    qué book en ese instante. bid/ask None = lado retirado por tope de inventario.
+    """
+
+    __tablename__ = "mm_quotes"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ticker: str = Field(index=True, max_length=100)
+    fair_prob: float
+    fair_age_sec: float = 0.0  # edad del fair al cotizar (mide staleness del canal M2)
+    bid_cents: int | None = None
+    ask_cents: int | None = None
+    size: int = 0
+    yes_bid: int | None = None  # top-of-book al momento de cotizar (contexto del quote)
+    yes_ask: int | None = None
+    inventory: int = 0  # net simulado ANTES del quote (explica el skew aplicado)
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
+
+
+class MMShadowFill(SQLModel, table=True):
+    """
+    Fill HIPOTÉTICO del Motor 5 (F1): el book cruzó estrictamente una quote resting del
+    tick anterior. `rule` guarda la evidencia del cruce (auditable en la revisión
+    adversarial del gate F1→F2).
+    """
+
+    __tablename__ = "mm_shadow_fills"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ticker: str = Field(index=True, max_length=100)
+    side: str = Field(max_length=4)  # "buy" | "sell"
+    price_cents: int
+    count: int
+    fee_cents: int = 0  # comisión real del fill (kalshi_fee_cents con count)
+    rule: str = Field(max_length=50)  # p.ej. "ask 38 < bid 40"
+    inventory_after: int = 0
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
+
+
+class MMFunnelSnapshot(SQLModel, table=True):
+    """
+    Foto del embudo del Motor 5 por tick (patrón Motor2FunnelSnapshot): cuántos tickers
+    tenían fair fresco, cuántos se cotizaron, skips por causa, fills e inventario/PnL.
+    Es la memoria del loop de ingeniería del plan §6.
+    """
+
+    __tablename__ = "mm_funnel_snapshots"
+
+    id: int | None = Field(default=None, primary_key=True)
+    fair_fresh: int = 0  # tickers con fair dentro del TTL
+    quoted: int = 0
+    skip_no_book: int = 0
+    skip_unprofitable: int = 0
+    skip_degenerate: int = 0
+    skip_fair_range: int = 0
+    fills: int = 0
+    inventory_abs: int = 0  # Σ|net| simulado
+    mtm_pnl_cents: int = 0  # PnL mark-to-market neto de fees (el número del gate)
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
+
+
 class AnalystVerdict(SQLModel, table=True):
     """
     Veredicto diario del Analyst Loop (memoria persistente que se compara día-a-día).

@@ -211,6 +211,8 @@ def find_signals(
     diag: dict[str, float] | None = None,
     one_per_event: bool = True,
     max_stake_pct: float = 0.0,
+    fair_out: dict[str, float] | None = None,
+    max_edge: float | None = None,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -254,6 +256,7 @@ def find_signals(
             reject_started=0.0,  # el candidato correcto ya arrancó (Kalshi in-play) → descarta
             skip_out_of_horizon=0.0,  # la fecha del event_key ni siquiera está en el feed de odds
             skip_multi_outcome=0.0,  # evento Kalshi >3 outcomes: inmatchable contra feed h2h
+            reject_high_edge=0.0,  # señal sobre el techo de ejecución (anti-fantasma)
             best_net_edge=-1.0,  # fracción; -1 = no se evaluó ningún outcome
         )
     signals: list[ConsensusSignal] = []
@@ -353,9 +356,21 @@ def find_signals(
                     fp = fair.get(cn)
                     if fp is None:
                         continue
+                    # Canal Motor 5 (plan MM §1.2): el fair de TODO outcome matcheado se
+                    # expone vía out-param (no solo los que superan el umbral de señal) —
+                    # el market maker cotiza alrededor del fair, no del edge. Puro: el
+                    # caller decide si publicarlo (el poller solo lo hace con odds LIVE).
+                    if fair_out is not None:
+                        fair_out[q.market_ticker] = fp
                     event_signals.extend(
                         _signals_for_outcome(
-                            q, fp, capital_usd, min_edge, diag, max_stake_pct=max_stake_pct
+                            q,
+                            fp,
+                            capital_usd,
+                            min_edge,
+                            diag,
+                            max_stake_pct=max_stake_pct,
+                            max_edge=max_edge,
                         )
                     )
                 for es in event_signals:
@@ -447,9 +462,24 @@ def _emit_if_plausible(
     capital_usd: float,
     min_edge: float,
     max_stake_pct: float = 0.0,
+    max_edge: float | None = None,
+    diag: dict[str, float] | None = None,
 ) -> None:
-    """Emite la señal si min_edge < edge ≤ MAX_PLAUSIBLE_EDGE; un edge monstruoso se descarta."""
+    """Emite la señal si min_edge < edge ≤ techo(s); un edge alto/monstruoso se descarta."""
     if edge <= min_edge:
+        return
+    # Techo de EJECUCIÓN configurable (anti-fantasma, MOTOR_2_MAX_EDGE_PCT — espejo de
+    # MOTOR_1_MAX_EDGE_PCT). Evidencia de trades settled: bucket edge ~5% rentable
+    # (+$189, 59% win) pero 12-13% sangró (−$621, ≤54% win) — un edge consensus alto en
+    # un binario líquido es casi siempre consenso mal calibrado, no valor. Estricto `>`.
+    # DISTINTO del backstop MAX_PLAUSIBLE_EDGE de abajo (artefactos monstruosos, 15%).
+    if max_edge is not None and edge > max_edge:
+        if diag is not None:
+            diag["reject_high_edge"] = diag.get("reject_high_edge", 0.0) + 1.0
+        logger.info(
+            f"motor2.signal.rej_high ticker={q.market_ticker} side={side} "
+            f"edge={edge:.3f} > techo={max_edge:.3f} (anti-fantasma)"
+        )
         return
     if edge > MAX_PLAUSIBLE_EDGE:
         # Backstop: edge implausible = artefacto (mercado resuelto/stale) → NO graba ni apuesta.
@@ -471,6 +501,7 @@ def _signals_for_outcome(
     diag: dict[str, float] | None = None,
     *,
     max_stake_pct: float = 0.0,
+    max_edge: float | None = None,
 ) -> list[ConsensusSignal]:
     """Candidatos YES (prob justa) y NO (complemento) de UN outcome con edge neto > umbral.
 
@@ -488,10 +519,30 @@ def _signals_for_outcome(
         # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
         diag["best_net_edge"] = max(diag.get("best_net_edge", -1.0), yes_edge, no_edge)
     _emit_if_plausible(
-        out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge, max_stake_pct
+        out,
+        q,
+        "YES",
+        fair_prob,
+        q.yes_ask_cents,
+        yes_edge,
+        capital_usd,
+        min_edge,
+        max_stake_pct,
+        max_edge=max_edge,
+        diag=diag,
     )
     _emit_if_plausible(
-        out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge, max_stake_pct
+        out,
+        q,
+        "NO",
+        1.0 - fair_prob,
+        q.no_ask_cents,
+        no_edge,
+        capital_usd,
+        min_edge,
+        max_stake_pct,
+        max_edge=max_edge,
+        diag=diag,
     )
     return out
 

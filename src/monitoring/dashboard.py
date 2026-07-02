@@ -80,7 +80,8 @@ def build_dashboard_text(now: datetime | None = None) -> str:
     motors = (
         f"M1 {_motor_icon(settings.MOTOR_1_ARBITRAGE_ENABLED, False)} · "
         f"M2 {_motor_icon(settings.MOTOR_2_SPORTSBOOK_ENABLED, settings.MOTOR_2_EXECUTION_ENABLED)} · "
-        f"M3 {_motor_icon(settings.MOTOR_3_CLV_ENABLED, settings.MOTOR_3_EXECUTION_ENABLED)}"
+        f"M3 {_motor_icon(settings.MOTOR_3_CLV_ENABLED, settings.MOTOR_3_EXECUTION_ENABLED)} · "
+        f"M5 {_motor_icon(settings.MOTOR_MM_ENABLED, settings.MOTOR_MM_EXECUTION_ENABLED)}"
     )
 
     lines: list[str] = [
