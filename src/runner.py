@@ -248,6 +248,7 @@ class ProductionRunner:
                 trading_enabled=trading,
                 risk_manager=risk,
                 fill_feed=fill_feed,
+                mm_exposure_cap_usd=self.settings.MOTOR_MM_MAX_EXPOSURE_USD,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor5_mm runner: {type(e).__name__}: {e}"

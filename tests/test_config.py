@@ -133,17 +133,47 @@ def test_execution_without_engine_flag_rejected(fake_key: Path, monkeypatch):
         Settings()
 
 
-def test_motor_mm_execution_flag_rejected_in_production(fake_key: Path, monkeypatch):
-    """La ejecución del Motor 5 es F2 (demo only): en PRODUCCIÓN el flag rompe el boot
-    hasta F3 (smoke test + OK explícito, plan motor_5 §5)."""
+def test_motor_mm_execution_in_production_requires_f3_key(fake_key: Path, monkeypatch):
+    """PRODUCCIÓN + EXECUTION sin la llave F3 → boot roto (plan §5: el orden importa —
+    smoke test primero, luego girar la llave como acto deliberado)."""
     monkeypatch.setenv("KALSHI_ENV", "production")
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
     monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
     monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
 
-    with pytest.raises(ValidationError, match="demo only"):
+    with pytest.raises(ValidationError, match="llave F3"):
         Settings()
+
+
+def test_motor_mm_f3_key_wrong_value_still_blocks(fake_key: Path, monkeypatch):
+    """La llave exige el valor EXACTO — un typo no activa un market maker."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_F3_ACK", "noel-ok-f3")  # case incorrecto
+
+    with pytest.raises(ValidationError, match="llave F3"):
+        Settings()
+
+
+def test_motor_mm_f3_key_unlocks_production(fake_key: Path, monkeypatch):
+    """Con la llave exacta (OK de Noel 2026-07-02, documentado en el commit y en el
+    runbook), producción bootea — la secuencia §5 sigue mandando operativamente."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_F3_ACK", "NOEL-OK-F3")
+
+    s = Settings()
+    assert s.MOTOR_MM_EXECUTION_ENABLED and s.MOTOR_MM_F3_ACK == "NOEL-OK-F3"
+    assert s.MOTOR_MM_MAX_EXPOSURE_USD == 100.0  # canary cap default
 
 
 def test_motor_mm_execution_allowed_in_demo(fake_key: Path, monkeypatch):

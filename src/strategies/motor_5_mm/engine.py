@@ -76,6 +76,7 @@ class Motor5Engine:
         trading_enabled: bool = False,
         risk_manager: RiskManager | None = None,
         fill_feed: MMFillFeed | None = None,
+        mm_exposure_cap_usd: float | None = None,
     ) -> None:
         self._max_tickers = max_tickers
         self._half_spread = half_spread_cents
@@ -94,6 +95,7 @@ class Motor5Engine:
         self._trading_enabled = trading_enabled
         self._risk = risk_manager
         self._fill_feed = fill_feed
+        self._mm_exposure_cap_usd = mm_exposure_cap_usd
         self._executor: Motor5Executor | None = None
         self._reconciler: MMReconciler | None = None
         self._settled_coids: set[str] = set()  # fills ya aplicados al inventario (1 sola vez)
@@ -109,7 +111,9 @@ class Motor5Engine:
         async with self._client_factory() as client:
             self._client = client
             if self._trading_enabled:
-                self._executor = Motor5Executor(client, risk=self._risk)
+                self._executor = Motor5Executor(
+                    client, risk=self._risk, max_exposure_usd=self._mm_exposure_cap_usd
+                )
                 self._reconciler = MMReconciler(client)
             while not stop_event.is_set():
                 try:

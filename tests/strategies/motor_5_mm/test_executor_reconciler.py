@@ -268,3 +268,36 @@ async def test_reconcile_foreign_orders_untouched():
     }
     report = await MMReconciler(client).reconcile()
     assert report.phantom_cancelled == 0 and client.cancelled == []
+
+
+# =====================================================
+# Canary cap F3 (techo duro del costo abierto del MM)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_canary_cap_blocks_order_over_ceiling():
+    """Con $100 de cap y $95 ya abiertos, una quote de $10 NO se coloca."""
+    client = _FakeClient()
+    _pending_row("m5mm-open1", ticker="T-OTRO", count=200)  # 200×47c = $94 abiertos
+    ex = Motor5Executor(client, max_exposure_usd=100.0)
+    outcome = await ex.sync_quotes(_quote(bid=50, ask=None, size=20))  # $10 el bid
+    assert outcome == "risk_blocked"
+    assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_canary_cap_allows_within_ceiling():
+    client = _FakeClient()
+    ex = Motor5Executor(client, max_exposure_usd=100.0)
+    outcome = await ex.sync_quotes(_quote(bid=47, ask=53, size=10))  # ~$4.7+$5.3
+    assert outcome == "synced" and len(client.placed) == 2
+
+
+@pytest.mark.asyncio
+async def test_canary_cap_none_means_no_own_ceiling():
+    """Demo (F2): sin cap propio — manda solo el headroom global si hay RiskManager."""
+    client = _FakeClient()
+    _pending_row("m5mm-open2", ticker="T-OTRO", count=10_000)
+    ex = Motor5Executor(client, max_exposure_usd=None)
+    assert await ex.sync_quotes(_quote()) == "synced"

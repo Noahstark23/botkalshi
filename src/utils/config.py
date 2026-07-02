@@ -251,6 +251,22 @@ class Settings(BaseSettings):
         gt=0,
         description="Edad máx del fair de Motor 2 para cotizar (2 ciclos del poller por default)",
     )
+    # LLAVE F3 (plan §5.3): la ejecución del MM en PRODUCCIÓN exige el OK explícito de
+    # Noel, documentado. OK otorgado 2026-07-02 ("tienes mi ok") — pero el ORDEN de §5
+    # manda: smoke test (scripts/motor5_smoke_test.py) ANTES de girar esta llave. El
+    # valor exacto obliga a un acto deliberado en el env de Coolify, no un typo.
+    MOTOR_MM_F3_ACK: str = Field(
+        default="",
+        description="Llave de activación F3 en producción. Valor requerido: 'NOEL-OK-F3'. Vacío = producción bloqueada (demo no la necesita).",
+    )
+    # Canary cap del MM en producción (plan §5: 'capital canary topado — $100, techo duro
+    # por config'): tope ABSOLUTO del costo abierto (pending+filled) del Motor 5, aparte
+    # del headroom global del RiskManager. Primera semana: inventario a la mitad de demo.
+    MOTOR_MM_MAX_EXPOSURE_USD: float = Field(
+        default=100.0,
+        gt=0.0,
+        description="Techo duro (USD) del costo abierto del Motor 5 (canary F3)",
+    )
 
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,
@@ -447,15 +463,19 @@ class Settings(BaseSettings):
                     "MOTOR_REST_EXECUTION_ENABLED=true requiere MOTOR_REST_ENABLED=true "
                     "(la ejecución sin el motor corriendo es un no-op engañoso)."
                 )
-            # Motor 5: la ejecución real es F2 y corre SOLO contra demo. En PRODUCCIÓN el
-            # flag rompe el boot hasta F3 (smoke test + canonicalización + OK explícito de
-            # Noel — plan §5). NOTA: MOTOR_MM_ENABLED tampoco cuenta como "motor
+            # Motor 5 en PRODUCCIÓN (F3): requiere la LLAVE explícita (plan §5 — smoke
+            # test + canonicalización + OK de Noel; el OK está documentado en el campo
+            # MOTOR_MM_F3_ACK y en el commit que lo introdujo). Sin la llave, el flag
+            # rompe el boot. NOTA: MOTOR_MM_ENABLED tampoco cuenta como "motor
             # habilitado" arriba — shadow no opera capital (misma regla que *_EXECUTION).
-            if self.MOTOR_MM_EXECUTION_ENABLED:
+            if self.MOTOR_MM_EXECUTION_ENABLED and self.MOTOR_MM_F3_ACK != "NOEL-OK-F3":
                 raise ValueError(
-                    "MOTOR_MM_EXECUTION_ENABLED=true en PRODUCCIÓN: el Motor 5 está en "
-                    "F2 (demo only). La activación en producción es F3 y requiere smoke "
-                    "test + OK explícito (docs/motor_5_market_maker_plan_fases.md §5)."
+                    "MOTOR_MM_EXECUTION_ENABLED=true en PRODUCCIÓN sin la llave F3. "
+                    "Secuencia (plan §5, el orden importa): 1) correr scripts/"
+                    "motor5_smoke_test.py contra producción y verificar el cancel; "
+                    "2) setear MOTOR_MM_F3_ACK='NOEL-OK-F3' en el env (acto deliberado "
+                    "que documenta el OK); 3) redeploy con supervisión activa "
+                    "(docs/motor5_runbook_activacion.md)."
                 )
         return self
 

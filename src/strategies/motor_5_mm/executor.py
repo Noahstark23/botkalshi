@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, select
 
 from src.clients.kalshi_rest import (
     KalshiAPIError,
@@ -66,9 +66,18 @@ class Motor5Executor:
 
     _locks: ClassVar[dict[str, asyncio.Lock]] = {}
 
-    def __init__(self, client: KalshiRestClient, risk: RiskManager | None = None) -> None:
+    def __init__(
+        self,
+        client: KalshiRestClient,
+        risk: RiskManager | None = None,
+        *,
+        max_exposure_usd: float | None = None,
+    ) -> None:
         self._client = client
         self._risk = risk
+        # Canary cap F3 (plan §5): techo ABSOLUTO del costo abierto del MM (pending +
+        # filled), independiente del headroom global. None = sin cap propio (demo).
+        self._max_exposure_usd = max_exposure_usd
         self._live: dict[str, dict[str, LiveOrder]] = {}  # ticker → {action: LiveOrder}
         self.corrupted: set[str] = set()  # tickers con estado en duda → reconcile primero
 
@@ -139,6 +148,15 @@ class Motor5Executor:
                 f"(headroom < ${cost_usd:.2f})"
             )
             return None
+        if self._max_exposure_usd is not None:
+            open_cost = self._mm_open_cost_usd()
+            if open_cost + cost_usd > self._max_exposure_usd:
+                logger.warning(
+                    f"motor5.exec.canary_cap {ticker} {action} {count}@{price}c "
+                    f"(abierto ${open_cost:.2f} + ${cost_usd:.2f} > "
+                    f"cap ${self._max_exposure_usd:.2f})"
+                )
+                return None
         coid = f"{COID_PREFIX}{uuid.uuid4()}"
         # INTENT PRE-RED: si el proceso muere entre el INSERT y la respuesta, la fila
         # pending existe y el reconciler la resuelve contra get_orders.
@@ -251,6 +269,30 @@ class Motor5Executor:
             self._mark_row(coid, "cancelled", note=f"cancel_all: {reason[:50]}")
         logger.warning(f"motor5.exec.cancel_all n={len(ids)} reason={reason}")
         return len(ids)
+
+    def _mm_open_cost_usd(self) -> float:
+        """Costo abierto TOTAL del Motor 5 (pending reserva completo; filled usa
+        filled_count). Fail-safe: error de DB → inf (ante la duda, el cap bloquea)."""
+        try:
+            with get_session() as s:
+                rows = list(
+                    s.exec(
+                        select(Trade).where(
+                            Trade.strategy == STRATEGY,
+                            col(Trade.status).in_(["pending", "filled"]),
+                        )
+                    )
+                )
+        except Exception:
+            logger.exception("motor5.exec.open_cost_error → cap bloquea (fail-safe)")
+            return float("inf")
+        total = 0
+        for t in rows:
+            count = (
+                t.filled_count if t.status == "filled" and t.filled_count is not None else t.count
+            )
+            total += t.price_cents * count
+        return total / 100.0
 
     # =====================================================
     # DB best-effort
