@@ -103,6 +103,12 @@ class Trade(SQLModel, table=True):
     # el PnL (la pérdida/ganancia ya quedó realizada al precio de salida).
     closed_by_clv: bool = False
 
+    # Motor 5 F2 (fills PARCIALES de órdenes resting): contratos realmente llenados.
+    # None = semántica legacy (orden inmediata FOK/IOC: count entero se llenó o nada).
+    # El RiskManager usa filled_count (si está) para la exposición de filas 'filled':
+    # una resting de 1000 con 500 llenados (resto cancelado) expone 500, no 1000.
+    filled_count: int | None = None
+
     # Timestamps
     placed_at: datetime = Field(default_factory=_utc_now, index=True)
     filled_at: datetime | None = None
@@ -420,6 +426,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("edge_windows", "kind", "VARCHAR(20)"),  # P3: binary | multi_outcome
     ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
     ("portfolio_positions", "peak_bid_cents", "INTEGER"),  # Motor 3 FASE 2: trailing stop
+    ("trades", "filled_count", "INTEGER"),  # Motor 5 F2: fills parciales de resting orders
 ]
 
 
@@ -495,6 +502,41 @@ def kill_switch_engaged() -> tuple[bool, str | None]:
     with get_session() as s:
         row = s.get(OperationalState, _KILL_SWITCH_KEY)
         if row is None or row.value != "engaged":
+            return False, None
+        return True, row.reason
+
+
+_MM_QUOTES_PAUSED_KEY = "mm_quotes_paused"
+
+
+def set_mm_quotes_paused(paused: bool, reason: str | None = None) -> None:
+    """
+    Modo quotes_paused del Motor 5 (F2, plan §4.2): el MM DEJA de emitir quotes nuevas
+    pero SIGUE gestionando lo abierto (reconcile + cancel). Es la pausa intermedia entre
+    "operar normal" y el kill-switch (que cancela todo y frena el motor). Persistente
+    (sobrevive restarts), patrón kill-switch.
+    """
+    with get_session() as s:
+        row = s.get(OperationalState, _MM_QUOTES_PAUSED_KEY)
+        value = "paused" if paused else "clear"
+        if row is None:
+            row = OperationalState(
+                key=_MM_QUOTES_PAUSED_KEY, value=value, reason=(reason or "")[:500] or None
+            )
+        else:
+            row.value = value
+            row.reason = (reason or "")[:500] or None
+            row.updated_at = _utc_now()
+        s.add(row)
+        s.commit()
+
+
+def mm_quotes_paused() -> tuple[bool, str | None]:
+    """(paused, reason). Propaga si la DB falla — el engine asume paused ante error
+    (fail-safe: no cotizar es el estado seguro)."""
+    with get_session() as s:
+        row = s.get(OperationalState, _MM_QUOTES_PAUSED_KEY)
+        if row is None or row.value != "paused":
             return False, None
         return True, row.reason
 

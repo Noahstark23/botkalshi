@@ -416,7 +416,16 @@ class RiskManager:
         if not active_trades:
             return 0.0
 
-        total_cents = sum(t.price_cents * t.count for t in active_trades)
+        # Motor 5 F2 — reservado vs expuesto: una fila 'pending' (orden RESTING) reserva
+        # su count COMPLETO (conservador: puede llenarse entera en cualquier momento);
+        # una 'filled' con filled_count (fill PARCIAL: el resto se canceló) expone SOLO
+        # lo llenado. filled_count=None = semántica legacy (count entero).
+        def _exposure_count(t: Trade) -> int:
+            if t.status == "filled" and t.filled_count is not None:
+                return t.filled_count
+            return t.count
+
+        total_cents = sum(t.price_cents * _exposure_count(t) for t in active_trades)
 
         # Descuento de arbs hedged: agrupar las FILLED con arb_id identificable.
         groups: dict[str, list[Trade]] = {}
