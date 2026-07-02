@@ -128,13 +128,52 @@ def test_series_each_kalshi_event_matches_its_own_game():
     )
 
 
-def test_no_candidate_on_key_date_rejects_with_date():
-    """Solo existe la línea de MAÑANA → el evento Kalshi de HOY no matchea nada (reject_date)."""
+def test_key_date_without_feed_coverage_is_horizon_skip():
+    """Solo existe la línea de MAÑANA → la fecha de HOY ni siquiera está en el feed:
+    skip_out_of_horizon (pre-funnel, fix observabilidad 2026-07-02), NO reject_date —
+    antes este caso inflaba reject_date y tapaba los mismatches reales."""
     game_tomorrow = NOW + timedelta(hours=30)
     ke_today = _kalshi(f"KXMLBGAME-{_stamp(NOW + timedelta(hours=6))}PHINYM")
     diag: dict[str, float] = {}
     assert _find([ke_today], [_odds(game_tomorrow)], diag) == []
-    assert diag["reject_date"] == 1.0 and diag["events_matched"] == 0.0
+    assert diag["skip_out_of_horizon"] == 1.0
+    assert diag["reject_date"] == 0.0 and diag["events_matched"] == 0.0
+
+
+def test_reject_date_when_feed_covers_day_but_matchup_is_another_date():
+    """reject_date GENUINO: el feed SÍ cubre el día del key (otro partido), pero este
+    matchup solo existe mañana → candidatos por nombres sin fecha correcta."""
+    game_today_other = _odds(NOW + timedelta(hours=6), oid="other")
+    # otro partido hoy (nombres distintos) para que la fecha esté cubierta:
+    from src.clients.odds_api import Bookmaker, Market, Outcome
+
+    game_today_other = OddsEvent(
+        id="other",
+        sport_key="baseball_mlb",
+        commence_time=NOW + timedelta(hours=6),
+        home_team="Atlanta Braves",
+        away_team="Miami Marlins",
+        bookmakers=(
+            Bookmaker(
+                key="pinnacle",
+                title="P",
+                markets=(
+                    Market(
+                        key="h2h",
+                        outcomes=(
+                            Outcome(name="Atlanta Braves", price=1.6),
+                            Outcome(name="Miami Marlins", price=2.6),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    phinym_tomorrow = _odds(NOW + timedelta(hours=30), oid="tmrw")
+    ke_today = _kalshi(f"KXMLBGAME-{_stamp(NOW + timedelta(hours=6))}PHINYM")
+    diag: dict[str, float] = {}
+    assert _find([ke_today], [game_today_other, phinym_tomorrow], diag) == []
+    assert diag["reject_date"] == 1.0 and diag["skip_out_of_horizon"] == 0.0
 
 
 # =====================================================

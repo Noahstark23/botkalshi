@@ -247,11 +247,22 @@ def find_signals(
             reject_date=0.0,  # candidato(s) por nombres pero ninguno en la fecha del event_key
             reject_ambiguous=0.0,  # >1 candidato sin desambiguar (doubleheader/serie) → descarta
             reject_started=0.0,  # el candidato correcto ya arrancó (Kalshi in-play) → descarta
+            skip_out_of_horizon=0.0,  # la fecha del event_key ni siquiera está en el feed de odds
             best_net_edge=-1.0,  # fracción; -1 = no se evaluó ningún outcome
         )
     signals: list[ConsensusSignal] = []
     name_debug_budget = 3  # cap de logs name_debug por ciclo (evita spam)
+    # FILTRO PRE-FUNNEL (fix observabilidad 2026-07-02): las fechas (ET) que el feed de
+    # odds cubre. Un evento Kalshi de un día SIN cobertura (p.ej. el universo trae los
+    # partidos de mañana pero la odds API solo los de hoy) no es un rechazo interesante —
+    # antes inflaba reject_date/reject_absent y tapaba los mismatches reales del embudo.
+    odds_dates = {start_time_et(oe.commence_time).date() for oe in odds_events}
     for ke in kalshi_events:
+        parsed_key = parse_event_key_start(ke.event_key)
+        if parsed_key is not None and odds_dates and parsed_key[0] not in odds_dates:
+            if diag is not None:
+                diag["skip_out_of_horizon"] = diag.get("skip_out_of_horizon", 0.0) + 1.0
+            continue
         k_names = [q.outcome_name for q in ke.outcomes]
         k_canon = {canonical_name(n) for n in k_names}
         matched = False

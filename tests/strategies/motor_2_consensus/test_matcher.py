@@ -66,7 +66,7 @@ def test_accent_folding(accented, plain):
         ("USA", "united states"),
         ("United States of America", "united states"),
         ("Korea Republic", "south korea"),
-        ("Yankees", "yankees"),  # sin alias → queda normalizado
+        ("Yankees", "new york yankees"),  # nickname MLB poblado (plan 2026-07-02)
     ],
 )
 def test_canonical_name_resolves_alias(raw, expected):

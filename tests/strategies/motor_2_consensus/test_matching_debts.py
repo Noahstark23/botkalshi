@@ -199,3 +199,67 @@ def test_all_bookmakers_inconsistent_returns_empty():
         bookmakers=(broken,),
     )
     assert _consensus_fair_probs(ev) == {}
+
+
+# =====================================================
+# Aliases MLB poblados (plan amarillo 2026-07-02)
+# =====================================================
+# Evidencia: rej_names=16/49 (33%) en el funnel vivo + probes del operador (cws, sf, sd,
+# lad, laa, ny yankees, white sox, padres, oakland → MISSING). La estructura del matcher
+# ya estaba mergeada; esto es data entry. Colisiones cross-deporte (Giants NFL, Cardinals
+# NFL, Rangers NHL) las bloquea series_sport_compatible, no la tabla.
+
+_MLB_VARIANTS = {
+    "arizona diamondbacks": ["ARI", "AZ", "Diamondbacks", "D-backs"],
+    "atlanta braves": ["ATL", "Braves"],
+    "athletics": ["OAK", "ATH", "Oakland", "A's", "Athletics"],
+    "baltimore orioles": ["BAL", "Orioles"],
+    "boston red sox": ["BOS", "Red Sox"],
+    "chicago cubs": ["CHC", "Cubs", "Chi Cubs"],
+    "chicago white sox": ["CWS", "CHW", "White Sox", "Chi White Sox"],
+    "cincinnati reds": ["CIN", "Reds"],
+    "cleveland guardians": ["CLE", "Guardians"],
+    "colorado rockies": ["COL", "Rockies"],
+    "detroit tigers": ["DET", "Tigers"],
+    "houston astros": ["HOU", "Astros"],
+    "kansas city royals": ["KC", "KCR", "Royals"],
+    "los angeles angels": ["LAA", "LA Angels", "Angels"],
+    "los angeles dodgers": ["LAD", "LA Dodgers", "Dodgers"],
+    "miami marlins": ["MIA", "Marlins"],
+    "milwaukee brewers": ["MIL", "Brewers"],
+    "minnesota twins": ["MIN", "Twins"],
+    "new york mets": ["NYM", "NY Mets", "Mets"],
+    "new york yankees": ["NYY", "NY Yankees", "Yankees"],
+    "philadelphia phillies": ["PHI", "Phillies"],
+    "pittsburgh pirates": ["PIT", "Pirates"],
+    "san diego padres": ["SD", "SDP", "Padres"],
+    "san francisco giants": ["SF", "SFG", "Giants"],
+    "seattle mariners": ["SEA", "Mariners"],
+    "st louis cardinals": ["STL", "Cardinals", "St. Louis Cardinals"],
+    "tampa bay rays": ["TB", "TBR", "Rays"],
+    "texas rangers": ["TEX", "Rangers"],
+    "toronto blue jays": ["TOR", "Blue Jays", "Jays"],
+    "washington nationals": ["WSH", "WAS", "Nationals"],
+}
+
+
+@pytest.mark.parametrize(
+    ("variant", "canonical"),
+    [(v, canon) for canon, variants in _MLB_VARIANTS.items() for v in variants],
+)
+def test_mlb_variants_canonize(variant, canonical):
+    assert canonical_name(variant) == canonical
+
+
+def test_full_names_still_canonize_to_themselves():
+    for canon in _MLB_VARIANTS:
+        assert canonical_name(canon.title()) == canon
+
+
+def test_aliases_do_not_chain():
+    """Invariante estructural: todo VALOR de la tabla es canónico (get(v, v) == v) — un
+    alias que apunte a otro alias resolvería distinto según el lado que lo canonice."""
+    from src.strategies.motor_2_consensus.matcher import TEAM_ALIASES
+
+    for value in TEAM_ALIASES.values():
+        assert TEAM_ALIASES.get(value, value) == value, value
