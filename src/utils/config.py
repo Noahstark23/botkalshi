@@ -316,6 +316,17 @@ class Settings(BaseSettings):
     MOTOR_2_MIN_EDGE_PCT: float = Field(
         default=3.0, ge=0.0, description="Edge neto post-fee mínimo de Motor 2 (pp)"
     )
+    # Techo de edge de EJECUCIÓN de Motor 2 (anti-fantasma), en PUNTOS PORCENTUALES.
+    # Espejo de MOTOR_1_MAX_EDGE_PCT. Auditoría de trades reales: el bucket de edge
+    # ~5% fue rentable (+$189, 59% win) pero 12-13% sangró (−$621, ≤54% win). Un
+    # "edge consensus" alto en MLB es casi siempre artefacto (consenso mal calibrado).
+    # Se DETECTA/loguea pero NO se emite señal ejecutable por encima de este umbral.
+    # NO confundir con el backstop MAX_PLAUSIBLE_EDGE (15%, artefactos monstruosos).
+    MOTOR_2_MAX_EDGE_PCT: float = Field(
+        default=8.0,
+        gt=0.0,
+        description="Techo de edge para EJECUTAR Motor 2 (anti-fantasma, pp)",
+    )
     # Filtro underdog (FASE 3): las entradas <40c sangraron −$110,77 en el histórico. ENABLED
     # off = SHADOW intra-live (loguea lo que bloquearía pero igual entra); on = bloquea.
     MOTOR_2_MIN_ENTRY_CENTS: int = Field(

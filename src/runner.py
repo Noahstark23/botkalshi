@@ -350,6 +350,7 @@ class ProductionRunner:
                         min_edge=min_edge,
                         one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                         max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
+                        max_edge=self.settings.MOTOR_2_MAX_EDGE_PCT / 100.0,
                         risk_manager=risk,
                         executor=executor,
                     )
@@ -361,6 +362,7 @@ class ProductionRunner:
                     min_edge=min_edge,
                     one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
                     max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
+                    max_edge=self.settings.MOTOR_2_MAX_EDGE_PCT / 100.0,
                     risk_manager=risk,
                 )
                 await poller.run(self._stop_event)
