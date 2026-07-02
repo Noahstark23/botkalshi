@@ -397,6 +397,15 @@ class RiskManager:
 
         return TradeDecision(True, "Aprobado", allowed_count)
 
+    def exposure_headroom_usd(self) -> float:
+        """Headroom de exposición restante (USD): capital efectivo × MAX_SIMULTANEOUS
+        _EXPOSURE_PCT − exposición actual (reservado + expuesto, todos los motores).
+        Lo usa el Motor 5 F2 como gate pre-orden: cada quote nueva debe caber en el
+        headroom (su fila pending reserva el capital para los demás motores)."""
+        capital_usd = self._get_effective_capital_usd()
+        max_total = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
+        return max_total - self._get_current_exposure_usd()
+
     def _get_current_exposure_usd(self) -> float:
         """
         Capital EN RIESGO en posiciones abiertas (pending/filled, todos los motores).
