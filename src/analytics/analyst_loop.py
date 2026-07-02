@@ -26,7 +26,13 @@ from sqlmodel import Session, col, select
 
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import send_alert
-from src.storage.models import AnalystVerdict, EdgeWindow, Motor2FunnelSnapshot, get_session
+from src.storage.models import (
+    AnalystVerdict,
+    EdgeWindow,
+    MMFunnelSnapshot,
+    Motor2FunnelSnapshot,
+    get_session,
+)
 from src.utils.config import get_settings
 
 
@@ -52,6 +58,18 @@ class FunnelAgg:
     reject_names: int
     reject_no_fair: int
     best_pp: float  # mejor edge NETO VISTO (incluye near-misses < umbral); -1 si nada
+
+
+@dataclass(frozen=True, slots=True)
+class MMAgg:
+    """Motor 5 (F1 shadow) en la ventana. cycles=0 → motor apagado/sin datos (no se
+    reporta). El MTM es el ÚLTIMO snapshot (es acumulativo, no se suma)."""
+
+    cycles: int
+    quoted: int  # quotes emitidas (suma)
+    fills: int  # fills hipotéticos (suma)
+    mtm_last_cents: int  # PnL mark-to-market neto de fees, último tick
+    inventory_abs_last: int  # Σ|net| simulado, último tick
 
 
 # =====================================================
@@ -95,6 +113,26 @@ def aggregate_funnel(session: Session, since: datetime) -> FunnelAgg:
         reject_names=sum(r.reject_names for r in rows),
         reject_no_fair=sum(r.reject_no_fair for r in rows),
         best_pp=max(r.best_net_edge_pp for r in rows),
+    )
+
+
+def aggregate_mm(session: Session, since: datetime) -> MMAgg:
+    """Agrega los MMFunnelSnapshot desde `since` (tracker del gate F1→F2 del Motor 5)."""
+    rows = list(
+        session.exec(
+            select(MMFunnelSnapshot)
+            .where(col(MMFunnelSnapshot.created_at) >= since)
+            .order_by(col(MMFunnelSnapshot.created_at))
+        )
+    )
+    if not rows:
+        return MMAgg(0, 0, 0, 0, 0)
+    return MMAgg(
+        cycles=len(rows),
+        quoted=sum(r.quoted for r in rows),
+        fills=sum(r.fills for r in rows),
+        mtm_last_cents=rows[-1].mtm_pnl_cents,
+        inventory_abs_last=rows[-1].inventory_abs,
     )
 
 
@@ -227,10 +265,15 @@ class AnalystLoop:
             session.add(row)
             session.commit()
             session.refresh(row)
-        await self._report(row, funnel, prev_gt)
+            # Motor 5 (F1 shadow): línea informativa del digest — NO entra al veredicto ni
+            # al schema (misma decisión que los contadores nuevos del funnel: log-only).
+            mm = aggregate_mm(session, since)
+        await self._report(row, funnel, prev_gt, mm)
         return row
 
-    async def _report(self, row: AnalystVerdict, funnel: FunnelAgg, prev_gt: int | None) -> None:
+    async def _report(
+        self, row: AnalystVerdict, funnel: FunnelAgg, prev_gt: int | None, mm: MMAgg | None = None
+    ) -> None:
         trend = (
             "" if prev_gt is None else f" (tendencia >umbral: {prev_gt}→{row.consensus_gt_thresh})"
         )
@@ -244,6 +287,11 @@ class AnalystLoop:
             f"→ {row.recommendation}\n"
             f"(bot: mercados={BotState.tracked_markets_count} paused={BotState.is_paused})"
         )
+        if mm is not None and mm.cycles:
+            digest += (
+                f"\nM5 shadow: ticks={mm.cycles} quotes={mm.quoted} fills={mm.fills} "
+                f"mtm=${mm.mtm_last_cents / 100:+.2f} inv={mm.inventory_abs_last}"
+            )
         logger.info(f"analyst_loop.verdict {row.verdict} | {row.recommendation}")
         with contextlib.suppress(Exception):
             await send_alert(digest)  # no-op si Telegram no está configurado

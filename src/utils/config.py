@@ -221,6 +221,37 @@ class Settings(BaseSettings):
         default=30.0, gt=0, description="Timeout (s) de una recovery atascada de OrderbookManagerV2"
     )
 
+    # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
+    # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe
+    # hasta F2. Shadow = MOTOR_MM_ENABLED=True (EXECUTION queda False y sin efecto).
+    MOTOR_MM_ENABLED: bool = Field(
+        default=False,
+        description="Corre el Motor 5 en F1 shadow (quotes+fills hipotéticos; CERO órdenes)",
+    )
+    MOTOR_MM_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="RESERVADO F2+: en F1 no existe executor. En producción, True falla el boot (fail-loud, no un no-op engañoso).",
+    )
+    MOTOR_MM_MAX_TICKERS: int = Field(
+        default=10, ge=1, le=100, description="Máx tickers cotizados por tick (Motor 5)"
+    )
+    MOTOR_MM_HALF_SPREAD_CENTS: int = Field(
+        default=3, ge=1, le=20, description="Half-spread alrededor del fair (cents) (Motor 5)"
+    )
+    MOTOR_MM_QUOTE_SIZE_CONTRACTS: int = Field(
+        default=10, ge=1, description="Contratos por lado de cada quote shadow (Motor 5)"
+    )
+    MOTOR_MM_MAX_INVENTORY_CONTRACTS: int = Field(
+        default=50,
+        ge=1,
+        description="Tope de |inventario| simulado por ticker; al tope se cotiza solo el lado que reduce (Motor 5)",
+    )
+    MOTOR_MM_FAIR_TTL_SEC: float = Field(
+        default=600.0,
+        gt=0,
+        description="Edad máx del fair de Motor 2 para cotizar (2 ciclos del poller por default)",
+    )
+
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,
     # graba EdgeWindow). Default False. Para shadow mode = True + TRADING_ENABLED=False.
@@ -404,6 +435,16 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "MOTOR_REST_EXECUTION_ENABLED=true requiere MOTOR_REST_ENABLED=true "
                     "(la ejecución sin el motor corriendo es un no-op engañoso)."
+                )
+            # Motor 5 está en F1 (shadow): el executor NO existe. Un flag de ejecución
+            # prendido sería un no-op engañoso (parecería armado sin estarlo) → fail-loud.
+            # NOTA: MOTOR_MM_ENABLED tampoco cuenta como "motor habilitado" arriba — en F1
+            # no puede operar capital, igual que los *_EXECUTION_ENABLED (misma deuda).
+            if self.MOTOR_MM_EXECUTION_ENABLED:
+                raise ValueError(
+                    "MOTOR_MM_EXECUTION_ENABLED=true pero Motor 5 está en F1 (shadow): "
+                    "no existe executor todavía. El flag se habilita recién en F2 "
+                    "(docs/motor_5_market_maker_plan_fases.md §4)."
                 )
         return self
 

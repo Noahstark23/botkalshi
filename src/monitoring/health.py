@@ -240,6 +240,8 @@ async def status() -> dict[str, Any]:
                 "motor_2_execution": settings.MOTOR_2_EXECUTION_ENABLED,
                 "motor_3_clv": settings.MOTOR_3_CLV_ENABLED,
                 "motor_3_execution": settings.MOTOR_3_EXECUTION_ENABLED,
+                "motor_5_mm": settings.MOTOR_MM_ENABLED,
+                "motor_5_execution": settings.MOTOR_MM_EXECUTION_ENABLED,
             },
         },
         "capital": RiskManager.capital_status(),

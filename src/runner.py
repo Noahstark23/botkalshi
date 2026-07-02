@@ -207,6 +207,33 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_motor5_mm(self) -> None:
+        """
+        Motor 5 (market maker) F1 SHADOW — gateado por MOTOR_MM_ENABLED. Cotiza
+        HIPOTÉTICAMENTE alrededor del fair de Motor 2 (FairValueBook) contra el book real
+        y registra fills shadow con regla conservadora. CERO órdenes: en F1 el executor no
+        existe (docs/motor_5_market_maker_plan_fases.md §3) — no hay Capa A que gatear
+        porque no hay nada que ejecute; el validador de config rechaza además
+        MOTOR_MM_EXECUTION_ENABLED=true en producción hasta F2.
+        """
+        if not self.settings.MOTOR_MM_ENABLED:
+            return  # opt-in; default off → no-op
+        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        try:
+            from src.strategies.motor_5_mm.engine import Motor5Engine
+
+            await Motor5Engine(
+                max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
+                half_spread_cents=self.settings.MOTOR_MM_HALF_SPREAD_CENTS,
+                quote_size_contracts=self.settings.MOTOR_MM_QUOTE_SIZE_CONTRACTS,
+                max_inventory_contracts=self.settings.MOTOR_MM_MAX_INVENTORY_CONTRACTS,
+                fair_ttl_sec=self.settings.MOTOR_MM_FAIR_TTL_SEC,
+            ).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor5_mm runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
     async def _run_motor1_arb(self) -> None:
         """
         Motor 1 (arbitraje binario WS) — gateado por MOTOR_1_ARBITRAGE_ENABLED. Detecta
@@ -573,6 +600,8 @@ class ProductionRunner:
                 tasks.append(asyncio.create_task(self._run_motor3_clv(), name="motor3_clv"))
             if self.settings.MOTOR_1_ARBITRAGE_ENABLED:
                 tasks.append(asyncio.create_task(self._run_motor1_arb(), name="motor1_arb"))
+            if self.settings.MOTOR_MM_ENABLED:
+                tasks.append(asyncio.create_task(self._run_motor5_mm(), name="motor5_mm"))
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
             done, pending = await asyncio.wait(

@@ -131,3 +131,43 @@ def test_execution_without_engine_flag_rejected(fake_key: Path, monkeypatch):
 
     with pytest.raises(ValidationError, match="MOTOR_3_CLV_ENABLED"):
         Settings()
+
+
+def test_motor_mm_execution_flag_rejected_in_production_f1(fake_key: Path, monkeypatch):
+    """Motor 5 está en F1 (shadow, sin executor): EXECUTION=true sería un no-op engañoso
+    que PARECE armado → fail-loud al boot hasta F2 (plan motor_5 §4)."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="F1"):
+        Settings()
+
+
+def test_motor_mm_alone_does_not_count_as_enabled_motor(fake_key: Path, monkeypatch):
+    """MOTOR_MM_ENABLED en F1 no puede operar capital → NO satisface el guard 'ningún
+    motor habilitado' con TRADING_ENABLED=true (misma regla que los *_EXECUTION)."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="ningún motor"):
+        Settings()
+
+
+def test_motor_mm_shadow_config_valid_in_production(fake_key: Path, monkeypatch):
+    """El modo F1 legítimo: ENABLED=true + EXECUTION=false bootea (shadow junto a un
+    motor real cualquiera)."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+
+    s = Settings()
+    assert s.MOTOR_MM_ENABLED and not s.MOTOR_MM_EXECUTION_ENABLED
