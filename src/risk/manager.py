@@ -397,6 +397,15 @@ class RiskManager:
 
         return TradeDecision(True, "Aprobado", allowed_count)
 
+    def exposure_headroom_usd(self) -> float:
+        """Headroom de exposición restante (USD): capital efectivo × MAX_SIMULTANEOUS
+        _EXPOSURE_PCT − exposición actual (reservado + expuesto, todos los motores).
+        Lo usa el Motor 5 F2 como gate pre-orden: cada quote nueva debe caber en el
+        headroom (su fila pending reserva el capital para los demás motores)."""
+        capital_usd = self._get_effective_capital_usd()
+        max_total = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
+        return max_total - self._get_current_exposure_usd()
+
     def _get_current_exposure_usd(self) -> float:
         """
         Capital EN RIESGO en posiciones abiertas (pending/filled, todos los motores).
@@ -416,7 +425,16 @@ class RiskManager:
         if not active_trades:
             return 0.0
 
-        total_cents = sum(t.price_cents * t.count for t in active_trades)
+        # Motor 5 F2 — reservado vs expuesto: una fila 'pending' (orden RESTING) reserva
+        # su count COMPLETO (conservador: puede llenarse entera en cualquier momento);
+        # una 'filled' con filled_count (fill PARCIAL: el resto se canceló) expone SOLO
+        # lo llenado. filled_count=None = semántica legacy (count entero).
+        def _exposure_count(t: Trade) -> int:
+            if t.status == "filled" and t.filled_count is not None:
+                return t.filled_count
+            return t.count
+
+        total_cents = sum(t.price_cents * _exposure_count(t) for t in active_trades)
 
         # Descuento de arbs hedged: agrupar las FILLED con arb_id identificable.
         groups: dict[str, list[Trade]] = {}

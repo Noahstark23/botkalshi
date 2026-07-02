@@ -221,13 +221,34 @@ class ProductionRunner:
         await asyncio.sleep(20)  # dejar que init_db / boot terminen
         try:
             from src.strategies.motor_5_mm.engine import Motor5Engine
+            from src.strategies.motor_5_mm.fill_feed import MMFillFeed
 
+            # CAPA A: la ejecución real (F2, demo) requiere AMBOS flags; el validador de
+            # config además rompe el boot con EXECUTION=true en producción hasta F3.
+            trading = self.settings.TRADING_ENABLED and self.settings.MOTOR_MM_EXECUTION_ENABLED
+            risk = None
+            fill_feed = None
+            if trading:
+                from src.risk.manager import RiskManager
+
+                risk = RiskManager()
+                fill_feed = MMFillFeed()
+                if self._capture is not None:
+                    # Fast-path de fills por el WS compartido de data_capture; si no hay
+                    # capture, el reconciler (REST) sigue siendo la verdad completa.
+                    fill_feed.attach(self._capture.ws)
+                else:
+                    logger.warning("motor5: sin data_capture → fill feed WS no adjuntado")
             await Motor5Engine(
                 max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
                 half_spread_cents=self.settings.MOTOR_MM_HALF_SPREAD_CENTS,
                 quote_size_contracts=self.settings.MOTOR_MM_QUOTE_SIZE_CONTRACTS,
                 max_inventory_contracts=self.settings.MOTOR_MM_MAX_INVENTORY_CONTRACTS,
                 fair_ttl_sec=self.settings.MOTOR_MM_FAIR_TTL_SEC,
+                trading_enabled=trading,
+                risk_manager=risk,
+                fill_feed=fill_feed,
+                mm_exposure_cap_usd=self.settings.MOTOR_MM_MAX_EXPOSURE_USD,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor5_mm runner: {type(e).__name__}: {e}"
