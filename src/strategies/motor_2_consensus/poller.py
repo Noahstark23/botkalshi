@@ -122,6 +122,7 @@ class Motor2ShadowPoller:
             f"rej_date={int(diag.get('reject_date', 0))} "
             f"rej_ambig={int(diag.get('reject_ambiguous', 0))} "
             f"rej_started={int(diag.get('reject_started', 0))} "
+            f"skip_horizon={int(diag.get('skip_out_of_horizon', 0))} "
             f"best_edge={best_pp:.2f}pp umbral={self._min_edge * 100:.1f}pp"
         )
         # GATE DE DINERO REAL: persistir/apostar SOLO con odds reales (nunca sobre el fixture).
@@ -157,16 +158,24 @@ class Motor2ShadowPoller:
         except Exception:
             logger.exception("motor2.funnel.persist_error")
 
-    async def _execute(self, signals: list[ConsensusSignal]) -> None:
+    async def _execute(self, signals: list[ConsensusSignal]) -> dict[str, int]:
         """
         Apuesta las mejores señales del ciclo (mayor edge primero), hasta MAX_BETS_PER_CYCLE.
         El RiskManager (dentro del executor) corta por exposición/stop-loss. Best-effort:
         un error de una señal se loguea y NO frena las demás ni el loop.
+
+        Devuelve el conteo de desenlaces por motivo y lo loguea (fix observabilidad
+        2026-07-02: "el bot no apostó hoy" era indiagnosticable sin grepear línea por
+        línea — dedup_skip, stake_below, rechazos del RiskManager, etc. ahora salen
+        agregados en UNA línea `motor2.exec.cycle`).
         """
+        outcomes: dict[str, int] = {}
         top = sorted(signals, key=lambda s: s.edge_pct, reverse=True)[: self.MAX_BETS_PER_CYCLE]
         for sig in top:
             try:
                 outcome = await self._executor.execute(sig)  # type: ignore[union-attr]
+                key = "filled" if outcome.filled else (outcome.reason or "sin_motivo")
+                outcomes[key] = outcomes.get(key, 0) + 1
                 if outcome.filled:
                     logger.info(
                         f"motor2.bet FILLED ticker={sig.market_ticker} side={sig.kalshi_side} "
@@ -189,9 +198,16 @@ class Motor2ShadowPoller:
                     except Exception:
                         logger.exception("motor2.bet.alert_error")
             except Exception as e:
+                outcomes["error"] = outcomes.get("error", 0) + 1
                 logger.exception(
                     f"motor2.bet error ticker={sig.market_ticker}: {type(e).__name__}: {e}"
                 )
+        if outcomes:
+            desglose = " ".join(f"{k}={v}" for k, v in sorted(outcomes.items()))
+            logger.info(
+                f"motor2.exec.cycle señales={len(signals)} intentadas={len(top)} {desglose}"
+            )
+        return outcomes
 
     def _persist(self, signals: list[ConsensusSignal]) -> None:
         """

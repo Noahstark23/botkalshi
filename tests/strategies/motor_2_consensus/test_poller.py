@@ -314,3 +314,45 @@ async def test_run_loop_stops_on_event():
 
     await asyncio.gather(poller.run(stop), _stop_soon())
     assert stop.is_set()
+
+
+@pytest.mark.asyncio
+async def test_execute_cycle_counts_outcomes_by_reason():
+    """Fix observabilidad 2026-07-02: los desenlaces del ciclo de ejecución (dedup,
+    stake bajo, rechazos, fills) salen agregados — 'el bot no apostó hoy' se diagnostica
+    en UNA línea, no grepeando señal por señal."""
+    from src.strategies.motor_2_consensus.detector import ConsensusSignal
+
+    class _Outcome:
+        def __init__(self, filled, reason=""):
+            self.filled = filled
+            self.reason = reason
+            self.filled_count = 5 if filled else 0
+
+    outcomes = iter(
+        [_Outcome(True), _Outcome(False, "already_open"), _Outcome(False, "already_open")]
+    )
+
+    class _Exec:
+        async def execute(self, sig):
+            return next(outcomes)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([]),
+        _StubOdds([], is_live=True),
+        capital_usd=300.0,
+        executor=_Exec(),
+    )
+    sigs = [
+        ConsensusSignal(
+            market_ticker=f"T-{i}",
+            kalshi_side="YES",
+            odds_api_fair_prob=0.6,
+            kalshi_price_cents=50,
+            edge_pct=0.05 - i * 0.001,
+            recommended_size_usd=5.0,
+        )
+        for i in range(3)
+    ]
+    counts = await poller._execute(sigs)
+    assert counts == {"filled": 1, "already_open": 2}
