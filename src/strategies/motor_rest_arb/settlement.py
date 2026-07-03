@@ -134,7 +134,12 @@ class SettlementPoller:
     # Motores cuyos trades 'filled' este poller settlea. Motor 2 (apuestas direccionales
     # single-leg) se agrega acá: cada apuesta es su propio grupo (arb_group_key cae al
     # prefijo del coid), y _leg_pnl_cents resuelve un lado direccional sin cambios.
-    STRATEGIES = ("motor_rest_arb", "motor_2_consensus")
+    # motor_1_arbitrage (bug producción 2026-07-02): estaba FUERA de la lista → sus
+    # filled jamás se settleaban — un par hedged del 30-jun quedó 2 días como $235 de
+    # "exposición" permanente y estranguló el headroom compartido (Motor 2 → 0
+    # contratos). Sus filas legacy (notes=None, coid uuid pelado) caen a grupo unitario
+    # en arb_group_key: cada pata se settlea sola por la resolución de SU ticker.
+    STRATEGIES = ("motor_rest_arb", "motor_2_consensus", "motor_1_arbitrage")
 
     def __init__(self, source: SettlementSource) -> None:
         self.source = source
