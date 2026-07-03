@@ -188,7 +188,17 @@ class ArbitrageExecutor:
                 failed = True
             else:
                 filled.append((leg, coid))
-                order_id = str(result.get("order", {}).get("order_id", ""))
+                # order_id: V2 lo anida en 'order'; fallback plano por si el shape varía
+                # (las 60 filas del 30-jun quedaron con kalshi_order_id NULL — si esto
+                # vuelve a salir vacío, el WARNING de abajo deja la evidencia).
+                order_id = str(
+                    result.get("order", {}).get("order_id", "") or result.get("order_id", "")
+                )
+                if not order_id:
+                    logger.warning(
+                        f"motor1.exec.order_id_ausente coid={coid} "
+                        f"response_keys={sorted(result)[:8]} (shape inesperado del place)"
+                    )
                 with get_session() as s:
                     t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
                     if t:
@@ -328,7 +338,15 @@ class ArbitrageExecutor:
         count: int,
         client_ids: list[str],
     ) -> None:
-        """Insert one Trade row per leg with status='pending' before touching network."""
+        """Insert one Trade row per leg with status='pending' before touching network.
+
+        arb_id COMPARTIDO en notes (bug producción 2026-07-02): el RiskManager solo
+        netea arbs hedged si la fila trae 'arb_id=' en notes (manager.py) y el
+        SettlementPoller agrupa por él (arb_group_key). Sin esto, un par hedged de
+        riesgo neto ~$0 contaba su notional BRUTO como exposición direccional — el par
+        243×243 del 30-jun copó $235 del cap compartido y dejó a Motor 2 en 0 contratos.
+        """
+        arb_id = str(uuid.uuid4())
         with get_session() as s:
             for leg, coid in zip(opp.legs, client_ids, strict=True):
                 trade = Trade(
@@ -341,6 +359,7 @@ class ArbitrageExecutor:
                     strategy="motor_1_arbitrage",
                     estimated_edge_pct=opp.edge_pct,
                     status="pending",
+                    notes=f"arb_id={arb_id}",
                 )
                 s.add(trade)
             s.commit()
