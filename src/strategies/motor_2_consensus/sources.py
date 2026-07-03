@@ -143,7 +143,16 @@ def _parse_event_quotes(event_key: str, markets: list[dict]) -> KalshiEventQuote
         name = m.get("yes_sub_title") or m.get("yes_subtitle") or ""
         yes_ask = parse_price_to_cents(m.get("yes_ask_dollars") or m.get("yes_ask"))
         no_ask = parse_price_to_cents(m.get("no_ask_dollars") or m.get("no_ask"))
-        if ticker and name and yes_ask and no_ask:
+        # Rango operable 1..99: Kalshi reporta ask=100 cuando el lado ask del book está VACÍO
+        # (no hay a quién comprarle → jamás puede emitir señal). El truthiness previo lo dejaba
+        # pasar y _net_edge_pct lo colapsaba a -1.0, INDISTINGUIBLE del sentinel "nada evaluado"
+        # del funnel (auditoría 2026-07-03: única causa posible de matched>0 + best_edge=-100pp).
+        # Filtrarlo acá mantiene limpio el discriminador del funnel; si el evento queda con <2
+        # outcomes operables se descarta entero (mismo fail-safe de siempre).
+        ok_asks = (
+            yes_ask is not None and 1 <= yes_ask <= 99 and no_ask is not None and 1 <= no_ask <= 99
+        )
+        if ticker and name and ok_asks:
             quotes.append(
                 KalshiQuote(
                     market_ticker=ticker,
