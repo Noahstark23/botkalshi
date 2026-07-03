@@ -9,7 +9,7 @@ Dos modos, ambos SIN escribir nada:
    de umbral pero DESPUÉS del lookup fair.get(canonical_name(...)). Por lo tanto:
 
      matched=0  + best=-1      → nada matchea en el path LIVE (timing/scope; mirar rej_*)
-     matched>0  + best=-1      → BUG: lookup de nombres (fair.get(cn)=None para todo outcome)
+     matched>0  + best=-1      → asks=100¢ (book sin lado ask) en todo outcome matcheado
      0 < best ≤ umbral         → mercado EFICIENTE: hay edges pero bajo el umbral (no es bug)
      umbral < best ≤ techo     → BUG en emit/colapso (debería haber señal y no la hubo)
      best > techo (MAX_EDGE)   → edges altos rechazados por anti-fantasma (rej_high en logs)
@@ -96,11 +96,17 @@ def run_db(last: int) -> int:
     print(f"{'=' * 68}\nVEREDICTO")
     if not evaluados:
         if matched_avg > 0:
+            # Auditoría 2026-07-03 (15 agentes, refutación adversarial): el lookup de nombres NO
+            # puede fallar tras un match (el reference-set del matcher garantiza fair.get(cn) no
+            # None). La ÚNICA causa posible de matched>0 + best=-100.0 exacto es asks=100¢ (lado
+            # ask vacío del book): sources.py los deja pasar (truthiness) y _net_edge_pct los
+            # colapsa a -1.0, indistinguible del sentinel "nada evaluado".
             print(
-                "  🔴 BUG: hay eventos matcheados pero NINGÚN outcome se evaluó →\n"
-                "     fair.get(canonical_name(outcome)) devuelve None para todos (mismatch de\n"
-                "     nombres canónicos entre el matcher y las keys del fair dict).\n"
-                "     Corré --live para ver el dump por outcome y qué nombre no cruza."
+                "  🔴 hay eventos matcheados pero NINGÚN outcome dio edge computable →\n"
+                "     asks=100¢ (lado ask del book VACÍO en todos los outcomes matcheados):\n"
+                "     pasan el filtro de sources y _net_edge_pct los colapsa a -1. No hay contra\n"
+                "     quién comprar → sin señal posible. Corré --live para ver los asks reales;\n"
+                "     si es constante, los markets matcheados no tienen liquidez del lado ask."
             )
         else:
             print(
