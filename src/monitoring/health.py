@@ -309,7 +309,33 @@ async def pause_bot(reason: str = Query(..., min_length=1, max_length=200)) -> d
 
 @app.post("/admin/resume")
 async def resume_bot() -> dict[str, str]:
-    """Reanuda trading después de pausa manual."""
+    """Reanuda trading después de pausa manual.
+
+    Auditoría 2026-07-07 (P1): si el kill-switch PERSISTENTE está engaged (stop-loss o
+    rollback abortado), este endpoint NO puede levantarlo — un curl saltearía la
+    verificación de posiciones=0 de scripts/clear_kill_switch.py y además la pausa
+    volvería sola en el próximo redeploy (_rehydrate_kill_switch), dejando el bot en un
+    estado a medias. FAIL-CLOSED: si la DB no se puede leer, tampoco se resume.
+    """
+    from src.storage.models import kill_switch_engaged
+
+    try:
+        engaged, ks_reason = kill_switch_engaged()
+    except Exception as exc:
+        logger.error(f"/admin/resume: no se pudo leer el kill-switch: {exc} (fail-closed)")
+        raise HTTPException(
+            status_code=503, detail="No se pudo verificar el kill-switch — resume denegado"
+        ) from exc
+    if engaged:
+        logger.warning(f"/admin/resume RECHAZADO: kill-switch persistente engaged ({ks_reason})")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Kill-switch persistente engaged: {ks_reason}. "
+                "Levantarlo SOLO con scripts/clear_kill_switch.py (verifica posiciones=0)."
+            ),
+        )
+
     if not BotState.is_paused:
         return {"status": "already_running"}
 

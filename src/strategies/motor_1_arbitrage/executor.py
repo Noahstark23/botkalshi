@@ -10,17 +10,38 @@ from typing import TYPE_CHECKING
 from loguru import logger
 from sqlmodel import select
 
-from src.clients.kalshi_rest import KalshiRestClient
+from src.clients.kalshi_rest import KalshiAPIError, KalshiRestClient
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
 from src.risk.manager import RiskManager
-from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
+from src.storage.models import RiskEvent, Trade, _naive_utc_now, engage_kill_switch, get_session
 from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker
 from src.utils.config import get_settings
 
 if TYPE_CHECKING:
     pass
+
+# Un FOK que no encuentra volumen vuelve como HTTP 409 con este error.code — es un KILL
+# determinístico (la orden llegó y murió limpia, sin posición), NO un error de red.
+# Verificado contra la API viva en motor_rest_arb (demo, 2026-06-05); mismo criterio acá:
+# match estricto 409 + code conocido; cualquier otro error → estado DESCONOCIDO (queda
+# pending → lo resuelve reconcile_pending_trades).
+_FOK_KILL_ERROR_CODES = frozenset({"fill_or_kill_insufficient_resting_volume"})
+
+
+def _as_int(value: object) -> int | None:
+    """Castea a int un campo que puede venir int o fixed-point string. None si inválido."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (str, float)):
+        try:
+            return int(round(float(value)))
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 class ArbitrageExecutor:
@@ -142,7 +163,7 @@ class ArbitrageExecutor:
                     ).first()
                     if t:
                         t.status = "filled"
-                        t.filled_at = datetime.now(UTC)
+                        t.filled_at = _naive_utc_now()
                         t.kalshi_order_id = str(kalshi_order.get("order_id", ""))
                         s.add(t)
                         s.commit()
@@ -225,40 +246,72 @@ class ArbitrageExecutor:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        filled: list[tuple[ArbLeg, str]] = []
+        # Auditoría 2026-07-07 (P0): HTTP 200 significa "orden aceptada", NO "llenada". El fill
+        # REAL sale de fill_count de la respuesta. Con FOK debería ser count o 0; se registra el
+        # valor real igual (defensa ante shapes raros) y una pata con fill 0 = pata MUERTA limpia
+        # (cancelada, sin posición) → dispara rollback de las que SÍ llenaron.
+        filled: list[tuple[ArbLeg, str, int]] = []
         failed = False
         for leg, coid, result in zip(opp.legs, client_order_ids, results, strict=True):
             if isinstance(result, BaseException):
+                if (
+                    isinstance(result, KalshiAPIError)
+                    and result.status_code == 409
+                    and result.error_code in _FOK_KILL_ERROR_CODES
+                ):
+                    # KILL determinístico: FOK sin volumen — la orden murió limpia sin
+                    # posición. No es un error; la pata se cancela y se rollbackea el resto.
+                    logger.warning(
+                        f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK "
+                        f"killed (sin volumen) — sin posición"
+                    )
+                    self._update_trade_status(coid, "cancelled")
+                    failed = True
+                    continue
                 logger.critical(
                     f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) failed: {result}"
                 )
                 failed = True
-            else:
-                filled.append((leg, coid))
-                # Bug 2: alimentar el tracker de exposición con el fill (fuente rápida
-                # intra-burst). Bug 1: el place consumió cash → invalidar caché de balance.
-                self.event_tracker.record_fill(leg.market_ticker, leg.side, count, leg.price_cents)
-                self._balance_cache = None
-                # order_id: V2 lo anida en 'order'; fallback plano por si el shape varía
-                # (las 60 filas del 30-jun quedaron con kalshi_order_id NULL — si esto
-                # vuelve a salir vacío, el WARNING de abajo deja la evidencia).
-                order_id = str(
-                    result.get("order", {}).get("order_id", "") or result.get("order_id", "")
+                continue
+            order = result.get("order", result) if isinstance(result, dict) else {}
+            order_id = str(order.get("order_id", "") or result.get("order_id", ""))
+            fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+            if fill_count <= 0:
+                # FOK killed: la orden murió entera sin posición. NO es una pata fillada.
+                logger.warning(
+                    f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK sin fill "
+                    f"(killed) — sin posición"
                 )
-                if not order_id:
-                    logger.warning(
-                        f"motor1.exec.order_id_ausente coid={coid} "
-                        f"response_keys={sorted(result)[:8]} (shape inesperado del place)"
-                    )
-                with get_session() as s:
-                    t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
-                    if t:
-                        t.status = "filled"
-                        t.filled_at = datetime.now(UTC)
-                        if order_id:
-                            t.kalshi_order_id = order_id
-                        s.add(t)
-                        s.commit()
+                self._update_trade_status(coid, "cancelled")
+                failed = True
+                continue
+            if fill_count < count:
+                # No debería pasar con FOK; si pasa, registrar el count REAL (no la ficción).
+                logger.warning(
+                    f"ArbitrageExecutor: fill PARCIAL inesperado con FOK "
+                    f"{leg.market_ticker} ({leg.side}): {fill_count}/{count}"
+                )
+                failed = True
+            filled.append((leg, coid, fill_count))
+            # Bug 2: alimentar el tracker con el fill REAL. Bug 1: el place consumió cash.
+            self.event_tracker.record_fill(leg.market_ticker, leg.side, fill_count, leg.price_cents)
+            self._balance_cache = None
+            if not order_id:
+                logger.warning(
+                    f"motor1.exec.order_id_ausente coid={coid} "
+                    f"response_keys={sorted(result)[:8]} (shape inesperado del place)"
+                )
+            with get_session() as s:
+                t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
+                if t:
+                    t.status = "filled"
+                    t.count = fill_count  # el count REAL fillado, no el pedido
+                    t.fill_price_cents = leg.price_cents
+                    t.filled_at = _naive_utc_now()
+                    if order_id:
+                        t.kalshi_order_id = order_id
+                    s.add(t)
+                    s.commit()
 
         if not failed:
             logger.info(
@@ -271,7 +324,7 @@ class ArbitrageExecutor:
             f"ArbitrageExecutor: partial fill — {len(filled)}/{len(opp.legs)} legs filled, "
             "triggering rollback"
         )
-        await self._execute_iterative_rollback(filled, count)
+        await self._execute_iterative_rollback(filled)
         return False
 
     # =====================================================
@@ -280,14 +333,21 @@ class ArbitrageExecutor:
 
     async def _execute_iterative_rollback(
         self,
-        filled_legs: list[tuple[ArbLeg, str]],
-        count: int,
+        filled_legs: list[tuple[ArbLeg, str, int]],
     ) -> None:
-        """Sell filled legs aggressively (price=1) to exit position."""
+        """Vende las patas filladas (IOC agresivo a 1¢) para salir de la posición.
+
+        Auditoría 2026-07-07: (a) el sell va IOC — un fill parcial en una LIQUIDACIÓN es mejor
+        que nada, y jamás queda resting; (b) se lee fill_count del sell y SOLO lo confirmado
+        libera la posición; (c) la pérdida del rollback se REALIZA en pnl_cents (fila settled)
+        → entra en los stop-losses diario/semanal/mensual, que antes eran ciegos a esto."""
         await self._check_circuit_breaker()
 
-        for leg, original_coid in filled_legs:
+        for leg, original_coid, leg_count in filled_legs:
+            remaining = leg_count
             for attempt in range(self.max_rollback_retries):
+                if remaining <= 0:
+                    break
                 try:
                     ob = await self.client.get_orderbook(leg.market_ticker, depth=5)
                     orderbook = ob.get("orderbook", {})
@@ -320,19 +380,42 @@ class ArbitrageExecutor:
                         break
 
                     logger.info(
-                        f"rollback: selling {leg.market_ticker} ({leg.side}) "
-                        f"at price=1 (best bid={current_bid}¢), attempt {attempt + 1}"
+                        f"rollback: selling {remaining} {leg.market_ticker} ({leg.side}) "
+                        f"IOC at price=1 (best bid={current_bid}¢), attempt {attempt + 1}"
                     )
-                    await self.client.place_order(
+                    resp = await self.client.place_order(
                         ticker=leg.market_ticker,
                         side=leg.side,
                         action="sell",
-                        count=count,
+                        count=remaining,
                         order_type="limit",
                         yes_price=1 if leg.side == "yes" else None,
                         no_price=1 if leg.side == "no" else None,
+                        client_order_id=f"{original_coid}-rb{attempt}",
+                        time_in_force="immediate_or_cancel",
                     )
-                    self._update_trade_status(original_coid, "rolled_back")
+                    order = resp.get("order", resp) if isinstance(resp, dict) else {}
+                    sold = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+                    if sold <= 0:
+                        logger.warning(
+                            f"rollback: IOC sin fill para {leg.market_ticker} ({leg.side}) — "
+                            f"reintento {attempt + 1}/{self.max_rollback_retries}"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    sold = min(sold, remaining)
+                    # SOLO lo confirmado libera posición y realiza pérdida. Precio contable:
+                    # el bid leído (el IOC a 1¢ cruza desde el mejor bid; para sizes chicos es
+                    # el precio efectivo — se anota como estimación en notes).
+                    self._settle_rollback_fill(original_coid, leg, sold, current_bid)
+                    remaining -= sold
+                    if remaining > 0:
+                        logger.warning(
+                            f"rollback: fill parcial {sold}, quedan {remaining} "
+                            f"{leg.market_ticker} ({leg.side}) — reintento"
+                        )
+                        await asyncio.sleep(1)
+                        continue
                     break
 
                 except Exception as exc:
@@ -341,6 +424,68 @@ class ArbitrageExecutor:
                         f"attempt {attempt + 1}/{self.max_rollback_retries}: {exc}"
                     )
                     await asyncio.sleep(1)
+            if remaining > 0:
+                # Lo no vendido sigue ABIERTO (fila filled con el remanente): visible como
+                # exposición para el RiskManager y gestionable como huérfana por Motor 3.
+                logger.critical(
+                    f"rollback: {remaining} contratos de {leg.market_ticker} ({leg.side}) "
+                    f"quedaron SIN cerrar tras {self.max_rollback_retries} intentos"
+                )
+
+    def _settle_rollback_fill(
+        self, original_coid: str, leg: ArbLeg, sold: int, sell_price_cents: int
+    ) -> None:
+        """Realiza la pérdida del rollback en la fila BUY original (auditoría 2026-07-07: antes
+        el rollback marcaba 'rolled_back' sin pnl_cents → la pérdida JAMÁS entraba en las
+        ventanas de stop-loss, que solo agregan filas settled).
+
+        Cierre total → la fila pasa a settled con pnl realizado. Parcial → se PARTE (mismo
+        patrón que _settle_originals de M3): hija settled por lo vendido, la original conserva
+        el remanente abierto (exposición real, reintentable/gestionable). Best-effort: un fallo
+        de DB se loguea CRITICAL y no rompe el rollback (prioridad: seguir vendiendo)."""
+        from src.math.fees import kalshi_fee_cents
+
+        now = _naive_utc_now()
+        pnl = (
+            sold * (sell_price_cents - leg.price_cents)
+            - kalshi_fee_cents(sold, sell_price_cents)
+            - kalshi_fee_cents(sold, leg.price_cents)
+        )
+        note = f"rollback_sell~{sell_price_cents}c"
+        try:
+            with get_session() as s:
+                t = s.exec(select(Trade).where(Trade.client_order_id == original_coid)).first()
+                if t is None:
+                    logger.critical(f"rollback settle: fila {original_coid} no encontrada")
+                    return
+                if sold >= t.count:
+                    t.status = "settled"
+                    t.settled_at = now
+                    t.pnl_cents = pnl
+                    t.notes = f"{t.notes or ''} {note}".strip()[:500]
+                    s.add(t)
+                else:
+                    t.count = t.count - sold  # remanente sigue abierto (filled)
+                    s.add(t)
+                    s.add(
+                        Trade(
+                            client_order_id=f"{original_coid}-rbs{uuid.uuid4().hex[:8]}",
+                            ticker=leg.market_ticker,
+                            side=leg.side,
+                            action="buy",
+                            count=sold,
+                            price_cents=leg.price_cents,
+                            fill_price_cents=leg.price_cents,
+                            strategy="motor_1_arbitrage",
+                            status="settled",
+                            settled_at=now,
+                            pnl_cents=pnl,
+                            notes=f"{t.notes or ''} {note} split".strip()[:500],
+                        )
+                    )
+                s.commit()
+        except Exception:
+            logger.exception(f"rollback settle falló coid={original_coid} (pérdida sin realizar)")
 
     async def _check_circuit_breaker(self) -> None:
         """
@@ -513,11 +658,15 @@ class ArbitrageExecutor:
             if trade:
                 trade.status = status
                 if status == "filled":
-                    trade.filled_at = datetime.now(UTC)
+                    trade.filled_at = _naive_utc_now()
                 s.add(trade)
                 s.commit()
 
     async def _place_leg(self, leg: ArbLeg, count: int, coid: str) -> dict:
+        # FILL_OR_KILL obligatorio (auditoría 2026-07-07, P0): el default gtc dejaba la pata
+        # RESTING (exposición silenciosa, Issue #14) y un fill parcial rompía la simetría del
+        # arb. FOK = todo-o-nada por pata: fill_count == count o la orden muere limpia. El
+        # propio docstring de place_order lo exige para arbitraje; REST arb ya lo cumplía.
         return await self.client.place_order(
             ticker=leg.market_ticker,
             side=leg.side,
@@ -527,6 +676,7 @@ class ArbitrageExecutor:
             yes_price=leg.price_cents if leg.side == "yes" else None,
             no_price=leg.price_cents if leg.side == "no" else None,
             client_order_id=coid,
+            time_in_force="fill_or_kill",
         )
 
     async def _count_pending_trades(self) -> int:

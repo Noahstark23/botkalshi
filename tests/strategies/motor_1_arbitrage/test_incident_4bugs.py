@@ -47,7 +47,7 @@ def reset_bot_state():
 def mock_client() -> AsyncMock:
     client = AsyncMock()
     client.get_available_balance_usd.return_value = 10_000.0
-    client.place_order.return_value = {"order": {"order_id": "k-1"}}
+    client.place_order.return_value = {"order": {"order_id": "k-1", "fill_count": 10}}
     return client
 
 
@@ -239,7 +239,7 @@ async def test_bug3_single_aborted_rollback_pauses_persistently(executor, mock_c
         patch("src.strategies.motor_1_arbitrage.executor.alert_error", new_callable=AsyncMock),
         patch("src.strategies.motor_1_arbitrage.executor.alert_risk_event", new_callable=AsyncMock),
     ):
-        await executor._execute_iterative_rollback([(leg, "coid-1")], count=10)
+        await executor._execute_iterative_rollback([(leg, "coid-1", 10)])
 
     assert BotState.is_paused is True
     assert "rollback_aborted_slippage" in (BotState.pause_reason or "")
@@ -263,7 +263,7 @@ async def test_bug3_successful_rollback_does_not_pause(executor, mock_client):
     with patch(
         "src.strategies.motor_1_arbitrage.executor.alert_risk_event", new_callable=AsyncMock
     ):
-        await executor._execute_iterative_rollback([(leg, "coid-1")], count=10)
+        await executor._execute_iterative_rollback([(leg, "coid-1", 10)])
     engaged, _ = kill_switch_engaged()
     assert engaged is False
     # el circuit breaker genérico (3 en 60min) sigue intacto para rollbacks normales
