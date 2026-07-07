@@ -201,6 +201,23 @@ class ArbitrageExecutor:
 
         count = decision.max_allowed_count
 
+        # Auditoría rentabilidad 2026-07-07: el net del arb se validó al count DETECTADO,
+        # pero el RiskManager puede RECORTAR el count — y el ceil del fee por trade sube
+        # el fee/contrato al achicar (fee(1,50)=2c vs 1.75c teóricos): un arb marginal
+        # net>0 a 100 contratos puede ser net<=0 a 1-3. Recomputar al count autorizado y
+        # abortar si el arb recortado ya no es rentable (perdedor determinístico).
+        from src.math.fees import kalshi_fee_cents
+
+        resized_gross = (100 - sum(leg.price_cents for leg in opp.legs)) * count
+        resized_fees = sum(kalshi_fee_cents(count, leg.price_cents) for leg in opp.legs)
+        if resized_gross - resized_fees <= 0:
+            logger.info(
+                f"ArbitrageExecutor: arb ABORTADO por resize — net al count autorizado "
+                f"{count} = {resized_gross - resized_fees}c <= 0 (el ceil del fee se come "
+                f"el edge; detectado net={opp.net_profit_cents}c a count={opp.count})"
+            )
+            return False
+
         # Bug 2 — guard de exposición direccional por evento: si el evento YA arrastra residual
         # direccional sobre el cap (huérfanas/netting), NO se opera más ese evento. Un arb
         # completo netea a cero, así que se chequea la exposición ACUMULADA, no la del arb.

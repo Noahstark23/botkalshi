@@ -155,6 +155,21 @@ class Settings(BaseSettings):
     MOTOR_1_MAX_EDGE_PCT: float = Field(
         default=10.0, gt=0.0, description="Techo de edge para EJECUTAR (anti-fantasma, %) (Motor 1)"
     )
+    # Auditoría rentabilidad 2026-07-07: el "arb" binario intra-ticker = book AUTO-CRUZADO
+    # (yes_bid+no_bid>100), estado que el matching engine elimina en ms — casi toda señal
+    # de 1 tick es book local stale (evidencia: 0 ventanas binarias en TODA la historia;
+    # las 3054 EdgeWindow fueron multi-outcome). Confirmación + cooldown acotan el costo
+    # de perseguir fantasmas (cada fill asimétrico = rollback = spread + 2 fees).
+    MOTOR_1_CONFIRM_TICKS: int = Field(
+        default=2,
+        ge=1,
+        description="Ticks consecutivos (~1s c/u) que el cruce debe persistir antes de EJECUTAR (Motor 1)",
+    )
+    MOTOR_1_TICKER_COOLDOWN_SEC: float = Field(
+        default=60.0,
+        ge=0.0,
+        description="Cooldown por ticker tras una ejecución fallida de Motor 1 (KILL/rollback) — no re-martillar el mismo cruce stale",
+    )
     # Bug 2 (incidente 2026-07-07): cap de exposición DIRECCIONAL por EVENTO (partido). Los
     # tickers hermanos (…HOUWSH-HOU / …HOUWSH-WSH) son el MISMO evento real; los residuales de
     # netting/huérfanas se acumulaban en la misma dirección ($135) sin que nadie los sumara.
