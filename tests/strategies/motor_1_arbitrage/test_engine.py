@@ -22,11 +22,22 @@ from src.strategies.motor_1_arbitrage.engine import Motor1Engine
 from src.strategies.motor_1_arbitrage.orderbook import BookLevel, BookTop
 
 
-def _settings(*, trading: bool, exec_edge_pct: float = 0.0, max_edge_pct: float = 10_000.0):
+def _settings(
+    *,
+    trading: bool,
+    exec_edge_pct: float = 0.0,
+    max_edge_pct: float = 10_000.0,
+    confirm_ticks: int = 1,
+    cooldown_sec: float = 60.0,
+):
     s = MagicMock()
     s.MIN_EDGE_PCT = 0.0
     s.MOTOR_1_EXECUTION_EDGE_PCT = exec_edge_pct
     s.MOTOR_1_MAX_EDGE_PCT = max_edge_pct
+    # confirm_ticks=1 por default en los tests preexistentes: ejecutan al primer tick
+    # (la confirmación de persistencia se testea explícita en test_confirm_*).
+    s.MOTOR_1_CONFIRM_TICKS = confirm_ticks
+    s.MOTOR_1_TICKER_COOLDOWN_SEC = cooldown_sec
     s.TRADING_ENABLED = trading
     return s
 
@@ -172,3 +183,69 @@ async def test_tick_failure_does_not_kill_loop(tmp_db_engine):
 
     assert calls["n"] == 1
     rec.assert_called_once()  # el fallo del tick se registró, no se propagó
+
+
+# =====================================================
+# Confirmación de persistencia + cooldown (auditoría rentabilidad 2026-07-07:
+# el cruce binario intra-ticker de 1 tick es casi siempre book stale)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_confirm_ticks_waits_for_persistent_cross(tmp_db_engine):
+    """confirm_ticks=2: el primer tick NO ejecuta (streak 1/2); el segundo, con el cruce
+    aún vivo, SÍ. El fantasma de 1 tick jamás llega a la red."""
+    ex = _mock_executor()
+    eng = _engine(_settings(trading=True, confirm_ticks=2), executor=ex)
+    with patch.object(eng, "_detect", return_value=_opp(edge_pct=5.0)):
+        await eng._tick()
+        await _drain(eng)
+        ex.execute.assert_not_awaited()  # streak 1/2 → espera
+        await eng._tick()
+        await _drain(eng)
+    ex.execute.assert_awaited_once()  # streak 2/2 → ejecuta
+
+
+@pytest.mark.asyncio
+async def test_confirm_streak_resets_when_cross_dies(tmp_db_engine):
+    """CONTROL: si el cruce desaparece un tick, la racha vuelve a 0 — dos avistajes NO
+    consecutivos no confirman."""
+    ex = _mock_executor()
+    eng = _engine(_settings(trading=True, confirm_ticks=2), executor=ex)
+    opp = _opp(edge_pct=5.0)
+    with patch.object(eng, "_detect", side_effect=[opp, None, opp]):
+        await eng._tick()  # streak 1
+        await eng._tick()  # cruce muerto → reset
+        await eng._tick()  # streak 1 de nuevo
+        await _drain(eng)
+    ex.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cooldown_after_failed_execution(tmp_db_engine):
+    """Ejecución fallida (KILL/rollback) → cooldown: el mismo ticker no se re-ejecuta
+    aunque el cruce siga vivo (book stale re-martillado era el modo de falla)."""
+    ex = _mock_executor()
+    ex.execute = AsyncMock(return_value=False)  # falla
+    eng = _engine(_settings(trading=True, cooldown_sec=999.0), executor=ex)
+    with patch.object(eng, "_detect", return_value=_opp(edge_pct=5.0)):
+        await eng._tick()
+        await _drain(eng)
+        assert ex.execute.await_count == 1
+        await eng._tick()  # cruce sigue "vivo" pero el ticker está en cooldown
+        await _drain(eng)
+    assert ex.execute.await_count == 1  # NO se re-ejecutó
+
+
+@pytest.mark.asyncio
+async def test_successful_execution_no_cooldown(tmp_db_engine):
+    """CONTROL: una ejecución EXITOSA no impone cooldown — un cruce legítimo repetido
+    (book profundo) se puede volver a capturar."""
+    ex = _mock_executor()  # execute → True
+    eng = _engine(_settings(trading=True, cooldown_sec=999.0), executor=ex)
+    with patch.object(eng, "_detect", return_value=_opp(edge_pct=5.0)):
+        await eng._tick()
+        await _drain(eng)
+        await eng._tick()
+        await _drain(eng)
+    assert ex.execute.await_count == 2

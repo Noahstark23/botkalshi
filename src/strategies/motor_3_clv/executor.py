@@ -74,6 +74,7 @@ class Motor3ExitExecutor:
         strategy: str = STRATEGY,
         entry_origin: tuple[str, ...] = ("motor_2_consensus",),
         include_motor1_orphans: bool = False,
+        min_sell_bid_cents: int = 0,
     ) -> None:
         self.client = client
         # Estrategia con la que se audita la fila SELL del exit. Default motor_3_clv; Motor 2
@@ -90,6 +91,11 @@ class Motor3ExitExecutor:
         # _open_attributable_count y el settle las incluyen. Un par hedged completo JAMÁS
         # entra (motor1_orphan_buys lo excluye) → imposible vender la pata de un hedge.
         self._include_motor1_orphans = include_motor1_orphans
+        # Auditoría de rentabilidad 2026-07-07: piso de PRECIO para vender. Vender polvo
+        # (bid 1-4c) recupera centavos menos el fee (ceil ≥1c) y dona el spread — casi
+        # todo lo recuperable se pierde en el peaje. Debajo del piso NO se vende: la
+        # posición va a settle (que no paga fee). 0 = sin piso (comportamiento previo).
+        self._min_sell_bid_cents = min_sell_bid_cents
 
     def _lock_for(self, ticker: str) -> asyncio.Lock:
         return type(self)._locks.setdefault(ticker, asyncio.Lock())
@@ -208,6 +214,14 @@ class Motor3ExitExecutor:
                 f"motor3.exit.no_bid ticker={ticker} side={side} (sin liquidez para liquidar)"
             )
             return Motor3ExitOutcome(False, False, reason="no_bid")
+        if bid < self._min_sell_bid_cents:
+            # Piso de venta (auditoría 2026-07-07): a bid de polvo, fee+spread se comen
+            # casi todo lo recuperable — mejor dejar que settlee (settle no paga fee).
+            logger.info(
+                f"motor3.exit.bid_below_floor ticker={ticker} side={side} bid={bid}c < "
+                f"{self._min_sell_bid_cents}c (no se vende polvo; va a settle)"
+            )
+            return Motor3ExitOutcome(False, False, reason="bid_below_floor")
 
         # Vender al bid (cruza con el mejor bid). IOC: toma lo que haya, cancela el resto.
         coid = f"{uuid.uuid4()}-clvexit"

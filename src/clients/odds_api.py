@@ -89,6 +89,11 @@ class Bookmaker:
     key: str  # "pinnacle", "draftkings", ...
     title: str
     markets: tuple[Market, ...]
+    # Frescura de la línea (auditoría rentabilidad 2026-07-07): The Odds API reporta
+    # last_update por casa — una línea congelada/suspendida hace horas entraba al
+    # consenso con el mismo peso que una fresca. None = el feed no lo trajo (fail-open:
+    # no se filtra, comportamiento previo).
+    last_update: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +110,16 @@ def _parse_commence_time(raw: str) -> datetime:
     """ISO 8601 ('...Z') → datetime aware en UTC."""
     dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     return dt.astimezone(UTC)
+
+
+def _parse_last_update(raw: object) -> datetime | None:
+    """last_update de una casa, best-effort: ausente/malformado → None (no se filtra)."""
+    if not raw:
+        return None
+    try:
+        return _parse_commence_time(str(raw))
+    except (ValueError, TypeError):
+        return None
 
 
 def _parse_event(d: dict[str, Any]) -> OddsEvent | None:
@@ -124,6 +139,7 @@ def _parse_event(d: dict[str, Any]) -> OddsEvent | None:
                     )
                     for mk in bk.get("markets", [])
                 ),
+                last_update=_parse_last_update(bk.get("last_update")),
             )
             for bk in d.get("bookmakers", [])
         )

@@ -108,11 +108,37 @@ def test_trailing_not_armed_when_peak_barely_above_entry():
     )
 
 
-def test_trailing_armed_at_exact_margin_triggers_at_breakeven_or_better():
-    # peak = entry + drop → precio de disparo = entry (break-even bruto, nunca debajo)
+def test_trailing_breakeven_bruto_no_dispara_net_negativo():
+    """Auditoría rentabilidad 2026-07-07: peak = entry + drop armaba el trailing y el
+    disparo en el borde vendía EXACTAMENTE al entry — break-even bruto = −2 fees NETOS
+    garantizados. Ahora el gate net>0 (el mismo del TP) lo corta: vender al entry o
+    debajo jamás dispara."""
+    # bid == entry: net = 0 − 2 fees < 0 → NO dispara (antes: True)
     assert (
-        trailing_stop_due(_pos(), peak_bid=65, current_bid=60, entry_bid=60, drop_cents=5) is True
+        trailing_stop_due(_pos(), peak_bid=65, current_bid=60, entry_bid=60, drop_cents=5) is False
     )
+    # sin margen de armado (peak−entry < drop) → tampoco
     assert (
         trailing_stop_due(_pos(), peak_bid=64, current_bid=59, entry_bid=60, drop_cents=5) is False
+    )
+
+
+def test_trailing_gap_debajo_del_entry_no_vende():
+    """El caso del GAP: armado legítimo (peak 70 > entry+drop) pero el bid saltó a 30 —
+    la versión anterior disparaba y REALIZABA −30c/contrato (stop-loss encubierto).
+    Con el gate net>0, no se vende debajo del entry: la pérdida la maneja el settle."""
+    assert (
+        trailing_stop_due(_pos(), peak_bid=70, current_bid=30, entry_bid=60, drop_cents=5) is False
+    )
+
+
+def test_trailing_dispara_solo_con_ganancia_neta():
+    """CONTROL del gate: retroceso válido Y net>0 → sigue disparando (el trailing no
+    quedó muerto). entry 60, peak 90, bid 85: net = 25 − fee(85) − fee(60) > 0."""
+    assert (
+        trailing_stop_due(_pos(), peak_bid=90, current_bid=85, entry_bid=60, drop_cents=5) is True
+    )
+    # margen mínimo REAL: bid apenas sobre el entry, net <= 0 por fees → no dispara
+    assert (
+        trailing_stop_due(_pos(), peak_bid=67, current_bid=62, entry_bid=60, drop_cents=5) is False
     )

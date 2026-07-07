@@ -24,8 +24,10 @@ NO cablea ejecución: emite señales, no coloca órdenes. TRADING_ENABLED=false.
 from __future__ import annotations
 
 import contextlib
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from statistics import median
 
 from loguru import logger
 from pydantic import BaseModel
@@ -105,32 +107,66 @@ class ConsensusSignal(BaseModel):
 
 
 def _h2h_outcome_names(odds_event: OddsEvent) -> list[str]:
-    """Nombres de outcome del primer bookmaker con mercado h2h (cardinalidad + nombres)."""
+    """Set de referencia = los outcomes del set canónico MÁS FRECUENTE entre las casas
+    con h2h (auditoría rentabilidad 2026-07-07: antes se tomaba la PRIMERA casa del
+    array — si esa listaba un set atípico (nombre sin alias, 2-way donde el resto es
+    3-way), TODAS las demás se descartaban por 'set distinto' y el evento moría en
+    reject_no_fair, dependiendo del orden arbitrario del JSON de la API)."""
+    sets_vistos: Counter[frozenset[str]] = Counter()
+    primero_por_set: dict[frozenset[str], list[str]] = {}
     for bk in odds_event.bookmakers:
         for mk in bk.markets:
             if mk.key == "h2h" and mk.outcomes:
-                return [o.name for o in mk.outcomes]
-    return []
+                names = [o.name for o in mk.outcomes]
+                key = frozenset(canonical_name(n) for n in names)
+                sets_vistos[key] += 1
+                primero_por_set.setdefault(key, names)
+    if not sets_vistos:
+        return []
+    ganador = sets_vistos.most_common(1)[0][0]
+    return primero_por_set[ganador]
 
 
-def _consensus_fair_probs(odds_event: OddsEvent) -> dict[str, float]:
+def _consensus_fair_probs(
+    odds_event: OddsEvent,
+    *,
+    min_books: int = 1,
+    max_book_age_min: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, float]:
     """
-    Probabilidad JUSTA por outcome canónico: promedia la prob implícita de cada
-    bookmaker (consenso) y le quita el vig (multiplicativo). {} si no hay h2h usable.
+    Probabilidad JUSTA por outcome canónico: MEDIANA de la prob implícita de cada
+    bookmaker (consenso) y le quita el vig (multiplicativo). {} si no hay h2h usable,
+    si el consenso lo forman menos de `min_books` casas, o si todas las líneas están
+    vencidas.
+
+    Auditoría rentabilidad 2026-07-07 (tres endurecimientos de la MEDICIÓN):
+      - MEDIANA en vez de media simple: una sola casa soft/desviada movía el fair
+        entero (la media equiponderada no tiene resistencia a outliers; la mediana sí).
+      - min_books: el único gate previo era >=2 OUTCOMES — UNA casa podía formar el
+        "consenso" entero. Con pocas casas el fair hereda el shading recreativo y el
+        edge medido puede ser 100% ruido (n_books solo se logueaba).
+      - Frescura: una línea congelada/suspendida (last_update viejo) entra igual que
+        una fresca. Books sin last_update NO se filtran (fail-open, fixtures/tests).
     """
-    # Set de REFERENCIA: los outcomes canónicos del primer bookmaker con h2h. Cada casa
-    # entra al consenso solo con el set COMPLETO e IDÉNTICO (deuda auditoría 2026-07-01:
-    # agregar outcomes sueltos de casas parciales normalizaba el no-vig sobre el conjunto
-    # equivocado → fair inflado en los outcomes presentes, p.ej. un 1X2 sin Draw daba
-    # A=0.60/B=0.40 cuando el real era ~0.50/0.33/0.17 — edge fantasma de ~10pp).
+    # Set de REFERENCIA (set canónico más frecuente entre casas). Cada casa entra al
+    # consenso solo con el set COMPLETO e IDÉNTICO (deuda auditoría 2026-07-01: agregar
+    # outcomes sueltos de casas parciales normalizaba el no-vig sobre el conjunto
+    # equivocado → fair inflado, p.ej. 1X2 sin Draw daba A=0.60/B=0.40 vs ~0.50/0.33/0.17).
     reference = {canonical_name(n) for n in _h2h_outcome_names(odds_event)}
     if len(reference) < 2:
         return {}
-    sums: dict[str, float] = {}
-    counts: dict[str, int] = {}
+    probs_por_outcome: dict[str, list[float]] = {}
     book_keys: set[str] = set()
     skipped_books = 0
+    stale_books = 0
+    ref_now = now or datetime.now(UTC)
     for bk in odds_event.bookmakers:
+        if max_book_age_min is not None and bk.last_update is not None:
+            age_min = (ref_now - bk.last_update).total_seconds() / 60.0
+            if age_min > max_book_age_min:
+                stale_books += 1
+                continue  # línea vencida: no aporta información fresca al consenso
         for mk in bk.markets:
             if mk.key != "h2h":
                 continue
@@ -144,21 +180,23 @@ def _consensus_fair_probs(odds_event: OddsEvent) -> dict[str, float]:
                 continue  # set distinto/incompleto → esta casa NO entra al consenso
             book_keys.add(bk.key)
             for cn, p in probs.items():
-                sums[cn] = sums.get(cn, 0.0) + p
-                counts[cn] = counts.get(cn, 0) + 1
-    if skipped_books:
+                probs_por_outcome.setdefault(cn, []).append(p)
+    if skipped_books or stale_books:
         logger.info(
             f"motor2.consensus.books_descartadas event={getattr(odds_event, 'id', '?')} "
-            f"n={skipped_books} (set de outcomes distinto/incompleto vs referencia)"
+            f"set_distinto={skipped_books} stale={stale_books}"
         )
-    if len(sums) < 2:
+    if len(probs_por_outcome) < 2:
         return {}
-    names = list(sums)
-    avg_implied = [sums[n] / counts[n] for n in names]
-    fair = remove_vig_multiplicative(avg_implied)
-    # n_books = cuántas casas formaron el consenso. POCAS casas → fair ruidoso/sesgado: es el
-    # input que infla el sizing en mercados de edge sobreestimado (correlacionar después con el
-    # PnL). MLB en The Odds API suele traer menos casas que fútbol → más riesgo de sobre-edge.
+    if len(book_keys) < min_books:
+        logger.info(
+            f"motor2.consensus.pocas_casas event={getattr(odds_event, 'id', '?')} "
+            f"n_books={len(book_keys)} < min={min_books} → sin fair (consenso degenerado)"
+        )
+        return {}
+    names = list(probs_por_outcome)
+    med_implied = [median(probs_por_outcome[n]) for n in names]
+    fair = remove_vig_multiplicative(med_implied)
     logger.info(
         f"motor2.consensus event={getattr(odds_event, 'id', '?')} n_books={len(book_keys)} "
         f"outcomes={len(names)} fair={ {n: round(p, 4) for n, p in zip(names, fair, strict=True)} }"
@@ -213,6 +251,8 @@ def find_signals(
     max_stake_pct: float = 0.0,
     fair_out: dict[str, float] | None = None,
     max_edge: float | None = None,
+    min_books: int = 1,
+    max_book_age_min: float | None = None,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -341,7 +381,9 @@ def find_signals(
         # par, el evento Kalshi del miércoles apostaba contra la línea del martes).
         chosen, select_reject = _select_candidate(ke.event_key, candidates, now)
         if chosen is not None:
-            fair = _consensus_fair_probs(chosen)
+            fair = _consensus_fair_probs(
+                chosen, min_books=min_books, max_book_age_min=max_book_age_min, now=now
+            )
             if not fair:
                 best_reason = "no_fair"
             else:

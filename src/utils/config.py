@@ -155,6 +155,21 @@ class Settings(BaseSettings):
     MOTOR_1_MAX_EDGE_PCT: float = Field(
         default=10.0, gt=0.0, description="Techo de edge para EJECUTAR (anti-fantasma, %) (Motor 1)"
     )
+    # Auditoría rentabilidad 2026-07-07: el "arb" binario intra-ticker = book AUTO-CRUZADO
+    # (yes_bid+no_bid>100), estado que el matching engine elimina en ms — casi toda señal
+    # de 1 tick es book local stale (evidencia: 0 ventanas binarias en TODA la historia;
+    # las 3054 EdgeWindow fueron multi-outcome). Confirmación + cooldown acotan el costo
+    # de perseguir fantasmas (cada fill asimétrico = rollback = spread + 2 fees).
+    MOTOR_1_CONFIRM_TICKS: int = Field(
+        default=2,
+        ge=1,
+        description="Ticks consecutivos (~1s c/u) que el cruce debe persistir antes de EJECUTAR (Motor 1)",
+    )
+    MOTOR_1_TICKER_COOLDOWN_SEC: float = Field(
+        default=60.0,
+        ge=0.0,
+        description="Cooldown por ticker tras una ejecución fallida de Motor 1 (KILL/rollback) — no re-martillar el mismo cruce stale",
+    )
     # Bug 2 (incidente 2026-07-07): cap de exposición DIRECCIONAL por EVENTO (partido). Los
     # tickers hermanos (…HOUWSH-HOU / …HOUWSH-WSH) son el MISMO evento real; los residuales de
     # netting/huérfanas se acumulaban en la misma dirección ($135) sin que nadie los sumara.
@@ -210,6 +225,16 @@ class Settings(BaseSettings):
     MOTOR_3_MANAGES_ORPHANS: bool = Field(
         default=False,
         description="Si es True, Motor 3 aplica take-profit/trailing a huérfanas de Motor 1",
+    )
+    # Auditoría de rentabilidad 2026-07-07: piso de PRECIO para las VENTAS de salida
+    # (T-30/TP/trailing, M3 y el exit de M2). Vender a bid de polvo (1-4c) recupera
+    # centavos menos el fee (ceil ≥1c) y dona el spread en el momento de peor liquidez —
+    # mejor dejar que la posición settlee (el settle no paga fee). 0 = sin piso.
+    MOTOR_3_MIN_SELL_BID_CENTS: int = Field(
+        default=5,
+        ge=0,
+        le=99,
+        description="Bid mínimo (cents) para que una salida venda; debajo, la posición va a settle (0 = sin piso)",
     )
     # Motor 2 — cierre de posiciones (take-profit / trailing), espejo del de Motor 3. Motor 2
     # SOLO abría posiciones (ride-to-settlement) → PnL histórico negativo por asimetría
@@ -385,8 +410,26 @@ class Settings(BaseSettings):
         description="Precio mínimo (cents) para ejecutar Motor 2 (underdog filter)",
     )
     MOTOR_2_UNDERDOG_FILTER_ENABLED: bool = Field(
-        default=False,
+        # Default True desde la auditoría de rentabilidad 2026-07-07: el shadow intra-live
+        # ya cumplió su función — el histórico es concluyente (<40c: −$110,77, 17/21
+        # perdedoras; consistente con el sesgo favorito-longshot del de-vig multiplicativo,
+        # que sobreestima el fair del underdog). Dirección del cambio: BLOQUEA (conservador).
+        default=True,
         description="Si es True, Motor 2 BLOQUEA entradas <MOTOR_2_MIN_ENTRY_CENTS. Si es False, solo loguea (shadow).",
+    )
+    # Auditoría rentabilidad 2026-07-07 — endurecimiento de la MEDICIÓN del consenso:
+    # el único gate previo era >=2 OUTCOMES; UNA sola casa soft podía formar el "consenso"
+    # entero (n_books solo se logueaba), y una línea congelada hace horas pesaba igual
+    # que una fresca. Con pocas casas el edge medido puede ser 100% ruido.
+    MOTOR_2_MIN_BOOKS: int = Field(
+        default=3,
+        ge=1,
+        description="Mínimo de casas con set completo para que exista consenso (fair) en Motor 2",
+    )
+    MOTOR_2_MAX_BOOK_AGE_MIN: float = Field(
+        default=15.0,
+        ge=0.0,
+        description="Edad máxima (min) del last_update de una casa para entrar al consenso; 0 = sin filtro",
     )
     # Mutua exclusión por EVENTO: con True (default) Motor 2 emite UNA sola apuesta direccional
     # por partido (la de mayor edge neto), aunque el edge aparezca en varios outcomes/markets del

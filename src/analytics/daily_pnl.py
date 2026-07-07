@@ -254,13 +254,20 @@ class DailyPnLLoop:
                 return False  # ya reportado → idempotente (también lo blinda el unique de date)
             agg = aggregate_daily_pnl(s, day_start, day_end)
             pnl_usd = agg.total_pnl_cents / 100
+            # Auditoría rentabilidad 2026-07-07: starting_capital era el capital efectivo
+            # AL MOMENTO DEL REPORTE (incluso en backfill de días viejos) → la curva de
+            # equity persistida no encadenaba (ending(d) != starting(d+1)) y el % de un
+            # día viejo se dividía por el capital de HOY. Ahora ENCADENA: starting =
+            # ending de la última fila persistida (fallback: capital actual, sin historia).
+            prev = s.exec(select(DailyPnL).order_by(col(DailyPnL.date).desc())).first()
+            starting = prev.ending_capital if prev is not None else self._capital
             s.add(
                 DailyPnL(
                     date=day.isoformat(),
-                    starting_capital=self._capital,
-                    ending_capital=self._capital + pnl_usd,
+                    starting_capital=starting,
+                    ending_capital=starting + pnl_usd,
                     pnl=pnl_usd,
-                    pnl_pct=(pnl_usd / self._capital * 100) if self._capital else 0.0,
+                    pnl_pct=(pnl_usd / starting * 100) if starting else 0.0,
                     trades_count=agg.total_trades,
                     winning_trades=agg.total_wins,
                     losing_trades=agg.total_losses,
