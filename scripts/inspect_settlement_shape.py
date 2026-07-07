@@ -66,7 +66,9 @@ async def inspect(tickers: list[str]) -> int:
             # Veredicto del CÓDIGO REAL de producción:
             resolution = await source.get_resolution(ticker)
             if resolution is None:
-                print("  → KalshiSettlementSource.get_resolution: None (NO resuelto / shape no matchea)")
+                print(
+                    "  → KalshiSettlementSource.get_resolution: None (NO resuelto / shape no matchea)"
+                )
             else:
                 print(f"  → KalshiSettlementSource.get_resolution: {resolution.result!r} ✅")
                 resolved_any = True
