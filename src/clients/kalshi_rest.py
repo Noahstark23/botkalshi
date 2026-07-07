@@ -353,6 +353,16 @@ class KalshiRestClient:
         """Balance de la cuenta. Retorna `{'balance': cents}`."""
         return await self._request("GET", "/portfolio/balance")
 
+    async def get_available_balance_usd(self) -> float:
+        """Cash disponible en USD (Bug 1, incidente 2026-07-07: pre-check antes de colocar
+        patas de arb — el balance REAL de Kalshi es lo único que decide si acepta la orden).
+        Lanza ValueError si la respuesta no trae 'balance' (el caller decide fail-open)."""
+        data = await self.get_balance()
+        cents = data.get("balance") if isinstance(data, dict) else None
+        if cents is None:
+            raise ValueError(f"get_balance sin campo 'balance': {data!r}")
+        return float(cents) / 100.0
+
     async def get_positions(self, *, limit: int = 100, cursor: str | None = None) -> dict:
         """Posiciones abiertas, paginadas."""
         params: dict[str, Any] = {"limit": limit}

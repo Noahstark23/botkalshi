@@ -42,7 +42,11 @@ def reset_bot_state():
 
 @pytest.fixture
 def mock_client() -> AsyncMock:
-    return AsyncMock()
+    client = AsyncMock()
+    # Bug 1: el pre-check de balance corre en cada execute(); balance holgado por default
+    # para que los tests preexistentes no cambien de comportamiento.
+    client.get_available_balance_usd.return_value = 10_000.0
+    return client
 
 
 @pytest.fixture
@@ -71,6 +75,8 @@ def _mock_settings(trading_enabled: bool = True) -> MagicMock:
     s.TRADING_ENABLED = trading_enabled
     s.ACTIVE_CAPITAL_USD = 300.0
     s.MAX_TRADE_SIZE_PCT = 5.0
+    # Bug 2: cap holgado por default (los tests del guard lo bajan explícitamente).
+    s.MAX_EVENT_DIRECTIONAL_EXPOSURE_USD = 10_000.0
     return s
 
 

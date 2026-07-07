@@ -201,6 +201,7 @@ class ProductionRunner:
                 tp_threshold=self.settings.MOTOR_3_TAKE_PROFIT_CENTS,
                 trailing_enabled=self.settings.MOTOR_3_TRAILING_ENABLED,
                 trailing_drop=self.settings.MOTOR_3_TRAILING_DROP_CENTS,
+                manages_orphans=self.settings.MOTOR_3_MANAGES_ORPHANS,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"

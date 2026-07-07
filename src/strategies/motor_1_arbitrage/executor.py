@@ -15,7 +15,8 @@ from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
 from src.risk.manager import RiskManager
-from src.storage.models import RiskEvent, Trade, get_session
+from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
+from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker
 from src.utils.config import get_settings
 
 if TYPE_CHECKING:
@@ -63,6 +64,16 @@ class ArbitrageExecutor:
         self.max_rollback_retries = max_rollback_retries
         self.rollback_window_minutes = rollback_window_minutes
         self.circuit_breaker_threshold = circuit_breaker_threshold
+        # Bug 2 (incidente 2026-07-07): guard de exposición direccional por EVENTO — los tickers
+        # hermanos de un partido (…HOUWSH-HOU / …HOUWSH-WSH) se arbeaban independientes y los
+        # residuales se acumulaban en la misma dirección hasta $135 sin que nadie los sumara.
+        # LAZY: se construye en el primer execute() (get_settings ahí, no en __init__ — el
+        # executor también se instancia en contextos sin env completo, ej. reconcile de boot).
+        self.event_tracker: EventExposureTracker | None = None
+        # Bug 1: caché del balance real de Kalshi (TTL corto) para el pre-check por arb sin
+        # martillar la API. (monotonic_ts, balance_usd); se invalida tras cada place exitoso.
+        self._balance_cache: tuple[float, float] | None = None
+        self.BALANCE_CACHE_TTL_SEC = 5.0
 
     # =====================================================
     # Public interface
@@ -168,6 +179,42 @@ class ArbitrageExecutor:
             return True
 
         count = decision.max_allowed_count
+
+        # Bug 2 — guard de exposición direccional por evento: si el evento YA arrastra residual
+        # direccional sobre el cap (huérfanas/netting), NO se opera más ese evento. Un arb
+        # completo netea a cero, así que se chequea la exposición ACUMULADA, no la del arb.
+        if self.event_tracker is None:
+            self.event_tracker = EventExposureTracker(
+                max_exposure_usd=float(settings.MAX_EVENT_DIRECTIONAL_EXPOSURE_USD)
+            )
+        allowed, exposure_usd, event = self.event_tracker.check_new_arb(
+            [leg.market_ticker for leg in opp.legs]
+        )
+        if not allowed:
+            logger.warning(
+                f"ArbitrageExecutor: arb RECHAZADO por exposición direccional del evento "
+                f"{event}: ${exposure_usd:.2f} > cap "
+                f"${self.event_tracker.max_exposure_usd:.2f} (guard Bug 2)"
+            )
+            if self.event_tracker.should_alert(event):
+                try:  # best-effort: Telegram caído no debe romper el path de rechazo
+                    await alert_risk_event(
+                        "event_exposure_cap",
+                        f"Evento {event} con exposición direccional ${exposure_usd:.2f} > cap "
+                        f"${self.event_tracker.max_exposure_usd:.2f} — arbs sobre este evento "
+                        "bloqueados hasta que el residual se cierre/settlee.",
+                    )
+                except Exception:
+                    logger.exception("event_exposure_cap: alerta Telegram falló")
+            return False
+
+        # Bug 1 — pre-check de balance REAL antes de colocar CUALQUIER pata (van concurrentes:
+        # el costo relevante es el del arb ENTERO + fees). Si Kalshi no tiene cash para ambas
+        # patas, colocar la primera garantiza una huérfana cuando la segunda rebote con
+        # insufficient_balance. Abort limpio: sin patas, sin rollback, sin risk_event.
+        if not await self._balance_sufficient(opp, count):
+            return False
+
         client_order_ids = [str(uuid.uuid4()) for _ in opp.legs]
 
         self._persist_intents(opp, count, client_order_ids)
@@ -188,6 +235,10 @@ class ArbitrageExecutor:
                 failed = True
             else:
                 filled.append((leg, coid))
+                # Bug 2: alimentar el tracker de exposición con el fill (fuente rápida
+                # intra-burst). Bug 1: el place consumió cash → invalidar caché de balance.
+                self.event_tracker.record_fill(leg.market_ticker, leg.side, count, leg.price_cents)
+                self._balance_cache = None
                 # order_id: V2 lo anida en 'order'; fallback plano por si el shape varía
                 # (las 60 filas del 30-jun quedaron con kalshi_order_id NULL — si esto
                 # vuelve a salir vacío, el WARNING de abajo deja la evidencia).
@@ -265,6 +316,7 @@ class ArbitrageExecutor:
                             f"bid={current_bid}¢ original={leg.price_cents}¢. "
                             "Manual review required."
                         )
+                        await self._pause_on_aborted_rollback(leg, slippage_pct)
                         break
 
                     logger.info(
@@ -331,6 +383,96 @@ class ArbitrageExecutor:
                 f"{len(events)} atomic rollbacks in {self.rollback_window_minutes}min. "
                 "Bot paused. Manual review required.",
             )
+
+    async def _balance_sufficient(self, opp: ArbOpportunity, count: int) -> bool:
+        """
+        Bug 1 — pre-check del balance REAL de Kalshi contra el costo TOTAL del arb (todas las
+        patas + fees). FAIL-OPEN si el balance no se puede leer: el peor caso es el
+        comportamiento previo (Kalshi rechaza con insufficient_balance) — no bloquear todo el
+        motor por un hiccup de la API. También avisa (log warning) si el cash quedó por debajo
+        del 10% de ACTIVE_CAPITAL_USD — señal de que el colchón real se está agotando.
+        """
+        from src.math.fees import kalshi_fee_cents
+
+        total_cents = sum(
+            count * leg.price_cents + kalshi_fee_cents(count, leg.price_cents) for leg in opp.legs
+        )
+        total_usd = total_cents / 100.0
+        available = await self._available_balance_usd()
+        if available is None:
+            return True  # fail-open documentado: sin lectura, se intenta igual
+        settings = get_settings()
+        if available < settings.ACTIVE_CAPITAL_USD * 0.10:
+            logger.warning(
+                f"ArbitrageExecutor: balance real ${available:.2f} < 10% de "
+                f"ACTIVE_CAPITAL_USD (${settings.ACTIVE_CAPITAL_USD:.0f}) — colchón agotándose"
+            )
+        if total_usd > available:
+            logger.warning(
+                f"ArbitrageExecutor: arb ABORTADO por balance — costo ${total_usd:.2f} "
+                f"(ambas patas + fees) > cash disponible ${available:.2f}. Sin patas colocadas."
+            )
+            return False
+        return True
+
+    async def _available_balance_usd(self) -> float | None:
+        """Balance real de Kalshi en USD, cacheado ~5s (invalidado tras cada place exitoso).
+        None si la lectura falla (el caller decide fail-open)."""
+        import time as _time
+
+        now = _time.monotonic()
+        if (
+            self._balance_cache is not None
+            and now - self._balance_cache[0] < self.BALANCE_CACHE_TTL_SEC
+        ):
+            return self._balance_cache[1]
+        try:
+            usd = float(await self.client.get_available_balance_usd())
+        except Exception as exc:
+            logger.warning(f"ArbitrageExecutor: get_available_balance falló: {exc} (fail-open)")
+            return None
+        self._balance_cache = (now, usd)
+        return usd
+
+    async def _pause_on_aborted_rollback(self, leg: ArbLeg, slippage_pct: float) -> None:
+        """
+        Bug 3 (incidente 2026-07-07): UN rollback abortado por slippage = PAUSA INMEDIATA
+        y PERSISTENTE. Un abort significa que el mercado se movió tanto entre la pata y el
+        rollback (−89% en el incidente) que hay evidencia estructural de cambio (in-play,
+        liquidez, feed). Esperar 3 eventos (el circuit breaker genérico) acumula daño; y la
+        pausa runtime-only se perdía con un Redeploy → el bot volvía a operar sobre el mismo
+        mercado roto. engage_kill_switch persiste en operational_state → el boot re-hidrata
+        la pausa (_rehydrate_kill_switch) y SOLO scripts/clear_kill_switch.py la levanta.
+        Best-effort: un fallo de persistencia no rompe el rollback (prioridad: alertar).
+        """
+        reason = (
+            f"rollback_aborted_slippage: {leg.market_ticker} ({leg.side}) "
+            f"slippage {slippage_pct:.1f}% — pata huérfana sin cerrar, revisión manual"
+        )
+        BotState.is_paused = True
+        BotState.pause_reason = reason
+        try:
+            with get_session() as s:
+                s.add(
+                    RiskEvent(
+                        event_type="rollback_aborted_slippage",
+                        severity="critical",
+                        message=reason[:500],
+                    )
+                )
+                s.commit()
+            engage_kill_switch(reason)
+        except Exception:
+            logger.exception("pause_on_aborted_rollback: persistencia falló (pausa runtime activa)")
+        logger.critical(f"PAUSA PERSISTENTE por rollback abortado: {reason}")
+        try:  # best-effort: un fallo de Telegram no debe romper el flujo del rollback
+            await alert_risk_event(
+                "rollback_aborted_slippage",
+                f"{reason}. Bot pausado PERSISTENTE (sobrevive redeploy); "
+                "levantar con scripts/clear_kill_switch.py tras revisar la pata huérfana.",
+            )
+        except Exception:
+            logger.exception("pause_on_aborted_rollback: alerta Telegram falló")
 
     def _persist_intents(
         self,

@@ -73,6 +73,7 @@ class Motor3ExitExecutor:
         *,
         strategy: str = STRATEGY,
         entry_origin: tuple[str, ...] = ("motor_2_consensus",),
+        include_motor1_orphans: bool = False,
     ) -> None:
         self.client = client
         # Estrategia con la que se audita la fila SELL del exit. Default motor_3_clv; Motor 2
@@ -84,6 +85,11 @@ class Motor3ExitExecutor:
         # la venta). motor_rest_arb NO va acá: una leg de arb hedged nunca se liquida suelta
         # (vender la leg ganadora rompe el hedge → profit lockeado se vuelve pérdida).
         self._entry_origin = entry_origin
+        # Bug 4 (incidente 2026-07-07): con True, las patas HUÉRFANAS de Motor 1 (arb sin la
+        # pata hermana fillada) también cuentan como entradas atribuibles — el cap de
+        # _open_attributable_count y el settle las incluyen. Un par hedged completo JAMÁS
+        # entra (motor1_orphan_buys lo excluye) → imposible vender la pata de un hedge.
+        self._include_motor1_orphans = include_motor1_orphans
 
     def _lock_for(self, ticker: str) -> asyncio.Lock:
         return type(self)._locks.setdefault(ticker, asyncio.Lock())
@@ -137,21 +143,50 @@ class Motor3ExitExecutor:
             count = min(position.count, open_count)
             return await self._exit_locked(position.ticker, position.side, count)
 
+    def _attributable_buys(self, s, ticker: str, side: str) -> list[Trade]:
+        """BUYs 'filled' abiertos atribuibles para (ticker, side): los de entry_origin y — con
+        include_motor1_orphans — las HUÉRFANAS de Motor 1. La orfandad se decide mirando AMBOS
+        sides del arb (por eso la query de motor_1 va por ticker completo): un arb con las dos
+        patas vivas es un hedge y queda fuera SIEMPRE. Ordenado FIFO por placed_at (mismo
+        criterio de settle de siempre)."""
+        from src.strategies.motor_3_clv.orphans import motor1_orphan_buys
+
+        buys = [
+            b
+            for b in s.exec(
+                select(Trade).where(
+                    Trade.ticker == ticker,
+                    Trade.side == side,
+                    Trade.action == "buy",
+                    Trade.status == "filled",
+                    col(Trade.strategy).in_(self._entry_origin),
+                )
+            )
+            if not b.closed_by_clv and b.count > 0
+        ]
+        if self._include_motor1_orphans:
+            m1_all_sides = [
+                b
+                for b in s.exec(
+                    select(Trade).where(
+                        Trade.ticker == ticker,
+                        Trade.action == "buy",
+                        Trade.status == "filled",
+                        Trade.strategy == "motor_1_arbitrage",
+                    )
+                )
+                if not b.closed_by_clv and b.count > 0
+            ]
+            buys.extend(o for o in motor1_orphan_buys(m1_all_sides) if o.side == side)
+        buys.sort(key=lambda b: b.placed_at)
+        return buys
+
     def _open_attributable_count(self, ticker: str, side: str) -> int:
-        """Contratos BUY 'filled' aún abiertos (no closed_by_clv) de `entry_origin` para
+        """Contratos BUY 'filled' aún abiertos (no closed_by_clv) atribuibles para
         (ticker, side). Fail-safe: error de DB → 0 (ante la duda, NO vender)."""
         try:
             with get_session() as s:
-                buys = s.exec(
-                    select(Trade).where(
-                        Trade.ticker == ticker,
-                        Trade.side == side,
-                        Trade.action == "buy",
-                        Trade.status == "filled",
-                        col(Trade.strategy).in_(self._entry_origin),
-                    )
-                )
-                return sum(b.count for b in buys if not b.closed_by_clv and b.count > 0)
+                return sum(b.count for b in self._attributable_buys(s, ticker, side))
         except Exception:
             logger.exception(f"motor3.exit.attributable_check_failed ticker={ticker}")
             return 0
@@ -451,23 +486,13 @@ class Motor3ExitExecutor:
         CRÍTICO (fix auditoría 2026-07-01): un fallo acá ESCALA al caller (antes era
         best-effort → BUYs 'filled' para siempre = re-venta fantasma + settlement doble).
         """
-        origin = self._entry_origin
         now = _naive_utc_now()
         try:
             with get_session() as s:
-                buys = list(
-                    s.exec(
-                        select(Trade)
-                        .where(
-                            Trade.ticker == ticker,
-                            Trade.side == side,
-                            Trade.action == "buy",
-                            Trade.status == "filled",
-                            col(Trade.strategy).in_(origin),
-                        )
-                        .order_by(col(Trade.placed_at))
-                    )
-                )
+                # Mismo criterio que _open_attributable_count (entry_origin + huérfanas de
+                # Motor 1 si el flag está on) → el settle cierra EXACTAMENTE las patas que
+                # habilitaron la venta, FIFO. Un hedge de Motor 1 jamás aparece acá.
+                buys = self._attributable_buys(s, ticker, side)
                 remaining = filled_count
                 # Fee del EXIT asignada por tramo ACUMULATIVO (deuda auditoría 2026-07-01):
                 # sumar ceil(fee(closed)) por pata sobre-cobraba hasta (n_patas−1)¢ y no
