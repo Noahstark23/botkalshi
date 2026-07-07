@@ -76,7 +76,9 @@ def _breakdown(exec_rows: list[EdgeWindow], exec_thresh: float) -> None:
     print(f"    {'evento':<34} {'windows':>7} {'best%':>7} {'med%':>7}")
     top = sorted(by_event.items(), key=lambda kv: len(kv[1]), reverse=True)[:10]
     for ev, edges in top:
-        print(f"    {ev[:34]:<34} {len(edges):>7} {max(edges):>6.1f} {statistics.median(edges):>6.1f}")
+        print(
+            f"    {ev[:34]:<34} {len(edges):>7} {max(edges):>6.1f} {statistics.median(edges):>6.1f}"
+        )
 
 
 def report(hours: int | None, breakdown: bool) -> int:
@@ -126,8 +128,10 @@ def report(hours: int | None, breakdown: bool) -> int:
     if gross_cents and net_cents:
         gmean, nmean = statistics.fmean(gross_cents), statistics.fmean(net_cents)
         bite = (1 - nmean / gmean) * 100 if gmean else 0.0
-        print(f"  mordida de fees  : bruto≈{gmean:.2f}c → neto≈{nmean:.2f}c "
-              f"({bite:.0f}% se lo comen las fees)")
+        print(
+            f"  mordida de fees  : bruto≈{gmean:.2f}c → neto≈{nmean:.2f}c "
+            f"({bite:.0f}% se lo comen las fees)"
+        )
 
     # Estados post-trade: en shadow deben estar todos en default (jamás se ejecutó).
     executed = [r for r in rows if r.leg_states]

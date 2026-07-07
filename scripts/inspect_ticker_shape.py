@@ -24,6 +24,7 @@ Uso (lo corre el operador, requiere credenciales Kalshi y mercado activo):
         --tickers KXNBA-26-XXX KXNBA-26-YYY \\
         --max-messages 10 --out ticker_shapes.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,8 +35,12 @@ from src.clients.kalshi_ws import KalshiWebSocket
 
 # Mismos candidatos que usa el trigger (src/strategies/motor_rest_arb/trigger.py).
 _SIZE_KEY_CANDIDATES = (
-    "yes_bid_size_fp", "yes_bid_size", "yes_bid_qty",
-    "yes_ask_size_fp", "yes_ask_size", "yes_ask_qty",
+    "yes_bid_size_fp",
+    "yes_bid_size",
+    "yes_bid_qty",
+    "yes_ask_size_fp",
+    "yes_ask_size",
+    "yes_ask_qty",
 )
 _PRICE_KEY_CANDIDATES = ("yes_bid_dollars", "yes_ask_dollars")
 
@@ -51,7 +56,9 @@ async def _main() -> None:
     ap.add_argument("--tickers", nargs="+", required=True, help="Tickers de un mercado ACTIVO")
     ap.add_argument("--max-messages", type=int, default=10, help="Payloads a capturar (default 10)")
     ap.add_argument("--out", default="ticker_shapes.json", help="Archivo JSON de salida")
-    ap.add_argument("--timeout", type=float, default=300.0, help="Timeout total en seg (default 300)")
+    ap.add_argument(
+        "--timeout", type=float, default=300.0, help="Timeout total en seg (default 300)"
+    )
     args = ap.parse_args()
 
     ws = KalshiWebSocket()
@@ -112,7 +119,9 @@ async def _main() -> None:
         print(f"  ✓ El trigger PUEDE leer size con: {found_size}")
         print("    → el filtro de profundidad funcionará en shadow.")
     else:
-        other = [k for k in keys if "size" in k.lower() or "qty" in k.lower() or "depth" in k.lower()]
+        other = [
+            k for k in keys if "size" in k.lower() or "qty" in k.lower() or "depth" in k.lower()
+        ]
         print("  ✗ NINGÚN candidato de size del trigger aparece en el payload.")
         print(f"    Campos de size/qty observados que NO matchean: {other or '(ninguno)'}")
         print("    → AGREGAR esos nombres a _YES_BID/ASK_SIZE_KEYS en trigger.py ANTES")
