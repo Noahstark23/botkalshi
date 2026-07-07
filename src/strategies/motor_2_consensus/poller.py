@@ -54,6 +54,8 @@ class Motor2ShadowPoller:
         max_edge: float | None = None,
         risk_manager: RiskManager | None = None,
         executor: Motor2Executor | None = None,
+        min_books: int = 1,
+        max_book_age_min: float | None = None,
     ):
         self._kalshi = kalshi_source
         self._odds = odds_source
@@ -79,6 +81,11 @@ class Motor2ShadowPoller:
         self._max_stake_pct = max_stake_pct
         # Presente SOLO con TRADING_ENABLED=true (lo construye el runner, Capa A). None = shadow.
         self._executor = executor
+        # Endurecimiento de la MEDICIÓN del fair (auditoría rentabilidad 2026-07-07): mínimo
+        # de casas para que exista consenso + frescura máxima de la línea de cada casa.
+        # El runner los pasa desde MOTOR_2_MIN_BOOKS / MOTOR_2_MAX_BOOK_AGE_MIN.
+        self._min_books = min_books
+        self._max_book_age_min = max_book_age_min
 
     def _capital_for_cycle(self) -> float:
         """Capital base del sizing ESTE ciclo: el efectivo del RiskManager (dinámico) si hay RM;
@@ -110,6 +117,8 @@ class Motor2ShadowPoller:
             max_stake_pct=self._max_stake_pct,
             fair_out=fair_out,
             max_edge=self._max_edge,
+            min_books=self._min_books,
+            max_book_age_min=self._max_book_age_min,
         )
         # Canal Motor 5 (F1 shadow): publica el fair de todo outcome matcheado SOLO con
         # odds reales — un fair del fixture fake no es precio de referencia para cotizar.

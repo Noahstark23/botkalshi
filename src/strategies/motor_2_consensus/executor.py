@@ -34,6 +34,7 @@ from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.fees import kalshi_fee_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, engage_kill_switch, get_session
+from src.strategies.data_capture import _top_bid
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 
 STRATEGY = "motor_2_consensus"
@@ -142,6 +143,30 @@ class Motor2Executor:
                 f"stake=${signal.recommended_size_usd:.2f} < price={price}c (no se fuerza 1 contrato)"
             )
             return Motor2ExecutionOutcome(False, False, reason="stake_below_one_contract")
+
+        # RE-VALIDACIÓN PRE-PLACE (auditoría rentabilidad 2026-07-07, selección adversa):
+        # el ask de la señal se leyó al INICIO del ciclo (fetch serial de quotes + odds +
+        # detección = decenas de segundos antes) — un IOC limit a ese precio viejo SOLO
+        # llena si el mercado ya bajó, o sea: los fills se concentran exactamente cuando
+        # el fair también bajó (lineup/noticia). Se re-lee el book justo antes de reservar:
+        # ask actual > precio de la señal → señal STALE, abort limpio; y el count se capea
+        # al size visible (el edge se midió sobre un ask sin profundidad). FAIL-OPEN si la
+        # lectura falla (un hiccup no apaga el motor; el IOC limit sigue acotando el precio).
+        fresh_ask, fresh_size = await self._current_ask(signal.market_ticker, side)
+        if fresh_ask is not None and fresh_ask > price:
+            logger.info(
+                f"motor2.exec.stale_quote ticker={signal.market_ticker} side={side} "
+                f"señal={price}c ask_actual={fresh_ask}c (el precio se fue — no se persigue)"
+            )
+            return Motor2ExecutionOutcome(False, False, reason="stale_quote")
+        if fresh_size is not None and fresh_size < desired:
+            logger.info(
+                f"motor2.exec.depth_capped ticker={signal.market_ticker} side={side} "
+                f"desired={desired} → {fresh_size} (size visible al ask)"
+            )
+            desired = fresh_size
+            if desired <= 0:
+                return Motor2ExecutionOutcome(False, False, reason="no_depth_at_ask")
 
         opp = self._as_single_leg_opp(signal, side, price, desired)
         # A.1 — intent PRE-red, ahora BAJO EL MISMO LOCK que el check (deuda auditoría
@@ -298,6 +323,24 @@ class Motor2Executor:
             net_profit_cents=0,
             edge_pct=signal.edge_pct,
         )
+
+    async def _current_ask(self, ticker: str, side: str) -> tuple[int | None, int | None]:
+        """(ask actual, size disponible) para COMPRAR `side`, del book VIVO. El ask de
+        comprar yes es sintético contra el mejor bid de no (100 − no_bid) y viceversa
+        (convención del proyecto: el book de Kalshi lista bids por lado). (None, None)
+        si la lectura falla o el lado opuesto está vacío — FAIL-OPEN: el caller procede
+        (el IOC limit sigue acotando el precio; un book vacío = no-fill limpio)."""
+        try:
+            ob = await self.client.get_orderbook(ticker)
+        except Exception as exc:
+            logger.warning(f"motor2.exec.revalidation_error ticker={ticker}: {exc} (fail-open)")
+            return None, None
+        book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
+        opposite = "no" if side == "yes" else "yes"
+        bid, size = _top_bid(book.get(opposite) or [])
+        if bid is None:
+            return None, None
+        return 100 - bid, size
 
     def _open_position_exists(self, signal: ConsensusSignal) -> bool:
         """True si hay un Trade vivo (pending/filled) de Motor 2 en el evento/ticker.

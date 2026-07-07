@@ -381,6 +381,8 @@ class ProductionRunner:
                         max_edge=self.settings.MOTOR_2_MAX_EDGE_PCT / 100.0,
                         risk_manager=risk,
                         executor=executor,
+                        min_books=self.settings.MOTOR_2_MIN_BOOKS,
+                        max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
                     )
                     await poller.run(self._stop_event)
             else:
@@ -392,6 +394,8 @@ class ProductionRunner:
                     max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
                     max_edge=self.settings.MOTOR_2_MAX_EDGE_PCT / 100.0,
                     risk_manager=risk,
+                    min_books=self.settings.MOTOR_2_MIN_BOOKS,
+                    max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
                 )
                 await poller.run(self._stop_event)
         except Exception as e:
