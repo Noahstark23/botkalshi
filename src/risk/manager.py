@@ -442,26 +442,79 @@ class RiskManager:
             if t.status == "filled" and "arb_id=" in (t.notes or ""):
                 groups.setdefault(arb_group_key(t), []).append(t)
 
-        for legs in groups.values():
+        for arb_id, legs in groups.items():
             yes_legs = [t for t in legs if t.side == "yes"]
             no_legs = [t for t in legs if t.side == "no"]
-            if not yes_legs or not no_legs:
-                continue  # pata suelta → riesgo direccional real, cuenta entera
             tickers = {t.ticker for t in legs}
-            if len(tickers) != 1:
-                continue  # patas en mercados distintos: NO es el arb binario hedged
-            # Emparejar contratos: el hedge cubre min(count_yes, count_no) por lado.
-            cnt_yes = sum(t.count for t in yes_legs)
-            cnt_no = sum(t.count for t in no_legs)
-            paired = min(cnt_yes, cnt_no)
-            if paired <= 0:
+            if yes_legs and no_legs and len(tickers) == 1:
+                # Arb BINARIO hedged (yes+no del mismo ticker): descuenta el par.
+                cnt_yes = sum(t.count for t in yes_legs)
+                cnt_no = sum(t.count for t in no_legs)
+                paired = min(cnt_yes, cnt_no)
+                if paired <= 0:
+                    continue
+                # Costo promedio ponderado por lado × contratos emparejados.
+                cost_yes = sum(t.price_cents * t.count for t in yes_legs) / cnt_yes
+                cost_no = sum(t.price_cents * t.count for t in no_legs) / cnt_no
+                total_cents -= int(paired * (cost_yes + cost_no))
                 continue
-            # Costo promedio ponderado por lado × contratos emparejados.
-            cost_yes = sum(t.price_cents * t.count for t in yes_legs) / cnt_yes
-            cost_no = sum(t.price_cents * t.count for t in no_legs) / cnt_no
-            total_cents -= int(paired * (cost_yes + cost_no))
+            total_cents -= self._multi_outcome_hedge_discount_cents(legs=legs, arb_id=arb_id)
 
         return max(total_cents, 0) / 100.0
+
+    def _multi_outcome_hedge_discount_cents(self, *, legs: list[Trade], arb_id: str) -> int:
+        """
+        Descuento de exposición de un arb MULTI-OUTCOME hedged (auditoría rentabilidad
+        2026-07-07: el netting solo reconocía el caso binario intra-ticker — un
+        winner-take-all completo de 3 patas YES, payout 100¢/set garantizado, contaba
+        su notional BRUTO (~95¢/contrato) durante DÍAS hasta el settle y estrangulaba
+        el headroom compartido, el mismo modo de falla del 30-jun arreglado solo para
+        el binario).
+
+        SOLO se descuenta lo identificable con CERTEZA (ante la duda, sobrestimar):
+          - todas las patas del grupo son BUY YES de motor_rest_arb,
+          - >= 3 tickers DISTINTOS, todos hermanos del MISMO evento,
+          - NINGUNA fila del arb_id (cualquier status) quedó fuera de 'filled'/'settled'
+            — una pata cancelled/pending/error significa set INCOMPLETO (mixto FILL+KILL)
+            → riesgo direccional real, cuenta entero,
+          - costo del set (Σ wavg por pata) < 100¢ (si no, no hay hedge que descontar).
+        Descuento = min(counts por pata) × costo del set — el excedente sin pareja
+        sigue contando entero. Best-effort: cualquier fallo devuelve 0 (sin descuento).
+        """
+        from src.strategies.motor_1_arbitrage.event_exposure import event_ticker_of
+
+        if not legs or any(
+            t.side != "yes" or t.action != "buy" or t.strategy != "motor_rest_arb" for t in legs
+        ):
+            return 0
+        by_ticker: dict[str, list[Trade]] = {}
+        for t in legs:
+            by_ticker.setdefault(t.ticker, []).append(t)
+        if len(by_ticker) < 3:
+            return 0  # winner-take-all real = >=3 outcomes; con menos no hay certeza de hedge
+        events = {event_ticker_of(tk) for tk in by_ticker}
+        if len(events) != 1:
+            return 0  # patas de eventos distintos: no es un set del mismo partido
+        try:
+            with get_session() as sess:
+                siblings = list(
+                    sess.exec(select(Trade).where(col(Trade.notes).contains(f"arb_id={arb_id}")))
+                )
+        except Exception:
+            logger.exception("netting.multi.sibling_check_failed → sin descuento (conservador)")
+            return 0
+        if any(row.status not in ("filled", "settled") for row in siblings):
+            return 0  # una pata no-fillada = set incompleto (KILL/pending) → direccional
+        paired = min(sum(t.count for t in ts) for ts in by_ticker.values())
+        if paired <= 0:
+            return 0
+        set_cost = sum(
+            sum(t.price_cents * t.count for t in ts) / sum(t.count for t in ts)
+            for ts in by_ticker.values()
+        )
+        if set_cost >= 100:
+            return 0  # el set cuesta >= payout: no hay hedge que descontar
+        return int(paired * set_cost)
 
     async def _check_timeframe_stop_losses(self) -> str | None:
         """

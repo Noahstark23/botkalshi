@@ -379,3 +379,68 @@ async def test_reserve_persist_failure_degrades_to_rejection():
     with patch("src.risk.manager.get_settings", return_value=_risk_settings()):
         decision = await rm.check_and_reserve(_single_leg_opp(10), lambda d: False)
     assert not decision.approved and decision.reason == "persist_intent_failed"
+
+
+# =====================================================
+# Netting multi-outcome (auditoría rentabilidad 2026-07-07): el winner-take-all
+# completo es hedge (payout 100c/set) — antes contaba su notional BRUTO por días
+# =====================================================
+
+
+def _insert_multi_leg(
+    arb: str, ticker: str, price: int, count: int = 10, status: str = "filled"
+) -> None:
+    with models.get_session() as s:
+        s.add(
+            models.Trade(
+                client_order_id=str(uuid.uuid4()),
+                ticker=ticker,
+                side="yes",
+                action="buy",
+                count=count,
+                price_cents=price,
+                strategy="motor_rest_arb",
+                status=status,
+                notes=f"arb_id={arb}",
+            )
+        )
+        s.commit()
+
+
+def test_multi_outcome_complete_set_discounted_to_zero():
+    """1X2 completo (3 patas YES del mismo evento, Σ=96c<100, todas filled) →
+    payout garantizado → exposición direccional CERO."""
+    arb = str(uuid.uuid4())
+    for tk, p in (("KXWC-EV-A", 31), ("KXWC-EV-B", 32), ("KXWC-EV-C", 33)):
+        _insert_multi_leg(arb, tk, p)
+    assert _manager()._get_current_exposure_usd() == 0.0
+
+
+def test_multi_outcome_incomplete_set_counts_fully():
+    """CONTROL fail-safe: una pata del arb_id quedó cancelled (KILL) → el set es
+    INCOMPLETO (mixto FILL+KILL = direccional real) → cero descuento."""
+    arb = str(uuid.uuid4())
+    _insert_multi_leg(arb, "KXWC-EV-A", 31)
+    _insert_multi_leg(arb, "KXWC-EV-B", 32)
+    _insert_multi_leg(arb, "KXWC-EV-C", 33)
+    _insert_multi_leg(arb, "KXWC-EV-D", 5, status="cancelled")  # la pata que KILLeó
+    assert _manager()._get_current_exposure_usd() == pytest.approx(9.60)  # (31+32+33)×10/100
+
+
+def test_multi_outcome_two_legs_not_discounted():
+    """CONTROL de certeza: 2 patas all-yes de un evento NO son un set completo
+    verificable (cobertura parcial posible) → cuentan enteras."""
+    arb = str(uuid.uuid4())
+    _insert_multi_leg(arb, "KXWC-EV-A", 31)
+    _insert_multi_leg(arb, "KXWC-EV-B", 32)
+    assert _manager()._get_current_exposure_usd() == pytest.approx(6.30)
+
+
+def test_multi_outcome_cross_event_not_discounted():
+    """CONTROL: 3 patas all-yes pero de EVENTOS distintos → no es un set del mismo
+    partido → cuentan enteras."""
+    arb = str(uuid.uuid4())
+    _insert_multi_leg(arb, "KXWC-EV1-A", 31)
+    _insert_multi_leg(arb, "KXWC-EV2-B", 32)
+    _insert_multi_leg(arb, "KXWC-EV3-C", 33)
+    assert _manager()._get_current_exposure_usd() == pytest.approx(9.60)
