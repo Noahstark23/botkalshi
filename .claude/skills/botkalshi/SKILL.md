@@ -1,83 +1,98 @@
-```markdown
-# botkalshi Development Patterns
+---
+name: botkalshi
+description: Protocolo de trabajo de Fable 5 sobre el bot de trading Kalshi (dinero real). Usar al arrancar CUALQUIER tarea de este repo — diagnóstico de producción, cambio de lógica de trading, activación de flags, contención de incidente, o PR. Encapsula las reglas de seguridad no negociables y los workflows probados.
+---
 
-> Auto-generated skill from repository analysis
+# botkalshi — protocolo de trabajo (Fable 5)
 
-## Overview
-This skill teaches the core development patterns, coding conventions, and workflows used in the `botkalshi` Python codebase. You'll learn how to structure files, write imports and exports, follow commit conventions, and organize and run tests. This guide helps maintain consistency and efficiency when contributing to the repository.
+Bot 24/7 con **dinero real**. Todo error cuesta plata. El mapa completo del proyecto, los
+motores y la arquitectura de seguridad viven en `CLAUDE.md` (leelo primero si no lo tenés).
+Esta skill es el **protocolo operativo**: qué hacer, en qué orden, y qué no hacer jamás.
 
-## Coding Conventions
+## Invariantes de seguridad (violarlas = incidente)
 
-### File Naming
-- Use **snake_case** for all file and module names.
-  - Example: `order_handler.py`, `market_utils.py`
+1. **Capa A**: un executor solo existe con sus flags de ejecución on. Nunca construyas un
+   executor fuera del gate del runner; nunca instancies uno "por conveniencia" en un script.
+2. **Nunca vender la pata de un hedge** (arb con ambas patas filladas). Toda gestión de
+   posiciones pasa por atribución de origen (`_attributable_positions`, `orphans.py`).
+3. **Órdenes de arbitraje: SIEMPRE `time_in_force` explícito** (`fill_or_kill` para arbs,
+   `immediate_or_cancel` para direccionales/salidas). El default `gtc` deja orden RESTING =
+   exposición silenciosa (Issue #14, incidente 2026-07-07). Y **siempre leer `fill_count`
+   de la respuesta** — HTTP 200 significa "aceptada", no "llenada".
+4. **Pausas persistentes, no runtime-only**: cualquier condición que deba frenar el bot usa
+   `engage_kill_switch()` (DB, sobrevive redeploys) — un `BotState.is_paused` solo se pierde
+   en el próximo deploy. Levantar SOLO con `scripts/clear_kill_switch.py`.
+5. **Fail-open en LECTURA, fail-closed en VENTA**: un hiccup de API no apaga el bot; ante la
+   duda sobre qué se puede vender, NO se vende (`_open_attributable_count` error→0).
+6. **Dinero en cents enteros**; fees SOLO con `kalshi_fee_cents`. Tiempo: `settled_at`/
+   `close_time` NAIVE UTC; `placed_at` AWARE. No mezclar.
+7. **Lección 7**: cada loop con try/except por tick que registra (`BotState.record_error`)
+   y sigue. Nada de `except: pass`.
 
-### Import Style
-- Use **relative imports** within the package.
-  - Example:
-    ```python
-    from .utils import calculate_pnl
-    from ..models import Order
-    ```
+## Workflow 1 — Diagnóstico de producción (SIEMPRE antes de tocar código)
 
-### Export Style
-- Use **named exports**; explicitly define what is exported from each module.
-  - Example:
-    ```python
-    __all__ = ["OrderHandler", "process_order"]
-    ```
+1. No tenés acceso al container: pedile al operador el output de los scripts read-only
+   (`scripts/diag_motor2_funnel.py`, `diag_motor2_match.py`, `check_portfolio.py`) o queries
+   puntuales. Los snapshots persistidos (`Motor2FunnelSnapshot`, `RiskEvent`, logs greppables
+   `motor2.funnel`, `[MOTOR 3 TP SHADOW]`) son la evidencia primaria.
+2. Formulá el diagnóstico con discriminadores verificables ("si X entonces causa A; si Y,
+   causa B") antes de proponer el fix. Si el hallazgo contradice el brief del operador,
+   decilo con evidencia — el brief puede estar equivocado (pasó: "bug de settlement" que era
+   sizing; "lookup de nombres" que era asks=100).
+3. Para diagnósticos nuevos: script read-only en `scripts/` con docstring de uso, no parches.
 
-### Commit Messages
-- Follow **conventional commit** format.
-- Use the `feat` prefix for new features.
-  - Example:
-    ```
-    feat: add support for market order cancellation
-    ```
+## Workflow 2 — Cambio de lógica de trading (shadow-first)
 
-## Workflows
+1. Branch desde `origin/main` FRESCO (main se mueve rápido; hay varias sesiones).
+2. Flag de DETECCIÓN separado del de EJECUCIÓN; default off o shadow. Logs
+   `[... SHADOW] ... net=$` con fees reales (`kalshi_fee_cents`, ambos lados) para validar
+   contra datos antes de prender.
+3. Env var nueva: `utils/config.py` (Field + description) + `.env.example` + threading
+   runner→componente. Tuneable en vivo > hardcodeado.
+4. Tests obligatorios: mecanismo + control (el caso que NO debe disparar) + fail-safe.
+5. `python -m pytest -q` completo verde + `ruff check src/ tests/` + `ruff format` antes
+   de push. PR draft con: problema (evidencia), fix, verificación, y **limitaciones
+   honestas** (qué NO resuelve).
 
-### Adding a New Feature
-**Trigger:** When implementing a new functionality.
-**Command:** `/add-feature`
+## Workflow 3 — Activación de flags de ejecución (protocolo estricto)
 
-1. Create a new module or update an existing one using snake_case naming.
-2. Use relative imports for any internal dependencies.
-3. Add named exports to the module.
-4. Write or update relevant tests in a `*.test.*` file.
-5. Commit changes with a message starting with `feat:`.
-6. Open a pull request for review.
+Al proponer o acompañar CUALQUIER activación (`TRADING_ENABLED`, `MOTOR_X_EXECUTION_*`):
+1. **Repetí los riesgos conocidos pendientes AUNQUE ya se hayan hablado** — enumerá los bugs
+   P0/P1 abiertos y qué protege/no protege cada guard. (Regla nacida del incidente
+   2026-07-07: proceder "como rutina" costó ~$140.)
+2. Recomendá el colchón: sizing chico (`MAX_TRADE_SIZE_PCT` bajo), caps bajos
+   (`MAX_EVENT_DIRECTIONAL_EXPOSURE_USD`), motores no involucrados en off.
+3. Recordá el orden: el merge a main dispara AUTO-DEPLOY de Coolify (reinicia el container y
+   borra el estado runtime). Si hay que frenar/pausar, `engage_kill_switch` ANTES del merge.
+4. Checklist post-deploy: `curl /status` → `bot.is_paused` esperado (ojo: `capital.is_paused`
+   es OTRO concepto — piso de capital), motores con el icono correcto en `/dashboard`, y los
+   primeros logs del motor activado.
 
-### Writing and Running Tests
-**Trigger:** When verifying code correctness.
-**Command:** `/run-tests`
+## Workflow 4 — Contención de incidente
 
-1. Place test files alongside code or in a dedicated test directory, using the pattern `*.test.*` (e.g., `order_handler.test.py`).
-2. Write tests using your preferred testing framework (not specified in repo).
-3. Run tests using the appropriate test runner (e.g., `pytest`, `unittest`).
-   - Example:
-     ```bash
-     pytest
-     ```
-4. Ensure all tests pass before merging changes.
+1. Frenar: `docker exec -it kalshi-bot python -m scripts.engage_kill_switch "motivo"` (graba
+   el switch DB + pausa el proceso vivo vía /admin/pause). Fallback: Stop en Coolify.
+2. Verificar: `curl -s http://localhost:8080/status` → `bot.is_paused: true`.
+3. Forense read-only: trades/positions/RiskEvents del período, timeline exacto, y separar
+   pérdida realizada vs MTM vs proyectada al settle. NO "arreglar" datos de la DB.
+4. Fix por bugs numerados con success criteria por bug; no reactivar hasta que los P0 estén
+   mergeados y deployados. La reactivación sigue el Workflow 3.
 
-## Testing Patterns
+## Comandos de referencia
 
-- Test files follow the `*.test.*` pattern, such as `market_utils.test.py`.
-- The specific testing framework is not enforced; use standard Python test frameworks like `pytest` or `unittest`.
-- Place tests either next to the code or in a dedicated tests directory.
-- Example test file:
-  ```python
-  # order_handler.test.py
-  from .order_handler import process_order
-
-  def test_process_order_valid():
-      assert process_order("buy", 10) == "Order processed"
-  ```
-
-## Commands
-| Command        | Purpose                                    |
-|----------------|--------------------------------------------|
-| /add-feature   | Start the workflow for adding a new feature|
-| /run-tests     | Run all tests in the repository            |
+```bash
+python -m pytest -q                      # suite completa (~1000+ tests, debe quedar verde)
+ruff check src/ tests/ && ruff format src/ tests/
+python scripts/diag_motor2_funnel.py     # por qué señales=0 (en el container)
+python -m scripts.engage_kill_switch "x" # contención (en el container)
+python -m scripts.clear_kill_switch      # reactivación (posiciones=0 + "CLEAR")
 ```
+
+## Estilo del repo
+
+- Commits y comentarios en **español**, el PORQUÉ con contexto de incidente ("Bug X,
+  incidente AAAA-MM-DD: ..."), no el qué. Imports **absolutos** (`from src.módulo import ...`).
+- Tests en `tests/` espejo de `src/` (pytest, asyncio auto) — no hay patrón `*.test.py`.
+- PRs en draft; el operador mergea. No comentar PRs salvo necesidad real.
+- Nada de tocar la DB de producción ni "arreglar" datos históricos; los análisis
+  pre-2026-07-01 tienen fees ~100× subestimadas (edges inflados ~1pp).
