@@ -202,6 +202,7 @@ class ProductionRunner:
                 trailing_enabled=self.settings.MOTOR_3_TRAILING_ENABLED,
                 trailing_drop=self.settings.MOTOR_3_TRAILING_DROP_CENTS,
                 manages_orphans=self.settings.MOTOR_3_MANAGES_ORPHANS,
+                min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"
@@ -420,6 +421,7 @@ class ProductionRunner:
                 tp_threshold=self.settings.MOTOR_2_TAKE_PROFIT_CENTS,
                 trailing_enabled=self.settings.MOTOR_2_TRAILING_ENABLED,
                 trailing_drop=self.settings.MOTOR_2_TRAILING_DROP_CENTS,
+                min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor2_exits runner: {type(e).__name__}: {e}"

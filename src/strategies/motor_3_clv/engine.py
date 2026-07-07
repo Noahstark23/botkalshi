@@ -55,6 +55,7 @@ class Motor3Engine:
         trailing_enabled: bool = False,
         trailing_drop: int = DEFAULT_TRAILING_DROP_CENTS,
         manages_orphans: bool = False,
+        min_sell_bid_cents: int = 0,
     ) -> None:
         self._poller = PortfolioPoller()
         self._trading_enabled = trading_enabled
@@ -66,6 +67,7 @@ class Motor3Engine:
         # pata hermana). El count gestionado se CAPEA al total huérfano — el resto de la
         # posición (pares hedged) jamás se vende. Default off.
         self._manages_orphans = manages_orphans
+        self._min_sell_bid_cents = min_sell_bid_cents
         # (ticker, side) → (count huérfano, entry FIFO) — se refresca por tick en
         # _attributable_positions y alimenta el cap + _entry_bid_for.
         self._orphan_by_pair: dict[tuple[str, str], tuple[int, int]] = {}
@@ -88,6 +90,7 @@ class Motor3Engine:
                     client,
                     entry_origin=_ENTRY_ORIGIN,
                     include_motor1_orphans=self._manages_orphans,
+                    min_sell_bid_cents=self._min_sell_bid_cents,
                 )
             await self._loop(stop_event)
 
@@ -251,31 +254,40 @@ class Motor3Engine:
         return kept
 
     def _entry_bid_for(self, position: PortfolioPosition) -> int | None:
-        """Entry del lado abierto = primer BUY filled (FIFO por placed_at), igual criterio que
-        _settle_originals. None si no hay pata BUY (→ el trailing no se arma; fail-safe). Best-
-        effort: un fallo de DB loguea y devuelve None (no rompe el tick — Lección 7)."""
+        """Entry del lado abierto = promedio PONDERADO de TODAS las patas BUY filled
+        abiertas (auditoría rentabilidad 2026-07-07: el primer BUY FIFO subestimaba el
+        entry cuando había multi-leg a precios crecientes — el gate net>0 de TP/trailing
+        aprobaba contra la pata barata una venta que las patas caras realizaban en
+        pérdida; la venta cierra TODAS las patas, así que el entry de la DECISIÓN es el
+        wavg, mismo criterio que Motor2Position.entry_cents). El settle sigue FIFO.
+        None si no hay pata BUY (→ el trailing no se arma; fail-safe). Best-effort: un
+        fallo de DB loguea y devuelve None (no rompe el tick — Lección 7)."""
         try:
             with get_session() as s:
-                buy = s.exec(
-                    select(Trade)
-                    .where(
-                        Trade.ticker == position.ticker,
-                        Trade.side == position.side,
-                        Trade.action == "buy",
-                        Trade.status == "filled",
-                        col(Trade.strategy).in_(_ENTRY_ORIGIN),
+                buys = [
+                    b
+                    for b in s.exec(
+                        select(Trade).where(
+                            Trade.ticker == position.ticker,
+                            Trade.side == position.side,
+                            Trade.action == "buy",
+                            Trade.status == "filled",
+                            col(Trade.strategy).in_(_ENTRY_ORIGIN),
+                        )
                     )
-                    .order_by(col(Trade.placed_at))
-                ).first()
+                    if not b.closed_by_clv and b.count > 0
+                ]
         except Exception as exc:
             logger.warning(f"motor3.trail.entry_error ticker={position.ticker}: {exc}")
             return None
-        if buy is None:
+        if not buys:
             # Bug 4: posición gestionada como HUÉRFANA de Motor 1 (sin BUY de _ENTRY_ORIGIN) →
             # el entry sale del primer BUY huérfano (FIFO), cacheado por tick en attribution.
             orphan = self._orphan_by_pair.get((position.ticker, position.side))
             return orphan[1] if orphan is not None else None
-        return buy.fill_price_cents or buy.price_cents
+        total = sum(b.count for b in buys)
+        wavg = sum((b.fill_price_cents or b.price_cents) * b.count for b in buys) / total
+        return round(wavg)
 
     def _shadow_pnl_str(self, position: PortfolioPosition, bid: int, entry: int | None) -> str:
         """PnL realizado NETO de fees si la posición se cerrara al bid ahora — para validar el

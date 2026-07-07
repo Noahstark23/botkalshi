@@ -83,12 +83,14 @@ class Motor2ExitEngine:
         tp_threshold: int = DEFAULT_TAKE_PROFIT_CENTS,
         trailing_enabled: bool = False,
         trailing_drop: int = DEFAULT_TRAILING_DROP_CENTS,
+        min_sell_bid_cents: int = 0,
     ) -> None:
         self._trading_enabled = trading_enabled
         self._take_profit_enabled = take_profit_enabled
         self._tp_threshold = tp_threshold
         self._trailing_enabled = trailing_enabled
         self._trailing_drop = trailing_drop
+        self._min_sell_bid_cents = min_sell_bid_cents
         self._executor: Motor3ExitExecutor | None = None
         self._client: KalshiRestClient | None = None
         # Peak del bid por (ticker, side) para el trailing. EN MEMORIA (Motor 2 no tiene fila
@@ -111,7 +113,10 @@ class Motor2ExitEngine:
                 # (fix auditoría: cerrar FIFO cross-strategy podía settlear una pata de
                 # motor_rest_arb y dejar la de Motor 2 'filled' → re-venta + PnL mal atribuido).
                 self._executor = Motor3ExitExecutor(
-                    client, strategy=STRATEGY, entry_origin=(STRATEGY,)
+                    client,
+                    strategy=STRATEGY,
+                    entry_origin=(STRATEGY,),
+                    min_sell_bid_cents=self._min_sell_bid_cents,
                 )
             await self._loop(stop_event)
 

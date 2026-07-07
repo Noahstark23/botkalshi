@@ -128,3 +128,43 @@ async def test_concurrent_exit_skips_busy():
         ex._lock_for(pos.ticker).release()
     assert out.reason == "busy"
     c.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bid_below_floor_does_not_sell():
+    """Auditoría rentabilidad 2026-07-07: vender polvo (bid < piso) recupera centavos
+    menos el fee (ceil >=1c) y dona el spread — debajo del piso la posición va a settle
+    (que no paga fee)."""
+    _seed_open_buy(side="yes", count=10)
+    c = _client({"orderbook": {"yes": [[3, 100]], "no": []}})
+    ex = Motor3ExitExecutor(c, min_sell_bid_cents=5)
+    out = await ex.exit_position(_pos("yes"))
+    assert out.reason == "bid_below_floor" and out.placed is False
+    c.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bid_at_floor_sells():
+    """CONTROL: bid == piso → vende normal (el piso es estrictamente 'debajo de')."""
+    _seed_open_buy(side="yes", count=10)
+    c = _client(
+        {"orderbook": {"yes": [[5, 100]], "no": []}},
+        place_resp={"order": {"order_id": "k1", "fill_count": 10}},
+    )
+    ex = Motor3ExitExecutor(c, min_sell_bid_cents=5)
+    out = await ex.exit_position(_pos("yes"))
+    assert out.placed is True
+    assert c.place_order.await_args.kwargs["yes_price"] == 5
+
+
+@pytest.mark.asyncio
+async def test_floor_zero_keeps_previous_behavior():
+    """CONTROL legacy: min_sell_bid_cents=0 (default) → vende a cualquier bid 1..99."""
+    _seed_open_buy(side="yes", count=10)
+    c = _client(
+        {"orderbook": {"yes": [[1, 100]], "no": []}},
+        place_resp={"order": {"order_id": "k1", "fill_count": 10}},
+    )
+    ex = Motor3ExitExecutor(c)
+    out = await ex.exit_position(_pos("yes"))
+    assert out.placed is True

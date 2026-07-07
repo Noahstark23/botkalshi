@@ -211,6 +211,16 @@ class Settings(BaseSettings):
         default=False,
         description="Si es True, Motor 3 aplica take-profit/trailing a huérfanas de Motor 1",
     )
+    # Auditoría de rentabilidad 2026-07-07: piso de PRECIO para las VENTAS de salida
+    # (T-30/TP/trailing, M3 y el exit de M2). Vender a bid de polvo (1-4c) recupera
+    # centavos menos el fee (ceil ≥1c) y dona el spread en el momento de peor liquidez —
+    # mejor dejar que la posición settlee (el settle no paga fee). 0 = sin piso.
+    MOTOR_3_MIN_SELL_BID_CENTS: int = Field(
+        default=5,
+        ge=0,
+        le=99,
+        description="Bid mínimo (cents) para que una salida venda; debajo, la posición va a settle (0 = sin piso)",
+    )
     # Motor 2 — cierre de posiciones (take-profit / trailing), espejo del de Motor 3. Motor 2
     # SOLO abría posiciones (ride-to-settlement) → PnL histórico negativo por asimetría
     # (avg_loss ≫ avg_win). Mismo esquema de dos capas: ENABLED gatea la DETECCIÓN (+log

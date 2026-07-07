@@ -15,6 +15,7 @@ lo persiste el engine en `PortfolioPosition.peak_bid_cents` entre ticks.
 
 from __future__ import annotations
 
+from src.math.fees import kalshi_fee_cents
 from src.storage.models import PortfolioPosition
 
 # Retroceso (cents) desde el pico que dispara el cierre. Placeholder calibrable desde la
@@ -45,6 +46,12 @@ def trailing_stop_due(
       debajo del entry → sería stop-loss encubierto, no trailing).
     - current_bid > peak_bid → False (defensa: el pico es el máximo; si current lo supera, el
       caller no actualizó el peak — no disparar con datos incoherentes).
+    - vender al bid ACTUAL no deja ganancia neta de fees → False (auditoría rentabilidad
+      2026-07-07: el armado garantiza que el DISPARO (peak−drop) no quede bajo el entry,
+      pero el FILL es al bid real — en el borde exacto (bid == entry) vendía al entry
+      realizando −2 fees seguros, y en un GAP (bid muy por debajo del peak) vendía DEBAJO
+      del entry: el stop-loss encubierto que este módulo promete no ser. Mismo gate net>0
+      que ya usa el take-profit).
     - current_bid <= peak_bid - drop_cents → True (retroceso suficiente → asegurar).
     """
     if drop_cents <= 0:
@@ -56,5 +63,10 @@ def trailing_stop_due(
     if peak_bid - entry_bid < drop_cents:
         return False
     if current_bid > peak_bid:
+        return False
+    net_per_contract = (
+        current_bid - entry_bid - kalshi_fee_cents(1, current_bid) - kalshi_fee_cents(1, entry_bid)
+    )
+    if net_per_contract <= 0:
         return False
     return current_bid <= peak_bid - drop_cents
