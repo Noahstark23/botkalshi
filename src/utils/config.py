@@ -133,6 +133,14 @@ class Settings(BaseSettings):
     # === Operational toggles ===
     TRADING_ENABLED: bool = False
     MOTOR_1_ARBITRAGE_ENABLED: bool = False
+    # Capa A por motor para las ENTRADAS de Motor 1 (auditoría 2026-07-07, P1): antes el
+    # ArbitrageExecutor se construía con TRADING_ENABLED solo — prender el trading global
+    # para que M3 venda ARMABA también las compras de M1. Ahora M1 solo compra con los DOS
+    # flags (mismo esquema que MOTOR_3/REST/MM). Shadow = ARBITRAGE_ENABLED True + esto False.
+    MOTOR_1_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="Si es True (y TRADING_ENABLED es True), Motor 1 COLOCA arbs reales. Si es False, solo detecta y loguea (shadow).",
+    )
     # Umbral FINO de EJECUCIÓN del Motor 1 (binario WS), distinto del MIN_EDGE_PCT de
     # DETECCIÓN: se DETECTA/graba EdgeWindow con MIN_EDGE_PCT pero se EJECUTA solo si el
     # edge neto post-fee supera este % (= opp.edge_pct, una fuente de verdad). Conservador.
@@ -157,6 +165,14 @@ class Settings(BaseSettings):
         description="Cap de exposición direccional acumulada por evento (USD) para Motor 1",
     )
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
+    # Capa A por motor para las ENTRADAS (apuestas) de Motor 2 (auditoría 2026-07-07, P1):
+    # mismo gap que Motor 1 — el Motor2Executor de entrada se construía con TRADING_ENABLED
+    # solo. OJO: es DISTINTO de MOTOR_2_EXECUTION_ENABLED (que gatea las VENTAS del brazo de
+    # salida, más abajo). Shadow = SPORTSBOOK_ENABLED True + esto False.
+    MOTOR_2_ENTRY_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="Si es True (y TRADING_ENABLED es True), Motor 2 APUESTA (abre posiciones). Si es False, solo detecta y loguea (shadow). Las ventas las gatea MOTOR_2_EXECUTION_ENABLED.",
+    )
     MOTOR_3_CLV_ENABLED: bool = False
     MOTOR_3_EXECUTION_ENABLED: bool = Field(
         default=False,
@@ -469,6 +485,17 @@ class Settings(BaseSettings):
                     "TRADING_ENABLED=true pero ningún motor está habilitado. "
                     "Activa al menos un MOTOR_X_ENABLED (los *_EXECUTION_ENABLED "
                     "no arrancan motores por sí solos)."
+                )
+            if self.MOTOR_1_EXECUTION_ENABLED and not self.MOTOR_1_ARBITRAGE_ENABLED:
+                raise ValueError(
+                    "MOTOR_1_EXECUTION_ENABLED=true requiere MOTOR_1_ARBITRAGE_ENABLED=true "
+                    "(la ejecución sin el motor corriendo es un no-op engañoso)."
+                )
+            if self.MOTOR_2_ENTRY_EXECUTION_ENABLED and not self.MOTOR_2_SPORTSBOOK_ENABLED:
+                raise ValueError(
+                    "MOTOR_2_ENTRY_EXECUTION_ENABLED=true requiere "
+                    "MOTOR_2_SPORTSBOOK_ENABLED=true "
+                    "(la ejecución sin el motor corriendo es un no-op engañoso)."
                 )
             if self.MOTOR_3_EXECUTION_ENABLED and not self.MOTOR_3_CLV_ENABLED:
                 raise ValueError(

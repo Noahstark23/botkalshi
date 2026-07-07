@@ -133,6 +133,51 @@ def test_execution_without_engine_flag_rejected(fake_key: Path, monkeypatch):
         Settings()
 
 
+def test_motor1_execution_without_motor_flag_rejected(fake_key: Path, monkeypatch):
+    """Capa A por motor (auditoría 2026-07-07): MOTOR_1_EXECUTION_ENABLED sin el motor
+    corriendo es un no-op engañoso → fail-fast al boot (mismo patrón que M3/REST)."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_1_EXECUTION_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="MOTOR_1_ARBITRAGE_ENABLED"):
+        Settings()
+
+
+def test_motor2_entry_execution_without_motor_flag_rejected(fake_key: Path, monkeypatch):
+    """Ídem para la entrada de Motor 2 (distinta de MOTOR_2_EXECUTION_ENABLED, que gatea
+    las ventas del brazo de salida)."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_1_ARBITRAGE_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_ENTRY_EXECUTION_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="MOTOR_2_SPORTSBOOK_ENABLED"):
+        Settings()
+
+
+def test_motor1_and_motor2_entry_execution_boot_with_motor_flags(fake_key: Path, monkeypatch):
+    """CONTROL: con el motor + su flag de entrada, producción bootea (la combinación
+    legítima de activación no quedó bloqueada)."""
+    monkeypatch.setenv("KALSHI_ENV", "production")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_1_ARBITRAGE_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_1_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_ENTRY_EXECUTION_ENABLED", "true")
+
+    s = Settings()
+    assert s.MOTOR_1_EXECUTION_ENABLED is True
+    assert s.MOTOR_2_ENTRY_EXECUTION_ENABLED is True
+
+
 def test_motor_mm_execution_in_production_requires_f3_key(fake_key: Path, monkeypatch):
     """PRODUCCIÓN + EXECUTION sin la llave F3 → boot roto (plan §5: el orden importa —
     smoke test primero, luego girar la llave como acto deliberado)."""

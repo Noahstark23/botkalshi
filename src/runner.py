@@ -261,9 +261,11 @@ class ProductionRunner:
         Motor 1 (arbitraje binario WS) — gateado por MOTOR_1_ARBITRAGE_ENABLED. Detecta
         cruces YES+NO sobre el OrderbookManagerV2 (que vive en data_capture, alimentado por
         el WS) y graba EdgeWindow. CAPA A: el ArbitrageExecutor (que coloca órdenes) SOLO se
-        construye con TRADING_ENABLED=true — en shadow el engine recibe executor=None y es
-        estructuralmente incapaz de ejecutar. Best-effort: si cae, se registra y la task
-        termina — NO tira el bot.
+        construye con TRADING_ENABLED=true Y MOTOR_1_EXECUTION_ENABLED=true (auditoría
+        2026-07-07, P1: con TRADING_ENABLED solo, prender el trading global para que M3
+        venda armaba también las compras de M1) — en shadow el engine recibe executor=None
+        y es estructuralmente incapaz de ejecutar. Best-effort: si cae, se registra y la
+        task termina — NO tira el bot.
         """
         if not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             return  # opt-in; default off → no-op (no toca nada en prod)
@@ -281,9 +283,9 @@ class ProductionRunner:
         try:
             from src.strategies.motor_1_arbitrage.engine import Motor1Engine
 
-            # Capa A: el executor SOLO se construye con TRADING_ENABLED=true; en shadow el
-            # engine recibe executor=None (incapaz de ejecutar).
-            if self.settings.TRADING_ENABLED:
+            # Capa A: el executor SOLO se construye con los DOS flags (global + por motor);
+            # en shadow el engine recibe executor=None (incapaz de ejecutar).
+            if self.settings.TRADING_ENABLED and self.settings.MOTOR_1_EXECUTION_ENABLED:
                 async with KalshiRestClient() as client:
                     executor = ArbitrageExecutor(client, RiskManager())
                     await Motor1Engine(manager, executor=executor).run(self._stop_event)
@@ -299,10 +301,13 @@ class ProductionRunner:
         Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.
 
         Por defecto SHADOW (solo detecta/graba). APUESTA real solo cuando se cumplen
-        las DOS condiciones, en capas independientes:
+        las TRES condiciones, en capas independientes:
           1. odds REALES (LiveOddsSource) — nunca apuesta sobre el fixture fake.
-          2. TRADING_ENABLED=true → se construye el Motor2Executor (Capa A) y se inyecta.
-        Con cualquiera de las dos en falso, el motor sigue siendo shadow puro.
+          2. TRADING_ENABLED=true (muro global).
+          3. MOTOR_2_ENTRY_EXECUTION_ENABLED=true (Capa A por motor, auditoría 2026-07-07
+             P1) → recién ahí se construye el Motor2Executor y se inyecta. Distinto de
+             MOTOR_2_EXECUTION_ENABLED, que gatea las VENTAS del brazo de salida.
+        Con cualquiera en falso, el motor sigue siendo shadow puro.
 
         El flip a odds reales es POR CONFIG: con ODDS_API_KEY seteada → LiveOddsSource
         (odds reales, sport_keys/regions de settings); vacía → FakeOddsSource (fixture).
@@ -350,14 +355,14 @@ class ProductionRunner:
 
             # Umbral de edge tuneable por config (pp → fracción), una sola fuente de verdad.
             min_edge = self.settings.MOTOR_2_MIN_EDGE_PCT / 100.0
-            # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
-            # queda None → el poller jamás intenta apostar (y el muro Capa C de
-            # place_order es la defensa final aunque algo llegara a colarse).
+            # Capa A: el executor SOLO se construye con los DOS flags (global + entrada por
+            # motor). En shadow queda None → el poller jamás intenta apostar (y el muro
+            # Capa C de place_order es la defensa final aunque algo llegara a colarse).
             # RiskManager para el sizing: el poller le pide el capital EFECTIVO (dinámico) por
             # ciclo. Lee el cache de CLASE que refresca _run_balance_refresh → cualquier instancia
             # ve el mismo cash real. En la rama de trading es el MISMO RM que usa el executor.
             risk = RiskManager()
-            if self.settings.TRADING_ENABLED:
+            if self.settings.TRADING_ENABLED and self.settings.MOTOR_2_ENTRY_EXECUTION_ENABLED:
                 async with KalshiRestClient() as client:
                     executor = Motor2Executor(
                         client,
