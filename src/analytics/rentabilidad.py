@@ -17,8 +17,9 @@ scripts/audit_rentabilidad.py. Convenciones: cents enteros; settled_at naive UTC
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.analytics.loss_audit import _effective_count, _effective_price, real_entry_fee_cents
 from src.math.fees import kalshi_fee_cents
@@ -227,3 +228,133 @@ def veredicto(rows) -> Veredicto:
             f"${chico.sobrecosto_redondeo_cents / 100:+.2f} (impuesto de granularidad)"
         )
     return v
+
+
+# =====================================================
+# Pares M1 — la vista correcta para una estrategia hedged
+# =====================================================
+
+_ARB_ID_RE = re.compile(r"arb_id=([0-9a-fA-F-]{36})")
+
+
+@dataclass(slots=True)
+class ParM1:
+    ticker: str
+    paired: int  # contratos emparejados (min de ambas patas)
+    p_yes: int
+    p_no: int
+    via: str  # "arb_id" (filas nuevas) | "ventana" (legacy, ticker + 10s)
+
+    @property
+    def gross_cents(self) -> int:
+        return (100 - self.p_yes - self.p_no) * self.paired
+
+    @property
+    def fees_cents(self) -> int:
+        return kalshi_fee_cents(self.paired, self.p_yes) + kalshi_fee_cents(self.paired, self.p_no)
+
+    @property
+    def net_cents(self) -> int:
+        """Neto del PAR a fees reales — independiente de qué lado gane el partido."""
+        return self.gross_cents - self.fees_cents
+
+
+@dataclass(slots=True)
+class ResumenPares:
+    pares: list[ParM1] = field(default_factory=list)
+    sin_par: int = 0  # patas BUY de M1 sin gemela (huérfanas/rollback)
+    sin_par_pnl_cents: int = 0  # pnl settled de esas patas: el costo OPERACIONAL
+
+    @property
+    def net_cents(self) -> int:
+        return sum(p.net_cents for p in self.pares)
+
+    @property
+    def perdedores(self) -> int:
+        """Pares con net ≤ 0 a fees reales = perdedores DETERMINÍSTICOS al colocarse."""
+        return sum(1 for p in self.pares if p.net_cents <= 0)
+
+    @property
+    def contratos(self) -> int:
+        return sum(p.paired for p in self.pares)
+
+
+def pares_motor1(rows, *, pair_window_sec: float = 10.0) -> ResumenPares:
+    """Empareja las patas BUY de motor_1_arbitrage en pares yes/no hedged.
+
+    Corrección de lectura 2026-07-07: los buckets por PATA son un artefacto en una
+    estrategia hedged (una pata gana y la otra pierde POR CONSTRUCCIÓN — el bucket
+    <40c con win 1.8% son las patas baratas cuyas gemelas caras ganan el 99%). La
+    unidad económica de M1 es el PAR: net = (100 − p_yes − p_no)·paired − ambas fees.
+
+    Emparejamiento en dos pasadas, consistente con loss_audit.audit_motor1_arbs:
+      1. arb_id compartido en notes (filas post 2026-07-02, exacto).
+      2. Legacy sin arb_id: mismo ticker + placed_at dentro de pair_window_sec.
+    Lo que queda sin par son huérfanas/rollbacks: su pnl settled se reporta APARTE
+    (costo operacional, no del edge de la estrategia).
+    """
+    m1 = [
+        r
+        for r in rows
+        if r.strategy == "motor_1_arbitrage"
+        and r.action == "buy"
+        and r.status in ("filled", "settled")
+    ]
+    out = ResumenPares()
+    usados: set[int] = set()
+
+    # Pasada 1 — arb_id exacto.
+    por_arb: dict[str, list] = {}
+    for r in m1:
+        m = _ARB_ID_RE.search(r.notes or "")
+        if m:
+            por_arb.setdefault(m.group(1), []).append(r)
+    for legs in por_arb.values():
+        yes = next((r for r in legs if r.side == "yes"), None)
+        no = next((r for r in legs if r.side == "no"), None)
+        if yes is None or no is None:
+            continue  # pata sola con arb_id → queda para el conteo de huérfanas
+        usados.add(id(yes))
+        usados.add(id(no))
+        out.pares.append(
+            ParM1(
+                ticker=yes.ticker,
+                paired=min(_effective_count(yes), _effective_count(no)),
+                p_yes=_effective_price(yes),
+                p_no=_effective_price(no),
+                via="arb_id",
+            )
+        )
+
+    # Pasada 2 — legacy por ticker + ventana temporal (mismo criterio que loss_audit).
+    restantes = sorted(
+        (r for r in m1 if id(r) not in usados), key=lambda r: (r.ticker, _naive(r.placed_at))
+    )
+    ventana = timedelta(seconds=pair_window_sec)
+    for i, a in enumerate(restantes):
+        if id(a) in usados or a.side != "yes":
+            continue
+        for b in restantes[i + 1 :]:
+            if id(b) in usados or b.ticker != a.ticker or b.side != "no":
+                continue
+            if abs(_naive(b.placed_at) - _naive(a.placed_at)) > ventana:
+                break
+            usados.add(id(a))
+            usados.add(id(b))
+            out.pares.append(
+                ParM1(
+                    ticker=a.ticker,
+                    paired=min(_effective_count(a), _effective_count(b)),
+                    p_yes=_effective_price(a),
+                    p_no=_effective_price(b),
+                    via="ventana",
+                )
+            )
+            break
+
+    for r in m1:
+        if id(r) not in usados:
+            out.sin_par += 1
+            if r.status == "settled" and r.pnl_cents is not None:
+                out.sin_par_pnl_cents += r.pnl_cents
+    return out

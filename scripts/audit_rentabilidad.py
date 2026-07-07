@@ -8,8 +8,12 @@ Imprime, contra la DB real:
   2. Serie mensual por motor: ¿la curva cambió tras cada fix (fees 2026-07-01,
      salidas, flat sizing)? El histórico pre-fix tiene pnl SOBREESTIMADO (ver
      audit_perdidas_estructurales.py para el drag exacto).
-  3. Buckets por precio de entrada (favorite-longshot: ¿<40c sigue sangrando?).
-  4. Granularidad: distribución de contratos por trade y el sobrecosto del ceil
+  3. Pares M1 (la unidad económica correcta para hedged): net por PAR a fees
+     reales, perdedores determinísticos, y las patas sin par (huérfanas) con su
+     pnl aparte — el costo operacional separado del edge de la estrategia.
+  4. Buckets por precio de entrada SOLO para lo direccional (M2): en hedged, el
+     win% por pata es un artefacto (una gana y la otra pierde por construcción).
+  5. Granularidad: distribución de contratos por trade y el sobrecosto del ceil
      del fee — trades de 1-5 contratos pagan un "impuesto de redondeo" que un
      edge de 3pp no sobrevive.
 
@@ -30,6 +34,7 @@ from sqlmodel import col, select
 from src.analytics.rentabilidad import (
     buckets_por_precio,
     granularidad_fee,
+    pares_motor1,
     pnl_mensual,
     resumen_por_motor,
     veredicto,
@@ -68,8 +73,37 @@ def main() -> int:
         detalle = "  ".join(f"{k}={v / 100:+.2f}" for k, v in sorted(por_estrategia.items()))
         print(f"  {mes}: {detalle}")
 
-    print("\n-- Por precio de entrada --")
-    for b in buckets_por_precio(rows):
+    # Corrección de lectura 2026-07-07: en una estrategia HEDGED los buckets por pata
+    # son un artefacto (una pata gana y la otra pierde por construcción — el <40c con
+    # win 1.8% eran las patas baratas cuyas gemelas caras ganaban 99%). La unidad
+    # económica de M1 es el PAR; los buckets por precio solo aplican a lo DIRECCIONAL.
+    print("\n-- Pares M1 (la vista correcta para hedged: por PAR, no por pata) --")
+    pares = pares_motor1(rows)
+    if pares.pares:
+        via_arb = sum(1 for p in pares.pares if p.via == "arb_id")
+        print(
+            f"  pares={len(pares.pares)} (arb_id={via_arb}, ventana={len(pares.pares) - via_arb})"
+            f"  contratos={pares.contratos}  net_real=${pares.net_cents / 100:+.2f}"
+            f"  (~{pares.net_cents / len(pares.pares):.1f}c/par)"
+            f"  perdedores_deterministicos={pares.perdedores}"
+        )
+        peor = min(pares.pares, key=lambda p: p.net_cents)
+        print(
+            f"  peor par: {peor.ticker} yes@{peor.p_yes}c+no@{peor.p_no}c x{peor.paired}"
+            f" → net={peor.net_cents}c"
+        )
+    else:
+        print("  (sin pares hedged de M1 en la ventana)")
+    if pares.sin_par:
+        print(
+            f"  patas SIN par (huérfanas/rollback): n={pares.sin_par} "
+            f"pnl_settled=${pares.sin_par_pnl_cents / 100:+.2f}  ← costo OPERACIONAL, "
+            "no del edge de la estrategia"
+        )
+
+    print("\n-- Por precio de entrada (SOLO direccional M2 — por pata es engañoso en hedged) --")
+    directional = [r for r in rows if r.strategy == "motor_2_consensus"]
+    for b in buckets_por_precio(directional):
         if b.n:
             print(
                 f"  {b.label:8s} n={b.n:4d}  win={b.win_pct:5.1f}%  pnl=${b.pnl_cents / 100:+9.2f}"
