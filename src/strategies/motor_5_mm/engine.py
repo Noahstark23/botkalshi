@@ -123,6 +123,17 @@ class Motor5Engine:
                     BotState.record_error(f"motor5.engine: {type(exc).__name__}: {exc}")
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop_event.wait(), timeout=self.LOOP_INTERVAL_SEC)
+            # Shutdown limpio (auditoría 2026-07-07, P0 de F2): sin esto las quotes GTC
+            # quedaban RESTING en el book sin bot que las gestione — un fill contra una
+            # quote huérfana durante el redeploy es exposición que nadie ve hasta el
+            # próximo boot. Best-effort: un fallo acá no bloquea el shutdown (el
+            # reconciler del próximo boot cancela lo que sobreviva como huérfana).
+            if self._executor is not None:
+                try:
+                    n = await self._executor.cancel_all("shutdown")
+                    logger.info(f"[MOTOR 5] shutdown → cancel_all n={n}")
+                except Exception:
+                    logger.exception("motor5.engine.shutdown_cancel_error")
         logger.info("[MOTOR 5 SHADOW] detenido (stop_event)")
 
     async def _tick(self) -> None:
@@ -160,7 +171,10 @@ class Motor5Engine:
             # Fast-path del canal fill: cualquier fill encolado dispara reconcile YA.
             ws_fills = self._fill_feed.drain() if self._fill_feed is not None else []
             if self._reconciler is not None:
-                report = await self._reconciler.reconcile()
+                # live_coids: lo que ESTE proceso gestiona. Tras un restart es vacío →
+                # el reconcile cancela las resting del proceso anterior (huérfanas, P0
+                # auditoría 2026-07-07) antes de que el tick cotice encima.
+                report = await self._reconciler.reconcile(live_coids=self._executor.live_coids())
                 # Verdad del reconcile: los tickers con discrepancia quedan corruptos;
                 # los que salieron limpios se des-corrompen (ya se puede cotizar).
                 self._executor.corrupted = set(report.corrupted_tickers)

@@ -111,14 +111,23 @@ def _leg_pnl_cents(trade: Trade, result: str) -> int:
     Ganadora (side == result): payout 100¢/contrato − costo − fees.
     Perdedora: −costo − fees. Usa fill_price_cents si existe (precio real), si no el
     límite; fees de la fila (A.1 los registró al fill) o recomputados como fallback.
+
+    Un SELL fillado (Motor 5: el ask del MM es sell yes) ABRE la posición del lado
+    OPUESTO a 100−P — se colapsa a la fórmula de long con lado/precio efectivos (el fee
+    no cambia: P(100−P) es simétrico). Count: filled_count si existe (Motor 5 registra
+    ahí el fill REAL de una quote parcial); las filas de los otros motores lo dejan
+    None y caen a count, sin cambios.
     """
     price = trade.fill_price_cents or trade.price_cents
-    fees = (
-        trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(trade.count, price)
-    )
-    if trade.side == result:
-        return (100 - price) * trade.count - fees
-    return -price * trade.count - fees
+    count = trade.filled_count if trade.filled_count is not None else trade.count
+    side = trade.side
+    if trade.action == "sell":
+        side = "no" if trade.side == "yes" else "yes"
+        price = 100 - price
+    fees = trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(count, price)
+    if side == result:
+        return (100 - price) * count - fees
+    return -price * count - fees
 
 
 class SettlementPoller:
@@ -139,7 +148,11 @@ class SettlementPoller:
     # "exposición" permanente y estranguló el headroom compartido (Motor 2 → 0
     # contratos). Sus filas legacy (notes=None, coid uuid pelado) caen a grupo unitario
     # en arb_group_key: cada pata se settlea sola por la resolución de SU ticker.
-    STRATEGIES = ("motor_rest_arb", "motor_2_consensus", "motor_1_arbitrage")
+    # motor_5_mm (auditoría 2026-07-07, P0 — mismo bug que M1): sus fills quedaban
+    # 'filled' para siempre → pérdidas invisibles para los stop-losses Y costo abierto
+    # eterno que estrangulaba el canary cap. Coid 'm5mm-<uuid>' cae a grupo unitario;
+    # los SELL fillados (ask del MM) los resuelve _leg_pnl_cents como lado opuesto.
+    STRATEGIES = ("motor_rest_arb", "motor_2_consensus", "motor_1_arbitrage", "motor_5_mm")
 
     def __init__(self, source: SettlementSource) -> None:
         self.source = source

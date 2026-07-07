@@ -271,6 +271,92 @@ async def test_reconcile_foreign_orders_untouched():
 
 
 # =====================================================
+# Huérfanas resting (P0 auditoría 2026-07-07): resting real
+# que este proceso no gestiona → cancelar, no cotizar encima
+# =====================================================
+
+
+def _resting_order(coid: str, oid: str = "K10", ticker: str = "T", fill: str = "0.00") -> dict:
+    return {
+        "client_order_id": coid,
+        "order_id": oid,
+        "status": "resting",
+        "fill_count": fill,
+        "ticker": ticker,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphan_resting_is_cancelled():
+    """Tras un restart el executor arranca con _live vacío: la resting del proceso
+    anterior (pending en DB + resting en la API) se CANCELA en el primer reconcile."""
+    client = _FakeClient()
+    _pending_row("m5mm-fff")
+    client.orders_response = {"orders": [_resting_order("m5mm-fff")]}
+    report = await MMReconciler(client).reconcile(live_coids=set())
+    assert report.orphan_cancelled == 1 and report.resolved_cancelled == 1
+    assert client.cancelled == ["K10"]
+    row = _rows()[0]
+    assert row.status == "cancelled" and "orphan_resting_cancelled" in (row.notes or "")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphan_partial_fill_recorded_from_cancel_response():
+    """El fill parcial que ganó la carrera al cancel queda registrado (fila filled con
+    filled_count) → _apply_settled_fills lo lleva al inventario."""
+    client = _FakeClient()
+    _pending_row("m5mm-ggg")
+    client.orders_response = {"orders": [_resting_order("m5mm-ggg")]}
+
+    async def cancel_with_fill(order_id: str):
+        return {"order": {"order_id": order_id, "fill_count": "4.00"}}
+
+    client.cancel_order = cancel_with_fill
+    report = await MMReconciler(client).reconcile(live_coids=set())
+    assert report.orphan_cancelled == 1 and report.resolved_filled == 1
+    row = _rows()[0]
+    assert row.status == "filled" and row.filled_count == 4
+
+
+@pytest.mark.asyncio
+async def test_reconcile_live_quote_is_not_orphan():
+    """CONTROL: una resting que el executor SÍ gestiona (coid en live_coids) queda
+    intacta — still_resting, cero cancels."""
+    client = _FakeClient()
+    _pending_row("m5mm-hhh")
+    client.orders_response = {"orders": [_resting_order("m5mm-hhh")]}
+    report = await MMReconciler(client).reconcile(live_coids={"m5mm-hhh"})
+    assert report.orphan_cancelled == 0 and report.still_resting == 1
+    assert client.cancelled == []
+    assert _rows()[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_without_live_coids_keeps_legacy_behavior():
+    """CONTROL: live_coids=None (caller legacy/diagnóstico) → sin info no se cancela."""
+    client = _FakeClient()
+    _pending_row("m5mm-iii")
+    client.orders_response = {"orders": [_resting_order("m5mm-iii")]}
+    report = await MMReconciler(client).reconcile()
+    assert report.orphan_cancelled == 0 and report.still_resting == 1
+    assert client.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphan_cancel_error_corrupts_ticker():
+    """FAIL-SAFE: si el cancel de la huérfana falla, jamás se asume 'cancelada' — la
+    fila sigue pending y el ticker queda corrupto (no se cotiza encima)."""
+    client = _FakeClient()
+    _pending_row("m5mm-jjj", ticker="T-ORF")
+    client.orders_response = {"orders": [_resting_order("m5mm-jjj", ticker="T-ORF")]}
+    client.cancel_error = RuntimeError("timeout")
+    report = await MMReconciler(client).reconcile(live_coids=set())
+    assert report.orphan_cancelled == 0 and report.discrepancies == 1
+    assert "T-ORF" in report.corrupted_tickers
+    assert _rows()[0].status == "pending"
+
+
+# =====================================================
 # Canary cap F3 (techo duro del costo abierto del MM)
 # =====================================================
 

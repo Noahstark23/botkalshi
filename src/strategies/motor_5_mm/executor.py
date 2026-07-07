@@ -92,6 +92,12 @@ class Motor5Executor:
             if lo.kalshi_order_id
         ]
 
+    def live_coids(self) -> set[str]:
+        """client_order_ids de las quotes que ESTE proceso está gestionando. El
+        reconciler los usa para distinguir resting gestionadas de HUÉRFANAS (quotes de
+        un proceso anterior que nadie re-adoptó tras un restart — P0 auditoría)."""
+        return {lo.client_order_id for sides in self._live.values() for lo in sides.values()}
+
     # =====================================================
     # Sync de quotes por tick
     # =====================================================

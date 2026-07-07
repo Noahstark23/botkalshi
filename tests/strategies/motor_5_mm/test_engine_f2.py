@@ -50,14 +50,19 @@ class _FakeExecutor:
         self.cancel_all_calls.append(reason)
         return 2
 
+    def live_coids(self) -> set[str]:
+        return set()
+
 
 class _FakeReconciler:
     def __init__(self):
         self.calls = 0
         self.report = MMReconcileReport()
+        self.live_coids_seen: list[set[str] | None] = []
 
-    async def reconcile(self):
+    async def reconcile(self, live_coids=None):
         self.calls += 1
+        self.live_coids_seen.append(live_coids)
         return self.report
 
 
@@ -143,6 +148,60 @@ async def test_ticker_leaving_universe_retires_real_quotes():
     FairValueBook.clear()  # el fair desaparece
     await eng._tick()
     assert "T-A" in ex.retired
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_all_quotes():
+    """P0 auditoría 2026-07-07: al apagarse (stop_event), el engine cancela TODAS las
+    quotes resting — antes sobrevivían al proceso como exposición sin gestor."""
+    import asyncio
+    from unittest.mock import patch
+
+    class _Factory:
+        async def __aenter__(self):
+            return _ReadOnlyClient()
+
+        async def __aexit__(self, *a):
+            return False
+
+    fake_ex = _FakeExecutor()
+    stop = asyncio.Event()
+    stop.set()  # apagado inmediato: cero ticks, pero el cancel-all de salida corre igual
+    eng = Motor5Engine(trading_enabled=True, client_factory=_Factory)
+    with (
+        patch("src.strategies.motor_5_mm.engine.Motor5Executor", return_value=fake_ex),
+        patch("src.strategies.motor_5_mm.engine.MMReconciler"),
+    ):
+        await eng.run(stop)
+    assert fake_ex.cancel_all_calls == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_in_shadow_mode_has_no_executor_and_no_crash():
+    """CONTROL: en F1 shadow no hay executor → el shutdown no toca nada ni crashea."""
+    import asyncio
+
+    class _Factory:
+        async def __aenter__(self):
+            return _ReadOnlyClient()
+
+        async def __aexit__(self, *a):
+            return False
+
+    stop = asyncio.Event()
+    stop.set()
+    eng = Motor5Engine(trading_enabled=False, client_factory=_Factory)
+    await eng.run(stop)  # sin excepción = ok
+
+
+@pytest.mark.asyncio
+async def test_live_tick_passes_live_coids_to_reconciler():
+    """El reconcile recibe las quotes vivas del executor (base del barrido de
+    huérfanas): tras un restart _live está vacío → set() explícito, no None."""
+    client = _ReadOnlyClient()
+    eng, ex, rec = _live_engine(client)
+    await eng._tick()
+    assert rec.live_coids_seen == [set()]
 
 
 @pytest.mark.asyncio
