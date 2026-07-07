@@ -54,6 +54,7 @@ class Motor3Engine:
         tp_threshold: int = DEFAULT_TAKE_PROFIT_CENTS,
         trailing_enabled: bool = False,
         trailing_drop: int = DEFAULT_TRAILING_DROP_CENTS,
+        manages_orphans: bool = False,
     ) -> None:
         self._poller = PortfolioPoller()
         self._trading_enabled = trading_enabled
@@ -61,6 +62,13 @@ class Motor3Engine:
         self._tp_threshold = tp_threshold
         self._trailing_enabled = trailing_enabled
         self._trailing_drop = trailing_drop
+        # Bug 4 (incidente 2026-07-07): gestionar también las HUÉRFANAS de Motor 1 (arb sin
+        # pata hermana). El count gestionado se CAPEA al total huérfano — el resto de la
+        # posición (pares hedged) jamás se vende. Default off.
+        self._manages_orphans = manages_orphans
+        # (ticker, side) → (count huérfano, entry FIFO) — se refresca por tick en
+        # _attributable_positions y alimenta el cap + _entry_bid_for.
+        self._orphan_by_pair: dict[tuple[str, str], tuple[int, int]] = {}
         self._executor: Motor3ExitExecutor | None = None
         self._client: KalshiRestClient | None = None
 
@@ -76,7 +84,11 @@ class Motor3Engine:
         async with KalshiRestClient() as client:
             self._client = client
             if self._trading_enabled:
-                self._executor = Motor3ExitExecutor(client, entry_origin=_ENTRY_ORIGIN)
+                self._executor = Motor3ExitExecutor(
+                    client,
+                    entry_origin=_ENTRY_ORIGIN,
+                    include_motor1_orphans=self._manages_orphans,
+                )
             await self._loop(stop_event)
 
     async def _loop(self, stop_event: asyncio.Event) -> None:
@@ -192,20 +204,49 @@ class Motor3Engine:
         attributable = {
             (b.ticker, b.side) for b in open_buys if b.strategy in _ENTRY_ORIGIN and b.count > 0
         }
+        # Bug 4: pares (ticker, side) con HUÉRFANAS de Motor 1 → gestionables, pero con el
+        # count CAPEADO al total huérfano (la posición neta puede incluir pares hedged que
+        # jamás se venden — 433 = 412 hedged + 21 huérfanos en el incidente).
+        self._orphan_by_pair = {}
+        if self._manages_orphans:
+            from src.strategies.motor_3_clv.orphans import motor1_orphan_buys
+
+            for b in sorted(motor1_orphan_buys(open_buys), key=lambda t: t.placed_at):
+                key = (b.ticker, b.side)
+                count, entry = self._orphan_by_pair.get(
+                    key, (0, b.fill_price_cents or b.price_cents)
+                )
+                self._orphan_by_pair[key] = (count + b.count, entry)  # entry = FIFO (el 1ro)
         kept: list[PortfolioPosition] = []
-        skipped_rest, skipped_foreign = 0, 0
+        skipped_rest, skipped_foreign, orphan_capped = 0, 0, 0
         for p in positions:
             if p.ticker in rest_tickers:
                 skipped_rest += 1
                 continue
-            if (p.ticker, p.side) not in attributable:
-                skipped_foreign += 1
+            if (p.ticker, p.side) in attributable:
+                kept.append(p)
                 continue
-            kept.append(p)
-        if skipped_rest or skipped_foreign:
+            orphan = self._orphan_by_pair.get((p.ticker, p.side))
+            if orphan is not None:
+                # Copia NO persistida con el count capeado al huérfano: el executor además
+                # re-capea contra sus BUYs atribuibles (doble red).
+                orphan_capped += 1
+                kept.append(
+                    PortfolioPosition(
+                        ticker=p.ticker,
+                        side=p.side,
+                        count=min(p.count, orphan[0]),
+                        close_time=p.close_time,
+                        peak_bid_cents=p.peak_bid_cents,
+                    )
+                )
+                continue
+            skipped_foreign += 1
+        if skipped_rest or skipped_foreign or orphan_capped:
             logger.info(
                 f"motor3.attribution kept={len(kept)} skip_rest_arb={skipped_rest} "
-                f"skip_foreign={skipped_foreign} (legs de arb hedged y posiciones ajenas no se gestionan)"
+                f"skip_foreign={skipped_foreign} orphan_capped={orphan_capped} "
+                f"(legs de arb hedged y posiciones ajenas no se gestionan)"
             )
         return kept
 
@@ -230,7 +271,10 @@ class Motor3Engine:
             logger.warning(f"motor3.trail.entry_error ticker={position.ticker}: {exc}")
             return None
         if buy is None:
-            return None
+            # Bug 4: posición gestionada como HUÉRFANA de Motor 1 (sin BUY de _ENTRY_ORIGIN) →
+            # el entry sale del primer BUY huérfano (FIFO), cacheado por tick en attribution.
+            orphan = self._orphan_by_pair.get((position.ticker, position.side))
+            return orphan[1] if orphan is not None else None
         return buy.fill_price_cents or buy.price_cents
 
     def _shadow_pnl_str(self, position: PortfolioPosition, bid: int, entry: int | None) -> str:

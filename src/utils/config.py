@@ -147,6 +147,15 @@ class Settings(BaseSettings):
     MOTOR_1_MAX_EDGE_PCT: float = Field(
         default=10.0, gt=0.0, description="Techo de edge para EJECUTAR (anti-fantasma, %) (Motor 1)"
     )
+    # Bug 2 (incidente 2026-07-07): cap de exposición DIRECCIONAL por EVENTO (partido). Los
+    # tickers hermanos (…HOUWSH-HOU / …HOUWSH-WSH) son el MISMO evento real; los residuales de
+    # netting/huérfanas se acumulaban en la misma dirección ($135) sin que nadie los sumara.
+    # Si un evento supera este cap, Motor 1 NO coloca más arbs sobre él (guard pre-arb).
+    MAX_EVENT_DIRECTIONAL_EXPOSURE_USD: float = Field(
+        default=25.0,
+        gt=0.0,
+        description="Cap de exposición direccional acumulada por evento (USD) para Motor 1",
+    )
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     MOTOR_3_CLV_ENABLED: bool = False
     MOTOR_3_EXECUTION_ENABLED: bool = Field(
@@ -177,6 +186,14 @@ class Settings(BaseSettings):
         ge=1,
         le=99,
         description="Retroceso (cents) desde el pico que dispara el trailing stop",
+    )
+    # Bug 4 (incidente 2026-07-07): con True, Motor 3 también gestiona las patas HUÉRFANAS de
+    # Motor 1 (BUY fillado cuyo arb quedó sin la pata hermana por rollback abortado). SOLO las
+    # huérfanas verdaderas — un par hedged completo JAMÁS se toca (venderlo suelto rompe el
+    # hedge, misma razón por la que motor_rest_arb está excluido). Default off (sin cambio).
+    MOTOR_3_MANAGES_ORPHANS: bool = Field(
+        default=False,
+        description="Si es True, Motor 3 aplica take-profit/trailing a huérfanas de Motor 1",
     )
     # Motor 2 — cierre de posiciones (take-profit / trailing), espejo del de Motor 3. Motor 2
     # SOLO abría posiciones (ride-to-settlement) → PnL histórico negativo por asimetría
