@@ -292,3 +292,86 @@ def test_leg_pnl_uses_fill_price_and_recomputes_missing_fees():
     from src.math.fees import kalshi_fee_cents
 
     assert pnl == (100 - 47) * 10 - kalshi_fee_cents(10, 47)
+
+
+# =====================================================
+# Motor 5 MM (P0 auditoría 2026-07-07): sus fills quedaban
+# 'filled' para siempre — fuera de STRATEGIES, sin pnl jamás
+# =====================================================
+
+
+def _mm_trade(
+    coid: str, *, action: str, price: int, count: int = 10, filled_count: int | None = None
+) -> None:
+    with models.get_session() as s:
+        s.add(
+            models.Trade(
+                client_order_id=coid,
+                ticker="T-MM",
+                side="yes",
+                action=action,
+                count=count,
+                price_cents=price,
+                strategy="motor_5_mm",
+                status="filled",
+                filled_count=filled_count,
+            )
+        )
+        s.commit()
+
+
+@pytest.mark.asyncio
+async def test_mm_buy_fill_settles_with_filled_count():
+    """Un bid fillado PARCIAL (filled_count=6 de count=10) settlea con el count REAL —
+    ni exposición eterna (canary cap) ni pérdida invisible para los stop-losses."""
+    from src.math.fees import kalshi_fee_cents
+
+    _mm_trade("m5mm-buy1", action="buy", price=47, filled_count=6)
+    source = FakeSettlementSource({"T-MM": "no"})  # el bid comprado PIERDE
+
+    settled = await SettlementPoller(source).settle_once()
+
+    assert settled == 1
+    row = _all_trades()["m5mm-buy1"]
+    assert row.status == "settled"
+    assert row.pnl_cents == -47 * 6 - kalshi_fee_cents(6, 47)
+
+
+@pytest.mark.asyncio
+async def test_mm_sell_fill_settles_as_opposite_side():
+    """El ask del MM (sell yes fillado) ABRE posición NO a 100−P: si resuelve NO gana
+    P·count − fee; el signo correcto era imposible con la fórmula long-only previa."""
+    from src.math.fees import kalshi_fee_cents
+
+    _mm_trade("m5mm-sell1", action="sell", price=60, filled_count=5)
+    source = FakeSettlementSource({"T-MM": "no"})  # short yes GANA
+
+    settled = await SettlementPoller(source).settle_once()
+
+    assert settled == 1
+    row = _all_trades()["m5mm-sell1"]
+    assert row.status == "settled"
+    assert row.pnl_cents == 60 * 5 - kalshi_fee_cents(5, 60)
+
+
+@pytest.mark.asyncio
+async def test_mm_sell_fill_losing_side():
+    """CONTROL del signo: el short yes con resolución YES pierde (100−P)·count − fee."""
+    from src.math.fees import kalshi_fee_cents
+
+    _mm_trade("m5mm-sell2", action="sell", price=60, filled_count=5)
+    source = FakeSettlementSource({"T-MM": "yes"})
+
+    await SettlementPoller(source).settle_once()
+
+    row = _all_trades()["m5mm-sell2"]
+    assert row.pnl_cents == -(100 - 60) * 5 - kalshi_fee_cents(5, 60)
+
+
+@pytest.mark.asyncio
+async def test_mm_unresolved_market_waits():
+    """CONTROL: mercado sin resolver → la fila sigue filled (nada se settlea de más)."""
+    _mm_trade("m5mm-wait", action="buy", price=47, filled_count=10)
+    settled = await SettlementPoller(FakeSettlementSource({})).settle_once()
+    assert settled == 0
+    assert _all_trades()["m5mm-wait"].status == "filled"

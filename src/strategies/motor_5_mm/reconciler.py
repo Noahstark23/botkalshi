@@ -7,7 +7,13 @@ Una orden cancelada por Kalshi/UI dejaba un 'pending' fantasma reservando capita
 siempre; un fill no visto dejaba exposición invisible. Este loop cierra ambos:
 
   Por cada fila Trade pending de strategy='motor_5_mm':
-    - orden 'resting' en la API   → OK (se refresca kalshi_order_id si faltaba).
+    - orden 'resting' en la API   → OK (se refresca kalshi_order_id si faltaba)…
+      …salvo que su coid NO esté entre las quotes vivas del executor (live_coids):
+      HUÉRFANA de un proceso anterior (P0 auditoría 2026-07-07: tras un restart el
+      executor arranca con _live vacío y jamás re-adoptaba las resting del proceso
+      previo — cotizaba ENCIMA, duplicando exposición). Se CANCELA (no se adopta:
+      el engine re-cotiza al fair actual en el mismo tick, que es lo correcto para
+      un MM) y el fill parcial que haya ganado la carrera se registra del response.
     - 'executed'                  → fila filled (+ filled_count si la API lo trae).
     - 'canceled' con fill parcial → filled con filled_count; sin fill → cancelled.
     - NO aparece en la API        → DISCREPANCIA → ticker corrupto.
@@ -37,6 +43,7 @@ class MMReconcileReport:
     resolved_cancelled: int = 0
     still_resting: int = 0
     phantom_cancelled: int = 0
+    orphan_cancelled: int = 0
     discrepancies: int = 0
     corrupted_tickers: set[str] = field(default_factory=set)
 
@@ -45,7 +52,9 @@ class MMReconciler:
     def __init__(self, client: KalshiRestClient) -> None:
         self._client = client
 
-    async def reconcile(self) -> MMReconcileReport:
+    async def reconcile(self, live_coids: set[str] | None = None) -> MMReconcileReport:
+        """live_coids: quotes que el executor gestiona AHORA (executor.live_coids()).
+        None = sin información (caller legacy/diagnóstico) → no se cancelan huérfanas."""
         report = MMReconcileReport()
         try:
             resp = await self._client.get_orders(limit=200)
@@ -78,6 +87,12 @@ class MMReconciler:
             status = str(order.get("status", "")).lower()
             filled = _parse_count(order.get("fill_count")) or 0
             if status == "resting":
+                if live_coids is not None and row.client_order_id not in live_coids:
+                    # HUÉRFANA: resting real que este proceso no gestiona (quedó de un
+                    # proceso anterior). Cancelar — dejarla viva duplica exposición
+                    # cuando el engine cotice el mismo ticker.
+                    await self._cancel_orphan(row, order, report)
+                    continue
                 report.still_resting += 1
                 if not row.kalshi_order_id and order.get("order_id"):
                     self._update(row.client_order_id, kalshi_order_id=order["order_id"])
@@ -135,9 +150,54 @@ class MMReconciler:
                 f"motor5.reconcile pending={report.pending_checked} "
                 f"resting={report.still_resting} filled={report.resolved_filled} "
                 f"cancelled={report.resolved_cancelled} phantom={report.phantom_cancelled} "
-                f"discrep={report.discrepancies}"
+                f"orphan={report.orphan_cancelled} discrep={report.discrepancies}"
             )
         return report
+
+    async def _cancel_orphan(self, row: Trade, order: dict, report: MMReconcileReport) -> None:
+        """Cancela una quote resting huérfana y resuelve su fila con la verdad del
+        cancel-response (un fill parcial pudo ganar la carrera → fila filled, y
+        _apply_settled_fills la lleva al inventario). FAIL-SAFE: si el cancel falla,
+        el ticker queda corrupto — nunca se asume 'cancelada' sin confirmación."""
+        oid = row.kalshi_order_id or order.get("order_id")
+        if not oid:
+            report.discrepancies += 1
+            report.corrupted_tickers.add(row.ticker)
+            logger.warning(
+                f"motor5.reconcile.orphan_sin_order_id coid={row.client_order_id[:13]}… "
+                f"ticker={row.ticker} → corrupto"
+            )
+            return
+        try:
+            resp = await self._client.cancel_order(oid)
+        except Exception:
+            report.discrepancies += 1
+            report.corrupted_tickers.add(row.ticker)
+            logger.exception(
+                f"motor5.reconcile.orphan_cancel_error coid={row.client_order_id[:13]}… "
+                f"ticker={row.ticker} → corrupto"
+            )
+            return
+        report.orphan_cancelled += 1
+        cancelled = resp.get("order", resp) if isinstance(resp, dict) else {}
+        filled = _parse_count(cancelled.get("fill_count")) or 0
+        if filled > 0:
+            report.resolved_filled += 1
+            self._update(
+                row.client_order_id,
+                status="filled",
+                filled_count=filled,
+                note="reconcile: orphan_partial_then_cancel",
+            )
+        else:
+            report.resolved_cancelled += 1
+            self._update(
+                row.client_order_id, status="cancelled", note="reconcile: orphan_resting_cancelled"
+            )
+        logger.warning(
+            f"motor5.reconcile.orphan_cancelled coid={row.client_order_id[:13]}… "
+            f"ticker={row.ticker} filled={filled}"
+        )
 
     def _update(
         self,
