@@ -10,6 +10,7 @@ from sqlmodel import SQLModel, create_engine, select
 
 import src.storage.models as _models
 from src.math.arbitrage import detect_binary_arb
+from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import RiskEvent, Trade, get_session
@@ -109,7 +110,7 @@ async def test_dry_run_skips_network(executor, mock_client, binary_opp):
 
 @pytest.mark.asyncio
 async def test_all_legs_fill_returns_true(executor, mock_client, binary_opp):
-    mock_client.place_order.return_value = {"order": {"order_id": "kalshi-001"}}
+    mock_client.place_order.return_value = {"order": {"order_id": "kalshi-001", "fill_count": 10}}
 
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",
@@ -125,6 +126,7 @@ async def test_all_legs_fill_returns_true(executor, mock_client, binary_opp):
     assert len(trades) == 2
     assert all(t.status == "filled" for t in trades)
     assert all(t.filled_at is not None for t in trades)
+    assert all(t.count == 10 for t in trades)  # el count REAL confirmado por fill_count
 
 
 # =====================================================
@@ -136,9 +138,9 @@ async def test_all_legs_fill_returns_true(executor, mock_client, binary_opp):
 async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp):
     # YES leg succeeds, NO leg raises
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes"}},  # YES buy succeeds
+        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES buy fills
         Exception("network error"),  # NO buy fails
-        {"order": {}},  # YES rollback sell succeeds
+        {"order": {"fill_count": 10}},  # YES rollback sell fills
     ]
     mock_client.get_orderbook.return_value = {
         "orderbook": {"yes": [[38, 10], [35, 5]], "no": [[44, 8]]}
@@ -155,18 +157,23 @@ async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp)
     with get_session() as s:
         trades = list(s.exec(select(Trade)).all())
 
-    # YES leg should be rolled_back; NO leg stays pending (never filled)
+    # YES leg vendida entera → SETTLED con la pérdida REALIZADA en pnl_cents (auditoría
+    # 2026-07-07: antes 'rolled_back' sin pnl → invisible para los stop-losses).
+    # NO leg queda pending (nunca filló; estado desconocido → reconcile).
     by_side = {t.side: t for t in trades}
-    assert by_side["yes"].status == "rolled_back"
+    assert by_side["yes"].status == "settled"
+    expected_pnl = 10 * (38 - 40) - kalshi_fee_cents(10, 38) - kalshi_fee_cents(10, 40)
+    assert by_side["yes"].pnl_cents == expected_pnl
+    assert by_side["yes"].settled_at is not None
     assert by_side["no"].status == "pending"
 
 
 @pytest.mark.asyncio
 async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_opp):
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes"}},  # YES buy succeeds
+        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES buy fills
         Exception("fail"),  # NO buy fails
-        {"order": {}},  # YES rollback sell succeeds
+        {"order": {"fill_count": 10}},  # YES rollback sell fills
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
 
@@ -185,12 +192,14 @@ async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_op
     assert len(sell_calls) == 1
     assert sell_calls[0].kwargs["yes_price"] == 1
     assert sell_calls[0].kwargs["side"] == "yes"
+    # el sell de liquidación va IOC: jamás queda resting (auditoría 2026-07-07)
+    assert sell_calls[0].kwargs["time_in_force"] == "immediate_or_cancel"
 
 
 @pytest.mark.asyncio
 async def test_rollback_aborts_on_excessive_slippage(executor, mock_client, binary_opp):
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes"}},
+        {"order": {"order_id": "k-yes", "fill_count": 10}},
         Exception("fail"),
     ]
     # YES bid = 5¢, original price = 40¢ → slippage = (40-5)/40*100 = 87.5% > 10%
@@ -214,11 +223,13 @@ async def test_rollback_aborts_on_excessive_slippage(executor, mock_client, bina
     ]
     assert len(sell_calls) == 0
 
-    # YES trade NOT updated to rolled_back
+    # La pata YES queda ABIERTA (filled, sin settle): exposición visible para el
+    # RiskManager y gestionable como huérfana por Motor 3 — jamás desaparece en silencio.
     with get_session() as s:
         trades = list(s.exec(select(Trade)).all())
     by_side = {t.side: t for t in trades}
-    assert by_side["yes"].status != "rolled_back"
+    assert by_side["yes"].status == "filled"
+    assert by_side["yes"].pnl_cents is None
 
 
 # =====================================================
@@ -495,7 +506,7 @@ async def test_rollback_skips_leg_when_no_bid(mock_client, mock_risk_manager, bi
     # Use max_rollback_retries=1 to keep test fast (1 sleep instead of 3)
     ex = ArbitrageExecutor(mock_client, mock_risk_manager, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes"}},
+        {"order": {"order_id": "k-yes", "fill_count": 10}},
         Exception("fail"),
     ]
     # No bids available on any side
@@ -520,7 +531,7 @@ async def test_rollback_retries_on_sell_exception(mock_client, mock_risk_manager
     """Verify the except block fires when the sell call itself raises."""
     ex = ArbitrageExecutor(mock_client, mock_risk_manager, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes"}},  # YES buy succeeds
+        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES buy fills
         Exception("no buy"),  # NO buy fails
         Exception("sell failed"),  # rollback sell also fails
     ]
