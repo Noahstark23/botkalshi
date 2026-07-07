@@ -9,6 +9,10 @@ Bot 24/7 con **dinero real**. Todo error cuesta plata. El mapa completo del proy
 motores y la arquitectura de seguridad viven en `CLAUDE.md` (leelo primero si no lo tenés).
 Esta skill es el **protocolo operativo**: qué hacer, en qué orden, y qué no hacer jamás.
 
+Para trabajar SOBRE un motor específico, invocá además su skill: `motor-1-arbitraje`,
+`motor-2-consenso`, `motor-3-clv`, `motor-rest-arb`, `motor-5-mm` — cada una trae el mapa
+de archivos, flags, invariantes propias, diagnóstico y checklist de activación del motor.
+
 ## Invariantes de seguridad (violarlas = incidente)
 
 1. **Capa A**: un executor solo existe con sus flags de ejecución on. Nunca construyas un
