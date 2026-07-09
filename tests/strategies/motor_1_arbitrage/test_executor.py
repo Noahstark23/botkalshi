@@ -136,15 +136,13 @@ async def test_all_legs_fill_returns_true(executor, mock_client, binary_opp):
 
 @pytest.mark.asyncio
 async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp):
-    # YES leg succeeds, NO leg raises
+    # Hard-first: la dura (NO, precio 45 > 40) va primero y LLENA; la fácil (YES) falla.
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES buy fills
-        Exception("network error"),  # NO buy fails
-        {"order": {"fill_count": 10}},  # YES rollback sell fills
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        Exception("network error"),  # YES (fácil) buy fails
+        {"order": {"fill_count": 10}},  # NO rollback sell fills
     ]
-    mock_client.get_orderbook.return_value = {
-        "orderbook": {"yes": [[38, 10], [35, 5]], "no": [[44, 8]]}
-    }
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[44, 8], [43, 5]], "yes": []}}
 
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",
@@ -157,25 +155,26 @@ async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp)
     with get_session() as s:
         trades = list(s.exec(select(Trade)).all())
 
-    # YES leg vendida entera → SETTLED con la pérdida REALIZADA en pnl_cents (auditoría
+    # NO leg (dura) vendida entera → SETTLED con la pérdida REALIZADA en pnl_cents (auditoría
     # 2026-07-07: antes 'rolled_back' sin pnl → invisible para los stop-losses).
-    # NO leg queda pending (nunca filló; estado desconocido → reconcile).
+    # YES leg (fácil): SÍ se envió (la dura llenó), falló con excepción no-kill → estado
+    # DESCONOCIDO → queda pending (la resuelve reconcile). Es el caso residual raro.
     by_side = {t.side: t for t in trades}
-    assert by_side["yes"].status == "settled"
-    expected_pnl = 10 * (38 - 40) - kalshi_fee_cents(10, 38) - kalshi_fee_cents(10, 40)
-    assert by_side["yes"].pnl_cents == expected_pnl
-    assert by_side["yes"].settled_at is not None
-    assert by_side["no"].status == "pending"
+    assert by_side["no"].status == "settled"
+    expected_pnl = 10 * (44 - 45) - kalshi_fee_cents(10, 44) - kalshi_fee_cents(10, 45)
+    assert by_side["no"].pnl_cents == expected_pnl
+    assert by_side["no"].settled_at is not None
+    assert by_side["yes"].status == "pending"  # fácil enviada tras la dura, falló → reconcile
 
 
 @pytest.mark.asyncio
 async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_opp):
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES buy fills
-        Exception("fail"),  # NO buy fails
-        {"order": {"fill_count": 10}},  # YES rollback sell fills
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        Exception("fail"),  # YES (fácil) buy fails
+        {"order": {"fill_count": 10}},  # NO rollback sell fills
     ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[44, 10]], "yes": []}}
 
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",
@@ -183,15 +182,14 @@ async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_op
     ):
         await executor.execute(binary_opp)
 
-    # Find the sell call (place_order called 3 times: buy YES, buy NO, sell YES)
     sell_calls = [
         call
         for call in mock_client.place_order.call_args_list
         if call.kwargs.get("action") == "sell"
     ]
     assert len(sell_calls) == 1
-    assert sell_calls[0].kwargs["yes_price"] == 1
-    assert sell_calls[0].kwargs["side"] == "yes"
+    assert sell_calls[0].kwargs["no_price"] == 1  # se rollbackea la pata NO (dura)
+    assert sell_calls[0].kwargs["side"] == "no"
     # el sell de liquidación va IOC: jamás queda resting (auditoría 2026-07-07)
     assert sell_calls[0].kwargs["time_in_force"] == "immediate_or_cancel"
 
@@ -199,11 +197,11 @@ async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_op
 @pytest.mark.asyncio
 async def test_rollback_aborts_on_excessive_slippage(executor, mock_client, binary_opp):
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
-        Exception("fail"),
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        Exception("fail"),  # YES (fácil) buy fails
     ]
-    # YES bid = 5¢, original price = 40¢ → slippage = (40-5)/40*100 = 87.5% > 10%
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[5, 10]], "no": []}}
+    # NO bid = 5¢, original price = 45¢ → slippage = (45-5)/45*100 = 88.9% > 10%
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[5, 10]], "yes": []}}
 
     with (
         patch(
@@ -223,13 +221,13 @@ async def test_rollback_aborts_on_excessive_slippage(executor, mock_client, bina
     ]
     assert len(sell_calls) == 0
 
-    # La pata YES queda ABIERTA (filled, sin settle): exposición visible para el
+    # La pata NO (dura) queda ABIERTA (filled, sin settle): exposición visible para el
     # RiskManager y gestionable como huérfana por Motor 3 — jamás desaparece en silencio.
     with get_session() as s:
         trades = list(s.exec(select(Trade)).all())
     by_side = {t.side: t for t in trades}
-    assert by_side["yes"].status == "filled"
-    assert by_side["yes"].pnl_cents is None
+    assert by_side["no"].status == "filled"
+    assert by_side["no"].pnl_cents is None
 
 
 # =====================================================
@@ -531,11 +529,11 @@ async def test_rollback_retries_on_sell_exception(mock_client, mock_risk_manager
     """Verify the except block fires when the sell call itself raises."""
     ex = ArbitrageExecutor(mock_client, mock_risk_manager, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES buy fills
-        Exception("no buy"),  # NO buy fails
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        Exception("no easy"),  # YES (fácil) buy fails
         Exception("sell failed"),  # rollback sell also fails
     ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[44, 10]], "yes": []}}
 
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",

@@ -133,114 +133,118 @@ async def test_buy_legs_use_fill_or_kill(executor, mock_client, binary_opp):
 
 
 @pytest.mark.asyncio
-async def test_zero_fill_count_marks_leg_cancelled_and_rolls_back_other(
-    executor, mock_client, binary_opp
-):
-    """HTTP 200 con fill_count=0 = FOK killed: pata SIN posición → cancelled (no filled),
-    y la pata que SÍ llenó se rollbackea."""
-    mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},  # YES fills
-        {"order": {"order_id": "k-no", "fill_count": 0}},  # NO: 200 pero killed
-        {"order": {"fill_count": 10}},  # sell del rollback
-    ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
-
+async def test_hard_first_full_arb_places_hard_then_easy(executor, mock_client, binary_opp):
+    """Caso feliz hard-first: la dura (NO) llena → recién ahí la fácil (YES) → arb completo.
+    Verifica el ORDEN (dura primero) y que ambas quedan filled."""
+    mock_client.place_order.return_value = {"order": {"order_id": "k", "fill_count": 10}}
     with _patched():
-        assert await executor.execute(binary_opp) is False
+        assert await executor.execute(binary_opp) is True
 
-    (no_row,) = _trade(side="no")
-    assert no_row.status == "cancelled"  # jamás "filled" por el 200
-    yes_rows = _trade(side="yes")
-    assert [t.status for t in yes_rows] == ["settled"]  # rollback realizado
-    assert len(_sell_calls(mock_client)) == 1
+    buys = _buy_calls(mock_client)
+    assert [c.kwargs["side"] for c in buys] == [
+        "no",
+        "yes",
+    ]  # dura (45) primero, fácil (40) después
+    assert all(t.status == "filled" and t.count == 10 for t in _trade())
+    assert len(_sell_calls(mock_client)) == 0  # sin rollback
 
 
 @pytest.mark.asyncio
-async def test_fok_409_kill_marks_leg_cancelled(executor, mock_client, binary_opp):
-    """El FOK sin volumen vuelve como 409 fill_or_kill_insufficient_resting_volume:
-    kill DETERMINÍSTICO → cancelled limpio (no queda pending eterno ni cuenta como error)."""
+async def test_hard_leg_killed_skips_without_sending_easy(executor, mock_client, binary_opp):
+    """Hard-first (fix 2026-07-09): la pata DURA (NO, precio 45 > 40) se coloca PRIMERO. Si
+    killa (HTTP 200 con fill 0), la fácil (YES) NUNCA se envía → cero exposición, skip limpio,
+    SIN rollback. Es el caso DOMINANTE que antes encadenaba partial→rollback→circuit breaker."""
+    mock_client.place_order.side_effect = [
+        {"order": {"order_id": "k-no", "fill_count": 0}},  # NO (dura) FOK killed
+    ]
+    with _patched():
+        assert await executor.execute(binary_opp) is False
+
+    buys = _buy_calls(mock_client)
+    assert len(buys) == 1  # SOLO la dura se envió — la fácil NUNCA
+    assert buys[0].kwargs["side"] == "no"  # la dura (precio mayor) va primero
+    assert len(_sell_calls(mock_client)) == 0  # sin rollback: no se compró nada
+    by_side = {t.side: t for t in _trade()}
+    assert by_side["no"].status == "cancelled"  # killed
+    assert by_side["yes"].status == "cancelled"  # nunca enviada
+
+
+@pytest.mark.asyncio
+async def test_hard_leg_409_kill_skips_without_sending_easy(executor, mock_client, binary_opp):
+    """Ídem con el 409 determinístico de FOK sin volumen: la dura killa → la fácil no se
+    envía, cero rollback."""
     kill = KalshiClientError(409, "conflict", "{}", "fill_or_kill_insufficient_resting_volume")
-    mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
-        kill,
-        {"order": {"fill_count": 10}},  # sell del rollback
-    ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
-
+    mock_client.place_order.side_effect = [kill]  # NO (dura) 409-kill
     with _patched():
         assert await executor.execute(binary_opp) is False
 
-    (no_row,) = _trade(side="no")
-    assert no_row.status == "cancelled"
-    assert len(_sell_calls(mock_client)) == 1
+    assert len(_buy_calls(mock_client)) == 1  # la fácil no se envió
+    assert len(_sell_calls(mock_client)) == 0
+    by_side = {t.side: t for t in _trade()}
+    assert by_side["no"].status == "cancelled" and by_side["yes"].status == "cancelled"
 
 
 @pytest.mark.asyncio
-async def test_other_409_stays_pending_for_reconcile(executor, mock_client, binary_opp):
-    """CONTROL: un 409 con OTRO code es estado DESCONOCIDO → la fila queda pending
-    (la resuelve reconcile contra Kalshi), NO se asume kill."""
+async def test_hard_leg_other_409_error_skips_and_stays_pending(executor, mock_client, binary_opp):
+    """CONTROL: un 409 con OTRO code en la dura = estado DESCONOCIDO → la fila dura queda
+    pending (la resuelve reconcile), la fácil NO se envía. Jamás se asume kill."""
     other = KalshiClientError(409, "conflict", "{}", "market_closed")
-    mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
-        other,
-        {"order": {"fill_count": 10}},
-    ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
-
+    mock_client.place_order.side_effect = [other]  # NO (dura) error desconocido
     with _patched():
         assert await executor.execute(binary_opp) is False
 
-    (no_row,) = _trade(side="no")
-    assert no_row.status == "pending"
+    assert len(_buy_calls(mock_client)) == 1  # la fácil no se envió
+    by_side = {t.side: t for t in _trade()}
+    assert by_side["no"].status == "pending"  # desconocido → reconcile
+    assert by_side["yes"].status == "cancelled"  # no enviada
 
 
 @pytest.mark.asyncio
-async def test_unexpected_partial_fill_records_real_count(executor, mock_client, binary_opp):
-    """Defensivo: si FOK devolviera un parcial (no debería), se registra el count REAL
-    (no la ficción del pedido) y el rollback vende exactamente lo fillado."""
+async def test_hard_partial_fill_rolls_back_without_sending_easy(executor, mock_client, binary_opp):
+    """Defensivo: si la dura devolviera un parcial (no debería con FOK), hay exposición pero
+    el arb no puede quedar simétrico → la fácil NO se envía y se rollbackea la dura por el
+    count REAL (6), no el pedido (10)."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 6}},  # parcial inesperado 6/10
-        Exception("no buy"),
-        {"order": {"fill_count": 6}},  # sell del rollback
+        {"order": {"order_id": "k-no", "fill_count": 6}},  # NO (dura) parcial 6/10
+        {"order": {"fill_count": 6}},  # sell del rollback de la dura
     ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
-
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
     with _patched():
         assert await executor.execute(binary_opp) is False
 
+    buys = _buy_calls(mock_client)
+    assert len(buys) == 1 and buys[0].kwargs["side"] == "no"  # la fácil no se envió
     sells = _sell_calls(mock_client)
-    assert len(sells) == 1
-    assert sells[0].kwargs["count"] == 6  # vende lo REAL, no 10
-    (yes_row,) = _trade(side="yes")
-    assert yes_row.count == 6
-    assert yes_row.status == "settled"
+    assert len(sells) == 1 and sells[0].kwargs["count"] == 6  # vende lo REAL, no 10
+    (no_row,) = _trade(side="no")
+    assert no_row.count == 6 and no_row.status == "settled"
 
 
 # =====================================================
-# Rollback: pérdida realizada (visible para stop-losses)
+# Rollback (dura llena + fácil falla → path #137): pérdida realizada
 # =====================================================
 
 
 @pytest.mark.asyncio
 async def test_rollback_settles_row_with_realized_pnl(executor, mock_client, binary_opp):
-    """La fila del BUY pasa a settled con pnl_cents (venta − compra − ambas fees):
-    exactamente lo que agregan las ventanas de stop-loss diario/semanal/mensual."""
+    """La dura (NO) llena, la fácil (YES) falla → rollback de la dura con la pérdida REALIZADA
+    en pnl_cents (venta − compra − ambas fees): lo que agregan las ventanas de stop-loss."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
-        Exception("no buy"),
-        {"order": {"fill_count": 10}},
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        Exception("no easy"),  # YES (fácil) falla
+        {"order": {"fill_count": 10}},  # sell del rollback de NO
     ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
     with _patched():
         await executor.execute(binary_opp)
 
-    (yes_row,) = _trade(side="yes")
-    expected = 10 * (38 - 40) - kalshi_fee_cents(10, 38) - kalshi_fee_cents(10, 40)
-    assert yes_row.status == "settled"
-    assert yes_row.pnl_cents == expected
-    assert yes_row.settled_at is not None and yes_row.settled_at.tzinfo is None  # naive UTC
-    assert "rollback_sell~38c" in (yes_row.notes or "")
+    (no_row,) = _trade(side="no")
+    expected = 10 * (43 - 45) - kalshi_fee_cents(10, 43) - kalshi_fee_cents(10, 45)
+    assert no_row.status == "settled"
+    assert no_row.pnl_cents == expected
+    assert no_row.settled_at is not None and no_row.settled_at.tzinfo is None  # naive UTC
+    assert "rollback_sell~43c" in (no_row.notes or "")
 
 
 @pytest.mark.asyncio
@@ -248,24 +252,24 @@ async def test_rollback_partial_sell_splits_row(executor, mock_client, binary_op
     """El IOC vende 4 y después 6: la fila se PARTE (patrón _settle_originals de M3) —
     hija settled por lo vendido, original con el remanente hasta que también se vende."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
-        Exception("no buy"),
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        Exception("no easy"),  # YES (fácil) falla
         {"order": {"fill_count": 4}},  # sell parcial
         {"order": {"fill_count": 6}},  # sell del remanente
     ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
     with _patched():
         await executor.execute(binary_opp)
 
-    yes_rows = _trade(side="yes")
-    assert len(yes_rows) == 2
-    child = next(t for t in yes_rows if "-rbs" in t.client_order_id)
-    original = next(t for t in yes_rows if "-rbs" not in t.client_order_id)
+    no_rows = _trade(side="no")
+    assert len(no_rows) == 2
+    child = next(t for t in no_rows if "-rbs" in t.client_order_id)
+    original = next(t for t in no_rows if "-rbs" not in t.client_order_id)
     assert child.status == "settled" and child.count == 4
-    assert child.pnl_cents == 4 * (38 - 40) - kalshi_fee_cents(4, 38) - kalshi_fee_cents(4, 40)
+    assert child.pnl_cents == 4 * (43 - 45) - kalshi_fee_cents(4, 43) - kalshi_fee_cents(4, 45)
     assert original.status == "settled" and original.count == 6
-    assert original.pnl_cents == 6 * (38 - 40) - kalshi_fee_cents(6, 38) - kalshi_fee_cents(6, 40)
+    assert original.pnl_cents == 6 * (43 - 45) - kalshi_fee_cents(6, 43) - kalshi_fee_cents(6, 45)
 
 
 @pytest.mark.asyncio
@@ -275,16 +279,16 @@ async def test_rollback_sell_without_fill_keeps_row_open(mock_client, mock_risk,
     Jamás se marca cerrada una posición que sigue viva."""
     ex = ArbitrageExecutor(mock_client, mock_risk, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
-        Exception("no buy"),
+        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        Exception("no easy"),  # YES (fácil) falla
         {"order": {"fill_count": 0}},  # IOC sin fill
     ]
-    mock_client.get_orderbook.return_value = {"orderbook": {"yes": [[38, 10]], "no": []}}
+    mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
     with _patched():
         assert await ex.execute(binary_opp) is False
 
-    (yes_row,) = _trade(side="yes")
-    assert yes_row.status == "filled"  # sigue abierta — nada se realizó
-    assert yes_row.pnl_cents is None
-    assert yes_row.count == 10
+    (no_row,) = _trade(side="no")
+    assert no_row.status == "filled"  # sigue abierta — nada se realizó
+    assert no_row.pnl_cents is None
+    assert no_row.count == 10

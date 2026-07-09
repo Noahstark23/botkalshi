@@ -11,7 +11,7 @@ from loguru import logger
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiAPIError, KalshiRestClient
-from src.math.arbitrage import ArbLeg, ArbOpportunity
+from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
 from src.risk.manager import RiskManager
@@ -253,96 +253,154 @@ class ArbitrageExecutor:
         if not await self._balance_sufficient(opp, count):
             return False
 
-        client_order_ids = [str(uuid.uuid4()) for _ in opp.legs]
+        # HARD-FIRST (fix 2026-07-09): el arb es free-money COMPETITIVO — la resting volume
+        # que el book V2 vio al detectar VUELA entre la detección y la ejecución (otros la
+        # toman o la quote se retira). Disparar ambas patas a ciegas en paralelo hacía que la
+        # líquida llenara y la fina KILL-eara (409) → partial fill → rollback → circuit breaker
+        # (el "problema de patas" recurrente). En vez de eso se coloca PRIMERO la pata DURA
+        # (cara/fina — la que empíricamente killa): la FOK secuenciada sobre ella ES el test
+        # barato de profundidad viva. Si killa, no se compró nada, las fáciles NO se envían y
+        # el arb se salta LIMPIO (cero exposición, cero rollback, cero breaker); solo si la
+        # dura llena se disparan las fáciles. Espeja el guardarraíl ya probado en
+        # motor_rest_arb (executor.py, #85); select_hard_leg es la fuente única. NO se agrega
+        # pre-check de depth: sería un no-op (count = min(available_size) ya, por construcción).
+        coids = {leg: str(uuid.uuid4()) for leg in opp.legs}
+        self._persist_intents(opp, count, [coids[leg] for leg in opp.legs])
 
-        self._persist_intents(opp, count, client_order_ids)
+        hard_leg, other_legs = select_hard_leg(opp)
 
-        tasks = [
-            self._place_leg(leg, count, coid)
-            for leg, coid in zip(opp.legs, client_order_ids, strict=True)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Paso 1: SOLO la pata dura, y esperarla.
+        (hard_result,) = await asyncio.gather(
+            self._place_leg(hard_leg, count, coids[hard_leg]), return_exceptions=True
+        )
+        hard_state, hard_fill = self._process_leg_result(
+            hard_leg, coids[hard_leg], count, hard_result
+        )
 
-        # Auditoría 2026-07-07 (P0): HTTP 200 significa "orden aceptada", NO "llenada". El fill
-        # REAL sale de fill_count de la respuesta. Con FOK debería ser count o 0; se registra el
-        # valor real igual (defensa ante shapes raros) y una pata con fill 0 = pata MUERTA limpia
-        # (cancelada, sin posición) → dispara rollback de las que SÍ llenaron.
-        filled: list[tuple[ArbLeg, str, int]] = []
+        if hard_state in ("killed", "error"):
+            # La dura no abrió posición limpia → las fáciles NUNCA se envían: cero exposición.
+            # 'killed' = skip limpio; 'error' = fila dura pending que resuelve el reconcile.
+            # Este es el caso DOMINANTE que antes encadenaba partial→rollback→breaker.
+            for leg in other_legs:
+                self._update_trade_status(coids[leg], "cancelled")
+            logger.info(
+                f"ArbitrageExecutor: pata dura {hard_leg.market_ticker} ({hard_leg.side}) "
+                f"{hard_state} → {len(other_legs)} pata(s) fácil(es) NO enviada(s) "
+                "(cero exposición, sin rollback)"
+            )
+            return False
+
+        filled: list[tuple[ArbLeg, str, int]] = [(hard_leg, coids[hard_leg], hard_fill)]
+
+        if hard_state == "filled_partial":
+            # La dura llenó PARCIAL (no debería con FOK): hay exposición pero el arb no puede
+            # quedar simétrico → no se envían las fáciles y se rollbackea la dura.
+            for leg in other_legs:
+                self._update_trade_status(coids[leg], "cancelled")
+            logger.critical(
+                f"ArbitrageExecutor: pata dura {hard_leg.market_ticker} fill PARCIAL "
+                f"{hard_fill}/{count} → rollback de la dura, fáciles no enviadas"
+            )
+            await self._execute_iterative_rollback(filled)
+            return False
+
+        # Paso 2: la dura LLENÓ completa → recién ahora las fáciles (paralelo ENTRE ELLAS; en
+        # un arb binario es una sola). Con la dura ya adentro, un KILL de la fácil (rara: es la
+        # líquida) sí deja exposición → rollback de lo lleno (mismo path #137, pérdida real).
+        cheap_results = await asyncio.gather(
+            *[self._place_leg(lg, count, coids[lg]) for lg in other_legs],
+            return_exceptions=True,
+        )
         failed = False
-        for leg, coid, result in zip(opp.legs, client_order_ids, results, strict=True):
-            if isinstance(result, BaseException):
-                if (
-                    isinstance(result, KalshiAPIError)
-                    and result.status_code == 409
-                    and result.error_code in _FOK_KILL_ERROR_CODES
-                ):
-                    # KILL determinístico: FOK sin volumen — la orden murió limpia sin
-                    # posición. No es un error; la pata se cancela y se rollbackea el resto.
-                    logger.warning(
-                        f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK "
-                        f"killed (sin volumen) — sin posición"
-                    )
-                    self._update_trade_status(coid, "cancelled")
-                    failed = True
-                    continue
-                logger.critical(
-                    f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) failed: {result}"
-                )
+        for lg, res in zip(other_legs, cheap_results, strict=True):
+            state, fc = self._process_leg_result(lg, coids[lg], count, res)
+            if state in ("filled_full", "filled_partial"):
+                filled.append((lg, coids[lg], fc))
+            if state != "filled_full":
                 failed = True
-                continue
-            order = result.get("order", result) if isinstance(result, dict) else {}
-            order_id = str(order.get("order_id", "") or result.get("order_id", ""))
-            fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
-            if fill_count <= 0:
-                # FOK killed: la orden murió entera sin posición. NO es una pata fillada.
-                logger.warning(
-                    f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK sin fill "
-                    f"(killed) — sin posición"
-                )
-                self._update_trade_status(coid, "cancelled")
-                failed = True
-                continue
-            if fill_count < count:
-                # No debería pasar con FOK; si pasa, registrar el count REAL (no la ficción).
-                logger.warning(
-                    f"ArbitrageExecutor: fill PARCIAL inesperado con FOK "
-                    f"{leg.market_ticker} ({leg.side}): {fill_count}/{count}"
-                )
-                failed = True
-            filled.append((leg, coid, fill_count))
-            # Bug 2: alimentar el tracker con el fill REAL. Bug 1: el place consumió cash.
-            self.event_tracker.record_fill(leg.market_ticker, leg.side, fill_count, leg.price_cents)
-            self._balance_cache = None
-            if not order_id:
-                logger.warning(
-                    f"motor1.exec.order_id_ausente coid={coid} "
-                    f"response_keys={sorted(result)[:8]} (shape inesperado del place)"
-                )
-            with get_session() as s:
-                t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
-                if t:
-                    t.status = "filled"
-                    t.count = fill_count  # el count REAL fillado, no el pedido
-                    t.fill_price_cents = leg.price_cents
-                    t.filled_at = _naive_utc_now()
-                    if order_id:
-                        t.kalshi_order_id = order_id
-                    s.add(t)
-                    s.commit()
 
         if not failed:
             logger.info(
-                f"ArbitrageExecutor: all {len(opp.legs)} legs filled — "
+                f"ArbitrageExecutor: all {len(opp.legs)} legs filled (hard-first) — "
                 f"net_profit={opp.net_profit_cents}¢"
             )
             return True
 
         logger.critical(
-            f"ArbitrageExecutor: partial fill — {len(filled)}/{len(opp.legs)} legs filled, "
-            "triggering rollback"
+            f"ArbitrageExecutor: partial fill hard-first — {len(filled)}/{len(opp.legs)} "
+            "legs filled, triggering rollback"
         )
         await self._execute_iterative_rollback(filled)
         return False
+
+    def _process_leg_result(
+        self, leg: ArbLeg, coid: str, count: int, result: object
+    ) -> tuple[str, int]:
+        """Resuelve el resultado de una pata FOK a (estado, fill_count real).
+
+        Auditoría 2026-07-07 (P0): HTTP 200 = "orden aceptada", NO "llenada" — el fill REAL
+        sale de fill_count. Estados:
+          - 'filled_full'    (fill_count >= count): pata llena.
+          - 'filled_partial' (0 < fill_count < count): no debería con FOK — defensivo; se
+            registra el count REAL igual.
+          - 'killed'         (409 determinístico de FOK sin volumen, o HTTP 200 con fill 0):
+            sin posición → fila cancelled.
+          - 'error'          (excepción no-kill): estado DESCONOCIDO → la fila queda pending y
+            la resuelve reconcile_pending_trades. Jamás se asume que no pasó nada.
+        Para los 'filled_*' hace el bookkeeping del fill (Trade row + event_tracker + invalida
+        el cache de balance). El rollback lo decide el CALLER (hard-first)."""
+        if isinstance(result, BaseException):
+            if (
+                isinstance(result, KalshiAPIError)
+                and result.status_code == 409
+                and result.error_code in _FOK_KILL_ERROR_CODES
+            ):
+                logger.warning(
+                    f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK killed "
+                    "(sin volumen) — sin posición"
+                )
+                self._update_trade_status(coid, "cancelled")
+                return "killed", 0
+            logger.critical(
+                f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) failed: {result}"
+            )
+            return "error", 0
+
+        order = result.get("order", result) if isinstance(result, dict) else {}
+        order_id = str(order.get("order_id", "") or result.get("order_id", ""))
+        fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+        if fill_count <= 0:
+            logger.warning(
+                f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK sin fill "
+                "(killed) — sin posición"
+            )
+            self._update_trade_status(coid, "cancelled")
+            return "killed", 0
+        if fill_count < count:
+            logger.warning(
+                f"ArbitrageExecutor: fill PARCIAL inesperado con FOK "
+                f"{leg.market_ticker} ({leg.side}): {fill_count}/{count}"
+            )
+        # Bug 2: alimentar el tracker con el fill REAL. Bug 1: el place consumió cash.
+        self.event_tracker.record_fill(leg.market_ticker, leg.side, fill_count, leg.price_cents)
+        self._balance_cache = None
+        if not order_id:
+            logger.warning(
+                f"motor1.exec.order_id_ausente coid={coid} "
+                f"response_keys={sorted(result)[:8]} (shape inesperado del place)"
+            )
+        with get_session() as s:
+            t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
+            if t:
+                t.status = "filled"
+                t.count = fill_count  # el count REAL fillado, no el pedido
+                t.fill_price_cents = leg.price_cents
+                t.filled_at = _naive_utc_now()
+                if order_id:
+                    t.kalshi_order_id = order_id
+                s.add(t)
+                s.commit()
+        return ("filled_full" if fill_count >= count else "filled_partial"), fill_count
 
     # =====================================================
     # Internal helpers
