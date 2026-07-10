@@ -384,9 +384,17 @@ def _apply_sqlite_pragmas(dbapi_conn: Any, _connection_record: Any) -> None:
       es idempotente y barato.
     - busy_timeout=5000: ante lock, esperar hasta 5s en vez de fallar al instante
       (el default es 0 → fallo inmediato). Cubre el residual de contención.
+    - auto_vacuum=INCREMENTAL (incidente disco-lleno 2026-07-10): SOLO tiene efecto en una
+      DB VACÍA (antes de crear tablas), y persiste en el archivo. En una DB ya existente
+      con auto_vacuum=NONE (todas las de prod hasta hoy) es un NO-OP inofensivo — cambiarlo
+      ahí requiere un full VACUUM (o el rebuild_db.py, que crea la nueva ya con INCREMENTAL).
+      El efecto real es que TODA DB nueva (deploy fresco) nace con auto_vacuum → el
+      incremental_vacuum del loop de mantenimiento le recupera disco online, sin full VACUUM
+      nunca. Se setea PRIMERO, antes de WAL, porque exige que aún no haya ninguna tabla.
     """
     cur = dbapi_conn.cursor()
     try:
+        cur.execute("PRAGMA auto_vacuum=INCREMENTAL")  # antes de crear tablas (no-op si ya hay)
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA busy_timeout=5000")
         cur.execute("PRAGMA synchronous=NORMAL")  # seguro con WAL; menos fsync por commit

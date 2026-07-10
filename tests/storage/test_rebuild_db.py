@@ -93,3 +93,15 @@ def test_rebuild_refuses_if_dst_exists(seeded_db):
 
     (seeded_db.parent / "trades.db.rebuilt").write_text("x")
     assert rb.main() == 1
+
+
+def test_rebuild_verifies_sacred_counts_and_prints_swap(seeded_db, capsys):
+    """La copia buena verifica cada tabla sagrada nueva==vieja (OK) e imprime los comandos de
+    swap. Con trades vieja=1 y nueva=1, la verificación pasa y aparece el bloque de swap."""
+    import scripts.rebuild_db as rb
+
+    assert rb.main() == 0
+    out = capsys.readouterr().out
+    assert "VERIFICACIÓN de tablas sagradas" in out
+    assert "trades" in out and "OK" in out
+    assert "SWAP MANUAL (verificación OK)" in out  # solo se imprime si NO hubo mismatch
