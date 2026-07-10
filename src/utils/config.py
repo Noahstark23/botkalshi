@@ -485,6 +485,23 @@ class Settings(BaseSettings):
         default=60, ge=10, description="Intervalo del monitor de memoria (s)"
     )
 
+    # === Mantenimiento de DB (incidente disco-lleno 2026-07-10) ===
+    # orderbook_events se grababa por cada delta del WS (millones/día) y NADIE la lee → llenó
+    # el disco. OPT-IN: default off (los books viven en memoria, no hace falta persistirlos).
+    PERSIST_ORDERBOOK_EVENTS: bool = Field(
+        default=False,
+        description="Si es True, persiste cada orderbook_delta a orderbook_events (telemetry pesada; default off).",
+    )
+    # Loop de retención: poda tablas de DIAGNÓSTICO por ventana + wal_checkpoint. NUNCA toca
+    # estado de trading. Default on; acota el crecimiento de la DB para que no se vuelva a llenar.
+    DB_MAINTENANCE_ENABLED: bool = Field(
+        default=True,
+        description="Corre el loop de retención de tablas de diagnóstico + WAL checkpoint.",
+    )
+    DB_MAINTENANCE_INTERVAL_HOURS: float = Field(
+        default=6.0, gt=0, description="Cada cuánto corre el mantenimiento de DB (horas)."
+    )
+
     # ---- Validators ----
 
     @field_validator("KALSHI_PRIVATE_KEY_PATH")

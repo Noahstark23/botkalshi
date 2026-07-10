@@ -243,15 +243,20 @@ class DataCaptureService:
                 BotState.record_error(f"orderbook_delta unknown shape: keys={sample_keys}")
                 return
 
-            with get_session() as s:
-                event = OrderbookEvent(
-                    ticker=ticker,
-                    side=side,
-                    price_cents=price_cents,
-                    delta=delta_size,
-                )
-                s.add(event)
-                s.commit()
+            # Persistir orderbook_events es OPT-IN (default off, incidente disco-lleno 2026-07-10):
+            # una fila por cada delta del WS (~240 tickers, 24/7) = millones/día, y NADIE la lee
+            # (telemetry write-only). Los books viven en memoria (OrderbookManagerV2). Solo se graba
+            # si PERSIST_ORDERBOOK_EVENTS=true (debug puntual, con retención via _run_db_maintenance).
+            if self.settings.PERSIST_ORDERBOOK_EVENTS:
+                with get_session() as s:
+                    event = OrderbookEvent(
+                        ticker=ticker,
+                        side=side,
+                        price_cents=price_cents,
+                        delta=delta_size,
+                    )
+                    s.add(event)
+                    s.commit()
         except Exception:
             logger.exception("Error procesando orderbook_delta")
             BotState.record_error("orderbook_delta processing error")
