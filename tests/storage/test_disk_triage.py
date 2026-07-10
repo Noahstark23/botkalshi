@@ -41,7 +41,8 @@ def seeded_db(tmp_path, monkeypatch):
     return db
 
 
-def test_triage_is_readonly_and_reports_tables(seeded_db, monkeypatch, capsys):
+def test_triage_default_is_instant_estimate_and_readonly(seeded_db, monkeypatch, capsys):
+    """Default: estimado por max(rowid) (no escanea el archivo — no se cuelga en DBs de GB)."""
     import sys
 
     import scripts.disk_triage as dt
@@ -50,7 +51,9 @@ def test_triage_is_readonly_and_reports_tables(seeded_db, monkeypatch, capsys):
     assert dt.main() == 0
     out = capsys.readouterr().out
     assert "TRIAGE DE DISCO" in out
-    assert "orderbook_events" in out  # aparece en el desglose por tabla
+    assert "estimado por max(rowid)" in out  # NO usa dbstat por defecto
+    assert "BYTES POR TABLA" not in out
+    assert "orderbook_events" in out
     # No modificó la DB: las 50 filas siguen ahí.
     conn = sqlite3.connect(str(seeded_db))
     try:
@@ -58,6 +61,19 @@ def test_triage_is_readonly_and_reports_tables(seeded_db, monkeypatch, capsys):
         assert conn.execute("SELECT count(*) FROM trades").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_triage_bytes_flag_uses_dbstat(seeded_db, monkeypatch, capsys):
+    """--bytes: desglose exacto por bytes vía dbstat (opt-in; escanea toda la DB)."""
+    import sys
+
+    import scripts.disk_triage as dt
+
+    monkeypatch.setattr(sys, "argv", ["disk_triage.py", "--bytes"])
+    assert dt.main() == 0
+    out = capsys.readouterr().out
+    assert "BYTES POR TABLA (dbstat" in out
+    assert "orderbook_events" in out
 
 
 def test_clean_logs_removes_gz_and_truncates_log(tmp_path, monkeypatch, capsys):
