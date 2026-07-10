@@ -88,45 +88,56 @@ def _report_db_files(src: str) -> None:
     print(f"  {'TOTAL (db+wal+shm)':24s} {_fmt(total)}")
 
 
-def _report_tables(src: str) -> None:
-    """Bytes por tabla vía dbstat; si dbstat no está compilado, fallback a filas."""
+def _report_tables(src: str, *, byte_scan: bool = False) -> None:
+    """Cuál tabla es el monstruo.
+
+    Por defecto: estimado INSTANTÁNEO por max(rowid) — NO escanea el archivo (clave: con
+    dbstat, un escaneo completo sobre una DB de 57GB + WAL vivo se cuelga minutos; incidente
+    2026-07-10). Con --bytes: el desglose EXACTO por bytes vía dbstat, que sí escanea todo el
+    archivo (solo usalo en DBs chicas o con el bot parado).
+    """
     if not os.path.exists(src):
         print(f"\n(no existe {src})")
         return
     conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     try:
-        try:
-            rows = list(
-                conn.execute(
-                    "SELECT name, sum(pgsize) AS bytes FROM dbstat "
-                    "GROUP BY name ORDER BY bytes DESC"
+        if byte_scan:
+            try:
+                rows = list(
+                    conn.execute(
+                        "SELECT name, sum(pgsize) AS bytes FROM dbstat "
+                        "GROUP BY name ORDER BY bytes DESC"
+                    )
                 )
+                print("\nBYTES POR TABLA (dbstat — escaneo COMPLETO, lento en DBs de GB):")
+                for name, byts in rows:
+                    tag = "" if name in _SACRED else "  ← diagnóstico (prunable)"
+                    if name.startswith(("sqlite_", "idx_", "ix_")):
+                        tag = ""
+                    print(f"  {name:30s} {_fmt(int(byts or 0)):>12s}{tag}")
+                return
+            except sqlite3.OperationalError:
+                print("\n(dbstat no disponible — caigo al estimado por rowid)")
+
+        # Default: estimado por max(rowid), O(log n), no lee el archivo entero.
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
-            print("\nBYTES POR TABLA (dbstat):")
-            for name, byts in rows:
-                tag = "" if name in _SACRED else "  ← diagnóstico (prunable)"
-                if name.startswith("sqlite_") or name.startswith("idx_") or name.startswith("ix_"):
-                    tag = ""
-                print(f"  {name:30s} {_fmt(int(byts or 0)):>12s}{tag}")
-        except sqlite3.OperationalError:
-            # dbstat no compilado en este SQLite → conteo de filas como proxy.
-            print("\n(dbstat no disponible — muestro CONTEO DE FILAS por tabla como proxy):")
-            tables = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-            ]
-            counts = []
-            for t in tables:
-                try:
-                    n = conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]  # noqa: S608
-                except sqlite3.OperationalError:
-                    n = -1
-                counts.append((t, n))
-            for t, n in sorted(counts, key=lambda x: x[1], reverse=True):
-                tag = "" if t in _SACRED else "  ← diagnóstico (prunable)"
-                print(f"  {t:30s} {n:>12,} filas{tag}")
+        ]
+        est: list[tuple[str, int]] = []
+        for t in tables:
+            try:
+                n = conn.execute(f"SELECT max(rowid) FROM {t}").fetchone()[0] or 0  # noqa: S608
+            except sqlite3.OperationalError:
+                n = -1
+            est.append((t, n))
+        print("\n~FILAS POR TABLA (estimado por max(rowid), instantáneo — no escanea el archivo):")
+        print("  (para bytes exactos: --bytes, pero escanea toda la DB → lento en GB)")
+        for t, n in sorted(est, key=lambda x: x[1], reverse=True):
+            tag = "" if t in _SACRED else "  ← diagnóstico (prunable)"
+            print(f"  {t:30s} {n:>14,}{tag}")
     finally:
         conn.close()
 
@@ -184,6 +195,11 @@ def main() -> int:
         action="store_true",
         help="Borra *.log.gz rotados y trunca el .log del día (seguro con el bot arriba; NO toca la DB).",
     )
+    parser.add_argument(
+        "--bytes",
+        action="store_true",
+        help="Desglose EXACTO por bytes vía dbstat (escanea toda la DB → LENTO en GB; usalo con el bot parado).",
+    )
     args = parser.parse_args()
 
     src = _db_path()
@@ -192,8 +208,10 @@ def main() -> int:
     print("=" * 72)
     _report_disk(src)
     _report_db_files(src)
-    _report_tables(src)
+    # Logs ANTES del desglose por tabla: aunque el escaneo por tabla sea lento, el reporte de
+    # logs ya salió (incidente 2026-07-10: el dbstat sobre 57GB colgaba y ocultaba todo lo demás).
     _report_logs(clean=args.clean_logs)
+    _report_tables(src, byte_scan=args.bytes)
 
     print("\n" + "=" * 72)
     print("QUÉ HACER CON LO QUE VES:")
