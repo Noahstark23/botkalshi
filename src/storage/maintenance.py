@@ -74,10 +74,29 @@ def checkpoint_wal() -> None:
         logger.exception("db_maintenance.wal_checkpoint_failed")
 
 
+def incremental_vacuum() -> None:
+    """PRAGMA incremental_vacuum: devuelve al SO las páginas libres del freelist SIN el
+    full VACUUM (que bloquea la DB entera + necesita ~2× espacio). Reclama ONLINE, en
+    caliente, de a poco.
+
+    IMPORTANTE: solo hace algo si la DB fue creada con auto_vacuum=INCREMENTAL (ver
+    scripts/rebuild_db.py). En una DB con auto_vacuum=NONE (el default histórico, y las ya
+    existentes) es un NO-OP inofensivo — por eso agregarlo al loop es seguro. Best-effort."""
+    try:
+        with get_session() as s:
+            s.execute(text("PRAGMA incremental_vacuum"))
+            s.commit()
+    except Exception:
+        logger.exception("db_maintenance.incremental_vacuum_failed")
+
+
 def run_maintenance_once(*, now: datetime | None = None) -> dict[str, int]:
-    """Una pasada de mantenimiento: poda + wal_checkpoint. Devuelve las filas borradas."""
+    """Una pasada de mantenimiento: poda + wal_checkpoint + incremental_vacuum. Devuelve las
+    filas borradas. El incremental_vacuum recupera disco online SI la DB es auto_vacuum=
+    INCREMENTAL (reconstruida con rebuild_db); si no, no-op."""
     deleted = prune_diagnostics(now=now)
     checkpoint_wal()
+    incremental_vacuum()
     total = sum(v for v in deleted.values() if v > 0)
     if total:
         logger.info(f"db_maintenance.pruned total={total} por_tabla={deleted}")
