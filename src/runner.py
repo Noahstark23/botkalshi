@@ -18,6 +18,7 @@ Punto de entrada del container Docker.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import signal
 import sys
@@ -527,6 +528,29 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_db_maintenance(self) -> None:
+        """
+        Mantenimiento de DB — gateado por DB_MAINTENANCE_ENABLED (default on). Poda las tablas
+        de DIAGNÓSTICO por ventana de retención + wal_checkpoint (incidente disco-lleno
+        2026-07-10: orderbook_events sin tope llenó el disco → writes fallando). NUNCA toca
+        estado de trading. Best-effort por tick: si falla, se registra y el loop SIGUE.
+        """
+        if not self.settings.DB_MAINTENANCE_ENABLED:
+            return
+        from src.storage.maintenance import run_maintenance_once
+
+        interval = self.settings.DB_MAINTENANCE_INTERVAL_HOURS * 3600
+        await asyncio.sleep(60)  # una primera pasada temprano tras el boot
+        while not self._stop_event.is_set():
+            try:
+                run_maintenance_once()
+            except Exception as e:
+                msg = f"db_maintenance runner: {type(e).__name__}: {e}"
+                logger.exception(msg)
+                BotState.record_error(msg)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -626,6 +650,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_telegram_commands(), name="telegram_commands"),
                 asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
                 asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
+                asyncio.create_task(self._run_db_maintenance(), name="db_maintenance"),
             ]
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
