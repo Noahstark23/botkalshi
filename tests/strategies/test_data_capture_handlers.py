@@ -154,6 +154,59 @@ async def test_delta_handler_processes_dollar_string_shape(mock_session, service
 
 
 # =====================================================
+# Gate PERSIST_ORDERBOOK_EVENTS (incidente disco-lleno 2026-07-10)
+# =====================================================
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_orderbook_events_not_persisted_when_flag_off(mock_session, service):
+    """Con PERSIST_ORDERBOOK_EVENTS=false (default), un delta válido NO escribe fila (los
+    books viven en memoria; era la tabla que llenó 54G)."""
+    service.settings.PERSIST_ORDERBOOK_EVENTS = False
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "side": "yes",
+            "price": "0.2700",
+            "delta": "-100.00",
+        },
+    }
+    await service._on_orderbook_delta(msg)
+
+    assert not mock_db.add.called  # CERO inserts con el flag off
+    assert BotState.last_error is None  # y no es un error: es el comportamiento esperado
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_orderbook_events_persisted_when_flag_on(mock_session, service):
+    """CONTROL: con el flag ON, sí escribe (debug puntual, acotado por la retención de 2d)."""
+    service.settings.PERSIST_ORDERBOOK_EVENTS = True
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "side": "yes",
+            "price": "0.2700",
+            "delta": "-100.00",
+        },
+    }
+    await service._on_orderbook_delta(msg)
+
+    assert mock_db.add.called
+
+
+# =====================================================
 # _on_orderbook_delta — shape viejo (backward compat)
 # =====================================================
 
