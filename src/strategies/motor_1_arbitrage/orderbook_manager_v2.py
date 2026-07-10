@@ -384,7 +384,9 @@ class OrderbookManagerV2:
                 f"v2.recovery_all_settled sid={sid}: los {len(all_tickers)} tickers están "
                 "settled/dead → circuit breaker (no se pide snapshot)."
             )
-            await self._disable_recovery(sid, "all_tickers_settled")
+            # Settlement esperado, no degradación: WARNING (no CRITICAL). progress fresco es válido
+            # acá (aún no se entró en _recovering, no hay pending que el cleanup haya borrado).
+            await self._disable_recovery(sid, "all_tickers_settled", expected_settlement=True)
             return
 
         self._recovering.add(sid)
@@ -438,21 +440,50 @@ class OrderbookManagerV2:
         self._pending_deltas.pop(sid, None)
         self._recovery_started_at.pop(sid, None)
 
-    async def _register_failure_and_maybe_break(self, sid: int, reason: str) -> bool:
+    async def _register_failure_and_maybe_break(
+        self,
+        sid: int,
+        reason: str,
+        *,
+        progress: str | None = None,
+        expected_settlement: bool = False,
+    ) -> bool:
         """Contabiliza un fallo de recovery del sid. Si llega a MAX_RECOVERY_FAILURES consecutivos,
         DESHABILITA la recovery del sid (circuit breaker) y devuelve True (el caller NO reintenta).
-        El contador se resetea cuando una recovery completa OK (_handle_recovery_snapshot)."""
+        El contador se resetea cuando una recovery completa OK (_handle_recovery_snapshot).
+
+        `progress` DEBE venir del caller computado ANTES de su _cleanup_recovery (fix 2026-07-10:
+        _disable_recovery lo recomputaba post-cleanup → pending=0 → 'recovered=total/total' FALSO).
+        `expected_settlement` baja el disable a WARNING (settlement esperado, no degradación)."""
         self._recovery_failures_by_sid[sid] = self._recovery_failures_by_sid.get(sid, 0) + 1
         if self._recovery_failures_by_sid[sid] >= self.MAX_RECOVERY_FAILURES:
-            await self._disable_recovery(sid, f"{reason}_x{self._recovery_failures_by_sid[sid]}")
+            await self._disable_recovery(
+                sid,
+                f"{reason}_x{self._recovery_failures_by_sid[sid]}",
+                progress=progress,
+                expected_settlement=expected_settlement,
+            )
             return True
         return False
 
-    async def _disable_recovery(self, sid: int, reason: str) -> None:
+    async def _disable_recovery(
+        self,
+        sid: int,
+        reason: str,
+        *,
+        progress: str | None = None,
+        expected_settlement: bool = False,
+    ) -> None:
         """Circuit breaker: deja de reintentar la recovery de este sid (book queda stale) y ALERTA.
         Evita el loop infinito cuando la causa es persistente (cuenta en 'Action required', sid
-        entero settled). Se re-habilita solo si una recovery del sid vuelve a completar OK."""
-        progress = self._recovery_progress(sid)  # ANTES de cleanup
+        entero settled). Se re-habilita solo si una recovery del sid vuelve a completar OK.
+
+        `progress`: pasarlo desde el caller (computado ANTES del cleanup) — si es None se computa
+        acá, pero cuando el caller ya limpió el estado (timeout/code15) eso da un 'recovered' FALSO
+        (pending=0). `expected_settlement=True` (settlement conocido) → WARNING en vez de CRITICAL:
+        un mercado cerrado dejando su sid stale es esperado, no una degradación del feed."""
+        if progress is None:
+            progress = self._recovery_progress(sid)  # solo válido si aún no se limpió
         self._cleanup_recovery(sid)
         self._recovery_disabled_sids.add(sid)
         fails = self._recovery_failures_by_sid.get(sid, 0)
@@ -460,8 +491,13 @@ class OrderbookManagerV2:
             f"sid={sid} recovery DESHABILITADA ({reason}, {fails} fallos, {progress}) — "
             "book stale, sin reintentos"
         )
-        logger.critical(f"v2.recovery_disabled {msg}")
-        BotState.record_error(f"v2.recovery_disabled {msg}")
+        if expected_settlement:
+            # Settlement esperado (mercado cerrado / sid entero settled): el book queda stale por
+            # diseño, no es una degradación del feed. WARNING + sin record_error (no ensucia BotState).
+            logger.warning(f"v2.recovery_disabled {msg}")
+        else:
+            logger.critical(f"v2.recovery_disabled {msg}")
+            BotState.record_error(f"v2.recovery_disabled {msg}")
         await self._fire_alert("recovery_disabled", msg)
 
     async def _handle_recovery_rejected(self, req_id: int, raw_msg: dict) -> None:
@@ -470,6 +506,9 @@ class OrderbookManagerV2:
         recovery; contar el fallo (circuit breaker); y si no se rompió, reintentar con el set ya
         FILTRADO (sin settled/dead)."""
         sid, tickers = self._pending_snapshot_requests[req_id]
+        progress = self._recovery_progress(
+            sid
+        )  # ANTES de cleanup (evita 'recovered' post-cleanup falso)
         bad = raw_msg.get("market_ticker")
         if isinstance(bad, str):
             self._dead_tickers.add(bad)
@@ -489,7 +528,7 @@ class OrderbookManagerV2:
             "(purga + circuit breaker; NO re-pide el set completo)"
         )
         BotState.record_error(f"v2 recovery rechazada (code 15) sid={sid}")
-        if await self._register_failure_and_maybe_break(sid, "code15"):
+        if await self._register_failure_and_maybe_break(sid, "code15", progress=progress):
             return
         await self._start_recovery(sid)
 
@@ -504,12 +543,37 @@ class OrderbookManagerV2:
         """
         discarded = len(self._pending_deltas.get(sid, []))
         progress = self._recovery_progress(sid)  # ANTES de cleanup (lee pending/timer)
+
+        # Sub-caso settlement (fix 2026-07-10): tickers cuyo snapshot NUNCA llegó dentro de la
+        # ventana. Con progreso PARCIAL (la mayoría recuperó, unos pocos atascados), los atascados
+        # casi seguro son settled/dead — Kalshi no manda snapshot de un mercado cerrado, y su
+        # close_time puede no haber llegado desde discovery (por eso el filtro _is_unrecoverable no
+        # los purgó). Marcarlos dead + reintentar con el resto: la recovery CONVERGE (los 240 vivos
+        # completan) en vez de escalar 5× a CRITICAL por 1-2 mercados cerrados. Si NADA recuperó
+        # (recovered=0), es feed degradado real → NO se matan tickers, escala como antes (anti-OOM).
+        stuck = {
+            t
+            for _rid, (s, pend) in self._pending_snapshot_requests.items()
+            if s == sid
+            for t in pend
+        }
+        total = len(self._tickers_by_sid.get(sid, set()))
+        settled_subcase = reason == "timeout" and 0 < len(stuck) < total
+        if settled_subcase:
+            self._dead_tickers |= stuck
+            logger.info(
+                f"v2.recovery_stuck_marked_dead sid={sid} stuck={len(stuck)}/{total} "
+                f"tickers={sorted(stuck)[:5]} → dead + reintento con el resto (probable settlement)."
+            )
+
         self._cleanup_recovery(sid)
         logger.warning(
             f"v2.recovery_aborted sid={sid} reason={reason} {progress} discarded_msgs={discarded} "
             "→ reintentando snapshot (acotado por circuit breaker)."
         )
-        if await self._register_failure_and_maybe_break(sid, reason):
+        if await self._register_failure_and_maybe_break(
+            sid, reason, progress=progress, expected_settlement=settled_subcase
+        ):
             return
         await self._start_recovery(sid)
 
