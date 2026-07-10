@@ -134,19 +134,39 @@ def main() -> int:
         print(f"  {t:26s} {n}")
     print(f"\nDB nueva: {dst}  ({new_size / 1e6:.1f} MB)  ← vs {os.path.getsize(src) / 1e9:.2f} GB")
 
-    # 3. Verificación crítica: el kill-switch y los trades tienen que estar.
-    v = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+    # 3. Verificación crítica: los conteos de las tablas SAGRADAS en la nueva DB DEBEN
+    #    coincidir EXACTO con la vieja. Si alguna perdió filas, la copia está mal → se ABORTA
+    #    y NO se imprimen los comandos de swap (fail-safe: jamás reemplazar con estado incompleto).
+    old_ro = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    new_ro = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+    mismatches: list[str] = []
+    print("\n=== VERIFICACIÓN de tablas sagradas (nueva vs vieja) ===")
     try:
-        n_trades = v.execute("SELECT count(*) FROM trades").fetchone()[0]
-        opstate = list(v.execute("SELECT key, value, reason FROM operational_state"))
+        for t in _SACRED:
+            if t not in table_names:
+                continue
+            old_n = old_ro.execute(f"SELECT count(*) FROM {t}").fetchone()[0]  # noqa: S608 (const)
+            new_n = new_ro.execute(f"SELECT count(*) FROM {t}").fetchone()[0]  # noqa: S608 (const)
+            ok = "OK" if old_n == new_n else "← MISMATCH"
+            print(f"  {t:22s} vieja={old_n}  nueva={new_n}  {ok}")
+            if old_n != new_n:
+                mismatches.append(f"{t}: vieja={old_n} nueva={new_n}")
+        opstate = list(new_ro.execute("SELECT key, value, reason FROM operational_state"))
     finally:
-        v.close()
-    print("\n=== VERIFICACIÓN (revisá esto ANTES de swapear) ===")
-    print(f"  trades copiados: {n_trades}")
+        old_ro.close()
+        new_ro.close()
     print(f"  operational_state (kill-switch): {opstate or '(vacío)'}")
 
+    if mismatches:
+        print(
+            "\nERROR: la copia PERDIÓ filas sagradas — NO swapear.\n  "
+            + "\n  ".join(mismatches)
+            + f"\nLa DB vieja {src} está intacta. Borrá {dst} y reintentá."
+        )
+        return 1
+
     print(
-        "\n=== SWAP MANUAL (solo si la verificación está OK) ===\n"
+        "\n=== SWAP MANUAL (verificación OK) ===\n"
         f"  mv {src} {src}.OLD\n"
         f"  mv {dst} {src}\n"
         "  # borrá los -wal/-shm viejos si quedaron:  rm -f "

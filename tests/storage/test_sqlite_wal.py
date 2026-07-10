@@ -40,6 +40,16 @@ def test_pragmas_applied_wal_and_busy_timeout(sqlite_engine):
     assert int(busy) == 5000
 
 
+def test_fresh_db_created_with_auto_vacuum_incremental(sqlite_engine):
+    """Incidente disco-lleno 2026-07-10: una DB NUEVA nace con auto_vacuum=INCREMENTAL (2) —
+    así el incremental_vacuum del loop de mantenimiento le recupera disco online, sin full
+    VACUUM nunca. (En DBs viejas auto_vacuum=NONE el pragma es no-op; ver rebuild_db.py)."""
+    models.SQLModel.metadata.create_all(sqlite_engine)
+    with sqlite_engine.connect() as conn:
+        auto_vacuum = conn.execute(text("PRAGMA auto_vacuum")).scalar()
+    assert int(auto_vacuum) == 2  # 2 = INCREMENTAL
+
+
 def test_two_concurrent_writers_no_database_locked(sqlite_engine):
     """Dos sesiones escribiendo (simula V1 + shadow) no lanzan 'database is locked'."""
     models.SQLModel.metadata.create_all(sqlite_engine)
