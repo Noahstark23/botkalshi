@@ -59,6 +59,7 @@ class Motor2ShadowPoller:
         max_book_age_min: float | None = None,
         burst_interval_sec: float = 0.0,
         burst_window_min: float = 45.0,
+        linemove=None,
     ):
         self._kalshi = kalshi_source
         self._odds = odds_source
@@ -99,6 +100,9 @@ class Motor2ShadowPoller:
         self._burst_window_min = burst_window_min
         self._next_kickoff: datetime | None = None  # próximo commence_time futuro visto
         self._in_burst = False  # para loguear solo las transiciones (anti-spam)
+        # Motor 6 (F1 shadow, opcional): pasajero del ciclo — observa (quotes, fair) y
+        # detecta line-moves. None = apagado. JAMÁS ejecuta (no existe executor en F1).
+        self._linemove = linemove
 
     def _capital_for_cycle(self) -> float:
         """Capital base del sizing ESTE ciclo: el efectivo del RiskManager (dinámico) si hay RM;
@@ -139,6 +143,14 @@ class Motor2ShadowPoller:
         if self._odds.is_live and fair_out:
             FairValueBook.publish(fair_out)
             logger.info(f"motor2.fair_book publicados={len(fair_out)}")
+        # Motor 6 (pasajero best-effort): line-moves sobre el MISMO (quotes, fair) del ciclo
+        # — cero requests extra. Su observe es internamente best-effort; el guard de acá es
+        # el cinturón redundante: M6 nunca puede romper el ciclo del host.
+        if self._linemove is not None:
+            try:
+                self._linemove.observe(kalshi_events, fair_out, is_live=self._odds.is_live)
+            except Exception:
+                logger.exception("motor6.shadow hook falló (el ciclo de M2 sigue)")
         logger.info(
             f"motor2.shadow ciclo: kalshi={len(kalshi_events)} odds={len(odds_events)} "
             f"señales={len(signals)} live={self._odds.is_live} executor={self._executor is not None}"
