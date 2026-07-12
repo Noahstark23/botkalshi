@@ -43,6 +43,30 @@ class Settings(BaseSettings):
     MAX_DAILY_LOSS_PCT: float = Field(3.0, gt=0, le=10)
     MAX_WEEKLY_LOSS_PCT: float = Field(8.0, gt=0, le=20)
     MAX_MONTHLY_LOSS_PCT: float = Field(15.0, gt=0, le=30)
+    # Pisos en USD de los stop-losses (problema de escala, 2026-07-12): con capital chico
+    # los % producen límites a nivel de RUIDO (3% de $180 = $5.40 → 2-3 trades chicos
+    # perdedores apagaban TODO el bot y exigían clear manual). El límite efectivo es
+    # max(capital × %, piso): con capital grande manda el % (igual que siempre); con
+    # capital chico el piso evita el falso positivo. Piso 0 = comportamiento histórico.
+    MAX_DAILY_LOSS_FLOOR_USD: float = Field(
+        default=20.0, ge=0, description="Piso en USD del stop-loss diario (0 = solo %)"
+    )
+    MAX_WEEKLY_LOSS_FLOOR_USD: float = Field(
+        default=40.0, ge=0, description="Piso en USD del stop-loss semanal (0 = solo %)"
+    )
+    MAX_MONTHLY_LOSS_FLOOR_USD: float = Field(
+        default=60.0, ge=0, description="Piso en USD del stop-loss mensual (0 = solo %)"
+    )
+    # Respuesta ESCALONADA (2026-07-12): el breach DIARIO pausa solo las ENTRADAS nuevas y
+    # se auto-recupera en el rollover del día UTC (la ventana se recomputa de DB en cada
+    # check) — sin kill-switch persistente ni clear_kill_switch.py. Un día malo es ruido;
+    # una racha semanal/mensual es problema estructural: esas ventanas SIGUEN disparando el
+    # kill-switch persistente (nuclear, manual). False = comportamiento histórico (diario
+    # también nuclear).
+    DAILY_STOP_ENTRIES_ONLY: bool = Field(
+        default=True,
+        description="Breach diario: pausa entradas hasta el día UTC siguiente (auto-recupera) en vez de kill-switch persistente.",
+    )
     MAX_SIMULTANEOUS_EXPOSURE_PCT: float = Field(25.0, gt=0, le=100)
     MAX_TRADE_SIZE_PCT: float = Field(5.0, gt=0, le=20)
     # Cap ABSOLUTO por orden (anti-slippage), en USD — independiente del % y del capital.

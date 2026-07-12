@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 from loguru import logger
 from sqlmodel import col, select
@@ -580,24 +580,87 @@ class RiskManager:
         weekly_pnl_usd = sum((t.pnl_cents or 0) for t in weekly_trades) / 100.0
         daily_pnl_usd = sum((t.pnl_cents or 0) for t in daily_trades) / 100.0
 
+        # Orden MÁS SEVERO PRIMERO (mensual → semanal → diario): con el breach diario en modo
+        # soft (no latchea), si un mismo día rompe también la ventana semanal/mensual, el
+        # kill-switch persistente DEBE latchear — si el diario se evaluara primero, lo taparía.
         limits = [
-            ("Diario", daily_pnl_usd, self.settings.MAX_DAILY_LOSS_PCT),
-            ("Semanal", weekly_pnl_usd, self.settings.MAX_WEEKLY_LOSS_PCT),
-            ("Mensual", monthly_pnl_usd, self.settings.MAX_MONTHLY_LOSS_PCT),
+            (
+                "Mensual",
+                monthly_pnl_usd,
+                self.settings.MAX_MONTHLY_LOSS_PCT,
+                self.settings.MAX_MONTHLY_LOSS_FLOOR_USD,
+            ),
+            (
+                "Semanal",
+                weekly_pnl_usd,
+                self.settings.MAX_WEEKLY_LOSS_PCT,
+                self.settings.MAX_WEEKLY_LOSS_FLOOR_USD,
+            ),
+            (
+                "Diario",
+                daily_pnl_usd,
+                self.settings.MAX_DAILY_LOSS_PCT,
+                self.settings.MAX_DAILY_LOSS_FLOOR_USD,
+            ),
         ]
 
         # C-01: stop-losses sobre el capital base REAL (balance de Kalshi), no el estático.
+        # Límite efectivo = max(capital × %, piso USD): con capital chico los % puros daban
+        # límites a nivel de ruido ($5.40/día con $180) que apagaban todo el bot (2026-07-12).
         capital_usd = self._get_effective_capital_usd()
-        for period_name, pnl_usd, max_pct in limits:
-            max_loss_usd = capital_usd * (max_pct / 100.0)
+        for period_name, pnl_usd, max_pct, floor_usd in limits:
+            max_loss_usd = max(capital_usd * (max_pct / 100.0), floor_usd)
             if pnl_usd < 0 and abs(pnl_usd) >= max_loss_usd:
+                if period_name == "Diario" and self.settings.DAILY_STOP_ENTRIES_ONLY:
+                    # Respuesta escalonada (2026-07-12): un día malo pausa SOLO las entradas
+                    # nuevas y se auto-recupera en el rollover UTC (la ventana se recomputa
+                    # de DB en cada check). NO latchea el kill-switch persistente ni
+                    # BotState.is_paused — semanal/mensual (arriba) siguen siendo nucleares.
+                    await self._notify_daily_stop(pnl_usd, max_loss_usd, max_pct)
+                    return period_name
                 await self._trigger_kill_switch(
                     f"Stop-Loss {period_name} superado: PnL=${pnl_usd:.2f}, "
-                    f"límite=${-max_loss_usd:.2f} ({max_pct}%)"
+                    f"límite=${-max_loss_usd:.2f} ({max_pct}% o piso ${floor_usd:.2f})"
                 )
                 return period_name
 
         return None
+
+    # Anti-spam del aviso del stop diario soft: fecha UTC del último aviso (estado de CLASE,
+    # mismo patrón que la caché de balance). El check corre en cada pre-trade y el breach
+    # persiste todo el día → sin esto, una alerta por intento de entrada.
+    _daily_stop_alert_date: date | None = None
+
+    async def _notify_daily_stop(self, pnl_usd: float, max_loss_usd: float, max_pct: float) -> None:
+        """Aviso del stop diario SOFT — one-shot por día UTC. Best-effort SIEMPRE: un fallo
+        de alerta/DB no debe romper el check de riesgo (la entrada ya fue rechazada)."""
+        today = datetime.now(UTC).date()
+        if RiskManager._daily_stop_alert_date == today:
+            return
+        RiskManager._daily_stop_alert_date = today
+        msg = (
+            f"Stop-Loss Diario: PnL=${pnl_usd:.2f}, límite=${-max_loss_usd:.2f} ({max_pct}% "
+            f"o piso). Entradas NUEVAS en pausa hasta el próximo día UTC (auto-recupera; "
+            f"salidas/gestión siguen operando). Sin kill-switch."
+        )
+        logger.warning(f"risk.daily_stop: {msg}")
+        try:
+            with get_session() as s:
+                s.add(
+                    RiskEvent(
+                        event_type="daily_stop",
+                        severity="warning",
+                        message=msg[:1000],
+                        capital_at_event=self._get_effective_capital_usd(),
+                    )
+                )
+                s.commit()
+        except Exception:
+            logger.exception("risk.daily_stop.risk_event_persist_failed")
+        try:
+            await alert_risk_event("daily_stop", msg)
+        except Exception:
+            logger.exception("risk.daily_stop.alert_failed")
 
     async def _trigger_kill_switch(self, reason: str) -> None:
         """Pausa el bot y notifica. Idempotente (no spamea si ya pausado)."""
