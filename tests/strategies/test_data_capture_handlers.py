@@ -526,3 +526,91 @@ async def test_delta_real_2026_no_warning_emitted(mock_session, service):
 
     # Si hubiera WARNING se registraria en BotState.last_error
     assert BotState.last_error is None
+
+
+# =====================================================
+# Backpressure del DiskGuard (lazo cerrado, incidente 2026-07-10)
+# =====================================================
+
+
+@pytest.fixture
+def disk_critical():
+    """Simula disco en CRITICAL (estado de CLASE del DiskGuard) y lo restaura al salir."""
+    from src.storage.disk_guard import CRITICAL, DiskGuard
+
+    DiskGuard._state = CRITICAL
+    yield
+    DiskGuard.reset()
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_disk_critical_sheds_orderbook_events_even_with_flag_on(
+    mock_session, service, disk_critical
+):
+    """Con disco CRITICAL, ni siquiera PERSIST_ORDERBOOK_EVENTS=true escribe: la telemetría
+    se descarta (backpressure) para no comerse el disco que el trading necesita."""
+    service.settings.PERSIST_ORDERBOOK_EVENTS = True
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_delta",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "side": "yes",
+            "price": "0.2700",
+            "delta": "-100.00",
+        },
+    }
+    await service._on_orderbook_delta(msg)
+
+    assert not mock_db.add.called  # CERO inserts en critical
+    assert BotState.last_error is None  # descartar telemetría NO es un error
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_disk_critical_sheds_market_snapshots(mock_session, service, disk_critical):
+    """Con disco CRITICAL, el snapshot WS tampoco persiste MarketSnapshot (diagnóstico)."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "yes_dollars_fp": [["0.2700", "100.00"]],
+            "no_dollars_fp": [["0.7000", "75.00"]],
+        },
+    }
+    await service._on_orderbook_snapshot(msg)
+
+    assert not mock_db.add.called
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_disk_ok_snapshot_still_persists(mock_session, service):
+    """CONTROL: con disco OK (default), el snapshot persiste normal — el guard no rompe
+    el path feliz."""
+    from src.storage.disk_guard import DiskGuard
+
+    DiskGuard.reset()
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    msg = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": "KXMLB-26-LAD",
+            "yes_dollars_fp": [["0.2700", "100.00"]],
+            "no_dollars_fp": [["0.7000", "75.00"]],
+        },
+    }
+    await service._on_orderbook_snapshot(msg)
+
+    assert mock_db.add.called
