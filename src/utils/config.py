@@ -472,6 +472,16 @@ class Settings(BaseSettings):
         le=5.0,
         description="Stake flat por trade de Motor 2 (% del capital). 0 = ¼ Kelly (previo).",
     )
+    # Precisión de la fee en el edge (auditoría 2026-07-12): _net_edge_pct medía la fee con
+    # count=1; el ceil por ORDEN de Kalshi la sobreestima hasta +0.78pp en asks bajos vs lo
+    # que la orden real (stake flat, 2-9 contratos) paga por contrato → el funnel mostraba
+    # edges más pesimistas que la economía real. On = fee medida al count real del stake.
+    # Shadow-first: default OFF (comportamiento histórico exacto); prender y comparar el
+    # best_net_edge_pp del funnel antes/después ANTES de tocar el umbral MIN_EDGE.
+    MOTOR_2_FEE_AT_STAKE_COUNT: bool = Field(
+        default=False,
+        description="Medir la fee del edge al count real del stake flat (más preciso) en vez de count=1 (pesimista).",
+    )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto

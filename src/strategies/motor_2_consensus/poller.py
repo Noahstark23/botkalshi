@@ -56,6 +56,7 @@ class Motor2ShadowPoller:
         executor: Motor2Executor | None = None,
         min_books: int = 1,
         max_book_age_min: float | None = None,
+        fee_at_stake_count: bool = False,
     ):
         self._kalshi = kalshi_source
         self._odds = odds_source
@@ -86,6 +87,9 @@ class Motor2ShadowPoller:
         # El runner los pasa desde MOTOR_2_MIN_BOOKS / MOTOR_2_MAX_BOOK_AGE_MIN.
         self._min_books = min_books
         self._max_book_age_min = max_book_age_min
+        # Fee del edge al count real del stake (MOTOR_2_FEE_AT_STAKE_COUNT; default off =
+        # comportamiento histórico). Ver _net_edge_pct en detector.py.
+        self._fee_at_stake_count = fee_at_stake_count
 
     def _capital_for_cycle(self) -> float:
         """Capital base del sizing ESTE ciclo: el efectivo del RiskManager (dinámico) si hay RM;
@@ -119,6 +123,7 @@ class Motor2ShadowPoller:
             max_edge=self._max_edge,
             min_books=self._min_books,
             max_book_age_min=self._max_book_age_min,
+            fee_at_stake_count=self._fee_at_stake_count,
         )
         # Canal Motor 5 (F1 shadow): publica el fair de todo outcome matcheado SOLO con
         # odds reales — un fair del fixture fake no es precio de referencia para cotizar.
