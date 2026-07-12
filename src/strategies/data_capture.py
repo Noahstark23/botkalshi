@@ -166,7 +166,7 @@ class DataCaptureService:
         """
         from src.strategies.motor_rest_arb.engine import RestArbEngine
 
-        return self._event_universe_for(RestArbEngine.MULTI_SERIES)
+        return self._event_universe_for(RestArbEngine.multi_series_from_settings())
 
     def motor2_event_universe(self, series: frozenset[str]) -> dict[str, set[str]]:
         """

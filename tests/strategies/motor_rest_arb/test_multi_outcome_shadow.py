@@ -29,6 +29,10 @@ def _engine(*, executor=None, risk_manager=None) -> RestArbEngine:
     settings.MOTOR_REST_MIN_DEPTH = 2
     settings.MOTOR_REST_EXECUTION_EDGE_PCT = 1.5
     settings.MOTOR_REST_MAX_EDGE_PCT = 10_000.0  # techo alto: no interfiere en estos tests
+    # Universo multi ahora viene de config (defaults de producción).
+    settings.MOTOR_REST_MULTI_SERIES = "KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP"
+    settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC = 30.0
+    settings.MOTOR_REST_MULTI_MIN_LEGS = 3
     settings.TRADING_ENABLED = False
     with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
         eng = RestArbEngine(executor=executor, risk_manager=risk_manager)
@@ -242,3 +246,43 @@ async def test_heartbeat_reports_multi_and_near_miss():
     assert len(hb) == 1
     assert "multi: 1 señales" in hb[0]
     assert "near-miss" in hb[0] and EV in hb[0]
+
+
+# =====================================================
+# Universo multi tunable por env (auditoría 2026-07-12)
+# =====================================================
+
+
+def test_multi_series_tunable_via_config():
+    """MECANISMO: MOTOR_REST_MULTI_SERIES en config amplía el universo sin tocar código
+    (auditoría 2026-07-12: hardcodeado a 4 series del Mundial → 0 evaluaciones fuera de
+    las ventanas de partido)."""
+    settings = MagicMock()
+    settings.MOTOR_REST_MIN_EDGE_CENTS = 1
+    settings.MOTOR_REST_MIN_DEPTH = 2
+    settings.MOTOR_REST_EXECUTION_EDGE_PCT = 1.5
+    settings.MOTOR_REST_MAX_EDGE_PCT = 10.0
+    settings.MOTOR_REST_MULTI_SERIES = "KXWCGAME, KXNBASERIES"  # con espacio: se trimea
+    settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC = 30.0
+    settings.MOTOR_REST_MULTI_MIN_LEGS = 3
+    settings.TRADING_ENABLED = False
+    with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
+        eng = RestArbEngine()
+    assert frozenset({"KXWCGAME", "KXNBASERIES"}) == eng.MULTI_SERIES
+    # La serie nueva entra al universo; una no listada queda fuera (match EXACTO).
+    eng.update_universe({f"{EV}-ARG", "KXNBASERIES-26-A", "KXNBASERIESX-26-B"})
+    assert "KXNBASERIES-26" in eng._event_universe
+    assert not any(k.startswith("KXNBASERIESX") for k in eng._event_universe)
+
+
+def test_multi_series_default_unchanged():
+    """CONTROL: el default de config reproduce EXACTO el hardcode previo (sin env nuevo,
+    cero cambio de comportamiento en producción)."""
+    from src.utils.config import Settings
+
+    default = Settings.model_fields["MOTOR_REST_MULTI_SERIES"].default
+    assert frozenset(s.strip() for s in default.split(",")) == frozenset(
+        {"KXWCGAME", "KXWCGROUPWIN", "KXMENWORLDCUP", "KXMWORLDCUP"}
+    )
+    assert Settings.model_fields["MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC"].default == 30.0
+    assert Settings.model_fields["MOTOR_REST_MULTI_MIN_LEGS"].default == 3

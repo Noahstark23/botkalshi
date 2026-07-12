@@ -362,6 +362,26 @@ class Settings(BaseSettings):
     MOTOR_REST_MAX_EDGE_PCT: float = Field(
         default=10.0, gt=0.0, description="Techo de edge para EJECUTAR (anti-fantasma, %)"
     )
+    # Universo del path multi-outcome — antes hardcodeado en el engine (auditoría 2026-07-12:
+    # solo 4 series del Mundial → fuera de las ventanas de partido, universo vacío = 0
+    # evaluaciones). Tuneable en vivo > hardcodeado. ⚠️ SOLO series winner-take-all
+    # (mutuamente excluyentes y exhaustivas: exactamente UN outcome gana). NO meter series
+    # de props/totals (KXWCTEAMGOALS, KXWCGAMEGOALS…): sus markets NO son excluyentes →
+    # comprar YES en todos NO es arb → señal falsa que EJECUTA plata real.
+    MOTOR_REST_MULTI_SERIES: str = Field(
+        default="KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP",
+        description="Series winner-take-all del path multi-outcome (separadas por coma, match por serie EXACTA).",
+    )
+    MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC: float = Field(
+        default=30.0,
+        gt=0,
+        description="Edad máxima de quote por pata: una pata stale → grupo NO se evalúa (anti-fantasma).",
+    )
+    MOTOR_REST_MULTI_MIN_LEGS: int = Field(
+        default=3,
+        ge=3,
+        description="Mínimo de outcomes para evaluar un evento multi (WTA real exige ≥3; no bajar).",
+    )
 
     # === Optional ===
     SENTRY_DSN: str = ""
