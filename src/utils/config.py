@@ -512,6 +512,31 @@ class Settings(BaseSettings):
         description="Ventana pre-kickoff (min) en la que aplica el burst del poller M2.",
     )
 
+    # === Motor 6 (line-move follower) — F1 SHADOW ===
+    # Tesis (funnel 2026-07-12): los edges reales son transitorios — nacen cuando las casas
+    # MUEVEN la línea y Kalshi tarda en seguirla. M6 detecta el DELTA del fair entre ciclos
+    # de M2 (pasajero del mismo loop: cero API extra) y registra la señal. F1 = shadow puro:
+    # no existe executor; loguea [MOTOR 6 SHADOW] + graba EdgeWindow kind="linemove".
+    MOTOR_6_LINEMOVE_ENABLED: bool = Field(
+        default=False,
+        description="Corre el shadow del Motor 6 (line-moves) dentro del ciclo de M2. Solo observa.",
+    )
+    MOTOR_6_MOVE_MIN_PP: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Movimiento mínimo del fair entre ciclos (pp) para considerar line-move.",
+    )
+    MOTOR_6_EDGE_MIN_PP: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Edge neto post-fee mínimo (pp) vs el ask actual (filtra moves ya digeridos).",
+    )
+    MOTOR_6_MAX_EDGE_PP: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="Techo anti-fantasma (pp): un neto enorme = quote stale, no un regalo.",
+    )
+
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
     # (eficiente / matching_bug / edge_candidato), lo persiste (memoria día-a-día) y manda
