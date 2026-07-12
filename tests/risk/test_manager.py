@@ -72,6 +72,12 @@ def mock_settings():
         s.CAPITAL_FLOOR_USD = 1.0
         s.CAPITAL_CAP_USD = 100_000.0
         s.CAPITAL_SMOOTHING_PCT = 0.0
+        # Stop-loss a escala chica NEUTRALIZADO por default (los tests dedicados overridean):
+        # pisos 0 (solo %) y diario nuclear (comportamiento histórico de estos tests).
+        s.MAX_DAILY_LOSS_FLOOR_USD = 0.0
+        s.MAX_WEEKLY_LOSS_FLOOR_USD = 0.0
+        s.MAX_MONTHLY_LOSS_FLOOR_USD = 0.0
+        s.DAILY_STOP_ENTRIES_ONLY = False
         m.return_value = s
         yield s
 
@@ -215,6 +221,10 @@ async def test_absolute_usd_cap_binds_when_pct_would_exceed(mock_session):
         s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # remaining $1250
         s.MAX_TRADE_SIZE_PCT = 5.0
         s.MAX_TRADE_SIZE_USD = 200.0
+        s.MAX_DAILY_LOSS_FLOOR_USD = 0.0
+        s.MAX_WEEKLY_LOSS_FLOOR_USD = 0.0
+        s.MAX_MONTHLY_LOSS_FLOOR_USD = 0.0
+        s.DAILY_STOP_ENTRIES_ONLY = False
         m.return_value = s
         rm = RiskManager()
         leg1 = ArbLeg(
