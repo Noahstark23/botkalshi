@@ -551,6 +551,64 @@ class ProductionRunner:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
 
+    async def _run_disk_guard(self) -> None:
+        """
+        DiskGuard — lazo CERRADO de presión de disco (incidente 2026-07-10: el WAL a ~8MB/s
+        llenó el 96% del disco sin que nadie adentro del bot lo viera; el deploy del fix
+        falló por `no space left on device`).
+
+        Cada tick mide el disco libre del mount de la DB. En TRANSICIÓN de estado:
+          - → warn:     alerta Telegram + poda inmediata (no esperar el ciclo de 6h).
+          - → critical: alerta URGENTE + poda; además DiskGuard.diagnostics_allowed()
+                        pasa a False y los escritores de telemetría descartan (backpressure).
+          - → ok:       alerta de recuperación.
+        El estado de trading JAMÁS se gatea. Best-effort por tick (Lección 7): si un tick
+        falla, se registra y el loop SIGUE; las alertas son best-effort SIEMPRE.
+        """
+        if not self.settings.DISK_GUARD_ENABLED:
+            return
+        from src.monitoring.telegram_alerts import send_alert
+        from src.storage.disk_guard import DiskGuard
+        from src.storage.maintenance import run_maintenance_once
+
+        interval = self.settings.DISK_GUARD_INTERVAL_MINUTES * 60
+        await asyncio.sleep(45)  # dejar que init_db / boot terminen
+        prev = DiskGuard.snapshot()["state"]
+        while not self._stop_event.is_set():
+            try:
+                state = DiskGuard.evaluate()
+                if state != prev:
+                    snap = DiskGuard.snapshot()
+                    logger.warning(f"disk_guard: transición {prev} → {state} ({snap})")
+                    if state == "critical":
+                        with contextlib.suppress(Exception):  # alertas best-effort SIEMPRE
+                            await send_alert(
+                                f"🔴 DISCO CRITICAL: {snap['free_gb']} GB libres — "
+                                "telemetría DESCARTADA (trading sigue). Liberá disco YA.",
+                                urgent=True,
+                            )
+                        run_maintenance_once()  # checkpoint trunca el WAL = libera ya
+                    elif state == "warn":
+                        with contextlib.suppress(Exception):
+                            await send_alert(
+                                f"🟠 Disco WARN: {snap['free_gb']} GB libres — "
+                                "poda inmediata disparada. Revisá antes de que sea critical."
+                            )
+                        run_maintenance_once()
+                    else:  # recuperado
+                        with contextlib.suppress(Exception):
+                            await send_alert(
+                                f"🟢 Disco recuperado: {snap['free_gb']} GB libres — "
+                                "telemetría reactivada."
+                            )
+                    prev = state
+            except Exception as e:
+                msg = f"disk_guard runner: {type(e).__name__}: {e}"
+                logger.exception(msg)
+                BotState.record_error(msg)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+
     async def _reconcile_on_boot(self) -> None:
         """
         Reconcilia trades huérfanos post-crash.
@@ -651,6 +709,7 @@ class ProductionRunner:
                 asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
                 asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
                 asyncio.create_task(self._run_db_maintenance(), name="db_maintenance"),
+                asyncio.create_task(self._run_disk_guard(), name="disk_guard"),
             ]
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))

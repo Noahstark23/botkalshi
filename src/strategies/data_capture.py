@@ -26,6 +26,7 @@ from loguru import logger
 from src.clients.kalshi_rest import KalshiRestClient
 from src.clients.kalshi_ws import KalshiWebSocket
 from src.monitoring.health import BotState
+from src.storage.disk_guard import DiskGuard
 from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
@@ -247,7 +248,8 @@ class DataCaptureService:
             # una fila por cada delta del WS (~240 tickers, 24/7) = millones/día, y NADIE la lee
             # (telemetry write-only). Los books viven en memoria (OrderbookManagerV2). Solo se graba
             # si PERSIST_ORDERBOOK_EVENTS=true (debug puntual, con retención via _run_db_maintenance).
-            if self.settings.PERSIST_ORDERBOOK_EVENTS:
+            # DiskGuard: en disco CRITICAL la telemetría se descarta (backpressure) — trading no.
+            if self.settings.PERSIST_ORDERBOOK_EVENTS and DiskGuard.diagnostics_allowed():
                 with get_session() as s:
                     event = OrderbookEvent(
                         ticker=ticker,
@@ -301,6 +303,10 @@ class DataCaptureService:
             # En Kalshi modelo reciproco: ask de yes = 100 - bid de no
             yes_ask_cents = (100 - no_bid_cents) if no_bid_cents is not None else None
             no_ask_cents = (100 - yes_bid_cents) if yes_bid_cents is not None else None
+
+            # DiskGuard: market_snapshots es DIAGNÓSTICO — en disco critical se descarta.
+            if not DiskGuard.diagnostics_allowed():
+                return
 
             with get_session() as s:
                 snap = MarketSnapshot(
@@ -462,6 +468,10 @@ class DataCaptureService:
     async def _take_snapshots(self) -> None:
         """Una pasada de snapshots."""
         if not self._tracked_tickers:
+            return
+        # DiskGuard: market_snapshots es DIAGNÓSTICO — en disco critical se saltea la pasada
+        # entera (ni siquiera pega a la API: el snapshot solo existe para persistirse).
+        if not DiskGuard.diagnostics_allowed():
             return
 
         async with KalshiRestClient() as client:

@@ -501,6 +501,27 @@ class Settings(BaseSettings):
     DB_MAINTENANCE_INTERVAL_HOURS: float = Field(
         default=6.0, gt=0, description="Cada cuánto corre el mantenimiento de DB (horas)."
     )
+    # DiskGuard: lazo CERRADO de presión de disco. La retención de arriba es lazo abierto —
+    # nadie miraba el disco real y el WAL a ~8MB/s llenó el 96% sin que el bot se enterara
+    # (incidente 2026-07-10). WARN → alerta Telegram + poda inmediata; CRITICAL → además se
+    # descarta telemetría (orderbook_events/market_snapshots). Trading state JAMÁS se gatea.
+    DISK_GUARD_ENABLED: bool = Field(
+        default=True,
+        description="Monitorea disco libre del mount de la DB y hace backpressure de telemetría.",
+    )
+    DISK_GUARD_INTERVAL_MINUTES: float = Field(
+        default=5.0, gt=0, description="Cada cuánto mide el disco el DiskGuard (minutos)."
+    )
+    DISK_GUARD_WARN_FREE_GB: float = Field(
+        default=5.0,
+        gt=0,
+        description="Umbral WARN: menos de estos GB libres → alerta + poda inmediata.",
+    )
+    DISK_GUARD_CRITICAL_FREE_GB: float = Field(
+        default=2.0,
+        gt=0,
+        description="Umbral CRITICAL: menos de estos GB libres → además descarta telemetría.",
+    )
 
     # ---- Validators ----
 
