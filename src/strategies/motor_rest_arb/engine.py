@@ -77,25 +77,21 @@ class RestArbEngine:
     HEARTBEAT_EVERY = 200
 
     # ── P3: multi-outcome SHADOW (1X2/winner del Mundial) ──────────────────────
-    # SOLO series con estructura "exactamente UN outcome gana" (mutuamente excluyentes
-    # y exhaustivos). NO meter acá series de props/totals (KXWCTEAMGOALS,
-    # KXWCGAMEGOALS etc.): sus markets NO son excluyentes → comprar YES en todos NO
-    # es arb → señal falsa. El matching es por SERIE EXACTA (primer segmento del
-    # ticker), no por prefijo de string: "KXWCGAME" NO debe matchear "KXWCGAMEGOALS".
-    MULTI_SERIES = frozenset(
-        {
-            "KXWCGAME",  # partidos 1X2 — verificado 2026-06-13: 3 markets/evento
-            # (ej. KXWCGAME-26JUN27JORARG-{JOR,ARG,TIE})
-            "KXWCGROUPWIN",  # ganador de grupo (N excluyentes)
-            "KXMENWORLDCUP",  # ganador del torneo
-            "KXMWORLDCUP",
-        }
-    )
-    # Frescura: todas las patas del evento deben tener quote con esta edad máxima.
-    # Una pata stale (precio viejo) genera arb fantasma → grupo incompleto = no evaluar.
-    MULTI_MAX_QUOTE_AGE_SEC = 30.0
-    # Mínimo de outcomes para evaluar (1X2 = 3; winner de grupo/torneo ≥ 3).
-    MULTI_MIN_LEGS = 3
+    # El universo, la frescura y el mínimo de patas vienen de config (auditoría 2026-07-12:
+    # hardcodeados acá, el universo era solo 4 series del Mundial → fuera de las ventanas de
+    # partido, 0 evaluaciones; tuneable en vivo > hardcodeado). Se materializan como
+    # atributos de instancia en __init__. ⚠️ La regla NO cambió: SOLO series con estructura
+    # "exactamente UN outcome gana" (mutuamente excluyentes y exhaustivos). NO meter series
+    # de props/totals (KXWCTEAMGOALS, KXWCGAMEGOALS…): sus markets NO son excluyentes →
+    # comprar YES en todos NO es arb → señal falsa. El matching es por SERIE EXACTA (primer
+    # segmento del ticker), no por prefijo: "KXWCGAME" NO debe matchear "KXWCGAMEGOALS".
+
+    @staticmethod
+    def multi_series_from_settings() -> frozenset[str]:
+        """Única fuente de verdad del universo multi (config → set). La usan el engine
+        (__init__) y data_capture (multi_event_universe) — no duplicar el parseo."""
+        raw = get_settings().MOTOR_REST_MULTI_SERIES
+        return frozenset(s.strip() for s in raw.split(",") if s.strip())
 
     def __init__(
         self,
@@ -103,6 +99,10 @@ class RestArbEngine:
         risk_manager: RiskManager | None = None,
     ) -> None:
         self.settings = get_settings()
+        # Universo multi-outcome desde config (defaults idénticos al hardcode previo).
+        self.MULTI_SERIES = self.multi_series_from_settings()
+        self.MULTI_MAX_QUOTE_AGE_SEC = self.settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC
+        self.MULTI_MIN_LEGS = self.settings.MOTOR_REST_MULTI_MIN_LEGS
         self._signals_seen = 0  # cruces de arbitraje detectados (EdgeWindows grabadas)
         self._tickers_evaluated = 0  # tickers procesados (para el heartbeat)
         # Diagnóstico de profundidad (instrumentación, NO afecta la lógica del trigger):
