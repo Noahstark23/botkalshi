@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -56,6 +57,8 @@ class Motor2ShadowPoller:
         executor: Motor2Executor | None = None,
         min_books: int = 1,
         max_book_age_min: float | None = None,
+        burst_interval_sec: float = 0.0,
+        burst_window_min: float = 45.0,
     ):
         self._kalshi = kalshi_source
         self._odds = odds_source
@@ -86,6 +89,16 @@ class Motor2ShadowPoller:
         # El runner los pasa desde MOTOR_2_MIN_BOOKS / MOTOR_2_MAX_BOOK_AGE_MIN.
         self._min_books = min_books
         self._max_book_age_min = max_book_age_min
+        # Burst polling pre-kickoff (auditoría 2026-07-12): los edges reales del funnel son
+        # TRANSITORIOS (5.63pp el 07-05, 3.20pp el 07-07 — un ciclo y desaparecen) y se
+        # concentran cerca del inicio del partido (line moves por lineups/noticias que
+        # Kalshi tarda en seguir). Con el intervalo base (300s) se ven de casualidad.
+        # burst_interval_sec > 0 → cuando hay un kickoff dentro de burst_window_min, el
+        # loop acelera a este intervalo. 0 = off (comportamiento histórico).
+        self._burst_interval_sec = burst_interval_sec
+        self._burst_window_min = burst_window_min
+        self._next_kickoff: datetime | None = None  # próximo commence_time futuro visto
+        self._in_burst = False  # para loguear solo las transiciones (anti-spam)
 
     def _capital_for_cycle(self) -> float:
         """Capital base del sizing ESTE ciclo: el efectivo del RiskManager (dinámico) si hay RM;
@@ -104,6 +117,7 @@ class Motor2ShadowPoller:
         if not odds_events:
             logger.info("motor2.shadow sin eventos de odds este ciclo")
             return []
+        self._note_next_kickoff(odds_events)
 
         diag: dict[str, float] = {}
         fair_out: dict[str, float] = {}
@@ -258,11 +272,50 @@ class Motor2ShadowPoller:
         except Exception:
             logger.exception("motor2.shadow persist_error")
 
+    def _note_next_kickoff(self, odds_events: list) -> None:
+        """Registra el próximo commence_time FUTURO del feed (para el burst pre-kickoff).
+        Best-effort: cualquier rareza del feed deja None → ritmo base (nunca rompe el loop)."""
+        try:
+            now = datetime.now(UTC)
+            upcoming = [
+                oe.commence_time
+                for oe in odds_events
+                if getattr(oe, "commence_time", None) and oe.commence_time > now
+            ]
+            self._next_kickoff = min(upcoming) if upcoming else None
+        except Exception:
+            logger.exception("motor2.burst next_kickoff falló (se sigue a ritmo base)")
+            self._next_kickoff = None
+
+    def _cycle_timeout(self) -> float:
+        """Intervalo del PRÓXIMO ciclo: burst si hay kickoff dentro de la ventana, base si no.
+        El burst caza los edges transitorios pre-kickoff que el ritmo de 300s ve de casualidad."""
+        if self._burst_interval_sec <= 0 or self._next_kickoff is None:
+            burst = False
+        else:
+            mins_to_kick = (self._next_kickoff - datetime.now(UTC)).total_seconds() / 60.0
+            burst = 0.0 <= mins_to_kick <= self._burst_window_min
+        if burst != self._in_burst:  # loguear SOLO transiciones (anti-spam)
+            self._in_burst = burst
+            if burst:
+                logger.info(
+                    f"motor2.burst ON: kickoff {self._next_kickoff} en <"
+                    f"{self._burst_window_min:.0f}min → interval={self._burst_interval_sec:.0f}s"
+                )
+            else:
+                logger.info(f"motor2.burst OFF → interval base {self._interval:.0f}s")
+        return self._burst_interval_sec if burst else self._interval
+
     async def run(self, stop_event: asyncio.Event) -> None:
         """Loop supervisado hasta stop_event. Cada ciclo es best-effort."""
         cap_src = "effective(RM)" if self._risk is not None else "static"
+        burst_desc = (
+            f", burst={self._burst_interval_sec:.0f}s@T-{self._burst_window_min:.0f}min"
+            if self._burst_interval_sec > 0
+            else ""
+        )
         logger.info(
-            f"motor2.shadow arrancado (interval={self._interval}s, "
+            f"motor2.shadow arrancado (interval={self._interval}s{burst_desc}, "
             f"odds={'LIVE' if self._odds.is_live else 'FAKE'}, "
             f"capital=${self._capital_for_cycle():.2f} [{cap_src}])"
         )
@@ -271,8 +324,8 @@ class Motor2ShadowPoller:
                 await self.poll_once()
             except Exception as e:
                 logger.exception(f"motor2.shadow ciclo falló: {type(e).__name__}: {e}")
-            # Espera interrumpible: el timeout es el ritmo normal del loop; un set() del
-            # stop_event lo corta de inmediato (shutdown sin esperar el intervalo entero).
+            # Espera interrumpible: el timeout es el ritmo del loop (base o burst); un set()
+            # del stop_event lo corta de inmediato (shutdown sin esperar el intervalo entero).
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop_event.wait(), timeout=self._interval)
+                await asyncio.wait_for(stop_event.wait(), timeout=self._cycle_timeout())
         logger.info("motor2.shadow detenido (stop_event)")

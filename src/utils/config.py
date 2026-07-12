@@ -496,6 +496,21 @@ class Settings(BaseSettings):
         le=5.0,
         description="Stake flat por trade de Motor 2 (% del capital). 0 = ¼ Kelly (previo).",
     )
+    # Burst polling pre-kickoff (auditoría 2026-07-12): los edges reales del funnel son
+    # transitorios y se concentran cerca del inicio del partido; con el ritmo base (300s)
+    # se ven de casualidad. Con burst > 0, el poller acelera a ese intervalo cuando hay un
+    # kickoff dentro de la ventana. Costo: más requests a The Odds API SOLO en esas
+    # ventanas (tarifa plana hoy). 0 = off (comportamiento histórico).
+    MOTOR_2_BURST_INTERVAL_SEC: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Intervalo acelerado del poller M2 cuando hay kickoff próximo (s). 0 = off.",
+    )
+    MOTOR_2_BURST_WINDOW_MIN: float = Field(
+        default=45.0,
+        gt=0.0,
+        description="Ventana pre-kickoff (min) en la que aplica el burst del poller M2.",
+    )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
