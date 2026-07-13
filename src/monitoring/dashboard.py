@@ -159,8 +159,12 @@ def build_dashboard_text(now: datetime | None = None) -> str:
 
 
 class TelegramCommandLoop:
-    """Long-polling de Telegram (getUpdates) para comandos on-demand. Solo /dashboard hoy, y
-    SOLO desde el TELEGRAM_CHAT_ID autorizado. Best-effort: un fallo se loguea y el loop sigue."""
+    """Long-polling de Telegram (getUpdates) para comandos on-demand, SOLO desde el
+    TELEGRAM_CHAT_ID autorizado. Best-effort: un fallo se loguea y el loop sigue.
+
+    Centro de comando C1 (2026-07-12): además del /dashboard, despacha los comandos
+    READ-ONLY de monitoring.command_center (incidentes/salud/funnel/pnl/posiciones/disco).
+    Nivel 0 por diseño: acá NO se muta nada — pausar/reanudar es C2/C3 (tiers + token)."""
 
     POLL_TIMEOUT_SEC = 25  # long-poll: Telegram retiene la conexión hasta este tiempo
     COMMANDS = ("/dashboard", "/dash", "/status")
@@ -191,13 +195,15 @@ class TelegramCommandLoop:
                     await asyncio.wait_for(stop_event.wait(), timeout=5.0)
 
     async def _poll_once(self) -> None:
+        from src.monitoring.command_center import COMMAND_BUILDERS
+
         for update in await self._get_updates():
             self._offset = update.get("update_id", 0) + 1  # ack: no re-traer este update
             msg = update.get("message") or update.get("channel_post") or {}
             chat_id = str((msg.get("chat") or {}).get("id", ""))
             text = (msg.get("text") or "").strip()
             cmd = text.split(maxsplit=1)[0].split("@")[0] if text else ""
-            if cmd not in self.COMMANDS:
+            if cmd not in self.COMMANDS and cmd not in COMMAND_BUILDERS:
                 continue
             if chat_id != str(self.settings.TELEGRAM_CHAT_ID):
                 logger.warning(
@@ -205,7 +211,20 @@ class TelegramCommandLoop:
                 )
                 continue
             logger.info(f"telegram.dashboard: {cmd} solicitado por chat autorizado")
-            await self._send_dashboard()
+            if cmd in self.COMMANDS:
+                await self._send_dashboard()
+            else:
+                await self._send_command(cmd, COMMAND_BUILDERS[cmd])
+
+    async def _send_command(self, cmd: str, builder) -> None:
+        """Ejecuta un builder del centro de comando. Best-effort: un builder roto responde
+        el error en el chat (el operador VE que falló) y el loop sigue."""
+        try:
+            text = builder()
+        except Exception as exc:
+            logger.exception(f"telegram.command_center.{cmd}_failed")
+            text = f"⚠️ Error en {cmd}: {type(exc).__name__}"
+        await send_alert(text)
 
     async def _maybe_auto_send(self) -> None:
         interval = self.settings.TELEGRAM_DASHBOARD_INTERVAL_SEC
