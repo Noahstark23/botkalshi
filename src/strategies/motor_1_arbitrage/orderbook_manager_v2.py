@@ -247,7 +247,28 @@ class OrderbookManagerV2:
             # Devuelve False si encoló el delta (ticker sin snapshot inicial):
             # en ese caso NO se avanza el baseline del sid, para que el snapshot
             # posterior no se interprete como gap.
-            applied = self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
+            try:
+                applied = self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
+            except OrderbookDesyncError:
+                # CUARENTENA (incidente 2026-07-12): el desync (new_qty<0) prueba que este
+                # book DIVERGIÓ de la realidad, pero la excepción moría en el dispatcher del
+                # WS y el book seguía initialized+no-stale → get_top_of_book seguía sirviendo
+                # precios FANTASMA → M1 detectaba "arbs" en banda sobre liquidez inexistente
+                # → fill parcial → rollback ×3 → circuit breaker (635 desyncs/día del mismo
+                # ticker: cada delta siguiente volvía a fallar porque nadie lo re-baseaba).
+                # Fail-closed: mark_stale YA (top_of_book→None, deltas dropeados) + recovery
+                # del sid (el snapshot fresco lo re-basea). Re-raise intacta (fail-loud).
+                ticker = raw_msg.get("msg", {}).get("market_ticker")
+                state = self._books.get(ticker) if ticker else None
+                if state is not None:
+                    state.mark_stale()
+                    logger.warning(
+                        f"v2.desync_quarantine ticker={ticker} sid={sid}: book stale + "
+                        "recovery (dejó de servir precios fantasma)"
+                    )
+                if sid not in self._recovering:
+                    await self._start_recovery(sid)
+                raise
         if applied:
             self._last_seq_by_sid[sid] = max(self._last_seq_by_sid.get(sid, 0), new_seq)
 
