@@ -496,6 +496,16 @@ class Settings(BaseSettings):
         le=5.0,
         description="Stake flat por trade de Motor 2 (% del capital). 0 = ¼ Kelly (previo).",
     )
+    # Precisión de la fee en el edge (auditoría 2026-07-12): _net_edge_pct medía la fee con
+    # count=1; el ceil por ORDEN de Kalshi la sobreestima hasta +0.78pp en asks bajos vs lo
+    # que la orden real (stake flat) paga por contrato. On = fee medida al count real.
+    # Shadow-first: default OFF. NOTA 2026-07-14: este campo se PERDIÓ en la resolución
+    # remota del merge de #155 (quedó el consumo en runner/poller sin la declaración) →
+    # AttributeError al boot de M2. El test de wiring runner↔Settings ahora lo previene.
+    MOTOR_2_FEE_AT_STAKE_COUNT: bool = Field(
+        default=False,
+        description="Medir la fee del edge al count real del stake flat (más preciso) en vez de count=1 (pesimista).",
+    )
     # Burst polling pre-kickoff (auditoría 2026-07-12): los edges reales del funnel son
     # transitorios y se concentran cerca del inicio del partido; con el ritmo base (300s)
     # se ven de casualidad. Con burst > 0, el poller acelera a ese intervalo cuando hay un
