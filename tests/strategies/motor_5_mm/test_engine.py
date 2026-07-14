@@ -6,6 +6,8 @@ orden, el AttributeError haría fallar el test: la garantía de CERO órdenes es
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 from sqlmodel import select
 
@@ -151,3 +153,54 @@ async def test_ticker_leaving_universe_retires_quote():
     with get_session() as s:
         assert list(s.exec(select(MMShadowFill))) == []
     assert "T-A" not in eng._live_quotes
+
+
+# =====================================================
+# Shape 2026 del orderbook REST + diagnóstico one-shot (incidente 2026-07-14)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_book_top_parses_fixed_point_shape():
+    """Shape 2026 (*_dollars_fp): el parser NO debe leer vacío en silencio (la causa
+    candidata de skip_no_book=~11k/día sin un solo error en logs)."""
+    client = AsyncMock()
+    client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes_dollars_fp": [["0.4200", "50.00"]],
+            "no_dollars_fp": [["0.5500", "30.00"]],
+        }
+    }
+    eng = _engine(client)
+    top = await eng._book_top("KXMLBGAME-X")
+    assert top == (42, 45)  # yes_bid=42; yes_ask=100−55=45
+
+
+@pytest.mark.asyncio
+async def test_book_top_legacy_shape_still_works():
+    """CONTROL: el shape legacy (yes/no en cents) sigue parseando igual que siempre."""
+    client = AsyncMock()
+    client.get_orderbook.return_value = {"orderbook": {"yes": [[42, 50]], "no": [[55, 30]]}}
+    eng = _engine(client)
+    top = await eng._book_top("KXMLBGAME-X")
+    assert top == (42, 45)
+
+
+@pytest.mark.asyncio
+async def test_unknown_shape_logs_diagnostic_once():
+    """Shape desconocido → None (skip_no_book) pero con log ONE-SHOT de las claves reales
+    (auto-diagnóstico: nunca más 11k skips silenciosos sin saber por qué)."""
+    from loguru import logger as _logger
+
+    client = AsyncMock()
+    client.get_orderbook.return_value = {"orderbook": {"claves_nuevas_2027": []}}
+    eng = _engine(client)
+    records: list[str] = []
+    sink = _logger.add(records.append, level="WARNING", format="{message}")
+    try:
+        assert await eng._book_top("KXMLBGAME-X") is None
+        assert await eng._book_top("KXMLBGAME-Y") is None  # segundo skip: sin re-log
+    finally:
+        _logger.remove(sink)
+    shape_logs = [r for r in records if "motor5.book_shape" in r]
+    assert len(shape_logs) == 1 and "claves_nuevas_2027" in shape_logs[0]

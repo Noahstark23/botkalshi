@@ -100,6 +100,7 @@ class Motor5Engine:
         self._reconciler: MMReconciler | None = None
         self._settled_coids: set[str] = set()  # fills ya aplicados al inventario (1 sola vez)
         self._kill_cancelled = False  # cancel-all del kill-switch ya disparado
+        self._book_shape_logged = False  # diagnóstico one-shot de shape del orderbook REST
 
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "F2 LIVE (demo)" if self._trading_enabled else "F1 SHADOW — CERO órdenes"
@@ -334,10 +335,25 @@ class Motor5Engine:
             logger.warning(f"motor5.book_error ticker={ticker}: {type(exc).__name__}: {exc}")
             return None
         book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-        yes_bid, _ = _top_bid(book.get("yes") or [])
-        no_bid, _ = _top_bid(book.get("no") or [])
+        # Shape 2026 defensivo (lección del WS, 2026-03: migró a *_dollars_fp y el parser
+        # viejo leía vacío EN SILENCIO): probar las claves fixed-point antes que las legacy.
+        yes_levels = book.get("yes_dollars_fp") or book.get("yes") or []
+        no_levels = book.get("no_dollars_fp") or book.get("no") or []
+        yes_bid, _ = _top_bid(yes_levels)
+        no_bid, _ = _top_bid(no_levels)
         yes_ask = (100 - no_bid) if no_bid is not None else None
         if yes_bid is None and yes_ask is None:
+            # Diagnóstico one-shot (incidente 2026-07-14: skip_no_book=~11k/día sin UN solo
+            # error — un shape desconocido parsea vacío en silencio y el funnel solo muestra
+            # el síntoma). Una línea con las claves reales convierte la próxima ocurrencia
+            # en auto-diagnóstico en vez de otra sesión de arqueología.
+            if not self._book_shape_logged:
+                self._book_shape_logged = True
+                logger.warning(
+                    f"motor5.book_shape ticker={ticker} sin niveles parseables — "
+                    f"keys={list(book.keys()) if isinstance(book, dict) else type(book).__name__} "
+                    f"raw={str(ob)[:300]}"
+                )
             return None
         return yes_bid, yes_ask
 
