@@ -5,6 +5,11 @@ Reglas (plan F1 §alcance 2, decisiones documentadas):
   1. Centro = fair − skew. El skew desplaza AMBAS quotes contra el inventario:
      largo (net>0) → centro más bajo (vende más fácil, compra menos) y viceversa.
      skew = (inventario / max_inventario) · half_spread, saturado a ±half_spread.
+  1b. EDGE-SKEW (asymmetric quoting, propuesta 2026-07-13, F2): si el mid del BOOK está
+     desplazado del fair, el centro se inclina edge_skew_cents HACIA el fair-side barato
+     (book bajo el fair → centro más alto → bid más agresivo: capturar más flujo del lado
+     donde el mercado está equivocado). 0 = off (comportamiento F1 exacto). El post-only
+     y el spread-mínimo-rentable (reglas 3 y 5) siguen mandando DESPUÉS del lean.
   2. bid = floor(centro − half_spread), ask = ceil(centro + half_spread) — el redondeo
      siempre ENSANCHA (nunca cotiza más agresivo que el spread configurado).
   3. Emulación post-only (fallback F3 anticipado): la quote NUNCA cruza el book —
@@ -46,6 +51,7 @@ def compute_quote(
     max_inventory_contracts: int,
     best_yes_bid: int | None,
     best_yes_ask: int | None,
+    edge_skew_cents: int = 0,
 ) -> tuple[QuoteSet | None, str | None]:
     """(QuoteSet, None) si hay quote emitible; (None, motivo_de_skip) si no."""
     if not (0.0 < fair_prob < 1.0):
@@ -53,6 +59,14 @@ def compute_quote(
     fair_cents = fair_prob * 100.0
     ratio = max(-1.0, min(1.0, inventory_contracts / max_inventory_contracts))
     center = fair_cents - ratio * half_spread_cents
+    # 1b. Edge-skew: lean hacia el lado donde el book está equivocado vs el fair. Solo con
+    # book bilateral (sin mid no hay dirección) y saturado a ±edge_skew_cents.
+    if edge_skew_cents > 0 and best_yes_bid is not None and best_yes_ask is not None:
+        book_mid = (best_yes_bid + best_yes_ask) / 2.0
+        if fair_cents > book_mid:
+            center += edge_skew_cents  # mercado subvaluado → comprar más agresivo
+        elif fair_cents < book_mid:
+            center -= edge_skew_cents  # mercado sobrevaluado → vender más agresivo
     bid: int | None = math.floor(center - half_spread_cents)
     ask: int | None = math.ceil(center + half_spread_cents)
     # Post-only emulado: nunca cruzar (ni tocar) el mejor precio contrario del book.

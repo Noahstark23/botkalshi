@@ -328,6 +328,16 @@ class Settings(BaseSettings):
         ge=1,
         description="Tope de |inventario| simulado por ticker; al tope se cotiza solo el lado que reduce (Motor 5)",
     )
+    # Edge-skew (asymmetric quoting, F2, propuesta 2026-07-13): inclina el centro de las
+    # quotes hacia el lado donde el BOOK está desplazado del fair (book bajo el fair → bid
+    # más agresivo). Captura más flujo del lado con edge; el post-only y el spread mínimo
+    # rentable siguen mandando. 0 = off (F1 histórico exacto).
+    MOTOR_MM_EDGE_SKEW_CENTS: int = Field(
+        default=0,
+        ge=0,
+        le=5,
+        description="Lean del centro de quotes hacia el lado con edge vs el book (¢). 0 = off.",
+    )
     MOTOR_MM_FAIR_TTL_SEC: float = Field(
         default=600.0,
         gt=0,
