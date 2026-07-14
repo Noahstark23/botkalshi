@@ -91,6 +91,9 @@ class Motor2ShadowPoller:
         # El runner los pasa desde MOTOR_2_MIN_BOOKS / MOTOR_2_MAX_BOOK_AGE_MIN.
         self._min_books = min_books
         self._max_book_age_min = max_book_age_min
+        # Fee del edge al count real del stake (MOTOR_2_FEE_AT_STAKE_COUNT; default off =
+        # comportamiento histórico). Ver _net_edge_pct en detector.py.
+        self._fee_at_stake_count = fee_at_stake_count
         # Burst polling pre-kickoff (auditoría 2026-07-12): los edges reales del funnel son
         # TRANSITORIOS (5.63pp el 07-05, 3.20pp el 07-07 — un ciclo y desaparecen) y se
         # concentran cerca del inicio del partido (line moves por lineups/noticias que
