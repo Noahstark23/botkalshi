@@ -157,6 +157,36 @@ class DataCaptureService:
         # None en shadow. La Capa 2 lo pasará al RestExecutor del Motor REST.
         self._rest_client = rest_client
         self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
+        # Motor 8 (F1 shadow, opcional): OFI en memoria, pasajero del feed de deltas.
+        # Requiere el manager V2 para medir mids (sin él, el experimento no tiene resultado).
+        self._ofi = None
+        if self.settings.MOTOR_8_OFI_ENABLED:
+            from src.strategies.motor_8_ofi.shadow import Motor8OfiShadow
+
+            self._ofi = Motor8OfiShadow(
+                self._mid_of,
+                window_sec=self.settings.MOTOR_8_OFI_WINDOW_SEC,
+                z_min=self.settings.MOTOR_8_OFI_Z_MIN,
+                min_baseline=self.settings.MOTOR_8_OFI_MIN_BASELINE,
+                cooldown_sec=self.settings.MOTOR_8_OFI_COOLDOWN_SEC,
+            )
+            logger.info("motor8.ofi shadow armado (F1: solo observa y mide)")
+
+    def _mid_of(self, ticker: str) -> float | None:
+        """MID del ticker en cents desde el manager V2 (memoria). None si el book no está
+        sano (uninit/stale/cuarentena) — el experimento OFI descarta antes que medir basura."""
+        v2 = self._v2_manager
+        if v2 is None:
+            return None
+        yes = v2.get_top_of_book(ticker, "yes")
+        no = v2.get_top_of_book(ticker, "no")
+        if yes is None or no is None or yes.best_bid is None or no.best_bid is None:
+            return None
+        yes_bid = yes.best_bid.price_cents
+        yes_ask = 100 - no.best_bid.price_cents
+        if not (1 <= yes_bid <= 99 and 1 <= yes_ask <= 99):
+            return None
+        return (yes_bid + yes_ask) / 2.0
 
     def multi_event_universe(self) -> dict[str, set[str]]:
         """
@@ -243,6 +273,11 @@ class DataCaptureService:
                 )
                 BotState.record_error(f"orderbook_delta unknown shape: keys={sample_keys}")
                 return
+
+            # Motor 8 (F1 shadow, opcional): OFI pasajero del feed — internamente best-effort,
+            # jamás rompe la captura.
+            if self._ofi is not None:
+                self._ofi.observe_delta(ticker, side, delta_size)
 
             # Persistir orderbook_events es OPT-IN (default off, incidente disco-lleno 2026-07-10):
             # una fila por cada delta del WS (~240 tickers, 24/7) = millones/día, y NADIE la lee

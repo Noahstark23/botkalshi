@@ -537,6 +537,29 @@ class Settings(BaseSettings):
         description="Techo anti-fantasma (pp): un neto enorme = quote stale, no un regalo.",
     )
 
+    # === Motor 8 (Order Flow Imbalance) — F1 SHADOW auto-validante ===
+    # Tesis a validar: un OFI anómalo (z-score de la ventana corta vs su historia) precede
+    # al movimiento. Reservas documentadas: books finos + flujo informado (adverse
+    # selection). El shadow NO asume dirección: mide el move real a T+30/T+60 y lo graba
+    # (EdgeWindow kind="ofi") — F2 decide contrarian vs momentum vs archivar CON datos.
+    # Pasajero del feed de deltas: cero API extra, cero persistencia de deltas.
+    MOTOR_8_OFI_ENABLED: bool = Field(
+        default=False,
+        description="Corre el shadow OFI (Motor 8) sobre el feed de deltas. Solo observa y mide.",
+    )
+    MOTOR_8_OFI_WINDOW_SEC: float = Field(
+        default=60.0, gt=0, description="Ventana corta del OFI (s)."
+    )
+    MOTOR_8_OFI_Z_MIN: float = Field(
+        default=3.0, gt=0, description="Z-score mínimo del OFI para registrar señal."
+    )
+    MOTOR_8_OFI_MIN_BASELINE: int = Field(
+        default=200, ge=10, description="Muestras mínimas de historia antes de señalar (madurez)."
+    )
+    MOTOR_8_OFI_COOLDOWN_SEC: float = Field(
+        default=120.0, gt=0, description="Silencio por ticker tras una señal (anti-ráfaga)."
+    )
+
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
     # (eficiente / matching_bug / edge_candidato), lo persiste (memoria día-a-día) y manda
