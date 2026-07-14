@@ -57,6 +57,7 @@ class Motor2ShadowPoller:
         executor: Motor2Executor | None = None,
         min_books: int = 1,
         max_book_age_min: float | None = None,
+        fee_at_stake_count: bool = False,
         burst_interval_sec: float = 0.0,
         burst_window_min: float = 45.0,
         linemove=None,
@@ -137,6 +138,7 @@ class Motor2ShadowPoller:
             max_edge=self._max_edge,
             min_books=self._min_books,
             max_book_age_min=self._max_book_age_min,
+            fee_at_stake_count=self._fee_at_stake_count,
         )
         # Canal Motor 5 (F1 shadow): publica el fair de todo outcome matcheado SOLO con
         # odds reales — un fair del fixture fake no es precio de referencia para cotizar.

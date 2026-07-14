@@ -403,9 +403,7 @@ class ProductionRunner:
                         executor=executor,
                         min_books=self.settings.MOTOR_2_MIN_BOOKS,
                         max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
-                        burst_interval_sec=self.settings.MOTOR_2_BURST_INTERVAL_SEC,
-                        burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
-                        linemove=self._build_motor6_shadow(),
+                        fee_at_stake_count=self.settings.MOTOR_2_FEE_AT_STAKE_COUNT,
                     )
                     await poller.run(self._stop_event)
             else:
@@ -419,9 +417,7 @@ class ProductionRunner:
                     risk_manager=risk,
                     min_books=self.settings.MOTOR_2_MIN_BOOKS,
                     max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
-                    burst_interval_sec=self.settings.MOTOR_2_BURST_INTERVAL_SEC,
-                    burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
-                    linemove=self._build_motor6_shadow(),
+                    fee_at_stake_count=self.settings.MOTOR_2_FEE_AT_STAKE_COUNT,
                 )
                 await poller.run(self._stop_event)
         except Exception as e:

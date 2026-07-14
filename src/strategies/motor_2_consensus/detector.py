@@ -204,17 +204,34 @@ def _consensus_fair_probs(
     return dict(zip(names, fair, strict=True))
 
 
-def _net_edge_pct(fair_prob: float, ask_cents: int) -> float:
+def _net_edge_pct(fair_prob: float, ask_cents: int, count: int = 1) -> float:
     """
     Edge NETO (fracción) de comprar un lado a `ask_cents` con prob justa `fair_prob`.
 
-    EV por contrato (¢) = fair_prob*100 − ask − comisión; /100 → fracción del payout $1.
+    EV por contrato (¢) = fair_prob*100 − ask − comisión_por_contrato; /100 → fracción del
+    payout $1.
+
+    `count` = contratos que la orden REALMENTE compraría (del stake flat). La fee de Kalshi
+    es ceil POR ORDEN: medirla con count=1 sobreestima la fee por contrato hasta +0.78pp en
+    asks bajos (auditoría 2026-07-12: el funnel mostraba edges más pesimistas que lo que la
+    orden real pagaría). Con count real: fee_por_contrato = ceil(fee(count))/count — la
+    misma economía que ejecuta el executor. Default 1 = comportamiento histórico.
     """
     if not (1 <= ask_cents <= 99):
         return -1.0  # ask fuera de rango → sin edge
-    fee = kalshi_fee_cents(1, ask_cents)
+    n = max(1, count)
+    fee = kalshi_fee_cents(n, ask_cents) / n
     net_ev_cents = fair_prob * 100.0 - ask_cents - fee
     return net_ev_cents / 100.0
+
+
+def _stake_count(ask_cents: int, capital_usd: float, max_stake_pct: float) -> int:
+    """Contratos que el stake FLAT compraría a este ask (mismo redondeo que el executor:
+    int(stake·100 // ask)). Mínimo 1 para que la fee por contrato esté siempre definida."""
+    if not (1 <= ask_cents <= 99) or max_stake_pct <= 0 or capital_usd <= 0:
+        return 1
+    stake_usd = round(capital_usd * max_stake_pct / 100.0, 2)
+    return max(1, int(stake_usd * 100 // ask_cents))
 
 
 def _size_usd(
@@ -253,6 +270,7 @@ def find_signals(
     max_edge: float | None = None,
     min_books: int = 1,
     max_book_age_min: float | None = None,
+    fee_at_stake_count: bool = False,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -413,6 +431,7 @@ def find_signals(
                             diag,
                             max_stake_pct=max_stake_pct,
                             max_edge=max_edge,
+                            fee_at_stake_count=fee_at_stake_count,
                         )
                     )
                 for es in event_signals:
@@ -544,6 +563,7 @@ def _signals_for_outcome(
     *,
     max_stake_pct: float = 0.0,
     max_edge: float | None = None,
+    fee_at_stake_count: bool = False,
 ) -> list[ConsensusSignal]:
     """Candidatos YES (prob justa) y NO (complemento) de UN outcome con edge neto > umbral.
 
@@ -552,10 +572,15 @@ def _signals_for_outcome(
     correlacionadas viven en market_tickers DISTINTOS (ej. yes@-PHI y no@-NYM son la misma
     dirección 'PHI gana') y este helper solo ve un market a la vez."""
     out: list[ConsensusSignal] = []
+    # fee_at_stake_count (2026-07-12): la fee del edge medida al count REAL que el stake
+    # flat compraría (fee ceil por ORDEN repartida) en vez de count=1 (que la sobreestima
+    # hasta +0.78pp en asks bajos). Off = comportamiento histórico exacto.
+    yes_n = _stake_count(q.yes_ask_cents, capital_usd, max_stake_pct) if fee_at_stake_count else 1
+    no_n = _stake_count(q.no_ask_cents, capital_usd, max_stake_pct) if fee_at_stake_count else 1
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
-    yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
+    yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents, count=yes_n)
     # NO: comprar a no_ask con la prob complementaria.
-    no_edge = _net_edge_pct(1.0 - fair_prob, q.no_ask_cents)
+    no_edge = _net_edge_pct(1.0 - fair_prob, q.no_ask_cents, count=no_n)
     if diag is not None:
         # Mejor edge NETO visto (aunque no supere el umbral) → distingue "mercado eficiente"
         # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
