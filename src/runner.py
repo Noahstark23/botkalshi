@@ -298,6 +298,25 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    def _build_motor6_shadow(self):
+        """Motor 6 F1 (line-moves) — pasajero del ciclo de M2; None = apagado. En F1 NO
+        existe executor: el módulo ni siquiera importa el cliente de órdenes (Capa A
+        llevada al extremo — hay un test-guard que lo verifica)."""
+        if not self.settings.MOTOR_6_LINEMOVE_ENABLED:
+            return None
+        from src.strategies.motor_6_linemove.shadow import Motor6LineMoveShadow
+
+        logger.info(
+            "motor6.shadow armado (move_min="
+            f"{self.settings.MOTOR_6_MOVE_MIN_PP}pp, edge_min={self.settings.MOTOR_6_EDGE_MIN_PP}pp, "
+            f"max={self.settings.MOTOR_6_MAX_EDGE_PP}pp) — F1: solo observa"
+        )
+        return Motor6LineMoveShadow(
+            move_min_pp=self.settings.MOTOR_6_MOVE_MIN_PP,
+            edge_min_pp=self.settings.MOTOR_6_EDGE_MIN_PP,
+            max_edge_pp=self.settings.MOTOR_6_MAX_EDGE_PP,
+        )
+
     async def _run_motor2_shadow(self) -> None:
         """
         Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.

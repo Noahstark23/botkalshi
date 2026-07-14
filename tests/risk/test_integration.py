@@ -45,8 +45,10 @@ def sqlite_engine(tmp_path):
 def _reset_botstate():
     prev = (BotState.is_paused, BotState.pause_reason)
     BotState.is_paused, BotState.pause_reason = False, None
+    RiskManager._daily_stop_alert_date = None  # anti-spam del stop diario soft (estado de clase)
     yield
     BotState.is_paused, BotState.pause_reason = prev
+    RiskManager._daily_stop_alert_date = None
 
 
 def _risk_settings() -> MagicMock:
@@ -58,6 +60,12 @@ def _risk_settings() -> MagicMock:
     s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # $1000
     s.MAX_TRADE_SIZE_PCT = 5.0  # $200
     s.MAX_TRADE_SIZE_USD = 200.0  # cap absoluto anti-slippage
+    # Stop-loss a escala chica NEUTRALIZADO por default (los tests dedicados overridean):
+    # pisos 0 (solo %) y diario nuclear (comportamiento histórico de estos tests).
+    s.MAX_DAILY_LOSS_FLOOR_USD = 0.0
+    s.MAX_WEEKLY_LOSS_FLOOR_USD = 0.0
+    s.MAX_MONTHLY_LOSS_FLOOR_USD = 0.0
+    s.DAILY_STOP_ENTRIES_ONLY = False
     return s
 
 
@@ -444,3 +452,97 @@ def test_multi_outcome_cross_event_not_discounted():
     _insert_multi_leg(arb, "KXWC-EV2-B", 32)
     _insert_multi_leg(arb, "KXWC-EV3-C", 33)
     assert _manager()._get_current_exposure_usd() == pytest.approx(9.60)
+
+
+# =====================================================
+# Stop-loss a escala chica (2026-07-12): pisos USD + breach diario auto-recuperable
+# =====================================================
+
+
+def _small_capital_settings(*, entries_only: bool = True) -> MagicMock:
+    """Settings a escala REAL del incidente: capital $180, pisos 20/40/60."""
+    s = _risk_settings()
+    s.ACTIVE_CAPITAL_USD = 180.0  # sin balance cacheado, el fallback ES el capital
+    s.MAX_DAILY_LOSS_FLOOR_USD = 20.0
+    s.MAX_WEEKLY_LOSS_FLOOR_USD = 40.0
+    s.MAX_MONTHLY_LOSS_FLOOR_USD = 60.0
+    s.DAILY_STOP_ENTRIES_ONLY = entries_only
+    return s
+
+
+def _small_manager(*, entries_only: bool = True) -> RiskManager:
+    with patch(
+        "src.risk.manager.get_settings",
+        return_value=_small_capital_settings(entries_only=entries_only),
+    ):
+        return RiskManager()
+
+
+@pytest.mark.asyncio
+async def test_floor_usd_absorbs_noise_losses_small_capital():
+    """CONTROL del piso: con $180, -$10 rompía el límite % puro ($5.40) y apagaba todo.
+    Con piso $20 el límite efectivo es max(5.40, 20)=$20 → -$10 NO dispara y se opera."""
+    _insert_trade(strategy="motor_2_consensus", status="settled", pnl=-1000, settled=True)
+    mgr = _small_manager()
+
+    with patch("src.risk.manager.alert_risk_event", new=AsyncMock()):
+        decision = await mgr.check_pre_trade(_opp(count=1))
+
+    assert decision.approved is True  # el ruido de $10 ya no apaga el bot
+    assert BotState.is_paused is False
+    assert models.kill_switch_engaged()[0] is False
+
+
+@pytest.mark.asyncio
+async def test_daily_breach_soft_rejects_entries_without_kill_switch():
+    """MECANISMO escalonado: breach diario REAL (-$21 ≥ piso $20) → rechaza entradas
+    nuevas PERO sin kill-switch persistente ni is_paused (auto-recupera en el rollover).
+    El aviso es one-shot por día (anti-spam) y deja RiskEvent de auditoría."""
+    _insert_trade(strategy="motor_2_consensus", status="settled", pnl=-2100, settled=True)
+    mgr = _small_manager()
+
+    with patch("src.risk.manager.alert_risk_event", new=AsyncMock()) as mock_alert:
+        d1 = await mgr.check_pre_trade(_opp(count=1))
+        d2 = await mgr.check_pre_trade(_opp(count=1))  # segundo intento el mismo día
+
+    assert d1.approved is False and "Diario" in d1.reason
+    assert d2.approved is False
+    assert BotState.is_paused is False  # NO nuclear: el resto del bot sigue
+    assert models.kill_switch_engaged()[0] is False  # NO persistente: mañana se recupera solo
+    assert mock_alert.await_count == 1  # one-shot: 2 checks, 1 aviso
+    from sqlmodel import select
+
+    with models.get_session() as s:
+        events = list(s.exec(select(models.RiskEvent)).all())
+    assert [e.event_type for e in events] == ["daily_stop"]  # auditoría, sin kill_switch
+
+
+@pytest.mark.asyncio
+async def test_weekly_breach_still_engages_persistent_kill_switch():
+    """CONTROL nuclear: una pérdida a escala SEMANAL (≥ piso $40) sigue latcheando el
+    kill-switch persistente AUNQUE el diario soft también esté roto — el orden
+    mensual→semanal→diario garantiza que lo severo no quede tapado por lo soft."""
+    _insert_trade(strategy="motor_2_consensus", status="settled", pnl=-4500, settled=True)
+    mgr = _small_manager()
+
+    with patch("src.risk.manager.alert_risk_event", new=AsyncMock()):
+        decision = await mgr.check_pre_trade(_opp(count=1))
+
+    assert decision.approved is False
+    assert "Semanal" in decision.reason  # la ventana severa gana, no la diaria
+    assert BotState.is_paused is True
+    assert models.kill_switch_engaged()[0] is True  # nuclear intacto
+
+
+@pytest.mark.asyncio
+async def test_daily_stop_legacy_mode_still_nuclear():
+    """CONTROL legacy: con DAILY_STOP_ENTRIES_ONLY=false, el breach diario vuelve a
+    latchear el kill-switch persistente (comportamiento histórico intacto por flag)."""
+    _insert_trade(strategy="motor_2_consensus", status="settled", pnl=-2100, settled=True)
+    mgr = _small_manager(entries_only=False)
+
+    with patch("src.risk.manager.alert_risk_event", new=AsyncMock()):
+        decision = await mgr.check_pre_trade(_opp(count=1))
+
+    assert decision.approved is False and "Diario" in decision.reason
+    assert models.kill_switch_engaged()[0] is True

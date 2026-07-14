@@ -43,6 +43,30 @@ class Settings(BaseSettings):
     MAX_DAILY_LOSS_PCT: float = Field(3.0, gt=0, le=10)
     MAX_WEEKLY_LOSS_PCT: float = Field(8.0, gt=0, le=20)
     MAX_MONTHLY_LOSS_PCT: float = Field(15.0, gt=0, le=30)
+    # Pisos en USD de los stop-losses (problema de escala, 2026-07-12): con capital chico
+    # los % producen límites a nivel de RUIDO (3% de $180 = $5.40 → 2-3 trades chicos
+    # perdedores apagaban TODO el bot y exigían clear manual). El límite efectivo es
+    # max(capital × %, piso): con capital grande manda el % (igual que siempre); con
+    # capital chico el piso evita el falso positivo. Piso 0 = comportamiento histórico.
+    MAX_DAILY_LOSS_FLOOR_USD: float = Field(
+        default=20.0, ge=0, description="Piso en USD del stop-loss diario (0 = solo %)"
+    )
+    MAX_WEEKLY_LOSS_FLOOR_USD: float = Field(
+        default=40.0, ge=0, description="Piso en USD del stop-loss semanal (0 = solo %)"
+    )
+    MAX_MONTHLY_LOSS_FLOOR_USD: float = Field(
+        default=60.0, ge=0, description="Piso en USD del stop-loss mensual (0 = solo %)"
+    )
+    # Respuesta ESCALONADA (2026-07-12): el breach DIARIO pausa solo las ENTRADAS nuevas y
+    # se auto-recupera en el rollover del día UTC (la ventana se recomputa de DB en cada
+    # check) — sin kill-switch persistente ni clear_kill_switch.py. Un día malo es ruido;
+    # una racha semanal/mensual es problema estructural: esas ventanas SIGUEN disparando el
+    # kill-switch persistente (nuclear, manual). False = comportamiento histórico (diario
+    # también nuclear).
+    DAILY_STOP_ENTRIES_ONLY: bool = Field(
+        default=True,
+        description="Breach diario: pausa entradas hasta el día UTC siguiente (auto-recupera) en vez de kill-switch persistente.",
+    )
     MAX_SIMULTANEOUS_EXPOSURE_PCT: float = Field(25.0, gt=0, le=100)
     MAX_TRADE_SIZE_PCT: float = Field(5.0, gt=0, le=20)
     # Cap ABSOLUTO por orden (anti-slippage), en USD — independiente del % y del capital.
@@ -472,15 +496,68 @@ class Settings(BaseSettings):
         le=5.0,
         description="Stake flat por trade de Motor 2 (% del capital). 0 = ¼ Kelly (previo).",
     )
-    # Precisión de la fee en el edge (auditoría 2026-07-12): _net_edge_pct medía la fee con
-    # count=1; el ceil por ORDEN de Kalshi la sobreestima hasta +0.78pp en asks bajos vs lo
-    # que la orden real (stake flat, 2-9 contratos) paga por contrato → el funnel mostraba
-    # edges más pesimistas que la economía real. On = fee medida al count real del stake.
-    # Shadow-first: default OFF (comportamiento histórico exacto); prender y comparar el
-    # best_net_edge_pp del funnel antes/después ANTES de tocar el umbral MIN_EDGE.
-    MOTOR_2_FEE_AT_STAKE_COUNT: bool = Field(
+    # Burst polling pre-kickoff (auditoría 2026-07-12): los edges reales del funnel son
+    # transitorios y se concentran cerca del inicio del partido; con el ritmo base (300s)
+    # se ven de casualidad. Con burst > 0, el poller acelera a ese intervalo cuando hay un
+    # kickoff dentro de la ventana. Costo: más requests a The Odds API SOLO en esas
+    # ventanas (tarifa plana hoy). 0 = off (comportamiento histórico).
+    MOTOR_2_BURST_INTERVAL_SEC: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Intervalo acelerado del poller M2 cuando hay kickoff próximo (s). 0 = off.",
+    )
+    MOTOR_2_BURST_WINDOW_MIN: float = Field(
+        default=45.0,
+        gt=0.0,
+        description="Ventana pre-kickoff (min) en la que aplica el burst del poller M2.",
+    )
+
+    # === Motor 6 (line-move follower) — F1 SHADOW ===
+    # Tesis (funnel 2026-07-12): los edges reales son transitorios — nacen cuando las casas
+    # MUEVEN la línea y Kalshi tarda en seguirla. M6 detecta el DELTA del fair entre ciclos
+    # de M2 (pasajero del mismo loop: cero API extra) y registra la señal. F1 = shadow puro:
+    # no existe executor; loguea [MOTOR 6 SHADOW] + graba EdgeWindow kind="linemove".
+    MOTOR_6_LINEMOVE_ENABLED: bool = Field(
         default=False,
-        description="Medir la fee del edge al count real del stake flat (más preciso) en vez de count=1 (pesimista).",
+        description="Corre el shadow del Motor 6 (line-moves) dentro del ciclo de M2. Solo observa.",
+    )
+    MOTOR_6_MOVE_MIN_PP: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Movimiento mínimo del fair entre ciclos (pp) para considerar line-move.",
+    )
+    MOTOR_6_EDGE_MIN_PP: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Edge neto post-fee mínimo (pp) vs el ask actual (filtra moves ya digeridos).",
+    )
+    MOTOR_6_MAX_EDGE_PP: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="Techo anti-fantasma (pp): un neto enorme = quote stale, no un regalo.",
+    )
+
+    # === Motor 8 (Order Flow Imbalance) — F1 SHADOW auto-validante ===
+    # Tesis a validar: un OFI anómalo (z-score de la ventana corta vs su historia) precede
+    # al movimiento. Reservas documentadas: books finos + flujo informado (adverse
+    # selection). El shadow NO asume dirección: mide el move real a T+30/T+60 y lo graba
+    # (EdgeWindow kind="ofi") — F2 decide contrarian vs momentum vs archivar CON datos.
+    # Pasajero del feed de deltas: cero API extra, cero persistencia de deltas.
+    MOTOR_8_OFI_ENABLED: bool = Field(
+        default=False,
+        description="Corre el shadow OFI (Motor 8) sobre el feed de deltas. Solo observa y mide.",
+    )
+    MOTOR_8_OFI_WINDOW_SEC: float = Field(
+        default=60.0, gt=0, description="Ventana corta del OFI (s)."
+    )
+    MOTOR_8_OFI_Z_MIN: float = Field(
+        default=3.0, gt=0, description="Z-score mínimo del OFI para registrar señal."
+    )
+    MOTOR_8_OFI_MIN_BASELINE: int = Field(
+        default=200, ge=10, description="Muestras mínimas de historia antes de señalar (madurez)."
+    )
+    MOTOR_8_OFI_COOLDOWN_SEC: float = Field(
+        default=120.0, gt=0, description="Silencio por ticker tras una señal (anti-ráfaga)."
     )
 
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
