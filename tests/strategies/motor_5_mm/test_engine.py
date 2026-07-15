@@ -187,9 +187,10 @@ async def test_book_top_legacy_shape_still_works():
 
 
 @pytest.mark.asyncio
-async def test_unknown_shape_logs_diagnostic_once():
-    """Shape desconocido → None (skip_no_book) pero con log ONE-SHOT de las claves reales
-    (auto-diagnóstico: nunca más 11k skips silenciosos sin saber por qué)."""
+async def test_unknown_shape_logs_diagnostic_once_per_ticker():
+    """Book inusable → None (skip_no_book) con log one-shot POR TICKER: el mismo ticker
+    no re-loguea, pero otro ticker con problema SÍ (un bool global dejaba que el primer
+    ticker consumiera el diagnóstico de todos los demás)."""
     from loguru import logger as _logger
 
     client = AsyncMock()
@@ -199,8 +200,54 @@ async def test_unknown_shape_logs_diagnostic_once():
     sink = _logger.add(records.append, level="WARNING", format="{message}")
     try:
         assert await eng._book_top("KXMLBGAME-X") is None
-        assert await eng._book_top("KXMLBGAME-Y") is None  # segundo skip: sin re-log
+        assert await eng._book_top("KXMLBGAME-X") is None  # mismo ticker: sin re-log
+        assert await eng._book_top("KXMLBGAME-Y") is None  # OTRO ticker: log propio
     finally:
         _logger.remove(sink)
     shape_logs = [r for r in records if "motor5.book_shape" in r]
-    assert len(shape_logs) == 1 and "claves_nuevas_2027" in shape_logs[0]
+    assert len(shape_logs) == 2
+    assert "KXMLBGAME-X" in shape_logs[0] and "claves_nuevas_2027" in shape_logs[0]
+    assert "KXMLBGAME-Y" in shape_logs[1]
+
+
+@pytest.mark.asyncio
+async def test_chronic_skip_relogs_after_backoff():
+    """Un skip CRÓNICO re-loguea tras BOOK_DIAG_REARM_SEC: el one-shot de por vida se
+    consumía (p.ej. en el boot, fuera de la ventana de log visible) y 127 funnels con
+    skip_book>0 quedaban sin UNA línea de causa (forense 2026-07-15)."""
+    from loguru import logger as _logger
+
+    client = AsyncMock()
+    client.get_orderbook.return_value = {"orderbook": {"yes": [], "no": []}}
+    eng = _engine(client)
+    records: list[str] = []
+    sink = _logger.add(records.append, level="WARNING", format="{message}")
+    try:
+        assert await eng._book_top("KXMLBGAME-X") is None  # log 1
+        assert await eng._book_top("KXMLBGAME-X") is None  # dentro del backoff: silencio
+        # Simular que pasó el backoff (envejecer el timestamp guardado, sin mockear reloj).
+        eng._book_diag_last["KXMLBGAME-X"] -= eng.BOOK_DIAG_REARM_SEC
+        assert await eng._book_top("KXMLBGAME-X") is None  # log 2 (re-armado)
+    finally:
+        _logger.remove(sink)
+    assert len([r for r in records if "motor5.book_shape" in r]) == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_book_diagnostic_distinguishes_thin_market():
+    """CONTROL forense: claves correctas pero listas VACÍAS (book fino, sin resting) →
+    el log dice yes_levels=0/no_levels=0 — distinguible de un problema de shape."""
+    from loguru import logger as _logger
+
+    client = AsyncMock()
+    client.get_orderbook.return_value = {"orderbook": {"yes": [], "no": []}}
+    eng = _engine(client)
+    records: list[str] = []
+    sink = _logger.add(records.append, level="WARNING", format="{message}")
+    try:
+        assert await eng._book_top("KXMLBGAME-Z") is None
+    finally:
+        _logger.remove(sink)
+    shape_logs = [r for r in records if "motor5.book_shape" in r]
+    assert len(shape_logs) == 1
+    assert "yes_levels=0" in shape_logs[0] and "no_levels=0" in shape_logs[0]
