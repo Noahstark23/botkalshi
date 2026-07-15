@@ -270,17 +270,25 @@ def test_delta_before_snapshot_raises() -> None:
 
 
 def test_delta_with_seq_not_advancing_raises() -> None:
-    """seq == self.sequence (no avanza) → ValueError."""
+    """seq == self.sequence (no avanza) → OrderbookSeqRegressionError (2026-07-15: la
+    regresión es señal de DIVERGENCIA, familia OrderbookError → cuarentena+recovery,
+    no un ValueError con traceback por delta)."""
+    from src.strategies.motor_1_arbitrage.orderbook import OrderbookSeqRegressionError
+
     state = initialized_state(seq=100)
-    with pytest.raises(ValueError, match="Invalid new sequence"):
+    with pytest.raises(OrderbookSeqRegressionError):
         state.apply_delta(make_delta(seq=100))
 
 
 def test_delta_seq_less_than_current_raises() -> None:
-    """seq < self.sequence → ValueError."""
+    """seq < self.sequence (epoch reset) → OrderbookSeqRegressionError, PRE-mutación."""
+    from src.strategies.motor_1_arbitrage.orderbook import OrderbookSeqRegressionError
+
     state = initialized_state(seq=100)
-    with pytest.raises(ValueError, match="Invalid new sequence"):
+    with pytest.raises(OrderbookSeqRegressionError) as exc:
         state.apply_delta(make_delta(seq=99))
+    assert exc.value.got_seq == 99 and exc.value.current_seq == 100
+    assert state.sequence == 100  # el book NO mutó (raise antes de tocar nada)
 
 
 def test_delta_with_gap_is_applied_without_error() -> None:
