@@ -163,6 +163,16 @@ def main() -> int:
         )
 
     print("\nVEREDICTO:")
+    if pairs == 0:
+        # 0 pares = NO se midió nada — jamás concluir "coherente" (defecto detectado en la
+        # primera corrida real: 4 campeón × 5 etapa → 0 matcheos). Imprimir los tickers
+        # permite distinguir a ojo "no hay solapamiento de equipos" de "el matching por
+        # código de equipo no encaja con la estructura real de la serie".
+        print("  ⚪ NO EVALUABLE: 0 pares matcheados — esto NO es evidencia de coherencia.")
+        print("  Tickers campeón:", sorted(m["ticker"] for m in champ_markets))
+        print("  Tickers etapa:  ", sorted(m["ticker"] for m in stage_markets))
+        print("  Revisar solapamiento de equipos / estructura del ticker de etapa.")
+        return 0
     if hard:
         print("  🔴 Hay violaciones FILLABLES post-fee → tesis del Motor 7 CON datos.")
         print("     Siguiente paso: F1 shadow según el patrón de escalabilidad del repo.")
