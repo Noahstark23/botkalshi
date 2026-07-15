@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from datetime import UTC, datetime
 
 from loguru import logger
@@ -63,6 +64,10 @@ class Motor5Engine:
     """Market maker F1: quotes shadow alrededor del fair de Motor 2, contra el book real."""
 
     LOOP_INTERVAL_SEC = 60.0
+    # Re-arme del diagnóstico de book: un skip CRÓNICO no debe auto-silenciarse — un
+    # one-shot de por vida se consume una vez (p.ej. en el boot, fuera de la ventana de
+    # log que alguien esté mirando) y el skip perpetuo vuelve a ser arqueología.
+    BOOK_DIAG_REARM_SEC = 1800.0
 
     def __init__(
         self,
@@ -102,10 +107,11 @@ class Motor5Engine:
         self._reconciler: MMReconciler | None = None
         self._settled_coids: set[str] = set()  # fills ya aplicados al inventario (1 sola vez)
         self._kill_cancelled = False  # cancel-all del kill-switch ya disparado
-        # Diagnóstico de book POR-TICKER (no un bool global): un ticker sano que pasa por
-        # la rama en el boot no debe consumir el one-shot del ticker que sí tiene el
-        # problema — con universo de hasta max_tickers, el detalle por ticker es barato.
-        self._book_diag_logged: set[str] = set()
+        # Diagnóstico de book POR-TICKER con backoff (no un bool global de por vida): un
+        # ticker sano en el boot no consume el diagnóstico del que tiene el problema, y
+        # un skip crónico re-loguea cada BOOK_DIAG_REARM_SEC en vez de callarse para
+        # siempre tras la primera vez. Valor = time.monotonic() del último log.
+        self._book_diag_last: dict[str, float] = {}
 
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "F2 LIVE (demo)" if self._trading_enabled else "F1 SHADOW — CERO órdenes"
@@ -358,8 +364,10 @@ class Motor5Engine:
             #   c) claves inesperadas / no-lista → shape (book_keys lo delata)
             # OJO forense: si skip_no_book incrementa SIN ninguna línea book_shape, el None
             # salió del path de excepción de arriba → grep motor5.book_error, no shape.
-            if ticker not in self._book_diag_logged:
-                self._book_diag_logged.add(ticker)
+            mono = time.monotonic()
+            last = self._book_diag_last.get(ticker)
+            if last is None or mono - last >= self.BOOK_DIAG_REARM_SEC:
+                self._book_diag_last[ticker] = mono
                 y_is_list = isinstance(yes_levels, list)
                 n_is_list = isinstance(no_levels, list)
                 logger.warning(
