@@ -102,7 +102,10 @@ class Motor5Engine:
         self._reconciler: MMReconciler | None = None
         self._settled_coids: set[str] = set()  # fills ya aplicados al inventario (1 sola vez)
         self._kill_cancelled = False  # cancel-all del kill-switch ya disparado
-        self._book_shape_logged = False  # diagnóstico one-shot de shape del orderbook REST
+        # Diagnóstico de book POR-TICKER (no un bool global): un ticker sano que pasa por
+        # la rama en el boot no debe consumir el one-shot del ticker que sí tiene el
+        # problema — con universo de hasta max_tickers, el detalle por ticker es barato.
+        self._book_diag_logged: set[str] = set()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "F2 LIVE (demo)" if self._trading_enabled else "F1 SHADOW — CERO órdenes"
@@ -338,24 +341,33 @@ class Motor5Engine:
             logger.warning(f"motor5.book_error ticker={ticker}: {type(exc).__name__}: {exc}")
             return None
         book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-        # Shape 2026 defensivo (lección del WS, 2026-03: migró a *_dollars_fp y el parser
-        # viejo leía vacío EN SILENCIO): probar las claves fixed-point antes que las legacy.
-        yes_levels = book.get("yes_dollars_fp") or book.get("yes") or []
-        no_levels = book.get("no_dollars_fp") or book.get("no") or []
+        # El REST /orderbook entrega 'yes'/'no' (así lo parsean TODOS los consumidores REST
+        # del repo; los niveles pueden venir en cents int o fixed-point string y
+        # _top_bid/parse_price_to_cents maneja ambos). Las claves *_dollars_fp son del WS
+        # (snapshot/delta) — quedan como fallback inofensivo, no como primera opción.
+        yes_levels = book.get("yes") or book.get("yes_dollars_fp") or []
+        no_levels = book.get("no") or book.get("no_dollars_fp") or []
         yes_bid, _ = _top_bid(yes_levels)
         no_bid, _ = _top_bid(no_levels)
         yes_ask = (100 - no_bid) if no_bid is not None else None
         if yes_bid is None and yes_ask is None:
-            # Diagnóstico one-shot (incidente 2026-07-14: skip_no_book=~11k/día sin UN solo
-            # error — un shape desconocido parsea vacío en silencio y el funnel solo muestra
-            # el síntoma). Una línea con las claves reales convierte la próxima ocurrencia
-            # en auto-diagnóstico en vez de otra sesión de arqueología.
-            if not self._book_shape_logged:
-                self._book_shape_logged = True
+            # Diagnóstico POR-TICKER que separa las tres causas que el funnel colapsa en
+            # 'skip_no_book' (el quoter tolera un solo lado; acá solo cae AMBOS sin top):
+            #   a) listas presentes pero VACÍAS  → book sin resting (selección de market)
+            #   b) niveles presentes pero size=0 → sin volumen usable
+            #   c) claves inesperadas / no-lista → shape (book_keys lo delata)
+            # OJO forense: si skip_no_book incrementa SIN ninguna línea book_shape, el None
+            # salió del path de excepción de arriba → grep motor5.book_error, no shape.
+            if ticker not in self._book_diag_logged:
+                self._book_diag_logged.add(ticker)
+                y_is_list = isinstance(yes_levels, list)
+                n_is_list = isinstance(no_levels, list)
                 logger.warning(
-                    f"motor5.book_shape ticker={ticker} sin niveles parseables — "
-                    f"keys={list(book.keys()) if isinstance(book, dict) else type(book).__name__} "
-                    f"raw={str(ob)[:300]}"
+                    f"motor5.book_shape ticker={ticker} sin top usable — "
+                    f"yes_levels={len(yes_levels) if y_is_list else type(yes_levels).__name__} "
+                    f"no_levels={len(no_levels) if n_is_list else type(no_levels).__name__} "
+                    f"book_keys={sorted(book.keys()) if isinstance(book, dict) else type(book).__name__} "
+                    f"raw={str(ob)[:400]}"
                 )
             return None
         return yes_bid, yes_ask
