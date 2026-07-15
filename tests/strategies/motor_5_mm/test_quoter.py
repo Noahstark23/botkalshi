@@ -109,3 +109,46 @@ def test_degenerate_after_clamps_is_skipped():
     clamp inferior (1==1) → degenerada, no cotiza."""
     quote, reason = _q(0.01, inventory_contracts=50)
     assert quote is None and reason == "degenerate"
+
+
+# =====================================================
+# Edge-skew (asymmetric quoting, F2 — propuesta 2026-07-13)
+# =====================================================
+
+
+def test_edge_skew_off_is_exact_f1_behavior():
+    """CONTROL: edge_skew_cents=0 (default) con book presente → quote IDÉNTICA a F1."""
+    base, _ = _q(0.50, best_yes_bid=45, best_yes_ask=55)
+    zero, _ = _q(0.50, best_yes_bid=45, best_yes_ask=55, edge_skew_cents=0)
+    assert (base.bid_cents, base.ask_cents) == (zero.bid_cents, zero.ask_cents)
+
+
+def test_edge_skew_leans_up_when_market_undervalues():
+    """MECANISMO: fair 50 > mid del book 45 (mercado subvaluado) → centro +2¢ → bid/ask
+    suben 2¢ (comprar más agresivo el lado con edge)."""
+    base, _ = _q(0.50, best_yes_bid=40, best_yes_ask=50)
+    skew, _ = _q(0.50, best_yes_bid=40, best_yes_ask=50, edge_skew_cents=2)
+    assert skew.bid_cents == base.bid_cents + 2
+    assert skew.ask_cents == base.ask_cents + 2
+
+
+def test_edge_skew_leans_down_when_market_overvalues():
+    """fair 50 < mid 55 → centro −2¢ (vender más agresivo)."""
+    base, _ = _q(0.50, best_yes_bid=50, best_yes_ask=60)
+    skew, _ = _q(0.50, best_yes_bid=50, best_yes_ask=60, edge_skew_cents=2)
+    assert skew.bid_cents == base.bid_cents - 2
+    assert skew.ask_cents == base.ask_cents - 2
+
+
+def test_edge_skew_never_beats_post_only():
+    """CONTROL de seguridad: el lean NUNCA vence la emulación post-only — con el ask del
+    book pegado, el bid skewed sigue clavado en best_ask−1 (jamás cruza = jamás taker)."""
+    skew, _ = _q(0.50, best_yes_bid=47, best_yes_ask=49, edge_skew_cents=5)
+    assert skew is None or skew.bid_cents <= 48  # best_ask − 1
+
+
+def test_edge_skew_without_book_mid_is_noop():
+    """Sin book bilateral no hay dirección → el lean no aplica (F1 exacto)."""
+    base, _ = _q(0.50)
+    skew, _ = _q(0.50, edge_skew_cents=3)
+    assert (base.bid_cents, base.ask_cents) == (skew.bid_cents, skew.ask_cents)

@@ -245,6 +245,7 @@ class ProductionRunner:
             await Motor5Engine(
                 max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
                 half_spread_cents=self.settings.MOTOR_MM_HALF_SPREAD_CENTS,
+                edge_skew_cents=self.settings.MOTOR_MM_EDGE_SKEW_CENTS,
                 quote_size_contracts=self.settings.MOTOR_MM_QUOTE_SIZE_CONTRACTS,
                 max_inventory_contracts=self.settings.MOTOR_MM_MAX_INVENTORY_CONTRACTS,
                 fair_ttl_sec=self.settings.MOTOR_MM_FAIR_TTL_SEC,

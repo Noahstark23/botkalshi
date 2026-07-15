@@ -69,6 +69,7 @@ class Motor5Engine:
         *,
         max_tickers: int = 10,
         half_spread_cents: int = 3,
+        edge_skew_cents: int = 0,
         quote_size_contracts: int = 10,
         max_inventory_contracts: int = 50,
         fair_ttl_sec: float = 600.0,
@@ -80,6 +81,7 @@ class Motor5Engine:
     ) -> None:
         self._max_tickers = max_tickers
         self._half_spread = half_spread_cents
+        self._edge_skew = edge_skew_cents
         self._size = quote_size_contracts
         self._max_inventory = max_inventory_contracts
         self._fair_ttl = fair_ttl_sec
@@ -218,6 +220,7 @@ class Motor5Engine:
                 ticker,
                 fv.fair_prob,
                 half_spread_cents=self._half_spread,
+                edge_skew_cents=self._edge_skew,
                 size_contracts=self._size,
                 inventory_contracts=self._inventory.net(ticker),
                 max_inventory_contracts=self._max_inventory,
