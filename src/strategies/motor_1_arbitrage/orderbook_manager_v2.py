@@ -37,6 +37,7 @@ from src.strategies.motor_1_arbitrage.orderbook import (
     BookTop,
     OrderbookDesyncError,
     OrderbookError,
+    OrderbookSeqRegressionError,
     OrderbookState,
 )
 
@@ -249,7 +250,7 @@ class OrderbookManagerV2:
             # posterior no se interprete como gap.
             try:
                 applied = self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
-            except OrderbookDesyncError:
+            except (OrderbookDesyncError, OrderbookSeqRegressionError):
                 # CUARENTENA (incidente 2026-07-12): el desync (new_qty<0) prueba que este
                 # book DIVERGIÓ de la realidad, pero la excepción moría en el dispatcher del
                 # WS y el book seguía initialized+no-stale → get_top_of_book seguía sirviendo
