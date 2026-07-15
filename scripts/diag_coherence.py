@@ -15,6 +15,14 @@ sin tocar la DB ni el bot). Correr donde haya salida a internet (el container si
 
     python scripts/diag_coherence.py
     python scripts/diag_coherence.py --series KXMENWORLDCUP,KXWCSTAGE  # universo custom
+    python scripts/diag_coherence.py --ladder                          # escaleras ordinales
+    python scripts/diag_coherence.py --ladder --series KXFIFATOTAL     # escalera custom
+
+MODO ESCALERA (--ladder, propuesta "Motor 10" 2026-07-13): dentro de un mismo evento
+ordinal (totales de goles, strikes), X>alto ⟹ X>bajo, así que P(alto) ≤ P(bajo).
+⚠️ La pata correcta del arb (la propuesta original venía INVERTIDA y perdía todo en el
+bucket del medio): comprar YES del strike BAJO + NO del strike ALTO → payout garantizado
+≥ $1 (medio paga $2). HARD si ask_yes(bajo) + ask_no(alto) + fees < 100¢.
 
 QUÉ MIRAR EN LA SALIDA:
   - "HARD": violación fillable AL BID/ASK actual con neto post-fee > 0 → tesis del
@@ -42,6 +50,8 @@ BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_IMPLICANT = ["KXMENWORLDCUP", "KXMWORLDCUP"]  # A (lo más específico)
 DEFAULT_IMPLIED = ["KXWCSTAGE"]  # B (A ⟹ B)
 DEFAULT_CONTEXT = ["KXWCGROUPWIN"]  # solo se imprime (no hay implicación válida)
+# Escaleras ordinales default (--ladder): series con strikes numéricos del MISMO evento.
+DEFAULT_LADDER_SERIES = ["KXFIFATOTAL", "KXWCTEAMGOALS"]
 
 
 def fetch_series(client: httpx.Client, series: str) -> list[dict[str, Any]]:
@@ -108,10 +118,123 @@ def evaluate_pair(champ: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any
     return res
 
 
+def _strike_of(m: dict[str, Any]) -> float | None:
+    """Strike numérico del market: floor_strike de la API si viene; si no, el último
+    segmento numérico del ticker (ej. ...-T2.5 → 2.5). None = no ordenable."""
+    fs = m.get("floor_strike")
+    if isinstance(fs, (int, float)):
+        return float(fs)
+    tail = m.get("ticker", "").rsplit("-", 1)[-1].lstrip("TABOU")
+    try:
+        return float(tail)
+    except ValueError:
+        return None
+
+
+def evaluate_ladder_pair(weak: dict[str, Any], strong: dict[str, Any]) -> dict[str, Any] | None:
+    """Par ordinal del MISMO evento: weak=strike bajo, strong=strike alto (alto ⟹ bajo).
+
+    HARD (arb real, PATAS CORRECTAS): comprar YES(bajo) + NO(alto). Payout: X>alto → 100;
+    medio → 200; X≤bajo → 100 (garantizado ≥100). Costo = ask_yes(bajo) + ask_no(alto);
+    neto = 100 − costo − fees > 0 → violación fillable.
+    soft: mid_yes(alto) > mid_yes(bajo) — monotonía rota a mid (el spread la tapa).
+    """
+    w_mid, s_mid = _mid(weak), _mid(strong)
+    if w_mid is None or s_mid is None:
+        return None
+    w_ask = weak.get("yes_ask") or 0
+    s_no_ask = strong.get("no_ask") or 0
+    res: dict[str, Any] = {
+        "event": weak.get("event_ticker", "?"),
+        "weak": weak["ticker"],
+        "strong": strong["ticker"],
+        "w_ask": w_ask,
+        "s_no_ask": s_no_ask,
+        "hard": False,
+        "soft": s_mid > w_mid,
+        "net_cents": None,
+    }
+    if 1 <= w_ask <= 99 and 1 <= s_no_ask <= 99:
+        cost = w_ask + s_no_ask
+        fees = kalshi_fee_cents(1, w_ask) + kalshi_fee_cents(1, s_no_ask)
+        net = 100 - cost - fees
+        if net > 0:
+            res["hard"] = True
+            res["net_cents"] = net
+    return res
+
+
+def run_ladder_study(series_list: list[str]) -> int:
+    """Estudio de monotonía en escaleras ordinales: agrupa por evento, ordena por strike,
+    evalúa TODOS los pares ordenados (bajo, alto) del evento."""
+    print("=" * 72)
+    print("ESTUDIO DE ESCALERAS ORDINALES (X>alto ⟹ X>bajo) — read-only, API pública")
+    print("=" * 72)
+    with httpx.Client() as client:
+        markets: list[dict[str, Any]] = []
+        for s in series_list:
+            ms = fetch_series(client, s)
+            print(f"{s}: {len(ms)} markets open")
+            markets.extend(ms)
+
+    by_event: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    unstrikeable = 0
+    for m in markets:
+        strike = _strike_of(m)
+        if strike is None:
+            unstrikeable += 1
+            continue
+        by_event.setdefault(m.get("event_ticker", m["ticker"]), []).append((strike, m))
+    if unstrikeable:
+        print(f"(sin strike parseable: {unstrikeable} markets — no entran a la escalera)")
+
+    pairs = soft = hard = 0
+    results: list[dict[str, Any]] = []
+    for _event, rungs in by_event.items():
+        rungs.sort(key=lambda x: x[0])
+        for i in range(len(rungs)):
+            for j in range(i + 1, len(rungs)):
+                res = evaluate_ladder_pair(rungs[i][1], rungs[j][1])
+                if res is None:
+                    continue
+                pairs += 1
+                soft += res["soft"]
+                hard += res["hard"]
+                if res["soft"] or res["hard"]:
+                    results.append(res)
+
+    print(
+        f"\nEventos con escalera: {len(by_event)}  ·  Pares: {pairs}  ·  soft: {soft}  ·  HARD: {hard}"
+    )
+    for r in sorted(results, key=lambda x: (not x["hard"], -(x["net_cents"] or -999)))[:30]:
+        tag = f"🔴 HARD net={r['net_cents']}¢/par" if r["hard"] else "🟠 soft"
+        print(
+            f"  {tag}  {r['event']}: YES({r['weak']})@{r['w_ask']} + NO({r['strong']})@{r['s_no_ask']}"
+        )
+
+    print("\nVEREDICTO:")
+    if pairs == 0:
+        print("  ⚪ NO EVALUABLE: 0 pares — revisar series/strikes (tickers impresos arriba).")
+        for m in markets[:20]:
+            print(f"    {m['ticker']} floor_strike={m.get('floor_strike')}")
+    elif hard:
+        print("  🔴 Violaciones de monotonía FILLABLES post-fee → tesis Motor 10 CON datos.")
+    elif soft:
+        print("  🟠 Monotonía rota a mid pero el spread la tapa → repetir en movimiento.")
+    else:
+        print("  🟢 Escaleras coherentes hoy — sin tesis (archivar costó $0).")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Estudio de coherencia cross-market (read-only).")
     p.add_argument("--series", help="Series implicante,implicada (override; coma-separadas)")
+    p.add_argument("--ladder", action="store_true", help="Modo escaleras ordinales (Motor 10)")
     args = p.parse_args()
+
+    if args.ladder:
+        series = args.series.split(",") if args.series else DEFAULT_LADDER_SERIES
+        return run_ladder_study(series)
 
     implicant, implied = DEFAULT_IMPLICANT, DEFAULT_IMPLIED
     if args.series:
