@@ -16,6 +16,7 @@ from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
 from src.risk.manager import RiskManager
 from src.storage.models import RiskEvent, Trade, _naive_utc_now, engage_kill_switch, get_session
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker
 from src.utils.config import get_settings
 
@@ -425,9 +426,12 @@ class ArbitrageExecutor:
                     break
                 try:
                     ob = await self.client.get_orderbook(leg.market_ticker, depth=5)
-                    orderbook = ob.get("orderbook", {})
-                    bids = orderbook.get(leg.side, [])
-                    current_bid = next((entry[0] for entry in bids if entry[0] > 0), None)
+                    # rest_orderbook_sides + _top_bid (shape 2026-07-15): el parser viejo
+                    # leía vacío con el shape nuevo (rollback nunca encontraba bid) y su
+                    # `entry[0] > 0` explotaba con precios dólares-string. _top_bid además
+                    # toma el MEJOR bid con size>0 (la referencia correcta para vender),
+                    # no el primer entry de la lista.
+                    current_bid, _ = _top_bid(rest_orderbook_sides(ob)[leg.side])
 
                     if current_bid is None:
                         logger.warning(

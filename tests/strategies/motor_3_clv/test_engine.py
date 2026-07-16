@@ -200,6 +200,30 @@ async def test_take_profit_shadow_detects_but_never_sells():
 
 
 @pytest.mark.asyncio
+async def test_take_profit_reads_new_rest_shape_2026_07():
+    """Shape 2026-07-15 (orderbook_fp + yes_dollars): el TP debe seguir decidible.
+    Sin el normalizador, este shape dejaba bid=None perpetuo → salidas MUERTAS en vivo
+    (fail-closed silencioso: el peor modo de falla para un brazo de venta)."""
+    eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=90)
+    eng._poller.sync_once = AsyncMock()
+    eng._client = MagicMock()
+    eng._client.get_orderbook = AsyncMock(
+        return_value={"orderbook_fp": {"yes_dollars": [["0.9500", "100.00"]]}}
+    )
+    eng._entry_bid_for = lambda p: 60
+
+    captured: list[str] = []
+    sink = logger.add(lambda m: captured.append(str(m)), level="INFO")
+    try:
+        with _patch_db([_far_pos("KXFP")]):
+            await eng._tick()
+    finally:
+        logger.remove(sink)
+
+    assert any("[MOTOR 3 TP SHADOW]" in m and "KXFP" in m for m in captured)
+
+
+@pytest.mark.asyncio
 async def test_take_profit_below_threshold_no_trigger():
     """bid < umbral → no se loguea TP ni se vende (aunque haya executor)."""
     eng = Motor3Engine(trading_enabled=False, take_profit_enabled=True, tp_threshold=90)

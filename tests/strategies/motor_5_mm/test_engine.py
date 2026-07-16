@@ -177,6 +177,23 @@ async def test_book_top_parses_fixed_point_shape():
 
 
 @pytest.mark.asyncio
+async def test_book_top_parses_rest_shape_2026_07():
+    """El shape REAL que el diag de #170 capturó en producción (160 líneas, 2026-07-15):
+    wrapper 'orderbook_fp' + 'yes_dollars'/'no_dollars' en dólares-string. Era LA causa
+    de fair_fresh=10/skip_book=10: books llenos (~$500k) que parseaban vacío."""
+    client = AsyncMock()
+    client.get_orderbook.return_value = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.5400", "558383.77"]],
+            "no_dollars": [["0.4500", "2000.00"]],
+        }
+    }
+    eng = _engine(client)
+    top = await eng._book_top("KXMLBGAME-X")
+    assert top == (54, 55)  # yes_bid=54; yes_ask=100−45=55
+
+
+@pytest.mark.asyncio
 async def test_book_top_legacy_shape_still_works():
     """CONTROL: el shape legacy (yes/no en cents) sigue parseando igual que siempre."""
     client = AsyncMock()

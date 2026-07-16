@@ -39,7 +39,7 @@ from src.storage.models import (
     engage_kill_switch,
     get_session,
 )
-from src.strategies.data_capture import _top_bid
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.poller import _as_int
 
 STRATEGY = "motor_3_clv"
@@ -207,8 +207,9 @@ class Motor3ExitExecutor:
         except Exception as exc:
             logger.warning(f"motor3.exit.orderbook_error ticker={ticker}: {exc}")
             return Motor3ExitOutcome(False, False, reason="orderbook_error")
-        book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-        bid, _ = _top_bid(book.get(side) or [])
+        # rest_orderbook_sides: shape 2026-07-15 — sin él, book vacío → 'no_bid' perpetuo
+        # y las posiciones quedaban invendibles (fail-closed, pero ciego).
+        bid, _ = _top_bid(rest_orderbook_sides(ob)[side])
         if bid is None or not (1 <= bid <= 99):
             logger.info(
                 f"motor3.exit.no_bid ticker={ticker} side={side} (sin liquidez para liquidar)"

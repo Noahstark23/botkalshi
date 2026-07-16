@@ -130,6 +130,45 @@ def _top_bid(levels: list[Any]) -> tuple[int | None, int | None]:
     return best_price_cents, best_size
 
 
+# Generaciones de shape del REST GET /markets/{t}/orderbook (incidente 2026-07-15: la API
+# migró a 'orderbook_fp' + 'yes_dollars'/'no_dollars' con precios en dólares-string y dejó
+# ciegos a TODOS los consumidores que buscaban 'orderbook' + 'yes'/'no' — M5 sin cotizar,
+# y peor: los brazos de salida de M2/M3 en fail-closed sin poder vender). Los VALORES los
+# convierte parse_price_to_cents (int cents, float, o dólares-string); acá solo se
+# normalizan las CLAVES, en orden nuevo→viejo.
+_BOOK_WRAPPER_KEYS = ("orderbook_fp", "orderbook")
+_BOOK_SIDE_KEYS: dict[str, tuple[str, ...]] = {
+    "yes": ("yes_dollars", "yes_dollars_fp", "yes"),
+    "no": ("no_dollars", "no_dollars_fp", "no"),
+}
+
+
+def rest_orderbook_sides(ob: object) -> dict[str, list]:
+    """Normaliza el response del REST /orderbook a {'yes': levels, 'no': levels}.
+
+    Tolera cualquier generación de shape (wrapper 'orderbook_fp' o 'orderbook', o el book
+    ya desenvuelto) y cualquier variante de claves de lado. Los niveles quedan tal cual
+    (los convierte _top_bid/parse_price_to_cents). Fail-safe: input raro → lados vacíos.
+    """
+    outer = ob if isinstance(ob, dict) else {}
+    book = outer
+    for wrapper in _BOOK_WRAPPER_KEYS:
+        inner = outer.get(wrapper)
+        if isinstance(inner, dict):
+            book = inner
+            break
+    sides: dict[str, list] = {}
+    for side, keys in _BOOK_SIDE_KEYS.items():
+        levels: list = []
+        for key in keys:
+            value = book.get(key)
+            if isinstance(value, list) and value:
+                levels = value
+                break
+        sides[side] = levels
+    return sides
+
+
 class DataCaptureService:
     """Captura de datos en tiempo real, sin trading."""
 
