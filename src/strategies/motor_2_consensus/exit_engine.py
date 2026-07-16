@@ -41,7 +41,7 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.storage.models import Trade, get_session
-from src.strategies.data_capture import _top_bid
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.take_profit import DEFAULT_TAKE_PROFIT_CENTS, take_profit_due
 from src.strategies.motor_3_clv.trailing_stop import (
@@ -253,8 +253,9 @@ class Motor2ExitEngine:
         if self._client is not None:
             try:
                 ob = await self._client.get_orderbook(ticker)
-                book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-                bid, _ = _top_bid(book.get(side) or [])
+                # rest_orderbook_sides: shape 2026-07-15 (orderbook_fp/yes_dollars) dejaba
+                # esto ciego → bid=None perpetuo → take-profit/trailing jamás disparaban.
+                bid, _ = _top_bid(rest_orderbook_sides(ob)[side])
             except Exception as exc:
                 logger.warning(f"motor2.exit.orderbook_error ticker={ticker} side={side}: {exc}")
                 bid = None

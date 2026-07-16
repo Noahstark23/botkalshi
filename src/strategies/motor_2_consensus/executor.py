@@ -34,7 +34,7 @@ from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.fees import kalshi_fee_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, engage_kill_switch, get_session
-from src.strategies.data_capture import _top_bid
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 
 STRATEGY = "motor_2_consensus"
@@ -335,9 +335,10 @@ class Motor2Executor:
         except Exception as exc:
             logger.warning(f"motor2.exec.revalidation_error ticker={ticker}: {exc} (fail-open)")
             return None, None
-        book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
+        # rest_orderbook_sides: shape 2026-07-15 — sin él la revalidación devolvía
+        # (None, None) siempre (fail-open declarado, pero sin el techo del book vivo).
         opposite = "no" if side == "yes" else "yes"
-        bid, size = _top_bid(book.get(opposite) or [])
+        bid, size = _top_bid(rest_orderbook_sides(ob)[opposite])
         if bid is None:
             return None, None
         return 100 - bid, size

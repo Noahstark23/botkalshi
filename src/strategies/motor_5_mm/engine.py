@@ -50,7 +50,7 @@ from src.storage.models import (
     kill_switch_engaged,
     mm_quotes_paused,
 )
-from src.strategies.data_capture import _top_bid
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.fair_value_book import FairValueBook
 from src.strategies.motor_5_mm.executor import STRATEGY, Motor5Executor
 from src.strategies.motor_5_mm.fill_feed import MMFillFeed
@@ -346,13 +346,12 @@ class Motor5Engine:
         except Exception as exc:
             logger.warning(f"motor5.book_error ticker={ticker}: {type(exc).__name__}: {exc}")
             return None
-        book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-        # El REST /orderbook entrega 'yes'/'no' (así lo parsean TODOS los consumidores REST
-        # del repo; los niveles pueden venir en cents int o fixed-point string y
-        # _top_bid/parse_price_to_cents maneja ambos). Las claves *_dollars_fp son del WS
-        # (snapshot/delta) — quedan como fallback inofensivo, no como primera opción.
-        yes_levels = book.get("yes") or book.get("yes_dollars_fp") or []
-        no_levels = book.get("no") or book.get("no_dollars_fp") or []
+        # Shape 2026-07-15: la API migró a 'orderbook_fp' + 'yes_dollars'/'no_dollars'
+        # (dólares-string) y este parser leía vacío en silencio (160 líneas book_shape
+        # sobre books con ~$500k resting). El normalizador tolera TODAS las generaciones.
+        sides = rest_orderbook_sides(ob)
+        yes_levels = sides["yes"]
+        no_levels = sides["no"]
         yes_bid, _ = _top_bid(yes_levels)
         no_bid, _ = _top_bid(no_levels)
         yes_ask = (100 - no_bid) if no_bid is not None else None
@@ -368,13 +367,10 @@ class Motor5Engine:
             last = self._book_diag_last.get(ticker)
             if last is None or mono - last >= self.BOOK_DIAG_REARM_SEC:
                 self._book_diag_last[ticker] = mono
-                y_is_list = isinstance(yes_levels, list)
-                n_is_list = isinstance(no_levels, list)
                 logger.warning(
                     f"motor5.book_shape ticker={ticker} sin top usable — "
-                    f"yes_levels={len(yes_levels) if y_is_list else type(yes_levels).__name__} "
-                    f"no_levels={len(no_levels) if n_is_list else type(no_levels).__name__} "
-                    f"book_keys={sorted(book.keys()) if isinstance(book, dict) else type(book).__name__} "
+                    f"yes_levels={len(yes_levels)} no_levels={len(no_levels)} "
+                    f"resp_keys={sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__} "
                     f"raw={str(ob)[:400]}"
                 )
             return None

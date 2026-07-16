@@ -7,7 +7,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.monitoring.health import BotState
-from src.strategies.data_capture import DataCaptureService, parse_price_to_cents, parse_size
+from src.strategies.data_capture import (
+    DataCaptureService,
+    _top_bid,
+    parse_price_to_cents,
+    parse_size,
+    rest_orderbook_sides,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -116,6 +122,52 @@ def test_parse_size_integer():
 def test_parse_size_invalid():
     assert parse_size(None) is None
     assert parse_size("bad") is None
+
+
+# =====================================================
+# rest_orderbook_sides — normalizador del REST /orderbook (incidente 2026-07-15:
+# la API migró a orderbook_fp + yes_dollars/no_dollars y dejó ciegos a M5 y a los
+# brazos de salida de M2/M3)
+# =====================================================
+
+
+def test_rest_sides_new_shape_2026_07():
+    """MECANISMO: el shape real capturado por el diag de #170 (160 líneas, books con
+    ~$500k resting que parseaban vacío)."""
+    ob = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.5400", "558383.77"], ["0.5300", "1000.00"]],
+            "no_dollars": [["0.4500", "2000.00"]],
+        }
+    }
+    sides = rest_orderbook_sides(ob)
+    assert _top_bid(sides["yes"]) == (54, 558384)
+    assert _top_bid(sides["no"]) == (45, 2000)
+
+
+def test_rest_sides_legacy_shape_unchanged():
+    """CONTROL: el shape histórico (orderbook + yes/no en cents int) sigue igual."""
+    ob = {"orderbook": {"yes": [[42, 50]], "no": [[55, 30]]}}
+    sides = rest_orderbook_sides(ob)
+    assert _top_bid(sides["yes"]) == (42, 50)
+    assert _top_bid(sides["no"]) == (55, 30)
+
+
+def test_rest_sides_ws_fp_variant_and_unwrapped():
+    """CONTROL: la variante *_dollars_fp (estilo WS) y un book ya desenvuelto también
+    normalizan — cualquier generación, mismas salidas."""
+    assert _top_bid(
+        rest_orderbook_sides({"orderbook": {"yes_dollars_fp": [["0.4200", "50.00"]]}})["yes"]
+    ) == (42, 50)
+    assert _top_bid(rest_orderbook_sides({"yes": [[42, 50]]})["yes"]) == (42, 50)
+
+
+def test_rest_sides_fail_safe_on_garbage():
+    """FAIL-SAFE: input raro (None, no-dict, wrapper con basura, lados no-lista) →
+    lados vacíos, jamás excepción (Lección 7: un hiccup no rompe el tick)."""
+    for garbage in (None, [], "x", {"orderbook_fp": None}, {"orderbook": {"yes": "no-list"}}):
+        sides = rest_orderbook_sides(garbage)
+        assert sides == {"yes": [], "no": []}
 
 
 # =====================================================

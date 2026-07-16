@@ -21,7 +21,7 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
-from src.strategies.data_capture import _top_bid
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.detector import detect_and_log, summarize_exits
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.poller import PortfolioPoller
@@ -332,8 +332,9 @@ class Motor3Engine:
         if self._client is not None:
             try:
                 ob = await self._client.get_orderbook(position.ticker)
-                book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-                bid, _ = _top_bid(book.get(position.side) or [])
+                # rest_orderbook_sides: shape 2026-07-15 (orderbook_fp/yes_dollars) dejaba
+                # esto ciego → bid=None perpetuo → TP/trailing jamás decidibles.
+                bid, _ = _top_bid(rest_orderbook_sides(ob)[position.side])
             except Exception as exc:
                 logger.warning(f"motor3.tp.orderbook_error ticker={position.ticker}: {exc}")
                 bid = None
