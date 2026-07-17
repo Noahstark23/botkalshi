@@ -20,6 +20,7 @@ from sqlmodel import col, select
 from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
+from src.risk.manager import RiskManager
 from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.detector import detect_and_log, summarize_exits
@@ -335,6 +336,9 @@ class Motor3Engine:
                 # rest_orderbook_sides: shape 2026-07-15 (orderbook_fp/yes_dollars) dejaba
                 # esto ciego → bid=None perpetuo → TP/trailing jamás decidibles.
                 bid, _ = _top_bid(rest_orderbook_sides(ob)[position.side])
+                # Pasajero (2026-07-17): publica el mark para el gate MTM del RiskManager
+                # (cero I/O extra — el bid ya se leyó para el TP). Best-effort adentro.
+                RiskManager.record_mark(position.ticker, position.side, bid)
             except Exception as exc:
                 logger.warning(f"motor3.tp.orderbook_error ticker={position.ticker}: {exc}")
                 bid = None

@@ -40,6 +40,7 @@ from sqlmodel import col, select
 from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
+from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
@@ -256,6 +257,9 @@ class Motor2ExitEngine:
                 # rest_orderbook_sides: shape 2026-07-15 (orderbook_fp/yes_dollars) dejaba
                 # esto ciego → bid=None perpetuo → take-profit/trailing jamás disparaban.
                 bid, _ = _top_bid(rest_orderbook_sides(ob)[side])
+                # Pasajero (2026-07-17): mark para el gate MTM del RiskManager (cero I/O
+                # extra — el bid ya se leyó para el TP). Best-effort adentro.
+                RiskManager.record_mark(ticker, side, bid)
             except Exception as exc:
                 logger.warning(f"motor2.exit.orderbook_error ticker={ticker} side={side}: {exc}")
                 bid = None

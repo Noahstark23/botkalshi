@@ -219,6 +219,10 @@ class RiskManager:
             cls._capital_fallback_warned = False  # ya hay balance real → re-habilita el WARNING
             logger.info(f"risk.capital: balance real de Kalshi = ${usd:.2f} (cash disponible)")
             await cls._check_capital_drift(usd)
+            # Observabilidad EN VIVO de los frenos (auditoría 2026-07-17): pasajero del
+            # refresh periódico — el % usado de cada ventana queda en el log ANTES de que
+            # dispare, no solo post-mortem. Best-effort adentro; jamás rompe el refresh.
+            cls.log_stop_loss_status()
             return usd
         except Exception as exc:
             last = cls._cached_capital_usd
@@ -351,6 +355,13 @@ class RiskManager:
                 "nuevas entradas en pausa",
                 0,
             )
+
+        # Gate SOFT de pérdida latente (MTM) — solo con UNREALIZED_STOP_ENABLED (default
+        # off: cambia la semántica realized-only, decisión del owner). Rechaza entradas
+        # nuevas; salidas/gestión siguen (no pasan por este check).
+        unrealized_reason = self._check_unrealized_stop()
+        if unrealized_reason:
+            return TradeDecision(False, unrealized_reason, 0)
 
         # C-01: capital base = balance REAL de Kalshi (no el ACTIVE_CAPITAL_USD estático).
         capital_usd = self._get_effective_capital_usd()
@@ -516,6 +527,202 @@ class RiskManager:
             return 0  # el set cuesta >= payout: no hay hedge que descontar
         return int(paired * set_cost)
 
+    def _stop_loss_snapshot(self) -> dict:
+        """
+        Foto ÚNICA de todas las ventanas de stop-loss: PnL settled + límite efectivo +
+        % usado, por ventana (rolling / mensual / semanal / diario, ordenadas MÁS severa
+        primero) + PnL del mes por motor.
+
+        Es LA fuente compartida entre el check que dispara (arriba) y la observabilidad
+        (stop_loss_status → dashboard, /pnl, log sl_status): la auditoría 2026-07-17
+        encontró el dashboard mostrando "796% consumido" mientras el freno decía OK —
+        comparaba una ventana ROLLING de 30 días contra el límite MENSUAL y sin pisos.
+        Dos matemáticas separadas SIEMPRE terminan divergiendo; acá queda una sola.
+
+        El rolling se COMPUTA siempre (observabilidad); si ROLLING_DRAWDOWN_STOP_ENABLED
+        es False, la ventana sale con gate_disabled=True y el check la salta (se ve el
+        drawdown venir sin que frene — el freno lo decide el operador con el flag).
+        """
+        now = datetime.now(UTC).replace(tzinfo=None)
+        today_start = datetime.combine(now.date(), time.min)
+        week_start = datetime.combine(now.date() - timedelta(days=now.weekday()), time.min)
+        month_start = datetime.combine(now.date().replace(day=1), time.min)
+        rolling_days = self.settings.MAX_ROLLING_DRAWDOWN_DAYS
+        rolling_start = now - timedelta(days=rolling_days)
+
+        # BUG FIX (borde de mes, 2026-07-01): el rango base cubre TODA la ventana más
+        # antigua — el lunes puede caer en el mes anterior y el rolling siempre es el
+        # más largo. Filtrar cada ventana en memoria desde el set completo.
+        range_start = min(month_start, week_start, rolling_start)
+        with get_session() as s:
+            stmt = select(Trade).where(
+                Trade.status == "settled",
+                col(Trade.settled_at) >= range_start,
+            )
+            all_trades = list(s.exec(stmt))
+
+        def _pnl_since(start: datetime) -> float:
+            return (
+                sum(
+                    (t.pnl_cents or 0) for t in all_trades if t.settled_at and t.settled_at >= start
+                )
+                / 100.0
+            )
+
+        # C-01: límites sobre el capital base REAL. Límite efectivo = max(capital × %,
+        # piso USD) — con capital chico los % puros daban límites de ruido (2026-07-12).
+        capital_usd = self._get_effective_capital_usd()
+
+        def _window(name: str, pnl: float, pct: float, floor: float, disabled: bool = False):
+            limit = max(capital_usd * (pct / 100.0), floor)
+            used = (abs(pnl) / limit * 100.0) if (pnl < 0 and limit > 0) else 0.0
+            return {
+                "name": name,
+                "pnl_usd": pnl,
+                "pct": pct,
+                "floor_usd": floor,
+                "limit_usd": limit,
+                "used_pct": used,
+                "gate_disabled": disabled,
+            }
+
+        s_ = self.settings
+        windows = [
+            _window(
+                f"Rolling{rolling_days}d",
+                _pnl_since(rolling_start),
+                s_.MAX_ROLLING_DRAWDOWN_PCT,
+                s_.MAX_ROLLING_DRAWDOWN_FLOOR_USD,
+                disabled=not s_.ROLLING_DRAWDOWN_STOP_ENABLED,
+            ),
+            _window(
+                "Mensual",
+                _pnl_since(month_start),
+                s_.MAX_MONTHLY_LOSS_PCT,
+                s_.MAX_MONTHLY_LOSS_FLOOR_USD,
+            ),
+            _window(
+                "Semanal",
+                _pnl_since(week_start),
+                s_.MAX_WEEKLY_LOSS_PCT,
+                s_.MAX_WEEKLY_LOSS_FLOOR_USD,
+            ),
+            _window(
+                "Diario",
+                _pnl_since(today_start),
+                s_.MAX_DAILY_LOSS_PCT,
+                s_.MAX_DAILY_LOSS_FLOOR_USD,
+            ),
+        ]
+
+        # Por-motor (mes calendario): el stop-loss es GLOBAL y el neto ENMASCARA qué motor
+        # sangra (M2 −$432 mientras M1 +$34). Observabilidad, no gate.
+        per_motor: dict[str, float] = {}
+        for t in all_trades:
+            if t.settled_at and t.settled_at >= month_start:
+                per_motor[t.strategy] = per_motor.get(t.strategy, 0.0) + (t.pnl_cents or 0) / 100.0
+
+        return {"capital_usd": capital_usd, "windows": windows, "per_motor_month": per_motor}
+
+    def stop_loss_status(self) -> dict:
+        """Snapshot read-only para dashboard//pnl/log — la MISMA matemática del freno, sin
+        efectos. Best-effort: nunca debe romper a su consumidor (dashboard, /status)."""
+        try:
+            return self._stop_loss_snapshot()
+        except Exception as exc:
+            logger.warning(f"risk.stop_loss_status falló: {type(exc).__name__}: {exc}")
+            return {"capital_usd": None, "windows": [], "per_motor_month": {}}
+
+    @classmethod
+    def log_stop_loss_status(cls) -> None:
+        """Una línea INFO `risk.sl_status` con el % usado de CADA freno + PnL del mes por
+        motor. Pasajero del refresh de balance (ya periódico) — el estado de los frenos
+        se ve EN VIVO en los logs, no solo post-mortem cuando ya disparó. Best-effort."""
+        try:
+            snap = cls().stop_loss_status()
+            if not snap["windows"]:
+                return
+            parts = [
+                f"{w['name']}={w['pnl_usd']:+.2f}/{-w['limit_usd']:.2f} ({w['used_pct']:.0f}%"
+                + (" gate_off)" if w["gate_disabled"] else ")")
+                for w in snap["windows"]
+            ]
+            motors = " ".join(f"{k}={v:+.2f}" for k, v in sorted(snap["per_motor_month"].items()))
+            logger.info(
+                f"risk.sl_status capital=${snap['capital_usd']:.2f} "
+                + " ".join(parts)
+                + (f" | mes_por_motor: {motors}" if motors else "")
+            )
+        except Exception as exc:
+            logger.warning(f"risk.sl_status falló: {type(exc).__name__}: {exc}")
+
+    # ── Gate SOFT de pérdida LATENTE (mark-to-market) — flag default OFF ─────────────
+    # ⚠️ Cambia la semántica realized-only (decisión documentada del owner) → solo corre
+    # con UNREALIZED_STOP_ENABLED=true. Marks: los publican los brazos de salida (M3/M2
+    # exit ya leen el bid de cada posición abierta por tick) como PASAJEROS — este gate
+    # no hace I/O de red (prohibido bajo _check_lock). Posición sin mark fresco NO cuenta:
+    # cobertura parcial honesta > mark inventado.
+    _marks: dict[tuple[str, str], tuple[int, datetime]] = {}
+    _unrealized_alert_date: date | None = None
+
+    @classmethod
+    def record_mark(cls, ticker: str, side: str, bid_cents: int | None) -> None:
+        """Publica el bid actual de (ticker, side) para el MTM. Best-effort y barato —
+        lo llaman M3/M2-exit con el bid que YA leyeron para sus take-profits."""
+        try:
+            if bid_cents is not None and 1 <= bid_cents <= 99:
+                cls._marks[(ticker, side)] = (
+                    bid_cents,
+                    datetime.now(UTC).replace(tzinfo=None),
+                )
+        except Exception:  # pragma: no cover - jamás romper al publicador
+            logger.exception("risk.record_mark_failed")
+
+    def _check_unrealized_stop(self) -> str | None:
+        """Pérdida LATENTE de las posiciones abiertas (filled no-settled, direccionales)
+        contra max(capital × %, piso). Breach → razón de rechazo (SOFT: solo entradas;
+        sin kill-switch, sin BotState — igual filosofía que el stop diario). Las patas
+        con arb_id se saltan (hedged: su MTM neto ≈ 0 y el netting ya las descuenta)."""
+        if not self.settings.UNREALIZED_STOP_ENABLED:
+            return None
+        now = datetime.now(UTC).replace(tzinfo=None)
+        ttl = self.settings.UNREALIZED_MARK_TTL_SEC
+        with get_session() as s:
+            stmt = select(Trade).where(
+                Trade.status == "filled",
+                Trade.action == "buy",
+                col(Trade.closed_by_clv).is_(False),
+            )
+            open_trades = list(s.exec(stmt))
+        unrealized_cents = 0
+        covered = 0
+        for t in open_trades:
+            if "arb_id=" in (t.notes or ""):
+                continue
+            mark = RiskManager._marks.get((t.ticker, t.side))
+            if mark is None or (now - mark[1]).total_seconds() > ttl:
+                continue
+            count = t.filled_count if t.filled_count is not None else t.count
+            unrealized_cents += (mark[0] - t.price_cents) * count
+            covered += 1
+        unrealized_usd = unrealized_cents / 100.0
+        capital_usd = self._get_effective_capital_usd()
+        limit_usd = max(
+            capital_usd * (self.settings.MAX_UNREALIZED_LOSS_PCT / 100.0),
+            self.settings.MAX_UNREALIZED_LOSS_FLOOR_USD,
+        )
+        if unrealized_usd < 0 and abs(unrealized_usd) >= limit_usd:
+            reason = (
+                f"Pérdida latente ${unrealized_usd:.2f} ≥ límite ${-limit_usd:.2f} "
+                f"({covered} posiciones con mark): entradas nuevas en pausa (MTM soft)"
+            )
+            today = datetime.now(UTC).date()
+            if RiskManager._unrealized_alert_date != today:
+                RiskManager._unrealized_alert_date = today
+                logger.warning(f"risk.unrealized_stop: {reason}")
+            return reason
+        return None
+
     async def _check_timeframe_stop_losses(self) -> str | None:
         """
         Calcula PnL realizado (UTC) on-the-fly desde tabla Trade.
@@ -547,69 +754,22 @@ class RiskManager:
                datetime.now()                            # usa local timezone
                datetime.now(UTC)                         # aware → SQLite lo guarda mal
         """
-        # SQLite retorna datetimes sin timezone info, usamos naive UTC para comparar
-        now = datetime.now(UTC).replace(tzinfo=None)
-        today_start = datetime.combine(now.date(), time.min)
+        snapshot = self._stop_loss_snapshot()
 
-        # Lunes de esta semana a las 00:00 UTC
-        days_since_monday = now.weekday()
-        week_start = datetime.combine(now.date() - timedelta(days=days_since_monday), time.min)
-
-        # Día 1 de este mes a las 00:00 UTC
-        month_start = datetime.combine(now.date().replace(day=1), time.min)
-
-        # BUG FIX (borde de mes): en los primeros días de un mes, el LUNES de esta semana cae en
-        # el MES ANTERIOR (ej. hoy 2026-07-01 → week_start 2026-06-29 < month_start 2026-07-01). Si
-        # el rango base arrancara en month_start, el stop-loss SEMANAL se computaba sobre un set que
-        # ya excluía esos días → SUBCONTABA la pérdida de la semana → protección semanal más débil
-        # justo tras el rollover de mes. El rango base debe cubrir TODA la ventana (la más antigua).
-        range_start = min(month_start, week_start)
-        with get_session() as s:
-            stmt = select(Trade).where(
-                Trade.status == "settled",
-                col(Trade.settled_at) >= range_start,
-            )
-            all_trades = list(s.exec(stmt))
-
-        # Filtrar cada timeframe en memoria desde el set completo (cada ventana, independiente).
-        monthly_trades = [t for t in all_trades if t.settled_at and t.settled_at >= month_start]
-        weekly_trades = [t for t in all_trades if t.settled_at and t.settled_at >= week_start]
-        daily_trades = [t for t in all_trades if t.settled_at and t.settled_at >= today_start]
-
-        monthly_pnl_usd = sum((t.pnl_cents or 0) for t in monthly_trades) / 100.0
-        weekly_pnl_usd = sum((t.pnl_cents or 0) for t in weekly_trades) / 100.0
-        daily_pnl_usd = sum((t.pnl_cents or 0) for t in daily_trades) / 100.0
-
-        # Orden MÁS SEVERO PRIMERO (mensual → semanal → diario): con el breach diario en modo
-        # soft (no latchea), si un mismo día rompe también la ventana semanal/mensual, el
-        # kill-switch persistente DEBE latchear — si el diario se evaluara primero, lo taparía.
-        limits = [
-            (
-                "Mensual",
-                monthly_pnl_usd,
-                self.settings.MAX_MONTHLY_LOSS_PCT,
-                self.settings.MAX_MONTHLY_LOSS_FLOOR_USD,
-            ),
-            (
-                "Semanal",
-                weekly_pnl_usd,
-                self.settings.MAX_WEEKLY_LOSS_PCT,
-                self.settings.MAX_WEEKLY_LOSS_FLOOR_USD,
-            ),
-            (
-                "Diario",
-                daily_pnl_usd,
-                self.settings.MAX_DAILY_LOSS_PCT,
-                self.settings.MAX_DAILY_LOSS_FLOOR_USD,
-            ),
-        ]
-
-        # C-01: stop-losses sobre el capital base REAL (balance de Kalshi), no el estático.
-        # Límite efectivo = max(capital × %, piso USD): con capital chico los % puros daban
-        # límites a nivel de ruido ($5.40/día con $180) que apagaban todo el bot (2026-07-12).
-        capital_usd = self._get_effective_capital_usd()
-        for period_name, pnl_usd, max_pct, floor_usd in limits:
-            max_loss_usd = max(capital_usd * (max_pct / 100.0), floor_usd)
+        # Orden MÁS SEVERO PRIMERO (rolling → mensual → semanal → diario): con el breach
+        # diario en modo soft (no latchea), si un mismo día rompe también una ventana
+        # nuclear, el kill-switch persistente DEBE latchear — si el diario se evaluara
+        # primero, lo taparía. El ROLLING va primero: es la ventana más larga (la sangría
+        # gradual que las de calendario dejan pasar — auditoría 2026-07-17, M2 −$430
+        # repartidos jun→jul sin un solo breach mensual).
+        for window in snapshot["windows"]:
+            period_name = window["name"]
+            pnl_usd = window["pnl_usd"]
+            max_loss_usd = window["limit_usd"]
+            max_pct = window["pct"]
+            floor_usd = window["floor_usd"]
+            if window.get("gate_disabled"):
+                continue
             if pnl_usd < 0 and abs(pnl_usd) >= max_loss_usd:
                 if period_name == "Diario" and self.settings.DAILY_STOP_ENTRIES_ONLY:
                     # Respuesta escalonada (2026-07-12): un día malo pausa SOLO las entradas

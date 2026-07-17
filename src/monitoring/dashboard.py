@@ -102,12 +102,14 @@ def build_dashboard_text(now: datetime | None = None) -> str:
         + ("  ⚠️ entradas pausadas" if cap.get("is_paused") else ""),
     ]
 
-    # 📊 PnL realizado (settled)
+    # 📊 PnL realizado (settled). OJO etiquetas (auditoría 2026-07-17): estas ventanas son
+    # RODANTES (7d/30d) — NO las de calendario del stop-loss. Mezclarlas produjo el "796%
+    # consumido" fantasma: pérdida rolling-30d comparada contra el límite MENSUAL.
     lines += [
         "",
         "📊 *PnL realizado* (liquidado, UTC)",
-        f"Hoy: `{_money(today.total_pnl_cents)}` · Semana: `{_money(week.total_pnl_cents)}`",
-        f"Mes: `{_money(month.total_pnl_cents)}` · Total: `{_money(total.total_pnl_cents)}`",
+        f"Hoy: `{_money(today.total_pnl_cents)}` · 7d: `{_money(week.total_pnl_cents)}`",
+        f"30d: `{_money(month.total_pnl_cents)}` · Total: `{_money(total.total_pnl_cents)}`",
     ]
 
     # 🏆 Por motor (acumulado — donde avg win/loss tiene muestra)
@@ -132,17 +134,20 @@ def build_dashboard_text(now: datetime | None = None) -> str:
         f"Posiciones abiertas: `{len(open_positions)}`",
     ]
 
-    # 🛑 Stop-loss — % consumido del límite (pérdida realizada del período / límite)
-    lines += ["", "🛑 *Stop-loss* (consumido del límite)"]
-    for label, pct, agg in (
-        ("Diario", settings.MAX_DAILY_LOSS_PCT, today),
-        ("Semanal", settings.MAX_WEEKLY_LOSS_PCT, week),
-        ("Mensual", settings.MAX_MONTHLY_LOSS_PCT, month),
-    ):
-        limit_usd = pct / 100.0 * eff_usd
-        loss_usd = max(0.0, -agg.total_pnl_cents / 100.0)
-        consumed = (loss_usd / limit_usd * 100.0) if limit_usd else 0.0
-        lines.append(f"{label}: `{consumed:.1f}%` de `${limit_usd:.2f}` ({pct:.0f}%)")
+    # 🛑 Stop-loss — DIRECTO del RiskManager (auditoría 2026-07-17): antes esta sección
+    # recalculaba con ventanas rolling y SIN los pisos USD → mostraba "796% consumido"
+    # de un freno que en realidad estaba OK (ventanas de calendario + pisos). Una sola
+    # matemática (stop_loss_status = la del check) para que dashboard y freno no diverjan.
+    lines += ["", "🛑 *Stop-loss* (consumido del límite — misma matemática que el freno)"]
+    sl = RiskManager().stop_loss_status()
+    if not sl["windows"]:
+        lines.append("_(no disponible)_")
+    for w in sl["windows"]:
+        gate = " · gate OFF" if w["gate_disabled"] else ""
+        lines.append(
+            f"{w['name']}: `{w['used_pct']:.0f}%` de `${w['limit_usd']:.2f}` "
+            f"(PnL `{w['pnl_usd']:+.2f}`){gate}"
+        )
 
     # 🔒 Trailing / CLV
     lines += [

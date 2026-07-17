@@ -67,6 +67,47 @@ class Settings(BaseSettings):
         default=True,
         description="Breach diario: pausa entradas hasta el día UTC siguiente (auto-recupera) en vez de kill-switch persistente.",
     )
+    # Stop-loss ROLLING (auditoría 2026-07-17): las ventanas de CALENDARIO resetean lunes /
+    # día 1 — una sangría GRADUAL repartida entre ventanas nunca cruza un umbral individual
+    # (M2: −$430 en ~3 semanas a caballo del rollover de junio→julio, sin un solo breach
+    # mensual). Esta ventana rueda con el reloj: PnL settled de los últimos N días vs
+    # max(capital × %, piso). Breach = kill-switch persistente (nuclear, como el mensual).
+    # ⚠️ Default OFF: activarlo con un drawdown histórico ya adentro de la ventana latchea
+    # el kill-switch en el PRIMER intento de entrada — decisión explícita del operador.
+    ROLLING_DRAWDOWN_STOP_ENABLED: bool = Field(
+        default=False,
+        description="Stop-loss por drawdown ROLLING (ventana móvil de N días, no calendario). Breach = kill-switch persistente.",
+    )
+    MAX_ROLLING_DRAWDOWN_PCT: float = Field(
+        default=15.0, gt=0, le=50, description="Drawdown rolling máximo como % del capital efectivo"
+    )
+    MAX_ROLLING_DRAWDOWN_DAYS: int = Field(
+        default=30, ge=2, le=90, description="Días de la ventana rolling del drawdown"
+    )
+    MAX_ROLLING_DRAWDOWN_FLOOR_USD: float = Field(
+        default=60.0, ge=0, description="Piso en USD del drawdown rolling (0 = solo %)"
+    )
+    # Gate de PnL NO-REALIZADO (mark-to-market) — ⚠️ CAMBIA la semántica realized-only que
+    # el owner definió a propósito (deuda documentada en RiskManager), por eso vive detrás
+    # de un flag default OFF y es SOFT (pausa solo entradas nuevas, sin kill-switch, como el
+    # stop diario). Marks: los publican como PASAJEROS los brazos de salida (M3/M2-exit ya
+    # leen el bid de cada posición abierta por tick — cero I/O extra); una posición sin mark
+    # fresco NO cuenta (cobertura parcial honesta, mejor que un mark inventado).
+    UNREALIZED_STOP_ENABLED: bool = Field(
+        default=False,
+        description="Gate SOFT de pérdida latente (MTM de posiciones abiertas): pausa entradas nuevas. Requiere decisión del owner.",
+    )
+    MAX_UNREALIZED_LOSS_PCT: float = Field(
+        default=10.0, gt=0, le=50, description="Pérdida latente máxima como % del capital efectivo"
+    )
+    MAX_UNREALIZED_LOSS_FLOOR_USD: float = Field(
+        default=40.0, ge=0, description="Piso en USD del gate de pérdida latente (0 = solo %)"
+    )
+    UNREALIZED_MARK_TTL_SEC: float = Field(
+        default=900.0,
+        gt=0,
+        description="Frescura máxima de un mark publicado por los brazos de salida para contar en el MTM",
+    )
     MAX_SIMULTANEOUS_EXPOSURE_PCT: float = Field(25.0, gt=0, le=100)
     MAX_TRADE_SIZE_PCT: float = Field(5.0, gt=0, le=20)
     # Cap ABSOLUTO por orden (anti-slippage), en USD — independiente del % y del capital.

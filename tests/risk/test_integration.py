@@ -66,6 +66,15 @@ def _risk_settings() -> MagicMock:
     s.MAX_WEEKLY_LOSS_FLOOR_USD = 0.0
     s.MAX_MONTHLY_LOSS_FLOOR_USD = 0.0
     s.DAILY_STOP_ENTRIES_ONLY = False
+    # Rolling + MTM neutralizados (2026-07-17): off = comportamiento histórico.
+    s.ROLLING_DRAWDOWN_STOP_ENABLED = False
+    s.MAX_ROLLING_DRAWDOWN_PCT = 15.0
+    s.MAX_ROLLING_DRAWDOWN_DAYS = 30
+    s.MAX_ROLLING_DRAWDOWN_FLOOR_USD = 0.0
+    s.UNREALIZED_STOP_ENABLED = False
+    s.MAX_UNREALIZED_LOSS_PCT = 10.0
+    s.MAX_UNREALIZED_LOSS_FLOOR_USD = 0.0
+    s.UNREALIZED_MARK_TTL_SEC = 900.0
     return s
 
 
