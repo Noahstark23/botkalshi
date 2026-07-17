@@ -44,6 +44,31 @@ class OrderbookNotInitializedError(OrderbookError):
     """Se intentó aplicar delta antes de cargar snapshot inicial."""
 
 
+class OrderbookSeqRegressionError(OrderbookError):
+    """
+    Raised by apply_delta cuando llega un seq ≤ al actual del book (regresión).
+
+    Causa dominante (incidente crónico 2026-07-15, 5k-400k ValueError/día): Kalshi
+    reinicia el contador de seq en una resuscripción (epoch nuevo, sid nuevo) — el
+    gap-check del manager es por sid y un sid NUEVO no tiene baseline, así que el
+    delta con seq bajo llega hasta acá con el book todavía en el epoch viejo alto.
+    Antes esto era un ValueError pelado: fuera de la familia OrderbookError, el
+    dispatcher lo logueaba con traceback ERROR por CADA delta y la cuarentena de
+    #158 no lo veía → el book quedaba congelado rechazando deltas indefinidamente.
+    Como OrderbookError: log INFO + cuarentena + recovery (el snapshot re-basea el
+    sequence — apply_snapshot ya lo hace) → un evento, no un millón.
+    """
+
+    def __init__(self, ticker: str, got_seq: int, current_seq: int) -> None:
+        self.ticker = ticker
+        self.got_seq = got_seq
+        self.current_seq = current_seq
+        super().__init__(
+            f"{ticker}: seq regression {got_seq} <= current {current_seq} "
+            "(epoch reset de Kalshi — requiere re-snapshot)"
+        )
+
+
 class OrderbookDesyncError(OrderbookError):
     """
     Raised by apply_delta when a delta produces new_qty < 0.
@@ -307,9 +332,13 @@ class OrderbookState:
             raise ValueError(f"Invalid price_cents: {price!r}")
         if not isinstance(delta_size, int):
             raise ValueError(f"Invalid delta size: {delta_size!r}")
-        if not isinstance(new_seq, int) or new_seq <= self._sequence:
-            raise ValueError(
-                f"Invalid new sequence: {new_seq!r} (must be > current {self._sequence})"
+        if not isinstance(new_seq, int):
+            raise ValueError(f"Invalid new sequence: {new_seq!r} (not an int)")
+        if new_seq <= self._sequence:
+            # Regresión = señal de divergencia (epoch reset), NO mensaje malformado →
+            # clase de la familia OrderbookError para que dispare cuarentena+recovery.
+            raise OrderbookSeqRegressionError(
+                ticker=self.ticker, got_seq=new_seq, current_seq=self._sequence
             )
 
         if ts_ms is not None:

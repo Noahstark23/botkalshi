@@ -16,6 +16,7 @@ Usage:
 
 Exit code 0 = clean, 1 = violations found.
 """
+
 from __future__ import annotations
 
 import re

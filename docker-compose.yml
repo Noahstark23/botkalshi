@@ -12,6 +12,9 @@ services:
       dockerfile: Dockerfile
     container_name: kalshi-bot
     restart: unless-stopped
+    # Margen para shutdown limpio (alert_shutdown + cierre de DB/WS) antes del SIGKILL.
+    # Default Docker = 10s; lo subimos para que el SIGTERM del redeploy cierre ordenado.
+    stop_grace_period: 30s
 
     # Variables de entorno - Coolify las inyecta desde su panel
     # En .env vacíos por default para que Coolify las defina
@@ -49,15 +52,37 @@ services:
       TRADING_ENABLED: ${TRADING_ENABLED:-false}
       MOTOR_1_ARBITRAGE_ENABLED: ${MOTOR_1_ARBITRAGE_ENABLED:-false}
       MOTOR_2_SPORTSBOOK_ENABLED: ${MOTOR_2_SPORTSBOOK_ENABLED:-false}
+      # Filtro underdog Motor 2 (FASE 3). ENABLED off = shadow (loguea lo que bloquearía pero
+      # igual entra); on = bloquea entradas <MIN_ENTRY_CENTS (sangraron −$110,77 históricos).
+      MOTOR_2_MIN_ENTRY_CENTS: ${MOTOR_2_MIN_ENTRY_CENTS:-40}
+      MOTOR_2_UNDERDOG_FILTER_ENABLED: ${MOTOR_2_UNDERDOG_FILTER_ENABLED:-false}
       MOTOR_3_CLV_ENABLED: ${MOTOR_3_CLV_ENABLED:-false}
+      # Ejecución de Motor 3 desacoplada del trading global (consenso de 2 flags). En false
+      # corre en SHADOW aunque TRADING_ENABLED=true → se valida sin vender de verdad.
+      MOTOR_3_EXECUTION_ENABLED: ${MOTOR_3_EXECUTION_ENABLED:-false}
+      # Take-profit por precio (FASE 1). ENABLED gatea detección+log; la venta sigue gateada
+      # por MOTOR_3_EXECUTION_ENABLED. Shadow = TAKE_PROFIT_ENABLED=true + EXECUTION=false.
+      MOTOR_3_TAKE_PROFIT_ENABLED: ${MOTOR_3_TAKE_PROFIT_ENABLED:-false}
+      MOTOR_3_TAKE_PROFIT_CENTS: ${MOTOR_3_TAKE_PROFIT_CENTS:-90}
+      # Trailing stop (FASE 2). ENABLED gatea detección+log; la venta sigue gateada por
+      # MOTOR_3_EXECUTION_ENABLED. DROP = retroceso en cents desde el pico del bid.
+      MOTOR_3_TRAILING_ENABLED: ${MOTOR_3_TRAILING_ENABLED:-false}
+      MOTOR_3_TRAILING_DROP_CENTS: ${MOTOR_3_TRAILING_DROP_CENTS:-5}
       USE_ORDERBOOK_MANAGER_V2: ${USE_ORDERBOOK_MANAGER_V2:-false}
 
       # Motor REST (shadow/live). MOTOR_REST_ENABLED=true + TRADING_ENABLED=false = shadow.
       MOTOR_REST_ENABLED: ${MOTOR_REST_ENABLED:-false}
+      # Ejecución de Motor REST desacoplada del trading global (consenso de 2 flags). En
+      # false corre en SHADOW (detecta + log de intención hard-first) aunque TRADING_ENABLED
+      # =true → se valida el guardarraíl sin ejecutar ni apagar a Motor 2.
+      MOTOR_REST_EXECUTION_ENABLED: ${MOTOR_REST_EXECUTION_ENABLED:-false}
       MOTOR_REST_MIN_EDGE_CENTS: ${MOTOR_REST_MIN_EDGE_CENTS:-1}
       MOTOR_REST_MIN_DEPTH: ${MOTOR_REST_MIN_DEPTH:-2}
       # Umbral FINO de ejecución (% del capital comprometido); calibrable desde Coolify.
       MOTOR_REST_EXECUTION_EDGE_PCT: ${MOTOR_REST_EXECUTION_EDGE_PCT:-1.5}
+
+      # Reportes (advisory-only, no tradean)
+      DAILY_PNL_REPORT_ENABLED: ${DAILY_PNL_REPORT_ENABLED:-false}
 
       # Optional
       SENTRY_DSN: ${SENTRY_DSN:-}
@@ -75,10 +100,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1024M
           cpus: '0.5'
         reservations:
-          memory: 256M
+          memory: 512M
           cpus: '0.25'
 
     # Healthcheck nativo Docker (además del de Dockerfile)

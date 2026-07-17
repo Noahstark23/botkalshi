@@ -207,6 +207,9 @@ async def status() -> dict[str, Any]:
             "last_gap_at": s.get("last_gap_at"),
         }
 
+    # Local: el RiskManager importa BotState de este módulo → import diferido evita el ciclo.
+    from src.risk.manager import RiskManager
+
     return {
         "bot": {
             "started_at": BotState.started_at.isoformat(),
@@ -234,9 +237,14 @@ async def status() -> dict[str, Any]:
             "motors_enabled": {
                 "motor_1_arbitrage": settings.MOTOR_1_ARBITRAGE_ENABLED,
                 "motor_2_sportsbook": settings.MOTOR_2_SPORTSBOOK_ENABLED,
+                "motor_2_execution": settings.MOTOR_2_EXECUTION_ENABLED,
                 "motor_3_clv": settings.MOTOR_3_CLV_ENABLED,
+                "motor_3_execution": settings.MOTOR_3_EXECUTION_ENABLED,
+                "motor_5_mm": settings.MOTOR_MM_ENABLED,
+                "motor_5_execution": settings.MOTOR_MM_EXECUTION_ENABLED,
             },
         },
+        "capital": RiskManager.capital_status(),
         "today": {
             "trades_count": len(trades_today),
             "winning": sum(1 for t in trades_today if t.pnl_cents and t.pnl_cents > 0),
@@ -301,7 +309,33 @@ async def pause_bot(reason: str = Query(..., min_length=1, max_length=200)) -> d
 
 @app.post("/admin/resume")
 async def resume_bot() -> dict[str, str]:
-    """Reanuda trading después de pausa manual."""
+    """Reanuda trading después de pausa manual.
+
+    Auditoría 2026-07-07 (P1): si el kill-switch PERSISTENTE está engaged (stop-loss o
+    rollback abortado), este endpoint NO puede levantarlo — un curl saltearía la
+    verificación de posiciones=0 de scripts/clear_kill_switch.py y además la pausa
+    volvería sola en el próximo redeploy (_rehydrate_kill_switch), dejando el bot en un
+    estado a medias. FAIL-CLOSED: si la DB no se puede leer, tampoco se resume.
+    """
+    from src.storage.models import kill_switch_engaged
+
+    try:
+        engaged, ks_reason = kill_switch_engaged()
+    except Exception as exc:
+        logger.error(f"/admin/resume: no se pudo leer el kill-switch: {exc} (fail-closed)")
+        raise HTTPException(
+            status_code=503, detail="No se pudo verificar el kill-switch — resume denegado"
+        ) from exc
+    if engaged:
+        logger.warning(f"/admin/resume RECHAZADO: kill-switch persistente engaged ({ks_reason})")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Kill-switch persistente engaged: {ks_reason}. "
+                "Levantarlo SOLO con scripts/clear_kill_switch.py (verifica posiciones=0)."
+            ),
+        )
+
     if not BotState.is_paused:
         return {"status": "already_running"}
 

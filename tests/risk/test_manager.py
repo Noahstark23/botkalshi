@@ -13,12 +13,12 @@ from datetime import UTC, datetime, time, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.monitoring.health import BotState
 from src.risk.manager import RiskManager
-from src.storage.models import Trade
+from src.storage.models import RiskEvent, Trade
 
 
 @pytest.fixture(autouse=True)
@@ -31,17 +31,63 @@ def reset_botstate():
     BotState.pause_reason = None
 
 
+@pytest.fixture(autouse=True)
+def reset_capital_cache():
+    """C-01: la caché de capital es de CLASE → resetear entre tests para no filtrarla."""
+    RiskManager._cached_capital_usd = None
+    RiskManager._last_balance_at = None
+    RiskManager._capital_fallback_warned = False
+    RiskManager._drift_alerted = False
+    RiskManager._last_raw_balance_usd = None
+    yield
+    RiskManager._cached_capital_usd = None
+    RiskManager._last_balance_at = None
+    RiskManager._capital_fallback_warned = False
+    RiskManager._drift_alerted = False
+    RiskManager._last_raw_balance_usd = None
+
+
 @pytest.fixture
 def mock_settings():
     with patch("src.risk.manager.get_settings") as m:
         s = MagicMock()
         s.TRADING_ENABLED = True
-        s.ACTIVE_CAPITAL_USD = 300.0
-        s.MAX_DAILY_LOSS_PCT = 3.0
-        s.MAX_WEEKLY_LOSS_PCT = 8.0
-        s.MAX_MONTHLY_LOSS_PCT = 15.0
-        s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0
-        s.MAX_TRADE_SIZE_PCT = 5.0
+        s.ACTIVE_CAPITAL_USD = 4000.0  # bankroll escalado
+        s.MAX_DAILY_LOSS_PCT = 3.0  # → $120
+        s.MAX_WEEKLY_LOSS_PCT = 8.0  # → $320
+        s.MAX_MONTHLY_LOSS_PCT = 15.0  # → $600
+        s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # → $1000
+        s.MAX_TRADE_SIZE_PCT = 5.0  # 5% de $4k = $200
+        s.MAX_TRADE_SIZE_USD = 200.0  # cap absoluto anti-slippage
+        # C-02/C-03 neutralizados por default para no alterar la semántica de los tests C-01:
+        # factor 100% (efectivo == cache), demo (sin clamp), umbral de drift alto (no alerta),
+        # telegram off (send_alert no-op, sin red). Los tests C-02/C-03 los overridean.
+        s.KALSHI_ENV = "demo"
+        s.CAPITAL_SAFETY_FACTOR_PCT = 100.0
+        s.CAPITAL_DRIFT_ALERT_PCT = 1000.0
+        s.telegram_configured = False
+        # Capital dinámico neutralizado por default (los tests dedicados lo overridean):
+        # dynamic on (path C-01/02 activo), piso bajo y techo alto (no bindean), sin suavizado.
+        s.DYNAMIC_CAPITAL_ENABLED = True
+        s.CAPITAL_FLOOR_USD = 1.0
+        s.CAPITAL_CAP_USD = 100_000.0
+        s.CAPITAL_SMOOTHING_PCT = 0.0
+        # Stop-loss a escala chica NEUTRALIZADO por default (los tests dedicados overridean):
+        # pisos 0 (solo %) y diario nuclear (comportamiento histórico de estos tests).
+        s.MAX_DAILY_LOSS_FLOOR_USD = 0.0
+        s.MAX_WEEKLY_LOSS_FLOOR_USD = 0.0
+        s.MAX_MONTHLY_LOSS_FLOOR_USD = 0.0
+        s.DAILY_STOP_ENTRIES_ONLY = False
+        # Rolling drawdown + gate MTM NEUTRALIZADOS por default (2026-07-17): los tests
+        # dedicados los overridean. Off = comportamiento histórico de estos tests.
+        s.ROLLING_DRAWDOWN_STOP_ENABLED = False
+        s.MAX_ROLLING_DRAWDOWN_PCT = 15.0
+        s.MAX_ROLLING_DRAWDOWN_DAYS = 30
+        s.MAX_ROLLING_DRAWDOWN_FLOOR_USD = 0.0
+        s.UNREALIZED_STOP_ENABLED = False
+        s.MAX_UNREALIZED_LOSS_PCT = 10.0
+        s.MAX_UNREALIZED_LOSS_FLOOR_USD = 0.0
+        s.UNREALIZED_MARK_TTL_SEC = 900.0
         m.return_value = s
         yield s
 
@@ -53,7 +99,7 @@ def risk_manager(mock_settings):
 
 @pytest.fixture
 def sample_opp():
-    """Arb binario: cost=85¢, count=15. Capital cap = 1500//85 = 17, so opp.count=15 wins."""
+    """Arb binario: cost=85¢, count=15. usable=$200 → 20000//85=235 cap, so opp.count=15 wins."""
     leg1 = ArbLeg(market_ticker="KX-TEST", side="yes", price_cents=40, count=15, available_size=100)
     leg2 = ArbLeg(market_ticker="KX-TEST", side="no", price_cents=45, count=15, available_size=100)
     return ArbOpportunity(
@@ -90,17 +136,17 @@ async def test_no_active_trades_allows_full_sizing(mock_session, risk_manager, s
     decision = await risk_manager.check_pre_trade(sample_opp)
 
     assert decision.approved is True
-    # 1500 cents max // 85 cents = 17 contracts cap, but opp.count=15 wins
+    # usable=$200 → 20000¢ // 85¢ = 235 cap, but opp.count=15 wins
     assert decision.max_allowed_count == 15
 
 
 @pytest.mark.asyncio
 @patch("src.risk.manager.get_session")
 async def test_exposure_exhausted_rejects(mock_session, risk_manager, sample_opp):
-    """$80 ya invertido, cap=$75 (25% of $300), debe rechazar."""
+    """$1040 ya invertido, cap=$1000 (25% of $4000), debe rechazar."""
     mock_trade = MagicMock()
     mock_trade.price_cents = 80
-    mock_trade.count = 100  # $80 exposure
+    mock_trade.count = 1300  # $1040 exposure > $1000 cap
 
     mock_db = MagicMock()
     mock_session.return_value.__enter__.return_value = mock_db
@@ -137,8 +183,10 @@ async def test_sizing_cap_strictly_applied(mock_session, risk_manager):
 
     decision = await risk_manager.check_pre_trade(opp)
     assert decision.approved is True
-    # usable=$15 (5% of $300), cost/unit=90¢ → 1500//90 = 16
-    assert decision.max_allowed_count == 16
+    # usable=$200 (min de 5%·$4k=$200 y cap absoluto $200), cost/unit=90¢ + fees/unit
+    # 4¢ (fee(1,50)=2 + fee(1,40)=2; deuda auditoría: el USD comprometido incluye la
+    # comisión) → 20000 // 94 = 212
+    assert decision.max_allowed_count == 212
 
 
 @pytest.mark.asyncio
@@ -167,6 +215,60 @@ async def test_opp_count_constrains_when_below_capital(mock_session, risk_manage
 
 @pytest.mark.asyncio
 @patch("src.risk.manager.get_session")
+async def test_absolute_usd_cap_binds_when_pct_would_exceed(mock_session):
+    """FASE 2: con capital alto, 5% daría >$200, pero el cap ABSOLUTO $200 es el que manda."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]
+
+    with patch("src.risk.manager.get_settings") as m:
+        s = MagicMock()
+        s.TRADING_ENABLED = True
+        s.ACTIVE_CAPITAL_USD = 5000.0  # 5% = $250 > cap absoluto $200
+        s.MAX_DAILY_LOSS_PCT = 3.0
+        s.MAX_WEEKLY_LOSS_PCT = 8.0
+        s.MAX_MONTHLY_LOSS_PCT = 15.0
+        s.MAX_SIMULTANEOUS_EXPOSURE_PCT = 25.0  # remaining $1250
+        s.MAX_TRADE_SIZE_PCT = 5.0
+        s.MAX_TRADE_SIZE_USD = 200.0
+        s.MAX_DAILY_LOSS_FLOOR_USD = 0.0
+        s.MAX_WEEKLY_LOSS_FLOOR_USD = 0.0
+        s.MAX_MONTHLY_LOSS_FLOOR_USD = 0.0
+        s.DAILY_STOP_ENTRIES_ONLY = False
+        s.ROLLING_DRAWDOWN_STOP_ENABLED = False
+        s.MAX_ROLLING_DRAWDOWN_PCT = 15.0
+        s.MAX_ROLLING_DRAWDOWN_DAYS = 30
+        s.MAX_ROLLING_DRAWDOWN_FLOOR_USD = 0.0
+        s.UNREALIZED_STOP_ENABLED = False
+        s.MAX_UNREALIZED_LOSS_PCT = 10.0
+        s.MAX_UNREALIZED_LOSS_FLOOR_USD = 0.0
+        s.UNREALIZED_MARK_TTL_SEC = 900.0
+        m.return_value = s
+        rm = RiskManager()
+        leg1 = ArbLeg(
+            market_ticker="KX", side="yes", price_cents=50, count=1000, available_size=1000
+        )
+        leg2 = ArbLeg(
+            market_ticker="KX", side="no", price_cents=50, count=1000, available_size=1000
+        )
+        opp = ArbOpportunity(
+            legs=(leg1, leg2),
+            count=1000,
+            gross_profit_cents=0,
+            fees_cents=0,
+            net_profit_cents=0,
+            edge_pct=5.0,
+        )
+        decision = await rm.check_pre_trade(opp)
+
+    # usable = min(5%·$5000=$250, remaining $1250, cap $200) = $200; cost/unit=100¢ +
+    # fees/unit 4¢ → 20000 // 104 = 192. Sin el cap absoluto serían ~240 → el cap recorta.
+    assert decision.approved is True
+    assert decision.max_allowed_count == 192
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
 async def test_zero_cost_legs_rejected(mock_session, risk_manager):
     mock_db = MagicMock()
     mock_session.return_value.__enter__.return_value = mock_db
@@ -186,6 +288,96 @@ async def test_zero_cost_legs_rejected(mock_session, risk_manager):
     decision = await risk_manager.check_pre_trade(opp)
     assert decision.approved is False
     assert "inválidos" in decision.reason
+
+
+# =========================================================
+# C-01 — capital base = balance real de Kalshi
+# =========================================================
+
+
+def _balance_factory(*, balance=None, raises=None):
+    """Factory que devuelve un client mock (async CM) con get_balance configurable."""
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    if raises is not None:
+        client.get_balance = AsyncMock(side_effect=raises)
+    else:
+        client.get_balance = AsyncMock(return_value={"balance": balance})
+    return lambda: client
+
+
+@pytest.mark.asyncio
+async def test_refresh_reads_balance_cents_to_usd(mock_settings):
+    """get_balance {'balance': 300000} → capital efectivo $3000.00 (cents→USD)."""
+    usd = await RiskManager.refresh_capital_from_balance(
+        client_factory=_balance_factory(balance=300000)
+    )
+    assert usd == 3000.0
+    assert RiskManager._cached_capital_usd == 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 3000.0
+    assert RiskManager._last_balance_at is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_updates_cached_value(mock_settings):
+    """Un segundo refresh con balance distinto actualiza la caché."""
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=100000))
+    assert RiskManager._cached_capital_usd == 1000.0
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=305000))
+    assert RiskManager._cached_capital_usd == 3050.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_last_known_on_api_failure(mock_settings):
+    """Si get_balance falla pero ya había un balance, se MANTIENE el último conocido."""
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=300000))
+    result = await RiskManager.refresh_capital_from_balance(
+        client_factory=_balance_factory(raises=TimeoutError("kalshi down"))
+    )
+    assert RiskManager._cached_capital_usd == 3000.0  # NO se pisó con el fallo
+    assert result == 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 3000.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_active_capital_when_never_fetched(mock_settings):
+    """Sin balance previo y la API falla → capital efectivo = ACTIVE_CAPITAL_USD (piso)."""
+    result = await RiskManager.refresh_capital_from_balance(
+        client_factory=_balance_factory(raises=RuntimeError("auth 401"))
+    )
+    assert result is None  # falló y no había previo
+    assert RiskManager._cached_capital_usd is None
+    # _get_effective_capital_usd cae al piso de seguridad (4000 del mock_settings).
+    assert RiskManager()._get_effective_capital_usd() == 4000.0
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_sizing_uses_effective_capital_not_config(mock_session, mock_settings):
+    """El sizing usa el balance REAL cacheado ($100), NO el ACTIVE_CAPITAL_USD de config ($4000)."""
+    RiskManager._cached_capital_usd = 100.0  # balance real, distinto del config
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]  # sin stop-loss, sin exposición previa
+
+    leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=50, count=15, available_size=100)
+    leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=40, count=15, available_size=100)
+    opp = ArbOpportunity(
+        legs=(leg1, leg2),
+        count=15,
+        gross_profit_cents=150,
+        fees_cents=4,
+        net_profit_cents=146,
+        edge_pct=16.0,
+    )
+
+    decision = await RiskManager().check_pre_trade(opp)
+
+    assert decision.approved is True
+    # capital $100: max_trade=5%·100=$5; cost/unit=90¢ → int(5*100)//90 = 5 contratos.
+    # (Con el $4000 de config darían 15 — prueba que NO se usa el estático.)
+    assert decision.max_allowed_count == 5
 
 
 # =========================================================
@@ -219,7 +411,7 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
 
     monkeypatch.setattr(rm_module, "get_session", make_session)
 
-    # Insertar trade settled hoy con pérdida $10 (excede límite $9 = 3% de $300)
+    # Insertar trade settled hoy con pérdida $121 (excede límite $120 = 3% de $4000)
     with Session(real_db_engine) as s:
         losing_trade = Trade(
             client_order_id="e2e-loss-1",
@@ -230,7 +422,7 @@ async def test_daily_pnl_breach_triggers_killswitch_e2e(
             price_cents=50,
             strategy="motor_1_arbitrage",
             status="settled",
-            pnl_cents=-1000,  # -$10
+            pnl_cents=-12100,  # -$121 > $120 daily
             # Anclado DENTRO de la ventana diaria de HOY (00:00 UTC + 1h): con
             # now−30min, correr el test entre 00:00 y 00:30 UTC caía en AYER →
             # el daily no veía la pérdida → flaky de medianoche (visto 2026-06-13).
@@ -277,7 +469,7 @@ async def test_daily_pnl_only_counts_settled_not_filled_e2e(
             price_cents=50,
             strategy="motor_1_arbitrage",
             status="filled",
-            pnl_cents=-1000,
+            pnl_cents=-13000,  # -$130 (superaría $120 daily SI estuviera settled; no lo está)
             placed_at=datetime.now(UTC).replace(tzinfo=None),
             filled_at=datetime.now(UTC).replace(tzinfo=None),
         )
@@ -298,12 +490,12 @@ async def test_weekly_pnl_breach_triggers_killswitch_e2e(
     risk_manager, sample_opp, real_db_engine, monkeypatch
 ):
     """
-    Pérdida dentro de la ventana semanal (> 8% capital = $24) dispara kill switch.
+    Pérdida dentro de la ventana semanal (> 8% capital = $320) dispara kill switch.
 
     El trade se inserta justo después del inicio de semana (lunes 00:01 UTC).
     Si hoy ES lunes, settled_at cae en today_start → también cuenta para daily.
     En ambos casos el resultado debe ser approved=False con "Stop-Loss" en reason.
-    Capital=$300, weekly cap=$24. Pérdida=$30 supera el límite.
+    Capital=$4000, weekly cap=$320. Pérdida=$321 supera el límite.
     """
     import src.risk.manager as rm_module
 
@@ -328,7 +520,7 @@ async def test_weekly_pnl_breach_triggers_killswitch_e2e(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-3000,  # -$30 > weekly cap $24
+                pnl_cents=-32100,  # -$321 > weekly cap $320
                 placed_at=settled_time - timedelta(hours=1),
                 filled_at=settled_time - timedelta(hours=1),
                 settled_at=settled_time,
@@ -345,12 +537,56 @@ async def test_weekly_pnl_breach_triggers_killswitch_e2e(
 
 
 @pytest.mark.asyncio
+async def test_weekly_stoploss_counts_across_month_boundary(
+    risk_manager, sample_opp, real_db_engine, monkeypatch
+):
+    """Borde de mes: una pérdida de ESTA semana pero del MES ANTERIOR debe contar para el stop-loss
+    SEMANAL. Antes se subcontaba (weekly ⊆ monthly, y el rango base arrancaba en month_start) →
+    protección semanal más débil justo tras el rollover de mes. Determinístico con freezegun:
+    hoy=2026-07-01 (miércoles) → week_start 2026-06-29; la pérdida cae el 2026-06-30 (esta semana,
+    mes anterior). Capital $4000, weekly cap $320; pérdida $321 debe disparar el stop-loss."""
+    from freezegun import freeze_time
+
+    import src.risk.manager as rm_module
+
+    monkeypatch.setattr(rm_module, "get_session", lambda: Session(real_db_engine))
+
+    with Session(real_db_engine) as s:
+        s.add(
+            Trade(
+                client_order_id="test-cross-month",
+                ticker="KX-TEST",
+                side="yes",
+                action="buy",
+                count=100,
+                price_cents=50,
+                strategy="motor_1_arbitrage",
+                status="settled",
+                pnl_cents=-32100,  # -$321 > weekly cap $320
+                placed_at=datetime(2026, 6, 30, 12, 0),
+                filled_at=datetime(2026, 6, 30, 12, 0),
+                settled_at=datetime(2026, 6, 30, 12, 0),  # martes: esta semana, mes ANTERIOR
+            )
+        )
+        s.commit()
+
+    with (
+        freeze_time("2026-07-01 10:00:00"),
+        patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock),
+    ):
+        decision = await risk_manager.check_pre_trade(sample_opp)
+
+    assert decision.approved is False
+    assert "Stop-Loss" in decision.reason
+
+
+@pytest.mark.asyncio
 async def test_weekly_pnl_old_trades_outside_window_dont_count(
     risk_manager, sample_opp, real_db_engine, monkeypatch
 ):
     """
     Trade de hace 10 días NO cuenta para la ventana semanal (siempre fuera del
-    calendario de lunes a hoy). Pérdida $15 < weekly cap $24 y < monthly cap $45.
+    calendario de lunes a hoy). Pérdida $15 < weekly cap $320 y < monthly cap $600.
     """
     import src.risk.manager as rm_module
 
@@ -372,7 +608,7 @@ async def test_weekly_pnl_old_trades_outside_window_dont_count(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-1500,  # -$15: < weekly $24, < monthly $45
+                pnl_cents=-1500,  # -$15: < weekly $320, < monthly $600
                 placed_at=now_naive - timedelta(days=11),
                 filled_at=now_naive - timedelta(days=11),
                 settled_at=now_naive - timedelta(days=10),
@@ -381,7 +617,7 @@ async def test_weekly_pnl_old_trades_outside_window_dont_count(
         s.commit()
 
     # 10 días > 7 días → siempre fuera de la ventana semanal.
-    # -$15 < cap mensual $45 → sin breach mensual tampoco.
+    # -$15 < cap mensual $600 → sin breach mensual tampoco.
     decision = await risk_manager.check_pre_trade(sample_opp)
 
     assert decision.approved is True
@@ -395,8 +631,8 @@ async def test_monthly_pnl_breach_triggers_killswitch_e2e(
     Pérdida > 15% capital ($45) en el mes actual dispara kill switch.
 
     Trade insertado al inicio del mes (mes actual, fuera de la semana actual
-    cuando el día del mes lo permite). Capital=$300, monthly cap=$45.
-    Pérdida=$50 supera el límite sin importar la ventana que lo atrape primero.
+    cuando el día del mes lo permite). Capital=$4000, monthly cap=$600.
+    Pérdida=$601 supera el límite sin importar la ventana que lo atrape primero.
     """
     import src.risk.manager as rm_module
 
@@ -420,7 +656,7 @@ async def test_monthly_pnl_breach_triggers_killswitch_e2e(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-5000,  # -$50 > monthly cap $45
+                pnl_cents=-60100,  # -$601 > monthly cap $600
                 placed_at=settled_time - timedelta(hours=1),
                 filled_at=settled_time - timedelta(hours=1),
                 settled_at=settled_time,
@@ -445,7 +681,7 @@ async def test_daily_breach_priority_over_weekly_monthly(
 
     El loop de limits = [Diario, Semanal, Mensual] retorna el primero que dispara.
     Un trade de hace 30 minutos cae en daily, weekly y monthly → 'Diario' gana.
-    Capital=$300, daily cap=$9 (3%). Pérdida=$15 supera.
+    Capital=$4000, daily cap=$120 (3%). Pérdida=$130 supera.
     """
     import src.risk.manager as rm_module
 
@@ -467,7 +703,7 @@ async def test_daily_breach_priority_over_weekly_monthly(
                 price_cents=50,
                 strategy="motor_1_arbitrage",
                 status="settled",
-                pnl_cents=-1500,  # -$15 > daily $9, weekly $24 y monthly $45 → daily primero
+                pnl_cents=-13000,  # -$130 > daily $120 (y weekly/monthly) → daily primero
                 # Anclado a HOY 00:00 UTC (+offsets) — now−30min caía en AYER si el
                 # test corría entre 00:00-00:30 UTC → flaky de medianoche (2026-06-13).
                 placed_at=datetime.combine(now_naive.date(), time.min),
@@ -483,3 +719,418 @@ async def test_daily_breach_priority_over_weekly_monthly(
     assert decision.approved is False
     assert "Diario" in decision.reason
     assert BotState.is_paused is True
+
+
+# =========================================================
+# C-02 — Capital base = cash real × factor de seguridad (clamp prod)
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_c02_safety_factor_applied(mock_settings):
+    """Factor 90% aplicado: cash $3000 → capital efectivo $2700."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 2700.0
+
+
+@pytest.mark.asyncio
+async def test_c02_clamp_hard_cap_in_prod(mock_settings):
+    """En prod, cash $6000 × 90% = $5400 → clampeado al hard cap $5000 (no rompe el validator)."""
+    mock_settings.KALSHI_ENV = "production"
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 6000.0
+    assert RiskManager()._get_effective_capital_usd() == 5000.0
+
+
+@pytest.mark.asyncio
+async def test_c02_demo_no_clamp(mock_settings):
+    """En demo NO se clampea (dinero fake): cash $6000 × 90% = $5400."""
+    mock_settings.KALSHI_ENV = "demo"
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 6000.0
+    assert RiskManager()._get_effective_capital_usd() == 5400.0
+
+
+@pytest.mark.asyncio
+async def test_c02_factor_100_uses_full_cash(mock_settings):
+    """Factor 100% = sin colchón: capital efectivo == cash real completo."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 100.0
+    RiskManager._cached_capital_usd = 3000.0
+    assert RiskManager()._get_effective_capital_usd() == 3000.0
+
+
+@pytest.mark.asyncio
+async def test_c02_fallback_is_unfactored(mock_settings):
+    """Sin cash real (cache None), el fallback ACTIVE_CAPITAL_USD NO se factoriza (ya es piso)."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.ACTIVE_CAPITAL_USD = 4000.0
+    RiskManager._cached_capital_usd = None
+    assert RiskManager()._get_effective_capital_usd() == 4000.0  # NO 3600
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_c02_low_cash_yields_zero_contracts(mock_session, mock_settings):
+    """Edge cash bajo ($10 × 90% = $9): usable $0.45 → 0 contratos, rechazo limpio (sin crash)."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    RiskManager._cached_capital_usd = 10.0
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]
+    leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=50, count=10, available_size=100)
+    leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=40, count=10, available_size=100)
+    opp = ArbOpportunity(
+        legs=(leg1, leg2),
+        count=10,
+        gross_profit_cents=100,
+        fees_cents=4,
+        net_profit_cents=96,
+        edge_pct=10.0,
+    )
+    decision = await RiskManager().check_pre_trade(opp)
+    assert decision.approved is False
+    assert decision.max_allowed_count == 0
+    assert "Sizing final 0" in decision.reason
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_c02_cap_chain_200usd_still_binds(mock_session, mock_settings):
+    """Con cash grande, el cap absoluto MAX_TRADE_SIZE_USD ($200) sigue acotando sobre el techo nuevo."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.KALSHI_ENV = "demo"  # sin clamp, deja crecer el cash
+    RiskManager._cached_capital_usd = 100_000.0  # $100k fake (demo)
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.side_effect = [[], []]
+    # cost/unit = 50¢ + fees/unit 4¢ (fee(1,30)=2, fee(1,20)=2) → 20000 // 54 = 370.
+    leg1 = ArbLeg(market_ticker="KX", side="yes", price_cents=30, count=1000, available_size=5000)
+    leg2 = ArbLeg(market_ticker="KX", side="no", price_cents=20, count=1000, available_size=5000)
+    opp = ArbOpportunity(
+        legs=(leg1, leg2),
+        count=1000,
+        gross_profit_cents=50_000,
+        fees_cents=100,
+        net_profit_cents=49_900,
+        edge_pct=10.0,
+    )
+    decision = await RiskManager().check_pre_trade(opp)
+    assert decision.approved is True
+    assert decision.max_allowed_count == 370
+
+
+# =========================================================
+# C-03 — Alerta de desfase config ↔ cash real
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_c03_drift_alert_fires_when_over_threshold(mock_settings):
+    """cash $3000 vs config $1000 (200% ≥ 25%) con dynamic OFF (el param maneja el
+    sizing) → alerta + marca _drift_alerted. Con dynamic ON ya no alerta (ver
+    test_c03_dynamic_on_drift_logs_but_does_not_alert)."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3000.0)
+    send.assert_awaited_once()
+    assert RiskManager._drift_alerted is True
+
+
+@pytest.mark.asyncio
+async def test_c03_no_alert_within_threshold(mock_settings):
+    """cash $3200 vs config $3000 (~6.7% < 25%) → no alerta."""
+    mock_settings.ACTIVE_CAPITAL_USD = 3000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3200.0)
+    send.assert_not_called()
+    assert RiskManager._drift_alerted is False
+
+
+@pytest.mark.asyncio
+async def test_c03_edge_triggered_no_duplicate(mock_settings):
+    """Dos lecturas con desfase alto seguidas → una sola alerta (edge-triggered).
+    dynamic OFF: es el modo donde la alerta Telegram existe."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3000.0)
+        await RiskManager._check_capital_drift(3100.0)
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_c03_rearm_after_realign(mock_settings):
+    """Tras alertar, re-arma sólo cuando el desfase baja con margen, y vuelve a alertar.
+    dynamic OFF: es el modo donde la alerta Telegram existe."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(3000.0)  # 200% → alerta
+        await RiskManager._check_capital_drift(1050.0)  # 5% < 20 (25-5) → re-arma
+        assert RiskManager._drift_alerted is False
+        await RiskManager._check_capital_drift(3000.0)  # alerta de nuevo
+    assert send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_c03_check_swallows_errors(mock_settings):
+    """Best-effort: un fallo del alert NO propaga (no rompe el refresh de fondo)."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch(
+        "src.risk.manager.send_alert", new=AsyncMock(side_effect=RuntimeError("telegram boom"))
+    ):
+        await RiskManager._check_capital_drift(3000.0)  # no debe levantar
+
+
+@pytest.mark.asyncio
+async def test_c03_refresh_triggers_drift_alert(mock_settings):
+    """El refresh real engancha el chequeo de drift (cash $3000 vs config $1000).
+    Con dynamic ON (necesario para que el refresh consulte la API), el chequeo corre
+    pero NO alerta por Telegram (informativo one-shot) — el estado marca el edge."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1000.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager.refresh_capital_from_balance(
+            client_factory=_balance_factory(balance=300000)
+        )
+    send.assert_not_called()
+    assert RiskManager._drift_alerted is True  # el chequeo SÍ corrió (one-shot marcado)
+
+
+@pytest.mark.asyncio
+async def test_c02_fallback_also_clamped_in_prod(mock_settings):
+    """Robustez C-02: aun por el fallback, en prod el capital base respeta el hard cap $5k
+    (no depende sólo del validator de config)."""
+    mock_settings.KALSHI_ENV = "production"
+    mock_settings.ACTIVE_CAPITAL_USD = (
+        8000.0  # validator real lo rechazaría; acá mockeado a propósito
+    )
+    RiskManager._cached_capital_usd = None  # sin cash real → fallback
+    assert RiskManager()._get_effective_capital_usd() == 5000.0
+
+
+# =========================================================
+# FASE 0.2 — Auditoría RiskEvent al pausar por stop-loss
+# =========================================================
+
+
+@pytest.mark.asyncio
+async def test_trigger_kill_switch_persists_risk_event_e2e(
+    risk_manager, real_db_engine, monkeypatch
+):
+    """
+    FASE 0.2: al pausar por stop-loss se escribe UNA fila RiskEvent de auditoría.
+
+    risk_events estaba vacío pese a las pausas. La supervivencia a reinicios la da
+    engage_kill_switch (OperationalState) — aquí lo aislamos (patch) para verificar
+    SOLO el nuevo rastro de auditoría contra el schema real.
+    """
+    import src.risk.manager as rm_module
+
+    monkeypatch.setattr(rm_module, "get_session", lambda: Session(real_db_engine))
+
+    reason = "Stop-Loss Diario superado: PnL=$-130.00, límite=$-120.00 (3.0%)"
+    with (
+        patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock),
+        patch("src.risk.manager.engage_kill_switch"),  # aislar OperationalState
+    ):
+        await risk_manager._trigger_kill_switch(reason)
+
+    with Session(real_db_engine) as s:
+        events = list(s.exec(select(RiskEvent)))
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.event_type == "kill_switch"
+    assert ev.severity == "critical"
+    assert "Stop-Loss Diario" in ev.message
+    assert ev.capital_at_event is not None
+
+
+@pytest.mark.asyncio
+async def test_trigger_kill_switch_idempotent_no_duplicate_risk_event(
+    risk_manager, real_db_engine, monkeypatch
+):
+    """Idempotencia: si ya está pausado, no re-escribe RiskEvent (no spamea risk_events)."""
+    import src.risk.manager as rm_module
+
+    monkeypatch.setattr(rm_module, "get_session", lambda: Session(real_db_engine))
+
+    with (
+        patch("src.risk.manager.alert_risk_event", new_callable=AsyncMock),
+        patch("src.risk.manager.engage_kill_switch"),
+    ):
+        await risk_manager._trigger_kill_switch("primer disparo")
+        await risk_manager._trigger_kill_switch("segundo disparo (ya pausado)")
+
+    with Session(real_db_engine) as s:
+        events = list(s.exec(select(RiskEvent)))
+
+    assert len(events) == 1
+    assert "primer disparo" in events[0].message
+
+
+# =========================================================
+# CAPITAL DINÁMICO (extensión) — toggle, floor/cap, pausa de entradas, suavizado, status
+# =========================================================
+
+
+def test_dynamic_disabled_uses_static_capital(mock_settings):
+    """DYNAMIC_CAPITAL_ENABLED=False → ignora el cash real, usa ACTIVE_CAPITAL_USD fijo."""
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    mock_settings.ACTIVE_CAPITAL_USD = 4000.0
+    RiskManager._cached_capital_usd = 9999.0  # habría dado otro número si dynamic estuviera on
+    assert RiskManager()._get_effective_capital_usd() == 4000.0
+
+
+def test_capital_cap_clamps_effective(mock_settings):
+    """Techo configurable: cash $5000 × 100% = $5000 → clampeado a CAPITAL_CAP_USD=$2000."""
+    mock_settings.CAPITAL_CAP_USD = 2000.0
+    RiskManager._cached_capital_usd = 5000.0
+    assert RiskManager()._get_effective_capital_usd() == 2000.0
+
+
+def test_capital_floor_clamps_effective(mock_settings):
+    """Piso: cash $50 → efectivo nunca baja de CAPITAL_FLOOR_USD=$100 (matemática de riesgo segura)."""
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0
+    assert RiskManager()._get_effective_capital_usd() == 100.0
+
+
+def test_can_open_new_positions_above_floor(mock_settings):
+    """cash $500 × 90% = $450 ≥ piso $100 → permite nuevas entradas."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 500.0
+    assert RiskManager().can_open_new_positions() is True
+
+
+def test_can_open_new_positions_below_floor(mock_settings):
+    """cash $50 × 90% = $45 < piso $100 → PAUSA de nuevas entradas."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0
+    assert RiskManager().can_open_new_positions() is False
+
+
+def test_can_open_when_dynamic_disabled(mock_settings):
+    """Modo estático → nunca pausa por piso (el cash real no se mira)."""
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 1.0
+    assert RiskManager().can_open_new_positions() is True
+
+
+def test_can_open_when_no_balance_yet(mock_settings):
+    """Sin balance real todavía (cache None) → no bloquea (el sizing/exposición protegen)."""
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = None
+    assert RiskManager().can_open_new_positions() is True
+
+
+@pytest.mark.asyncio
+@patch("src.risk.manager.get_session")
+async def test_check_pre_trade_pauses_entries_below_floor(mock_session, mock_settings, sample_opp):
+    """El gate de piso rechaza NUEVAS entradas (no toca stop-loss/kill-switch)."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__.return_value = mock_db
+    mock_db.exec.return_value = []  # sin trades → sin stop-loss ni exposición
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0  # $45 efectivo < piso
+
+    decision = await RiskManager().check_pre_trade(sample_opp)
+    assert decision.approved is False
+    assert "bajo el piso" in decision.reason
+    assert decision.max_allowed_count == 0
+
+
+@pytest.mark.asyncio
+async def test_smoothing_ignores_small_change(mock_settings):
+    """Cambio <5% no actualiza la caché de riesgo, pero sí el raw para /status."""
+    mock_settings.CAPITAL_SMOOTHING_PCT = 0.05
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=100000))
+    assert RiskManager._cached_capital_usd == 1000.0
+    # +2% (<5%): se mantiene la caché, el raw refleja lo nuevo.
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=102000))
+    assert RiskManager._cached_capital_usd == 1000.0
+    assert RiskManager._last_raw_balance_usd == 1020.0
+
+
+@pytest.mark.asyncio
+async def test_smoothing_allows_large_change(mock_settings):
+    """Cambio ≥5% sí actualiza la caché."""
+    mock_settings.CAPITAL_SMOOTHING_PCT = 0.05
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=100000))
+    await RiskManager.refresh_capital_from_balance(client_factory=_balance_factory(balance=110000))
+    assert RiskManager._cached_capital_usd == 1100.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_skipped_when_dynamic_disabled(mock_settings):
+    """Modo estático → no consulta la API (factory no se invoca)."""
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    called = {"n": 0}
+
+    def _factory():
+        called["n"] += 1
+        return _balance_factory(balance=100000)()
+
+    await RiskManager.refresh_capital_from_balance(client_factory=_factory)
+    assert called["n"] == 0
+
+
+def test_capital_status_dynamic(mock_settings):
+    """/status: modo dynamic, raw y effective presentes, is_paused=False sobre el piso."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 1000.0
+    RiskManager._last_raw_balance_usd = 1000.0
+    st = RiskManager.capital_status()
+    assert st["mode"] == "dynamic"
+    assert st["raw_balance_usd"] == 1000.0
+    assert st["effective_usd"] == 900.0  # 1000 × 90%
+    assert st["is_paused"] is False
+
+
+def test_capital_status_paused_below_floor(mock_settings):
+    """/status: is_paused=True cuando el cash real está bajo el piso."""
+    mock_settings.CAPITAL_SAFETY_FACTOR_PCT = 90.0
+    mock_settings.CAPITAL_FLOOR_USD = 100.0
+    RiskManager._cached_capital_usd = 50.0
+    RiskManager._last_raw_balance_usd = 50.0
+    st = RiskManager.capital_status()
+    assert st["is_paused"] is True
+    assert st["effective_usd"] == 100.0  # floored
+
+
+@pytest.mark.asyncio
+async def test_c03_dynamic_on_drift_logs_but_does_not_alert(mock_settings):
+    """Fix screenshot 2026-07-01: con DYNAMIC_CAPITAL_ENABLED el param NO maneja el sizing
+    (es solo fallback de boot) → el desfase config↔cash es esperado e informativo. Nada de
+    Telegram pidiendo 'actualizá el param en Coolify' — log INFO one-shot y listo."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1200.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = True
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(561.55)  # 53% de desfase
+    send.assert_not_called()
+    assert RiskManager._drift_alerted is True  # one-shot: no re-loguea cada refresh
+
+
+@pytest.mark.asyncio
+async def test_c03_dynamic_off_drift_still_alerts(mock_settings):
+    """Con dynamic OFF el param SÍ maneja el sizing → el desfase es accionable: Telegram."""
+    mock_settings.ACTIVE_CAPITAL_USD = 1200.0
+    mock_settings.CAPITAL_DRIFT_ALERT_PCT = 25.0
+    mock_settings.DYNAMIC_CAPITAL_ENABLED = False
+    with patch("src.risk.manager.send_alert", new=AsyncMock()) as send:
+        await RiskManager._check_capital_drift(561.55)
+    send.assert_awaited_once()

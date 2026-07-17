@@ -47,6 +47,12 @@ class _FakeRisk:
         self.last_opp = opp
         return self._decision
 
+    async def check_and_reserve(self, opp, persist_intent):
+        d = await self.check_pre_trade(opp)
+        if d.approved and not persist_intent(d):
+            return TradeDecision(False, "persist_intent_failed", 0)
+        return d
+
 
 class _FakeClient:
     """KalshiRestClient falso: place_order configurable (resp dict o excepción)."""
@@ -85,6 +91,45 @@ async def test_fill_records_filled_trade():
     t = _trade()
     assert t.status == "filled" and t.count == 5 and t.fill_price_cents == 40
     assert t.strategy == "motor_2_consensus" and t.kalshi_order_id == "ABC"
+
+
+@pytest.mark.asyncio
+async def test_underdog_filter_blocks_cheap_entry_when_enabled():
+    """FASE 3: con el flag on, una entrada <40c se bloquea SIN tocar la red ni el riesgo."""
+    client = _FakeClient(resp={"order": {}})
+    risk = _FakeRisk(TradeDecision(True, "Aprobado", 5))
+    ex = Motor2Executor(client, risk, min_entry_cents=40, underdog_filter_enabled=True)
+
+    outcome = await ex.execute(_signal(price=25))
+    assert not outcome.placed and not outcome.filled
+    assert outcome.reason == "underdog_filter"
+    client.place_order.assert_not_awaited()
+    assert risk.calls == 0  # ni siquiera consulta al RiskManager
+    assert _trade() is None
+
+
+@pytest.mark.asyncio
+async def test_underdog_filter_shadow_logs_but_executes_when_disabled():
+    """Shadow intra-live: con el flag off, la entrada <40c se LOGUEA pero igual se ejecuta."""
+    client = _FakeClient(resp={"order": {"order_id": "Z", "fill_count": 3, "remaining_count": 0}})
+    risk = _FakeRisk(TradeDecision(True, "Aprobado", 3))
+    ex = Motor2Executor(client, risk, min_entry_cents=40, underdog_filter_enabled=False)
+
+    outcome = await ex.execute(_signal(price=25, size_usd=1.0))
+    assert outcome.filled and outcome.filled_count == 3
+    client.place_order.assert_awaited_once()  # NO bloqueó en shadow
+
+
+@pytest.mark.asyncio
+async def test_underdog_filter_allows_entry_at_threshold():
+    """El umbral es estricto (price < min): a 40c exacto pasa el filtro y ejecuta."""
+    client = _FakeClient(resp={"order": {"order_id": "Y", "fill_count": 2, "remaining_count": 0}})
+    risk = _FakeRisk(TradeDecision(True, "Aprobado", 2))
+    ex = Motor2Executor(client, risk, min_entry_cents=40, underdog_filter_enabled=True)
+
+    outcome = await ex.execute(_signal(price=40, size_usd=1.0))
+    assert outcome.filled and outcome.filled_count == 2
+    client.place_order.assert_awaited_once()
 
 
 @pytest.mark.asyncio

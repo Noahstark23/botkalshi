@@ -30,7 +30,12 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from src.math.arbitrage import ArbOpportunity, detect_binary_arb, detect_multi_outcome_arb
+from src.math.arbitrage import (
+    ArbOpportunity,
+    detect_binary_arb,
+    detect_multi_outcome_arb,
+    select_hard_leg,
+)
 from src.monitoring.telegram_alerts import alert_trade
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.data_capture import parse_price_to_cents
@@ -72,25 +77,21 @@ class RestArbEngine:
     HEARTBEAT_EVERY = 200
 
     # ── P3: multi-outcome SHADOW (1X2/winner del Mundial) ──────────────────────
-    # SOLO series con estructura "exactamente UN outcome gana" (mutuamente excluyentes
-    # y exhaustivos). NO meter acá series de props/totals (KXWCTEAMGOALS,
-    # KXWCGAMEGOALS etc.): sus markets NO son excluyentes → comprar YES en todos NO
-    # es arb → señal falsa. El matching es por SERIE EXACTA (primer segmento del
-    # ticker), no por prefijo de string: "KXWCGAME" NO debe matchear "KXWCGAMEGOALS".
-    MULTI_SERIES = frozenset(
-        {
-            "KXWCGAME",  # partidos 1X2 — verificado 2026-06-13: 3 markets/evento
-            # (ej. KXWCGAME-26JUN27JORARG-{JOR,ARG,TIE})
-            "KXWCGROUPWIN",  # ganador de grupo (N excluyentes)
-            "KXMENWORLDCUP",  # ganador del torneo
-            "KXMWORLDCUP",
-        }
-    )
-    # Frescura: todas las patas del evento deben tener quote con esta edad máxima.
-    # Una pata stale (precio viejo) genera arb fantasma → grupo incompleto = no evaluar.
-    MULTI_MAX_QUOTE_AGE_SEC = 30.0
-    # Mínimo de outcomes para evaluar (1X2 = 3; winner de grupo/torneo ≥ 3).
-    MULTI_MIN_LEGS = 3
+    # El universo, la frescura y el mínimo de patas vienen de config (auditoría 2026-07-12:
+    # hardcodeados acá, el universo era solo 4 series del Mundial → fuera de las ventanas de
+    # partido, 0 evaluaciones; tuneable en vivo > hardcodeado). Se materializan como
+    # atributos de instancia en __init__. ⚠️ La regla NO cambió: SOLO series con estructura
+    # "exactamente UN outcome gana" (mutuamente excluyentes y exhaustivos). NO meter series
+    # de props/totals (KXWCTEAMGOALS, KXWCGAMEGOALS…): sus markets NO son excluyentes →
+    # comprar YES en todos NO es arb → señal falsa. El matching es por SERIE EXACTA (primer
+    # segmento del ticker), no por prefijo: "KXWCGAME" NO debe matchear "KXWCGAMEGOALS".
+
+    @staticmethod
+    def multi_series_from_settings() -> frozenset[str]:
+        """Única fuente de verdad del universo multi (config → set). La usan el engine
+        (__init__) y data_capture (multi_event_universe) — no duplicar el parseo."""
+        raw = get_settings().MOTOR_REST_MULTI_SERIES
+        return frozenset(s.strip() for s in raw.split(",") if s.strip())
 
     def __init__(
         self,
@@ -98,6 +99,10 @@ class RestArbEngine:
         risk_manager: RiskManager | None = None,
     ) -> None:
         self.settings = get_settings()
+        # Universo multi-outcome desde config (defaults idénticos al hardcode previo).
+        self.MULTI_SERIES = self.multi_series_from_settings()
+        self.MULTI_MAX_QUOTE_AGE_SEC = self.settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC
+        self.MULTI_MIN_LEGS = self.settings.MOTOR_REST_MULTI_MIN_LEGS
         self._signals_seen = 0  # cruces de arbitraje detectados (EdgeWindows grabadas)
         self._tickers_evaluated = 0  # tickers procesados (para el heartbeat)
         # Diagnóstico de profundidad (instrumentación, NO afecta la lógica del trigger):
@@ -132,6 +137,9 @@ class RestArbEngine:
         # P4: near-miss por ventana de heartbeat — cuán CERCA estuvo cada forma de arb.
         self._best_binary_gap: tuple[int, str] | None = None  # (ask−bid mínimo, ticker)
         self._best_multi_sum: tuple[int, int, str] | None = None  # (Σasks mínima, n_legs, event)
+        # SHADOW: de-dupe del log de intención hard-first. ticker_de_la_pata_dura →
+        # (side, count) de la última intención logueada → no re-loguear si no cambió.
+        self._last_shadow_intent: dict[str, tuple[str, int]] = {}
 
     def update_universe(self, tickers: set[str]) -> None:
         """
@@ -243,34 +251,83 @@ class RestArbEngine:
 
         self._signals_seen += 1
         edge_id = self._record_edge_window(signal)  # la detección se graba SIEMPRE primero
+        opp = signal.opportunity
+        ident = f"ticker={opp.legs[0].market_ticker}"
 
-        # ── Capa B del muro (guard en el path de ejecución) ─────────────────────
-        # En shadow el executor NO se construyó (Capa A) → self._executor is None.
-        # El flag TRADING_ENABLED es la segunda barrera. Cualquiera corta antes de ejecutar.
+        # ── Capa B del muro (guard del path de ejecución) ───────────────────────
+        # SHADOW: el executor NO se construyó (Capa A) o el trading global está off. En vez
+        # de cortar a ciegas, se LOGUEA la intención del guardarraíl hard-first (qué se
+        # ejecutaría) si la señal pasaría los umbrales — para validar #85 EN VIVO sin tocar
+        # la red. El criterio de umbral es el MISMO que en live (una sola fuente); en shadow
+        # los cortes NO se loguean (el de-dupe del intent ya evita el flood por tick).
         if self._executor is None or not self.settings.TRADING_ENABLED:
+            if self._passes_exec_thresholds(opp, "motor_rest.exec", ident, log=False):
+                self._log_shadow_intent(opp)
             return
 
-        # Umbral FINO de ejecución (distinto del trigger grueso): reusa opp.edge_pct
-        # (edge neto post-fee como % del capital comprometido). Solo ejecuta si lo supera.
-        opp = signal.opportunity
-        if opp.edge_pct < self.settings.MOTOR_REST_EXECUTION_EDGE_PCT:
-            logger.info(
-                f"motor_rest.exec.below_threshold ticker={opp.legs[0].market_ticker} "
-                f"edge={opp.edge_pct:.2f}% < {self.settings.MOTOR_REST_EXECUTION_EDGE_PCT}%"
-            )
+        # LIVE: umbral FINO de ejecución (loguea el motivo del corte).
+        if not self._passes_exec_thresholds(opp, "motor_rest.exec", ident, log=True):
             return
 
         # Single-flight con DESCARTE: si ya hay una ejecución en curso, se descarta este
         # arb (no se encola: estaría stale al terminar la anterior). Si sigue vivo,
         # re-dispara en el próximo tick.
         if self._executing:
-            logger.info(f"motor_rest.exec.skip_busy ticker={opp.legs[0].market_ticker}")
+            logger.info(f"motor_rest.exec.skip_busy {ident}")
             return
 
         # NO se awaitea inline: bloquearía el stream de tickers. Se lanza un task y se
         # guarda la referencia (evita el GC del task a mitad de execute()).
         self._executing = True
         self._exec_task = asyncio.create_task(self._execute_and_record(signal, edge_id))
+
+    def _passes_exec_thresholds(
+        self, opp: ArbOpportunity, log_prefix: str, ident: str, *, log: bool
+    ) -> bool:
+        """
+        ¿El opp supera los umbrales FINOS de EJECUCIÓN (edge ∈ [EXEC_EDGE_PCT, MAX_EDGE_PCT])?
+
+        Una sola fuente para shadow y live. `log=True` (live) loguea el motivo del corte;
+        `log=False` (shadow) lo evalúa en silencio — el flood lo evita el de-dupe del intent.
+        """
+        if opp.edge_pct < self.settings.MOTOR_REST_EXECUTION_EDGE_PCT:
+            if log:
+                logger.info(
+                    f"{log_prefix}.below_threshold {ident} "
+                    f"edge={opp.edge_pct:.2f}% < {self.settings.MOTOR_REST_EXECUTION_EDGE_PCT}%"
+                )
+            return False
+        if opp.edge_pct > self.settings.MOTOR_REST_MAX_EDGE_PCT:
+            if log:
+                logger.warning(
+                    f"{log_prefix}.edge_too_high {ident} "
+                    f"edge={opp.edge_pct:.2f}% > {self.settings.MOTOR_REST_MAX_EDGE_PCT}% "
+                    "(sospecha de fantasma: pata ~0¢ / mercado por resolver) → NO ejecuta"
+                )
+            return False
+        return True
+
+    def _log_shadow_intent(self, opp: ArbOpportunity) -> None:
+        """
+        SHADOW: loguea qué HARÍA el guardarraíl hard-first (#85) sin ejecutar nada.
+
+        De-dupe por ticker de la pata dura (clave = side, count): una intención persistente
+        se loguea UNA vez (evita el flood por tick). Permite verificar EN VIVO que se elige
+        la pata correcta (la cara/fina, que se dispararía PRIMERO) y que un KILL de esa pata
+        sería un no-op (cero órdenes baratas). Usa select_hard_leg → idéntico a la ejecución.
+        """
+        hard, others = select_hard_leg(opp)
+        key = (hard.side, opp.count)
+        if self._last_shadow_intent.get(hard.market_ticker) == key:
+            return
+        self._last_shadow_intent[hard.market_ticker] = key
+        others_str = ", ".join(f"{lg.market_ticker}:{lg.side}@{lg.price_cents}c" for lg in others)
+        logger.info(
+            f"motor_rest.shadow.intent hard_leg={hard.market_ticker}:{hard.side}@{hard.price_cents}c "
+            f"count={opp.count} edge={opp.edge_pct:.2f}% → se dispararía PRIMERO; "
+            f"otras=[{others_str}] NO se envían hasta que la dura llene "
+            f"(si la dura KILL-ea → 0 órdenes, no-op del guardarraíl #85)"
+        )
 
     async def _execute_and_record(self, signal: TriggerSignal, edge_id: int | None) -> None:
         """
@@ -456,20 +513,20 @@ class RestArbEngine:
         edge_id = self._record_multi_edge_window(event_key, opp)
 
         # ── Ejecución (Capa 2) del arb multi-outcome ───────────────────────────────
-        # Capa B del muro: en shadow el executor es None (Capa A no lo construyó) y/o
-        # TRADING_ENABLED=false → no se ejecuta. Cualquiera corta antes de tocar la red.
+        ident = f"event={event_key}"
+        # Capa B del muro. SHADOW: log de intención hard-first (qué se ejecutaría) si la
+        # señal pasaría los umbrales — valida #85 EN VIVO sin tocar la red.
         if self._executor is None or not self.settings.TRADING_ENABLED:
+            if self._passes_exec_thresholds(opp, "motor_rest.multi.exec", ident, log=False):
+                self._log_shadow_intent(opp)
             return
-        if opp.edge_pct < self.settings.MOTOR_REST_EXECUTION_EDGE_PCT:
-            logger.info(
-                f"motor_rest.multi.exec.below_threshold event={event_key} "
-                f"edge={opp.edge_pct:.2f}% < {self.settings.MOTOR_REST_EXECUTION_EDGE_PCT}%"
-            )
+        # LIVE: umbral FINO de ejecución (loguea el motivo del corte).
+        if not self._passes_exec_thresholds(opp, "motor_rest.multi.exec", ident, log=True):
             return
         # Single-flight COMPARTIDO con el binario: una sola ejecución a la vez (el lock
         # protege el circuit breaker del executor). Si hay una en curso, se descarta.
         if self._executing:
-            logger.info(f"motor_rest.multi.exec.skip_busy event={event_key}")
+            logger.info(f"motor_rest.multi.exec.skip_busy {ident}")
             return
         self._executing = True
         self._exec_task = asyncio.create_task(

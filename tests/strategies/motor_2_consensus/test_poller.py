@@ -9,6 +9,7 @@ ejecuta capital; el loop respeta stop_event.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlmodel import select
@@ -16,9 +17,21 @@ from sqlmodel import select
 import src.storage.models as models
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 from src.strategies.motor_2_consensus.detector import KalshiEventQuotes, KalshiQuote
+from src.strategies.motor_2_consensus.matcher import start_time_et
 from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
 
-EV = "KXWCGAME-26JUN27JORARG"
+# El matching ahora exige que la fecha del event_key coincida con el commence_time (en ET);
+# el datestamp se deriva del commence del test para que la coherencia se mantenga sola.
+_KEY_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
+def _key_datestamp(dt) -> str:
+    et = start_time_et(dt)
+    return f"{et.year % 100:02d}{_KEY_MONTHS[et.month - 1]}{et.day:02d}"
+
+
+_COMMENCE = datetime.now(UTC) + timedelta(hours=2)
+EV = f"KXWCGAME-{_key_datestamp(_COMMENCE)}JORARG"
 
 
 class _FakeKalshiSource:
@@ -83,7 +96,10 @@ async def test_poll_once_emits_signals_for_matched_event():
         capital_usd=300.0,
     )
     signals = await poller.poll_once()
-    assert any(s.market_ticker == f"{EV}-ARG" and s.kalshi_side == "YES" for s in signals)
+    # Con one_per_event (default), el evento colapsa a UNA sola apuesta direccional (la de
+    # mayor edge neto) — antes emitía una por cada outcome/lado con edge.
+    assert len(signals) == 1
+    assert signals[0].market_ticker.startswith(EV)
 
 
 @pytest.mark.asyncio
@@ -113,6 +129,34 @@ async def test_live_source_persists_consensus_windows():
     for w in wins:
         assert w.gross_spread_cents is not None and w.fees_cents is not None
         assert w.magnitude_cents == w.gross_spread_cents - w.fees_cents
+
+
+@pytest.mark.asyncio
+async def test_live_cycle_persists_funnel_snapshot():
+    """Con odds reales, cada ciclo graba un Motor2FunnelSnapshot (memoria para el Analyst Loop)."""
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+    )
+    await poller.poll_once()
+    with models.get_session() as s:
+        snaps = list(s.exec(select(models.Motor2FunnelSnapshot)).all())
+    assert len(snaps) == 1
+    assert snaps[0].kalshi_total >= 1 and snaps[0].events_matched >= 1
+
+
+@pytest.mark.asyncio
+async def test_fake_cycle_does_not_persist_funnel():
+    """Con fixture fake (no-live), NO se graba snapshot (data no real)."""
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=False),
+        capital_usd=300.0,
+    )
+    await poller.poll_once()
+    with models.get_session() as s:
+        assert list(s.exec(select(models.Motor2FunnelSnapshot)).all()) == []
 
 
 @pytest.mark.asyncio
@@ -174,6 +218,87 @@ async def test_executor_bets_only_on_live_odds():
 
 
 @pytest.mark.asyncio
+async def test_filled_bet_sends_telegram_alert(monkeypatch):
+    """Cuando una apuesta de Motor 2 LLENA → se manda aviso a Telegram con los datos."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = True
+        filled_count = 4
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+    alert = AsyncMock()
+    monkeypatch.setattr("src.monitoring.telegram_alerts.alert_bet_placed", alert)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    signals = await poller.poll_once()
+
+    assert signals
+    assert alert.await_count == ex.execute.await_count  # un aviso por apuesta llena
+    kwargs = alert.await_args.kwargs
+    assert kwargs["count"] == 4
+    assert kwargs["ticker"].startswith(EV)
+    assert kwargs["side"] in ("YES", "NO")
+    assert "price_cents" in kwargs and "edge_pct" in kwargs
+
+
+@pytest.mark.asyncio
+async def test_no_fill_does_not_alert(monkeypatch):
+    """IOC sin fill (no apostó de verdad) → NO se manda aviso (no spamear)."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = False
+        filled_count = 0
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+    alert = AsyncMock()
+    monkeypatch.setattr("src.monitoring.telegram_alerts.alert_bet_placed", alert)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    await poller.poll_once()
+    alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_alert_failure_does_not_break_betting_loop(monkeypatch):
+    """Si Telegram tira excepción, el loop de apuestas NO se rompe (best-effort aislado)."""
+    from unittest.mock import AsyncMock
+
+    class _Out:
+        filled = True
+        filled_count = 2
+
+    ex = AsyncMock()
+    ex.execute = AsyncMock(return_value=_Out())
+    monkeypatch.setattr(
+        "src.monitoring.telegram_alerts.alert_bet_placed",
+        AsyncMock(side_effect=RuntimeError("telegram down")),
+    )
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([_kalshi_event()]),
+        _StubOdds([_odds_event()], is_live=True),
+        capital_usd=300.0,
+        executor=ex,
+    )
+    signals = await poller.poll_once()  # no debe propagar la excepción
+    assert ex.execute.await_count == len(signals)  # se intentaron todas las apuestas
+
+
+@pytest.mark.asyncio
 async def test_run_loop_stops_on_event():
     poller = Motor2ShadowPoller(
         _FakeKalshiSource([_kalshi_event()]),
@@ -189,3 +314,45 @@ async def test_run_loop_stops_on_event():
 
     await asyncio.gather(poller.run(stop), _stop_soon())
     assert stop.is_set()
+
+
+@pytest.mark.asyncio
+async def test_execute_cycle_counts_outcomes_by_reason():
+    """Fix observabilidad 2026-07-02: los desenlaces del ciclo de ejecución (dedup,
+    stake bajo, rechazos, fills) salen agregados — 'el bot no apostó hoy' se diagnostica
+    en UNA línea, no grepeando señal por señal."""
+    from src.strategies.motor_2_consensus.detector import ConsensusSignal
+
+    class _Outcome:
+        def __init__(self, filled, reason=""):
+            self.filled = filled
+            self.reason = reason
+            self.filled_count = 5 if filled else 0
+
+    outcomes = iter(
+        [_Outcome(True), _Outcome(False, "already_open"), _Outcome(False, "already_open")]
+    )
+
+    class _Exec:
+        async def execute(self, sig):
+            return next(outcomes)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([]),
+        _StubOdds([], is_live=True),
+        capital_usd=300.0,
+        executor=_Exec(),
+    )
+    sigs = [
+        ConsensusSignal(
+            market_ticker=f"T-{i}",
+            kalshi_side="YES",
+            odds_api_fair_prob=0.6,
+            kalshi_price_cents=50,
+            edge_pct=0.05 - i * 0.001,
+            recommended_size_usd=5.0,
+        )
+        for i in range(3)
+    ]
+    counts = await poller._execute(sigs)
+    assert counts == {"filled": 1, "already_open": 2}

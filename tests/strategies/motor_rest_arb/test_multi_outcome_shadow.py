@@ -28,6 +28,11 @@ def _engine(*, executor=None, risk_manager=None) -> RestArbEngine:
     settings.MOTOR_REST_MIN_EDGE_CENTS = 1
     settings.MOTOR_REST_MIN_DEPTH = 2
     settings.MOTOR_REST_EXECUTION_EDGE_PCT = 1.5
+    settings.MOTOR_REST_MAX_EDGE_PCT = 10_000.0  # techo alto: no interfiere en estos tests
+    # Universo multi ahora viene de config (defaults de producción).
+    settings.MOTOR_REST_MULTI_SERIES = "KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP"
+    settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC = 30.0
+    settings.MOTOR_REST_MULTI_MIN_LEGS = 3
     settings.TRADING_ENABLED = False
     with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
         eng = RestArbEngine(executor=executor, risk_manager=risk_manager)
@@ -144,6 +149,74 @@ async def test_multi_path_never_touches_executor():
 
 
 @pytest.mark.asyncio
+async def test_shadow_logs_hard_first_intent():
+    """
+    SHADOW: un 1X2 con arb claro loguea la INTENCIÓN hard-first (#85) sin ejecutar:
+    la pata MÁS CARA se dispararía PRIMERO y las otras NO se envían hasta que llene.
+    """
+    from loguru import logger as _logger
+
+    eng = _engine()  # shadow (executor=None)
+    records: list[str] = []
+    sink = _logger.add(records.append, level="INFO", format="{message}")
+    try:
+        # Σasks = 80 < 100 (edge amplio, pasa el umbral). ARG es la pata más cara (40c).
+        await eng.on_ticker(_tick(T_ARG, "0.40"))
+        await eng.on_ticker(_tick(T_MEX, "0.25"))
+        await eng.on_ticker(_tick(T_TIE, "0.15"))
+    finally:
+        _logger.remove(sink)
+
+    intents = [r for r in records if "motor_rest.shadow.intent" in r]
+    assert len(intents) == 1
+    # La pata dura es la más cara (ARG @40c) y se anuncia "PRIMERO".
+    assert f"hard_leg={T_ARG}" in intents[0] and "@40c" in intents[0]
+    assert "PRIMERO" in intents[0] and "no-op" in intents[0]
+    # Las otras dos patas aparecen como "otras" (no se enviarían hasta que la dura llene).
+    assert T_MEX in intents[0] and T_TIE in intents[0]
+
+
+@pytest.mark.asyncio
+async def test_shadow_intent_dedupes_per_persistent_cross():
+    """El mismo arb repetido tick a tick loguea la intención UNA vez (anti-flood)."""
+    from loguru import logger as _logger
+
+    eng = _engine()
+    records: list[str] = []
+    sink = _logger.add(records.append, level="INFO", format="{message}")
+    try:
+        for _ in range(3):  # mismo grupo, 3 rondas
+            await eng.on_ticker(_tick(T_ARG, "0.40"))
+            await eng.on_ticker(_tick(T_MEX, "0.25"))
+            await eng.on_ticker(_tick(T_TIE, "0.15"))
+    finally:
+        _logger.remove(sink)
+
+    intents = [r for r in records if "motor_rest.shadow.intent" in r]
+    assert len(intents) == 1  # de-dupe: una sola intención pese a 3 evaluaciones
+
+
+@pytest.mark.asyncio
+async def test_shadow_no_intent_below_exec_threshold():
+    """Si el edge no supera MOTOR_REST_EXECUTION_EDGE_PCT, NO se loguea intención."""
+    from loguru import logger as _logger
+
+    eng = _engine()
+    eng.settings.MOTOR_REST_EXECUTION_EDGE_PCT = 99.0  # umbral imposible → nunca "ejecutaría"
+    records: list[str] = []
+    sink = _logger.add(records.append, level="INFO", format="{message}")
+    try:
+        await eng.on_ticker(_tick(T_ARG, "0.40"))
+        await eng.on_ticker(_tick(T_MEX, "0.25"))
+        await eng.on_ticker(_tick(T_TIE, "0.15"))  # arb real pero bajo el umbral de ejecución
+    finally:
+        _logger.remove(sink)
+
+    assert _multi_windows()  # se DETECTÓ y grabó (shadow detecta siempre)...
+    assert [r for r in records if "motor_rest.shadow.intent" in r] == []  # ...pero sin intención
+
+
+@pytest.mark.asyncio
 async def test_near_miss_binary_tracked_in_window():
     """P4: el gap binario mínimo (ask−bid) queda registrado para el heartbeat."""
     eng = _engine()
@@ -173,3 +246,43 @@ async def test_heartbeat_reports_multi_and_near_miss():
     assert len(hb) == 1
     assert "multi: 1 señales" in hb[0]
     assert "near-miss" in hb[0] and EV in hb[0]
+
+
+# =====================================================
+# Universo multi tunable por env (auditoría 2026-07-12)
+# =====================================================
+
+
+def test_multi_series_tunable_via_config():
+    """MECANISMO: MOTOR_REST_MULTI_SERIES en config amplía el universo sin tocar código
+    (auditoría 2026-07-12: hardcodeado a 4 series del Mundial → 0 evaluaciones fuera de
+    las ventanas de partido)."""
+    settings = MagicMock()
+    settings.MOTOR_REST_MIN_EDGE_CENTS = 1
+    settings.MOTOR_REST_MIN_DEPTH = 2
+    settings.MOTOR_REST_EXECUTION_EDGE_PCT = 1.5
+    settings.MOTOR_REST_MAX_EDGE_PCT = 10.0
+    settings.MOTOR_REST_MULTI_SERIES = "KXWCGAME, KXNBASERIES"  # con espacio: se trimea
+    settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC = 30.0
+    settings.MOTOR_REST_MULTI_MIN_LEGS = 3
+    settings.TRADING_ENABLED = False
+    with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
+        eng = RestArbEngine()
+    assert frozenset({"KXWCGAME", "KXNBASERIES"}) == eng.MULTI_SERIES
+    # La serie nueva entra al universo; una no listada queda fuera (match EXACTO).
+    eng.update_universe({f"{EV}-ARG", "KXNBASERIES-26-A", "KXNBASERIESX-26-B"})
+    assert "KXNBASERIES-26" in eng._event_universe
+    assert not any(k.startswith("KXNBASERIESX") for k in eng._event_universe)
+
+
+def test_multi_series_default_unchanged():
+    """CONTROL: el default de config reproduce EXACTO el hardcode previo (sin env nuevo,
+    cero cambio de comportamiento en producción)."""
+    from src.utils.config import Settings
+
+    default = Settings.model_fields["MOTOR_REST_MULTI_SERIES"].default
+    assert frozenset(s.strip() for s in default.split(",")) == frozenset(
+        {"KXWCGAME", "KXWCGROUPWIN", "KXMENWORLDCUP", "KXMWORLDCUP"}
+    )
+    assert Settings.model_fields["MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC"].default == 30.0
+    assert Settings.model_fields["MOTOR_REST_MULTI_MIN_LEGS"].default == 3

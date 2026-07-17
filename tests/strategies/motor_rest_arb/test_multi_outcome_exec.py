@@ -29,6 +29,11 @@ def _engine(*, executor=None, risk_manager=None, trading_enabled=True) -> RestAr
     settings.MOTOR_REST_MIN_EDGE_CENTS = 1
     settings.MOTOR_REST_MIN_DEPTH = 2
     settings.MOTOR_REST_EXECUTION_EDGE_PCT = 0.0  # umbral bajo: cualquier arb viable ejecuta
+    settings.MOTOR_REST_MAX_EDGE_PCT = 10_000.0  # techo alto: no interfiere en estos tests
+    # Universo multi ahora viene de config (defaults de producción).
+    settings.MOTOR_REST_MULTI_SERIES = "KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP"
+    settings.MOTOR_REST_MULTI_MAX_QUOTE_AGE_SEC = 30.0
+    settings.MOTOR_REST_MULTI_MIN_LEGS = 3
     settings.TRADING_ENABLED = trading_enabled
     with patch("src.strategies.motor_rest_arb.engine.get_settings", return_value=settings):
         eng = RestArbEngine(executor=executor, risk_manager=risk_manager)

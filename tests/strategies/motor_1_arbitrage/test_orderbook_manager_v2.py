@@ -558,3 +558,212 @@ async def test_delta_from_fixture_after_snapshot(manager: OrderbookManagerV2) ->
     assert top_no.best_bid is not None
     assert top_no.best_bid.price_cents == 85
     assert top_no.best_bid.size == 2900  # 3000 - 100
+
+
+# =====================================================
+# Cuarentena en desync (incidente 2026-07-12: rollbacks por precios fantasma)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_desync_quarantines_book_and_triggers_recovery(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """MECANISMO del fix: en OrderbookDesyncError el book queda EN CUARENTENA (stale →
+    get_top_of_book None: M1 deja de ver precios fantasma en el MISMO tick) y se dispara
+    la recovery del sid. Antes del fix el book seguía sirviendo datos divergidos → M1
+    detectaba arbs sobre liquidez inexistente → fill parcial → rollback ×3 → breaker."""
+    ticker = "KXMLBGAME-26JUL121610AZLAD-AZ"
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1, yes_fp=[["0.4000", "10.00"]])
+    )
+    assert manager.get_top_of_book(ticker, "yes") is not None  # book sano sirve
+
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00")
+        )
+
+    # Cuarentena inmediata: nadie más lee el book corrupto.
+    assert manager._books[ticker].is_stale
+    assert manager.get_top_of_book(ticker, "yes") is None
+    # Y la recovery del sid quedó en marcha (snapshot fresco lo re-baseará).
+    assert 1 in manager._recovering
+    mock_ws.send_command.assert_called_once_with(
+        "update_subscription",
+        action="get_snapshot",
+        params={"market_tickers": [ticker], "sids": [1]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_desync_quarantine_stops_repeat_desyncs(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """CONTROL anti-spam: tras la cuarentena, el MISMO delta corrupto ya no vuelve a
+    lanzar desync (el guard de stale lo dropea) — se corta el loop de 635 logs/día."""
+    ticker = "KXMLBGAME-26JUL121610AZLAD-AZ"
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1, yes_fp=[["0.4000", "10.00"]])
+    )
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00")
+        )
+
+    # El sid está en recovery → el delta siguiente se BUFFEREA (no re-lanza desync).
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00")
+    )  # no raise
+
+
+@pytest.mark.asyncio
+async def test_desync_recovery_snapshot_rebases_and_serves_again(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """El ciclo completo sana: desync → cuarentena → snapshot de recovery → el book se
+    re-basea y vuelve a servir precios REALES (no queda muerto para siempre)."""
+    ticker = "KXMLBGAME-26JUL121610AZLAD-AZ"
+    mock_ws.send_command.return_value = 42
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1, yes_fp=[["0.4000", "10.00"]])
+    )
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00")
+        )
+    assert manager.get_top_of_book(ticker, "yes") is None  # en cuarentena
+
+    recovery = make_ws_snapshot(ticker, sid=1, seq=50, yes_fp=[["0.1200", "500.00"]], req_id=42)
+    await manager.handle_message(recovery)
+
+    assert manager._books[ticker].is_initialized and not manager._books[ticker].is_stale
+    top = manager.get_top_of_book(ticker, "yes")
+    assert top is not None and top.best_bid is not None
+    assert top.best_bid.price_cents == 12  # precios frescos, no fantasma
+
+
+@pytest.mark.asyncio
+async def test_healthy_book_unaffected_by_other_sid_desync(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """CONTROL: el desync de un sid NO toca los books de otro sid (la cuarentena es
+    quirúrgica, no un apagón general del feed)."""
+    sano = "KXWCGAME-26JUL15ARGFRA-ARG"
+    roto = "KXMLBGAME-26JUL121610AZLAD-AZ"
+    await manager.handle_message(make_ws_snapshot(sano, sid=7, seq=1, yes_fp=[["0.5000", "20.00"]]))
+    await manager.handle_message(make_ws_snapshot(roto, sid=1, seq=1, yes_fp=[["0.4000", "10.00"]]))
+
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(
+            make_ws_delta(roto, sid=1, seq=2, price_dollars="0.4000", delta_fp="-15.00")
+        )
+
+    assert manager.get_top_of_book(roto, "yes") is None  # cuarentena
+    assert manager.get_top_of_book(sano, "yes") is not None  # el sano sigue sirviendo
+
+
+# =====================================================
+# Regresión de secuencia = epoch reset de Kalshi (incidente crónico 2026-07-15:
+# 5k-400k ValueError/día — el flood más grande de los logs del bot)
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_seq_regression_is_orderbook_error_family():
+    """La regresión hereda de OrderbookError → el dispatcher del WS la loguea como
+    INFO 'recovery event' (sin traceback) y la cuarentena de #158 la ve."""
+    from src.strategies.motor_1_arbitrage.orderbook import (
+        OrderbookError,
+        OrderbookSeqRegressionError,
+    )
+
+    assert issubclass(OrderbookSeqRegressionError, OrderbookError)
+
+
+@pytest.mark.asyncio
+async def test_epoch_reset_on_new_sid_quarantines_and_recovers(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """El escenario EXACTO del flood: book en epoch viejo (seq=1000); resuscripción de
+    Kalshi con sid NUEVO (sin baseline → el gap-check por sid no aplica) y seq bajo (5).
+    Antes: ValueError con traceback por CADA delta, book congelado para siempre.
+    Ahora: cuarentena inmediata + recovery del sid nuevo — UN evento."""
+    from src.strategies.motor_1_arbitrage.orderbook import OrderbookSeqRegressionError
+
+    ticker = "KXMLBGAME-26JUL15NYMPHI-NYM"
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1000, yes_fp=[["0.4000", "10.00"]])
+    )
+    assert manager.get_top_of_book(ticker, "yes") is not None
+
+    with pytest.raises(OrderbookSeqRegressionError):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=2, seq=5, price_dollars="0.4000", delta_fp="3.00")
+        )
+
+    # Cuarentena: el book del epoch viejo deja de servir en el MISMO tick.
+    assert manager._books[ticker].is_stale
+    assert manager.get_top_of_book(ticker, "yes") is None
+    # Recovery en marcha para el sid nuevo.
+    assert 2 in manager._recovering
+
+
+@pytest.mark.asyncio
+async def test_epoch_reset_flood_stops_after_first_event(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """CONTROL anti-flood: tras la cuarentena, los deltas siguientes del epoch nuevo se
+    BUFFEREAN (sid en recovery) — no re-lanzan nada. 400k errores/día → 1 evento."""
+    from src.strategies.motor_1_arbitrage.orderbook import OrderbookSeqRegressionError
+
+    ticker = "KXMLBGAME-26JUL15NYMPHI-NYM"
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1000, yes_fp=[["0.4000", "10.00"]])
+    )
+    with pytest.raises(OrderbookSeqRegressionError):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=2, seq=5, price_dollars="0.4000", delta_fp="3.00")
+        )
+    # Los siguientes del epoch nuevo: buffer silencioso, sin excepción.
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=2, seq=6, price_dollars="0.4000", delta_fp="1.00")
+    )
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=2, seq=7, price_dollars="0.4100", delta_fp="2.00")
+    )
+
+
+@pytest.mark.asyncio
+async def test_epoch_reset_heals_via_recovery_snapshot(
+    manager: OrderbookManagerV2, mock_ws: AsyncMock
+) -> None:
+    """El ciclo completo sana: regresión → cuarentena → snapshot de recovery del epoch
+    NUEVO → apply_snapshot re-basea el sequence (seq bajo ahora es válido) → el book
+    vuelve a servir y los deltas nuevos aplican. El bug crónico muere acá."""
+    from src.strategies.motor_1_arbitrage.orderbook import OrderbookSeqRegressionError
+
+    ticker = "KXMLBGAME-26JUL15NYMPHI-NYM"
+    mock_ws.send_command.return_value = 42
+    await manager.handle_message(
+        make_ws_snapshot(ticker, sid=1, seq=1000, yes_fp=[["0.4000", "10.00"]])
+    )
+    with pytest.raises(OrderbookSeqRegressionError):
+        await manager.handle_message(
+            make_ws_delta(ticker, sid=2, seq=5, price_dollars="0.4000", delta_fp="3.00")
+        )
+
+    # Snapshot de recovery del epoch NUEVO (seq bajo).
+    recovery = make_ws_snapshot(ticker, sid=2, seq=6, yes_fp=[["0.3500", "80.00"]], req_id=42)
+    await manager.handle_message(recovery)
+
+    st = manager._books[ticker]
+    assert st.is_initialized and not st.is_stale
+    assert st.sequence == 6  # re-baseado al epoch nuevo — la regresión ya no existe
+    top = manager.get_top_of_book(ticker, "yes")
+    assert top is not None and top.best_bid.price_cents == 35
+    # Y el flujo nuevo aplica normal: el libro quedó VIVO, no congelado.
+    await manager.handle_message(
+        make_ws_delta(ticker, sid=2, seq=7, price_dollars="0.3500", delta_fp="5.00")
+    )
+    assert manager._books[ticker].sequence == 7

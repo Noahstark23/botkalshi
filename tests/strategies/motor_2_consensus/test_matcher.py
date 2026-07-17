@@ -66,11 +66,50 @@ def test_accent_folding(accented, plain):
         ("USA", "united states"),
         ("United States of America", "united states"),
         ("Korea Republic", "south korea"),
-        ("Yankees", "yankees"),  # sin alias → queda normalizado
+        ("Yankees", "new york yankees"),  # nickname MLB poblado (plan 2026-07-02)
     ],
 )
 def test_canonical_name_resolves_alias(raw, expected):
     assert canonical_name(raw) == expected
+
+
+# =====================================================
+# Mundial 2026 — aliases de selecciones (grafías Kalshi ↔ The Odds API)
+# =====================================================
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("Türkiye", "Turkey"),  # confirmado en prod
+        ("Cabo Verde", "Cape Verde"),
+        ("Congo DR", "DR Congo"),
+        ("Democratic Republic of the Congo", "DR Congo"),
+        ("Korea DPR", "North Korea"),
+        ("China PR", "China"),
+    ],
+)
+def test_worldcup_team_alias_pairs_canonicalize_equal(a, b):
+    """Mismo país en dos grafías → mismo canónico (el alias es simétrico)."""
+    assert canonical_name(a) == canonical_name(b)
+
+
+def test_worldcup_turkey_real_1x2_matches():
+    """Partido real del Mundial: 'Türkiye' (Kalshi) ↔ 'Turkey' (Odds) → matchea."""
+    kalshi = ["Türkiye", "Paraguay", "Draw"]
+    odds = ["Turkey", "Draw", "Paraguay"]
+    assert outcomes_match(kalshi, odds) is True
+    assert match_outcomes(kalshi, odds) == {
+        "Türkiye": "Turkey",
+        "Paraguay": "Paraguay",
+        "Draw": "Draw",
+    }
+
+
+def test_dr_congo_does_not_match_republic_of_congo():
+    """SALVAGUARDA: RD del Congo y Rep. del Congo son países DISTINTOS → NO deben matchear."""
+    assert canonical_name("DR Congo") != canonical_name("Congo")
+    assert outcomes_match(["DR Congo", "Draw", "Spain"], ["Congo", "Draw", "Spain"]) is False
 
 
 # =====================================================
@@ -139,3 +178,65 @@ def test_duplicate_outcome_names_rejected_as_ambiguous():
     """Nombres duplicados tras canonizar (ambigüedad) → descarta aunque len coincida."""
     # "Tie" y "Draw" colapsan al mismo canónico → el lado tiene 2 nombres → 1 canónico.
     assert outcomes_match(["Draw", "Tie"], ["Draw", "Argentina"]) is False
+
+
+# =====================================================
+# MLB — alias nombre corto (Kalshi) ↔ full (Odds API) + trampa shared-city
+# =====================================================
+
+
+@pytest.mark.parametrize(
+    ("kalshi_short", "expected_full"),
+    [
+        ("Atlanta", "atlanta braves"),
+        ("San Francisco", "san francisco giants"),
+        ("New York M", "new york mets"),
+        ("New York Y", "new york yankees"),
+        ("Chicago C", "chicago cubs"),
+        ("Chicago WS", "chicago white sox"),
+        ("Los Angeles A", "los angeles angels"),
+        ("Los Angeles D", "los angeles dodgers"),
+        ("A's", "athletics"),  # "A's" → normaliza a 'as' → alias a 'athletics'
+        ("St. Louis", "st louis cardinals"),
+    ],
+)
+def test_mlb_short_name_resolves_to_full(kalshi_short, expected_full):
+    """Kalshi corto → canónico full de Odds API (vía alias MLB)."""
+    assert canonical_name(kalshi_short) == expected_full
+
+
+def test_mlb_real_game_short_vs_full_matches():
+    """Partido real: Kalshi corto ↔ Odds full → matchea por conjunto."""
+    assert (
+        outcomes_match(["Atlanta", "San Francisco"], ["Atlanta Braves", "San Francisco Giants"])
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("kalshi", "odds"),
+    [
+        (["New York M", "Cincinnati"], ["New York Yankees", "Cincinnati Reds"]),  # Mets≠Yankees
+        (["Chicago C", "Colorado"], ["Chicago White Sox", "Colorado Rockies"]),  # Cubs≠White Sox
+        (
+            ["Los Angeles A", "Arizona"],
+            ["Los Angeles Dodgers", "Arizona Diamondbacks"],
+        ),  # Angels≠Dodgers
+    ],
+)
+def test_mlb_shared_city_wrong_team_does_not_match(kalshi, odds):
+    """La trampa shared-city: el equipo equivocado de la misma ciudad NO debe matchear."""
+    assert outcomes_match(kalshi, odds) is False
+
+
+@pytest.mark.parametrize(
+    ("kalshi", "odds"),
+    [
+        (["New York M", "Cincinnati"], ["New York Mets", "Cincinnati Reds"]),
+        (["Chicago C", "Colorado"], ["Chicago Cubs", "Colorado Rockies"]),
+        (["Los Angeles A", "Arizona"], ["Los Angeles Angels", "Arizona Diamondbacks"]),
+    ],
+)
+def test_mlb_shared_city_correct_team_matches(kalshi, odds):
+    """El equipo CORRECTO de la misma ciudad sí matchea (desambiguación por sufijo)."""
+    assert outcomes_match(kalshi, odds) is True

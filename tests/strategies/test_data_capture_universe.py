@@ -1,7 +1,10 @@
 """
-Tests del seam read-only `event_universe` (Motor 2): agrupar tickers trackeados por
-event_key, filtrando por SERIE configurable. Generaliza el universo del Mundial a
-cualquier deporte (MLB, etc.) sin tocar el arb multi-outcome (que sigue WC-only).
+Tests de las fotos read-only por serie de DataCaptureService.
+
+`series_histogram` es el diagnóstico de onboarding de MLB: a partir de los tickers
+trackeados (sin red) reporta, por prefijo de serie, cuántos eventos hay y cuántos
+markets por evento — revelando el prefijo exacto y la ESTRUCTURA (2-market-por-equipo
+que el Motor 2 ya maneja vs 1-market-2-way que necesitaría variante).
 """
 
 from __future__ import annotations
@@ -14,60 +17,49 @@ from src.strategies.data_capture import DataCaptureService
 
 
 @pytest.fixture
-def service():
+def service() -> DataCaptureService:
     with (
         patch("src.strategies.data_capture.get_settings"),
         patch("src.strategies.data_capture.KalshiWebSocket"),
     ):
-        return DataCaptureService()
+        svc = DataCaptureService()
+        svc._tracked_tickers = set()
+        return svc
 
 
-def test_event_universe_groups_by_event_and_filters_series(service):
+def test_series_histogram_empty(service: DataCaptureService) -> None:
+    assert service.series_histogram() == {}
+
+
+def test_series_histogram_groups_by_prefix_and_structure(service: DataCaptureService) -> None:
     service._tracked_tickers = {
+        # Mundial 1X2: 2 eventos × 3 markets por-evento (Gana/Empata/Gana).
         "KXWCGAME-26JUN27JORARG-ARG",
         "KXWCGAME-26JUN27JORARG-JOR",
         "KXWCGAME-26JUN27JORARG-TIE",
-        "KXMLBGAME-25JUN14NYYBOS-NYY",
-        "KXMLBGAME-25JUN14NYYBOS-BOS",
-        "KXNBA-26-LAL",  # otra serie, no pedida
+        "KXWCGAME-26JUN28BRAFRA-BRA",
+        "KXWCGAME-26JUN28BRAFRA-FRA",
+        "KXWCGAME-26JUN28BRAFRA-TIE",
+        # MLB hipotético: 2 eventos × 2 markets por-equipo (estructura que SÍ maneja Motor 2).
+        "KXMLBGAME-26JUN15NYYBOS-NYY",
+        "KXMLBGAME-26JUN15NYYBOS-BOS",
+        "KXMLBGAME-26JUN15LADSFG-LAD",
+        "KXMLBGAME-26JUN15LADSFG-SFG",
     }
-    # Solo el Mundial:
-    wc = service.event_universe({"KXWCGAME"})
-    assert wc == {
-        "KXWCGAME-26JUN27JORARG": {
-            "KXWCGAME-26JUN27JORARG-ARG",
-            "KXWCGAME-26JUN27JORARG-JOR",
-            "KXWCGAME-26JUN27JORARG-TIE",
-        }
-    }
-    # Solo MLB (2-way moneyline agrupado por evento):
-    mlb = service.event_universe({"KXMLBGAME"})
-    assert mlb == {
-        "KXMLBGAME-25JUN14NYYBOS": {
-            "KXMLBGAME-25JUN14NYYBOS-NYY",
-            "KXMLBGAME-25JUN14NYYBOS-BOS",
-        }
-    }
-    # Ambos a la vez (config con varias series):
-    both = service.event_universe({"KXWCGAME", "KXMLBGAME"})
-    assert set(both) == {"KXWCGAME-26JUN27JORARG", "KXMLBGAME-25JUN14NYYBOS"}
+    hist = service.series_histogram()
+
+    assert set(hist) == {"KXWCGAME", "KXMLBGAME"}
+    wc_events, wc_mpe = hist["KXWCGAME"]
+    assert wc_events == 2 and wc_mpe == pytest.approx(3.0)  # 3-way → cardinalidad vs odds 1X2
+    mlb_events, mlb_mpe = hist["KXMLBGAME"]
+    assert mlb_events == 2 and mlb_mpe == pytest.approx(2.0)  # 2-way por-equipo → ✓ Motor 2
 
 
-def test_event_universe_series_match_is_exact(service):
-    """Igualdad EXACTA de serie: KXWCGAMEGOALS (totales) NO cae en KXWCGAME."""
+def test_series_histogram_one_market_two_way_signature(service: DataCaptureService) -> None:
+    """~1.0 mkt/evento = 1 market 2-way → señal de que haría falta variante de parseo."""
     service._tracked_tickers = {
-        "KXWCGAME-26JUN27JORARG-ARG",
-        "KXWCGAMEGOALS-26JUN27JORARG-O25",
+        "KXSOMEGAME-26JUN15AAABBB-GAME",
+        "KXSOMEGAME-26JUN15CCCDDD-GAME",
     }
-    assert set(service.event_universe({"KXWCGAME"})) == {"KXWCGAME-26JUN27JORARG"}
-
-
-def test_multi_event_universe_backcompat_is_world_cup(service):
-    """multi_event_universe sigue devolviendo solo el Mundial (MULTI_SERIES del Motor REST)."""
-    service._tracked_tickers = {
-        "KXWCGAME-26JUN27JORARG-ARG",
-        "KXWCGAME-26JUN27JORARG-JOR",
-        "KXMLBGAME-25JUN14NYYBOS-NYY",  # MLB NO debe aparecer acá
-    }
-    uni = service.multi_event_universe()
-    assert set(uni) == {"KXWCGAME-26JUN27JORARG"}
+    n_events, mpe = service.series_histogram()["KXSOMEGAME"]
+    assert n_events == 2 and mpe == pytest.approx(1.0)

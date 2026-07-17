@@ -24,6 +24,7 @@ def _settings(*, trading: bool, exec_edge_pct: float = 0.0) -> MagicMock:
     s.MOTOR_REST_MIN_EDGE_CENTS = 1
     s.MOTOR_REST_MIN_DEPTH = 2
     s.MOTOR_REST_EXECUTION_EDGE_PCT = exec_edge_pct
+    s.MOTOR_REST_MAX_EDGE_PCT = 10_000.0  # techo alto: no interfiere salvo en su test dedicado
     s.TRADING_ENABLED = trading
     return s
 
@@ -123,6 +124,23 @@ async def test_below_fine_threshold_does_not_execute():
 
     ex.execute.assert_not_awaited()
     rm.check_pre_trade.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_above_max_edge_does_not_execute():
+    """Techo anti-fantasma: edge por encima de MOTOR_REST_MAX_EDGE_PCT → graba pero NO ejecuta."""
+    ex, rm = _mock_executor(), _mock_risk()
+    s = _settings(trading=True, exec_edge_pct=0.0)
+    s.MOTOR_REST_MAX_EDGE_PCT = 1.0  # el arb del ticker (~5.3%) supera el techo → rechazo
+    eng = _engine(s, executor=ex, risk_manager=rm)
+    with patch.object(eng, "_record_edge_window", return_value=1):
+        await eng.on_ticker(_arb_ticker())
+        await _drain(eng)
+
+    assert eng._signals_seen == 1  # detectó y grabó el EdgeWindow
+    ex.execute.assert_not_awaited()  # pero el techo cortó la ejecución (anti-fantasma)
+    rm.check_pre_trade.assert_not_awaited()
+    assert eng._exec_task is None
 
 
 @pytest.mark.asyncio

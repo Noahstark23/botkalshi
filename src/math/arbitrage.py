@@ -35,6 +35,21 @@ class ArbOpportunity:
         return sum(leg.price_cents * leg.count for leg in self.legs)
 
 
+def select_hard_leg(opp: ArbOpportunity) -> tuple[ArbLeg, list[ArbLeg]]:
+    """
+    Elige la pata DURA del guardarraíl "hard-first" (#85) y devuelve (hard, otras).
+
+    HARD = la pata más cara (mayor `price_cents`), desempate por menor `available_size`
+    (la más fina). Empíricamente (prod) es la favorita cara/fina la que NO encuentra
+    volumen resting y KILL-ea. FUENTE ÚNICA: la usan el RestExecutor (orden de ejecución)
+    y el log de intención shadow del engine → nunca divergen. `otras` mantiene el orden
+    original de `opp.legs` (identidad, no valor).
+    """
+    hard = max(opp.legs, key=lambda lg: (lg.price_cents, -lg.available_size))
+    others = [lg for lg in opp.legs if lg is not hard]
+    return hard, others
+
+
 def detect_binary_arb(
     market_ticker: str,
     yes_ask_cents: int,

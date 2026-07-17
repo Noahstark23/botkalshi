@@ -18,6 +18,7 @@ Punto de entrada del container Docker.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import signal
 import sys
@@ -52,8 +53,9 @@ class ProductionRunner:
     # DB tracking
     # =====================================================
 
-    def _record_run_start(self) -> None:
-        """Registra arranque en DB para auditoría."""
+    def _record_run_start(self, capital_usd: float | None = None) -> None:
+        """Registra arranque en DB para auditoría. `capital_usd`: capital efectivo REAL
+        si el boot lo pudo traer; None → param estático (fallback)."""
         motors_enabled = []
         if self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             motors_enabled.append("motor_1_arbitrage")
@@ -67,7 +69,9 @@ class ProductionRunner:
                 environment=self.settings.KALSHI_ENV,
                 trading_enabled=self.settings.TRADING_ENABLED,
                 motors_enabled=json.dumps(motors_enabled),
-                capital_at_start=self.settings.ACTIVE_CAPITAL_USD,
+                capital_at_start=(
+                    capital_usd if capital_usd is not None else self.settings.ACTIVE_CAPITAL_USD
+                ),
             )
             s.add(run)
             s.commit()
@@ -176,15 +180,156 @@ class ProductionRunner:
             logger.exception(msg)
             BotState.record_error(msg)
 
+    async def _run_motor3_clv(self) -> None:
+        """
+        Motor 3 (CLV) — gateado por MOTOR_3_CLV_ENABLED. Liquida posiciones direccionales
+        a T-30min del cierre para capturar el closing line value. CAPA A: el executor (que
+        vende) solo se construye con TRADING_ENABLED=true — en shadow detecta y loguea las
+        salidas pero NUNCA vende (clave: place_order no frena 'sell', así que la protección
+        es Capa A, no el muro global). Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.MOTOR_3_CLV_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        try:
+            from src.strategies.motor_3_clv.engine import Motor3Engine
+
+            await Motor3Engine(
+                trading_enabled=(
+                    self.settings.TRADING_ENABLED and self.settings.MOTOR_3_EXECUTION_ENABLED
+                ),
+                take_profit_enabled=self.settings.MOTOR_3_TAKE_PROFIT_ENABLED,
+                tp_threshold=self.settings.MOTOR_3_TAKE_PROFIT_CENTS,
+                trailing_enabled=self.settings.MOTOR_3_TRAILING_ENABLED,
+                trailing_drop=self.settings.MOTOR_3_TRAILING_DROP_CENTS,
+                manages_orphans=self.settings.MOTOR_3_MANAGES_ORPHANS,
+                min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
+            ).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor3_clv runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_motor5_mm(self) -> None:
+        """
+        Motor 5 (market maker) F1 SHADOW — gateado por MOTOR_MM_ENABLED. Cotiza
+        HIPOTÉTICAMENTE alrededor del fair de Motor 2 (FairValueBook) contra el book real
+        y registra fills shadow con regla conservadora. CERO órdenes: en F1 el executor no
+        existe (docs/motor_5_market_maker_plan_fases.md §3) — no hay Capa A que gatear
+        porque no hay nada que ejecute; el validador de config rechaza además
+        MOTOR_MM_EXECUTION_ENABLED=true en producción hasta F2.
+        """
+        if not self.settings.MOTOR_MM_ENABLED:
+            return  # opt-in; default off → no-op
+        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        try:
+            from src.strategies.motor_5_mm.engine import Motor5Engine
+            from src.strategies.motor_5_mm.fill_feed import MMFillFeed
+
+            # CAPA A: la ejecución real (F2, demo) requiere AMBOS flags; el validador de
+            # config además rompe el boot con EXECUTION=true en producción hasta F3.
+            trading = self.settings.TRADING_ENABLED and self.settings.MOTOR_MM_EXECUTION_ENABLED
+            risk = None
+            fill_feed = None
+            if trading:
+                from src.risk.manager import RiskManager
+
+                risk = RiskManager()
+                fill_feed = MMFillFeed()
+                if self._capture is not None:
+                    # Fast-path de fills por el WS compartido de data_capture; si no hay
+                    # capture, el reconciler (REST) sigue siendo la verdad completa.
+                    fill_feed.attach(self._capture.ws)
+                else:
+                    logger.warning("motor5: sin data_capture → fill feed WS no adjuntado")
+            await Motor5Engine(
+                max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
+                half_spread_cents=self.settings.MOTOR_MM_HALF_SPREAD_CENTS,
+                edge_skew_cents=self.settings.MOTOR_MM_EDGE_SKEW_CENTS,
+                quote_size_contracts=self.settings.MOTOR_MM_QUOTE_SIZE_CONTRACTS,
+                max_inventory_contracts=self.settings.MOTOR_MM_MAX_INVENTORY_CONTRACTS,
+                fair_ttl_sec=self.settings.MOTOR_MM_FAIR_TTL_SEC,
+                trading_enabled=trading,
+                risk_manager=risk,
+                fill_feed=fill_feed,
+                mm_exposure_cap_usd=self.settings.MOTOR_MM_MAX_EXPOSURE_USD,
+            ).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor5_mm runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_motor1_arb(self) -> None:
+        """
+        Motor 1 (arbitraje binario WS) — gateado por MOTOR_1_ARBITRAGE_ENABLED. Detecta
+        cruces YES+NO sobre el OrderbookManagerV2 (que vive en data_capture, alimentado por
+        el WS) y graba EdgeWindow. CAPA A: el ArbitrageExecutor (que coloca órdenes) SOLO se
+        construye con TRADING_ENABLED=true Y MOTOR_1_EXECUTION_ENABLED=true (auditoría
+        2026-07-07, P1: con TRADING_ENABLED solo, prender el trading global para que M3
+        venda armaba también las compras de M1) — en shadow el engine recibe executor=None
+        y es estructuralmente incapaz de ejecutar. Best-effort: si cae, se registra y la
+        task termina — NO tira el bot.
+        """
+        if not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        # Dar tiempo a que el WS se suscriba y aterricen los primeros snapshots del book.
+        await asyncio.sleep(30)
+        if self._capture is None:
+            logger.error("motor1_arb: capture service no disponible → no arranca")
+            return
+        manager = getattr(self._capture, "_v2_manager", None)
+        if manager is None:
+            logger.error(
+                "motor1_arb: OrderbookManagerV2 no disponible en el capture service → no arranca"
+            )
+            return
+        try:
+            from src.strategies.motor_1_arbitrage.engine import Motor1Engine
+
+            # Capa A: el executor SOLO se construye con los DOS flags (global + por motor);
+            # en shadow el engine recibe executor=None (incapaz de ejecutar).
+            if self.settings.TRADING_ENABLED and self.settings.MOTOR_1_EXECUTION_ENABLED:
+                async with KalshiRestClient() as client:
+                    executor = ArbitrageExecutor(client, RiskManager())
+                    await Motor1Engine(manager, executor=executor).run(self._stop_event)
+            else:
+                await Motor1Engine(manager).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor1_arb runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    def _build_motor6_shadow(self):
+        """Motor 6 F1 (line-moves) — pasajero del ciclo de M2; None = apagado. En F1 NO
+        existe executor: el módulo ni siquiera importa el cliente de órdenes (Capa A
+        llevada al extremo — hay un test-guard que lo verifica)."""
+        if not self.settings.MOTOR_6_LINEMOVE_ENABLED:
+            return None
+        from src.strategies.motor_6_linemove.shadow import Motor6LineMoveShadow
+
+        logger.info(
+            "motor6.shadow armado (move_min="
+            f"{self.settings.MOTOR_6_MOVE_MIN_PP}pp, edge_min={self.settings.MOTOR_6_EDGE_MIN_PP}pp, "
+            f"max={self.settings.MOTOR_6_MAX_EDGE_PP}pp) — F1: solo observa"
+        )
+        return Motor6LineMoveShadow(
+            move_min_pp=self.settings.MOTOR_6_MOVE_MIN_PP,
+            edge_min_pp=self.settings.MOTOR_6_EDGE_MIN_PP,
+            max_edge_pp=self.settings.MOTOR_6_MAX_EDGE_PP,
+        )
+
     async def _run_motor2_shadow(self) -> None:
         """
         Motor 2 (consenso sportsbooks) — gateado por MOTOR_2_SPORTSBOOK_ENABLED.
 
         Por defecto SHADOW (solo detecta/graba). APUESTA real solo cuando se cumplen
-        las DOS condiciones, en capas independientes:
+        las TRES condiciones, en capas independientes:
           1. odds REALES (LiveOddsSource) — nunca apuesta sobre el fixture fake.
-          2. TRADING_ENABLED=true → se construye el Motor2Executor (Capa A) y se inyecta.
-        Con cualquiera de las dos en falso, el motor sigue siendo shadow puro.
+          2. TRADING_ENABLED=true (muro global).
+          3. MOTOR_2_ENTRY_EXECUTION_ENABLED=true (Capa A por motor, auditoría 2026-07-07
+             P1) → recién ahí se construye el Motor2Executor y se inyecta. Distinto de
+             MOTOR_2_EXECUTION_ENABLED, que gatea las VENTAS del brazo de salida.
+        Con cualquiera en falso, el motor sigue siendo shadow puro.
 
         El flip a odds reales es POR CONFIG: con ODDS_API_KEY seteada → LiveOddsSource
         (odds reales, sport_keys/regions de settings); vacía → FakeOddsSource (fixture).
@@ -205,16 +350,15 @@ class ProductionRunner:
                 RestKalshiQuoteSource,
             )
 
-            # Universo Kalshi de Motor 2: config-driven (series separadas por coma). Default
-            # = Mundial 1X2 (comportamiento actual). Sumar la serie de MLB lo enciende para
-            # béisbol sin tocar código. Capturamos el set una vez; el provider lo relee del
-            # tracker en cada ciclo (se actualiza con el re-discovery).
-            motor2_series = {
-                s.strip() for s in self.settings.MOTOR_2_KALSHI_SERIES.split(",") if s.strip()
-            }
-            capture = self._capture
-            kalshi_source = RestKalshiQuoteSource(lambda: capture.event_universe(motor2_series))
-            logger.info(f"motor2 kalshi_series={sorted(motor2_series)}")
+            # Universo de Motor 2: series de MOTOR2_SERIES (incluye MLB 2-way), NO el de
+            # Motor REST (MULTI_SERIES, solo winner-take-all ≥3). Sin esto, MLB no entra al
+            # funnel de Motor 2 por más sport_key/alias que haya.
+            motor2_series = frozenset(
+                s.strip() for s in self.settings.MOTOR2_SERIES.split(",") if s.strip()
+            )
+            kalshi_source = RestKalshiQuoteSource(
+                lambda: self._capture.motor2_event_universe(motor2_series)
+            )
             # FLIP POR CONFIG: con la API paga (ODDS_API_KEY) usa odds REALES; si no, el
             # fixture fake (shadow, jamás apuesta). Sin editar código para encender.
             if self.settings.ODDS_API_KEY:
@@ -226,28 +370,277 @@ class ProductionRunner:
                     f"motor2 odds=LIVE sports={sport_keys} regions={self.settings.ODDS_API_REGIONS}"
                 )
             else:
-                odds_source = FakeOddsSource(world_cup_demo_fixture())
+                odds_source = FakeOddsSource(
+                    world_cup_demo_fixture
+                )  # factory: fechas frescas por fetch
                 logger.info("motor2 odds=FAKE (ODDS_API_KEY no seteada → shadow con fixture)")
 
             # Umbral de edge tuneable por config (pp → fracción), una sola fuente de verdad.
             min_edge = self.settings.MOTOR_2_MIN_EDGE_PCT / 100.0
-            # Capa A: el executor SOLO se construye con TRADING_ENABLED=true. En shadow
-            # queda None → el poller jamás intenta apostar (y el muro Capa C de
-            # place_order es la defensa final aunque algo llegara a colarse).
-            if self.settings.TRADING_ENABLED:
+            # Capa A: el executor SOLO se construye con los DOS flags (global + entrada por
+            # motor). En shadow queda None → el poller jamás intenta apostar (y el muro
+            # Capa C de place_order es la defensa final aunque algo llegara a colarse).
+            # RiskManager para el sizing: el poller le pide el capital EFECTIVO (dinámico) por
+            # ciclo. Lee el cache de CLASE que refresca _run_balance_refresh → cualquier instancia
+            # ve el mismo cash real. En la rama de trading es el MISMO RM que usa el executor.
+            risk = RiskManager()
+            if self.settings.TRADING_ENABLED and self.settings.MOTOR_2_ENTRY_EXECUTION_ENABLED:
                 async with KalshiRestClient() as client:
-                    executor = Motor2Executor(client, RiskManager())
+                    executor = Motor2Executor(
+                        client,
+                        risk,
+                        min_entry_cents=self.settings.MOTOR_2_MIN_ENTRY_CENTS,
+                        underdog_filter_enabled=self.settings.MOTOR_2_UNDERDOG_FILTER_ENABLED,
+                        one_bet_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
+                    )
                     poller = Motor2ShadowPoller(
-                        kalshi_source, odds_source, min_edge=min_edge, executor=executor
+                        kalshi_source,
+                        odds_source,
+                        min_edge=min_edge,
+                        one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
+                        max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
+                        max_edge=self.settings.MOTOR_2_MAX_EDGE_PCT / 100.0,
+                        risk_manager=risk,
+                        executor=executor,
+                        min_books=self.settings.MOTOR_2_MIN_BOOKS,
+                        max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
+                        fee_at_stake_count=self.settings.MOTOR_2_FEE_AT_STAKE_COUNT,
+                        # Re-cableado 2026-07-17: el merge de #155 (7396b9e) borró estos
+                        # tres kwargs (agregados en #156/#157) y el hotfix #166 restauró
+                        # SOLO fee_at_stake_count — burst y Motor 6 quedaron como env vars
+                        # INERTES semanas enteras. Test de regresión los pinnea.
+                        burst_interval_sec=self.settings.MOTOR_2_BURST_INTERVAL_SEC,
+                        burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
+                        linemove=self._build_motor6_shadow(),
                     )
                     await poller.run(self._stop_event)
             else:
-                poller = Motor2ShadowPoller(kalshi_source, odds_source, min_edge=min_edge)
+                poller = Motor2ShadowPoller(
+                    kalshi_source,
+                    odds_source,
+                    min_edge=min_edge,
+                    one_per_event=self.settings.MOTOR_2_ONE_BET_PER_EVENT,
+                    max_stake_pct=self.settings.MOTOR_2_MAX_STAKE_PCT,
+                    max_edge=self.settings.MOTOR_2_MAX_EDGE_PCT / 100.0,
+                    risk_manager=risk,
+                    min_books=self.settings.MOTOR_2_MIN_BOOKS,
+                    max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
+                    fee_at_stake_count=self.settings.MOTOR_2_FEE_AT_STAKE_COUNT,
+                    # Re-cableado 2026-07-17 (ver rama con executor): perdidos en #155.
+                    burst_interval_sec=self.settings.MOTOR_2_BURST_INTERVAL_SEC,
+                    burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
+                    linemove=self._build_motor6_shadow(),
+                )
                 await poller.run(self._stop_event)
         except Exception as e:
             msg = f"motor2 runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+
+    async def _run_motor2_exits(self) -> None:
+        """
+        Motor 2 — cierre de posiciones (take-profit/trailing). Gateado por
+        MOTOR_2_SPORTSBOOK_ENABLED (corre junto al shadow poller, gestionando lo que ya hay
+        abierto). CAPA A: el executor (que vende) solo se construye con TRADING_ENABLED=true Y
+        MOTOR_2_EXECUTION_ENABLED=true — en shadow detecta y loguea [MOTOR 2 TP SHADOW] con net
+        de fees pero NUNCA vende. Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
+            return  # opt-in; default off → no-op (no toca nada en prod)
+        await asyncio.sleep(25)  # dejar que init_db / boot terminen
+        try:
+            from src.strategies.motor_2_consensus.exit_engine import Motor2ExitEngine
+
+            await Motor2ExitEngine(
+                trading_enabled=(
+                    self.settings.TRADING_ENABLED and self.settings.MOTOR_2_EXECUTION_ENABLED
+                ),
+                take_profit_enabled=self.settings.MOTOR_2_TAKE_PROFIT_ENABLED,
+                tp_threshold=self.settings.MOTOR_2_TAKE_PROFIT_CENTS,
+                trailing_enabled=self.settings.MOTOR_2_TRAILING_ENABLED,
+                trailing_drop=self.settings.MOTOR_2_TRAILING_DROP_CENTS,
+                min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
+            ).run(self._stop_event)
+        except Exception as e:
+            msg = f"motor2_exits runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_telegram_commands(self) -> None:
+        """
+        Dashboard on-demand por Telegram (/dashboard) — gateado por TELEGRAM_DASHBOARD_ENABLED.
+        READ-ONLY/ADVISORY: long-polling de getUpdates que responde el dashboard SOLO al chat
+        autorizado. NUNCA tradea ni toca capital. No-op si Telegram no está configurado.
+        Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.TELEGRAM_DASHBOARD_ENABLED:
+            return  # default on; se apaga por config
+        await asyncio.sleep(8)  # dejar que init_db / boot terminen
+        try:
+            from src.monitoring.dashboard import TelegramCommandLoop
+
+            await TelegramCommandLoop().run(self._stop_event)
+        except Exception as e:
+            msg = f"telegram_commands runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_daily_pnl(self) -> None:
+        """
+        Daily P&L digest — gateado por DAILY_PNL_REPORT_ENABLED. ADVISORY ONLY: una vez/día
+        agrega el P&L realizado por motor, lo persiste en DailyPnL y manda el digest a
+        Telegram. NUNCA tradea ni toca capital. Best-effort: si cae, se registra y termina.
+        """
+        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        try:
+            from src.analytics.daily_pnl import DailyPnLLoop
+
+            await DailyPnLLoop().run(self._stop_event)
+        except Exception as e:
+            msg = f"daily_pnl runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_balance_refresh(self) -> None:
+        """
+        C-01 — sincroniza el capital base del RiskManager con el balance REAL de Kalshi (cash
+        disponible): al arrancar y cada BALANCE_REFRESH_SECONDS. Read-only (GET balance),
+        corre FUERA del _check_lock (no bloquea el gatekeeper). Best-effort: si la API falla
+        se mantiene el último valor (el RiskManager cae a ACTIVE_CAPITAL_USD si nunca hubo
+        uno). NO tira el bot si revienta.
+        """
+        from src.risk.manager import RiskManager
+
+        await asyncio.sleep(5)  # dejar que el boot termine; trae el balance temprano
+        interval = self.settings.BALANCE_REFRESH_SECONDS
+        while not self._stop_event.is_set():
+            try:
+                await RiskManager.refresh_capital_from_balance()
+            except Exception as e:
+                # refresh ya es best-effort por dentro; este guard es la red final.
+                logger.warning(f"balance_refresh tick: {type(e).__name__}: {e}")
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                return  # stop solicitado
+            except TimeoutError:
+                pass
+
+    async def _run_analyst_loop(self) -> None:
+        """
+        Analyst Loop (loop engineering) — gateado por ANALYST_LOOP_ENABLED. ADVISORY ONLY:
+        observa EdgeWindow + el embudo de Motor 2, computa un veredicto, lo persiste y manda
+        un digest a Telegram. NUNCA tradea, cambia config ni mergea. Best-effort: si cae,
+        se registra y la task termina — NO tira el bot.
+        """
+        await asyncio.sleep(15)  # dejar que init_db / boot terminen
+        try:
+            from src.analytics.analyst_loop import AnalystLoop
+
+            await AnalystLoop().run(self._stop_event)
+        except Exception as e:
+            msg = f"analyst_loop runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_memory_monitor(self) -> None:
+        """
+        Monitor de memoria — gateado por MEMORY_MONITOR_ENABLED. ADVISORY ONLY: lee el uso
+        real del cgroup y avisa por Telegram cuando cruza MEMORY_MONITOR_THRESHOLD_PCT del
+        límite del contenedor (aviso temprano de crecimiento del baseline antes del OOM).
+        NUNCA tradea ni reinicia nada. Best-effort: si cae, se registra y la task termina.
+        """
+        if not self.settings.MEMORY_MONITOR_ENABLED:
+            return  # opt-out; default on → no-op si se desactiva
+        await asyncio.sleep(10)  # dejar que el boot termine
+        try:
+            from src.monitoring.memory_monitor import MemoryMonitor
+
+            await MemoryMonitor().run(self._stop_event)
+        except Exception as e:
+            msg = f"memory_monitor runner: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            BotState.record_error(msg)
+
+    async def _run_db_maintenance(self) -> None:
+        """
+        Mantenimiento de DB — gateado por DB_MAINTENANCE_ENABLED (default on). Poda las tablas
+        de DIAGNÓSTICO por ventana de retención + wal_checkpoint (incidente disco-lleno
+        2026-07-10: orderbook_events sin tope llenó el disco → writes fallando). NUNCA toca
+        estado de trading. Best-effort por tick: si falla, se registra y el loop SIGUE.
+        """
+        if not self.settings.DB_MAINTENANCE_ENABLED:
+            return
+        from src.storage.maintenance import run_maintenance_once
+
+        interval = self.settings.DB_MAINTENANCE_INTERVAL_HOURS * 3600
+        await asyncio.sleep(60)  # una primera pasada temprano tras el boot
+        while not self._stop_event.is_set():
+            try:
+                run_maintenance_once()
+            except Exception as e:
+                msg = f"db_maintenance runner: {type(e).__name__}: {e}"
+                logger.exception(msg)
+                BotState.record_error(msg)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+
+    async def _run_disk_guard(self) -> None:
+        """
+        DiskGuard — lazo CERRADO de presión de disco (incidente 2026-07-10: el WAL a ~8MB/s
+        llenó el 96% del disco sin que nadie adentro del bot lo viera; el deploy del fix
+        falló por `no space left on device`).
+
+        Cada tick mide el disco libre del mount de la DB. En TRANSICIÓN de estado:
+          - → warn:     alerta Telegram + poda inmediata (no esperar el ciclo de 6h).
+          - → critical: alerta URGENTE + poda; además DiskGuard.diagnostics_allowed()
+                        pasa a False y los escritores de telemetría descartan (backpressure).
+          - → ok:       alerta de recuperación.
+        El estado de trading JAMÁS se gatea. Best-effort por tick (Lección 7): si un tick
+        falla, se registra y el loop SIGUE; las alertas son best-effort SIEMPRE.
+        """
+        if not self.settings.DISK_GUARD_ENABLED:
+            return
+        from src.monitoring.telegram_alerts import send_alert
+        from src.storage.disk_guard import DiskGuard
+        from src.storage.maintenance import run_maintenance_once
+
+        interval = self.settings.DISK_GUARD_INTERVAL_MINUTES * 60
+        await asyncio.sleep(45)  # dejar que init_db / boot terminen
+        prev = DiskGuard.snapshot()["state"]
+        while not self._stop_event.is_set():
+            try:
+                state = DiskGuard.evaluate()
+                if state != prev:
+                    snap = DiskGuard.snapshot()
+                    logger.warning(f"disk_guard: transición {prev} → {state} ({snap})")
+                    if state == "critical":
+                        with contextlib.suppress(Exception):  # alertas best-effort SIEMPRE
+                            await send_alert(
+                                f"🔴 DISCO CRITICAL: {snap['free_gb']} GB libres — "
+                                "telemetría DESCARTADA (trading sigue). Liberá disco YA.",
+                                urgent=True,
+                            )
+                        run_maintenance_once()  # checkpoint trunca el WAL = libera ya
+                    elif state == "warn":
+                        with contextlib.suppress(Exception):
+                            await send_alert(
+                                f"🟠 Disco WARN: {snap['free_gb']} GB libres — "
+                                "poda inmediata disparada. Revisá antes de que sea critical."
+                            )
+                        run_maintenance_once()
+                    else:  # recuperado
+                        with contextlib.suppress(Exception):
+                            await send_alert(
+                                f"🟢 Disco recuperado: {snap['free_gb']} GB libres — "
+                                "telemetría reactivada."
+                            )
+                    prev = state
+            except Exception as e:
+                msg = f"disk_guard runner: {type(e).__name__}: {e}"
+                logger.exception(msg)
+                BotState.record_error(msg)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
 
     async def _reconcile_on_boot(self) -> None:
         """
@@ -303,7 +696,7 @@ class ProductionRunner:
         try:
             # Inicialización
             logger.info(f"🚀 Bot arrancando en {self.settings.KALSHI_ENV.upper()}")
-            logger.info(f"Capital activo: ${self.settings.ACTIVE_CAPITAL_USD}")
+            logger.info(f"Capital (config/fallback): ${self.settings.ACTIVE_CAPITAL_USD}")
             logger.info(f"Trading enabled: {self.settings.TRADING_ENABLED}")
 
             init_db()
@@ -312,15 +705,31 @@ class ProductionRunner:
 
             # Rehidratar el kill-switch PERSISTENTE: si quedó engaged (un kill-switch
             # previo + restart de Coolify), arrancar PAUSADO. La pausa en memoria no
-            # sobrevive restarts; esta sí. check_pre_trade corta vía BotState.is_paused y
-            # la Capa A no construye el executor. Despausa SOLO manual (clear_kill_switch.py).
+            # sobrevive restarts; esta sí. Entradas: check_pre_trade corta vía
+            # BotState.is_paused. Salidas: Motor3ExitExecutor.exit_position chequea
+            # is_paused por venta (fix auditoría 2026-07-01 — antes los exits ignoraban
+            # la pausa y podían duplicar la venta manual del runbook de reconciliación).
+            # Despausa SOLO manual (clear_kill_switch.py).
             await self._rehydrate_kill_switch()
 
             # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
             await self._reconcile_on_boot()
 
-            self._record_run_start()
-            await alert_startup()
+            # Capital REAL temprano (best-effort, fix 2026-07-01): las señales de
+            # arranque (log, Telegram, bot_runs) muestran el cash efectivo de Kalshi,
+            # no el param estático — que con capital dinámico es solo fallback de boot.
+            boot_capital: float | None = None
+            try:
+                fetched = await asyncio.wait_for(
+                    RiskManager.refresh_capital_from_balance(), timeout=15
+                )
+                if fetched is not None:
+                    boot_capital = RiskManager().effective_capital_usd()
+                    logger.info(f"Capital efectivo (cash real): ${boot_capital:.2f}")
+            except Exception as e:
+                logger.warning(f"boot: balance real no disponible aún ({e}) → señales con config")
+            self._record_run_start(boot_capital)
+            await alert_startup(boot_capital)
 
             # Lanzar servicios concurrentemente
             tasks = [
@@ -328,7 +737,23 @@ class ProductionRunner:
                 asyncio.create_task(self._run_data_capture(), name="capture"),
                 asyncio.create_task(self._run_settlement(), name="settlement"),
                 asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
+                asyncio.create_task(self._run_motor2_exits(), name="motor2_exits"),
+                asyncio.create_task(self._run_telegram_commands(), name="telegram_commands"),
+                asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
+                asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
+                asyncio.create_task(self._run_db_maintenance(), name="db_maintenance"),
+                asyncio.create_task(self._run_disk_guard(), name="disk_guard"),
             ]
+            if self.settings.ANALYST_LOOP_ENABLED:
+                tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
+            if self.settings.DAILY_PNL_REPORT_ENABLED:
+                tasks.append(asyncio.create_task(self._run_daily_pnl(), name="daily_pnl"))
+            if self.settings.MOTOR_3_CLV_ENABLED:
+                tasks.append(asyncio.create_task(self._run_motor3_clv(), name="motor3_clv"))
+            if self.settings.MOTOR_1_ARBITRAGE_ENABLED:
+                tasks.append(asyncio.create_task(self._run_motor1_arb(), name="motor1_arb"))
+            if self.settings.MOTOR_MM_ENABLED:
+                tasks.append(asyncio.create_task(self._run_motor5_mm(), name="motor5_mm"))
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
             done, pending = await asyncio.wait(

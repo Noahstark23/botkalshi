@@ -38,7 +38,7 @@ Bot de trading algorítmico para **Kalshi prediction markets** (regulado por CFT
 
 **Tesis del sistema:** El edge en prediction markets en 2026 NO viene de predecir resultados (mercados son ~98% eficientes). Viene de detectar ineficiencias matemáticas estructurales que duran segundos a minutos, antes de que market makers institucionales las capturen.
 
-**Bankroll target:** $2,500 ($300 inicial → escala hasta $2,000 si el sistema valida)
+**Bankroll target:** $4,000 (topado a $200/trade; escala desde el canary chico tras validar consistencia multi-día)
 **ROI realista 2026:** 1-2% mensual (no 3-5% como en 2024)
 **Mes 1 esperado:** -1% a 0% (calibración)
 **Función estratégica:** Ingreso pasivo complementario, NO plan principal de capital
@@ -125,6 +125,11 @@ src/
 ---
 
 ## 4. LOS 3 MOTORES DE TRADING
+
+> **Estrategia de volumen ($4k, 2026-06):** Para lograr el objetivo de **$220/mes** con
+> capital de **$4k topado a $200/trade**, el sistema requiere **volumen (90-120 trades/mes)**.
+> El **Motor 2 (Consensus)** y los **mercados multi-outcome** asumen la prioridad para
+> alcanzar esa frecuencia operativa (el arbitraje puro es de baja frecuencia y no la sostiene).
 
 ### Motor 1: Arbitraje Intra-Kalshi
 **Tesis:** En cada evento con N outcomes, sus precios deberían sumar ≥100¢. Si suman <100¢ después de comisión, arbitraje matemático garantizado.
@@ -257,8 +262,13 @@ src/
 ### Comisiones (CRÍTICO para cálculo de edge)
 - **~7% sobre profit aproximación high-level** (para Kelly sizing rough).
 - **Fórmula real (USAR para Motor 1 / arbitraje):**
-  `fee_cents = ceil(7 * count * price_yes_cents * (100 - price_yes_cents) / 1_000_000)`
+  `fee_cents = ceil(7 * count * price_yes_cents * (100 - price_yes_cents) / 10_000)`
   (Integer arithmetic. Mergeado en `src/math/fees.py`.)
+  ⚠️ **Corregido 2026-07-01 (auditoría Motor 2):** la versión anterior de esta línea
+  (y del código y sus tests) usaba denominador `1_000_000`, que produce el fee en
+  DÓLARES ceileados etiquetados como centavos — ~100× subestimado (fee(100, 50)
+  daba 2¢; el oficial es $1.75 = 175¢). Todo análisis de PnL/edge previo a esa
+  fecha subestima fees. Verificado contra el fee schedule oficial de Kalshi.
 - Aplica solo a trades rentables.
 - **Cualquier cálculo de edge en arbitraje debe usar la fórmula real, no la
   aproximación.** En arbitrajes con profit gross de pocos centavos, la

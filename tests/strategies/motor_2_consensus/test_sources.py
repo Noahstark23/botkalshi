@@ -64,6 +64,32 @@ def test_parse_event_quotes_extracts_real_names_and_both_asks():
     assert arg.yes_ask_cents == 55 and arg.no_ask_cents == 46
 
 
+def test_parse_event_quotes_skips_empty_book_ask_100():
+    """Ask=100¢ = lado ask del book VACÍO (no hay a quién comprarle): jamás puede emitir señal.
+    Antes el truthiness lo dejaba pasar y _net_edge_pct lo colapsaba a -1.0, indistinguible del
+    sentinel 'nada evaluado' del funnel (matched>0 + best_edge=-100pp). Debe filtrarse acá."""
+    markets = [
+        _market(f"{EV}-ARG", "Argentina", "0.55", "0.46"),  # operable → entra
+        _market(f"{EV}-JOR", "Jordan", "1.0000", "0.93"),  # yes ask vacío (100c) → FUERA
+        _market(f"{EV}-TIE", "Draw", "0.30", "1.0000"),  # no ask vacío (100c) → FUERA
+        _market(f"{EV}-OTR", "Otro", "0.40", "0.65"),  # operable → entra
+    ]
+    eq = _parse_event_quotes(EV, markets)
+    assert eq is not None
+    names = {q.outcome_name for q in eq.outcomes}
+    assert names == {"Argentina", "Otro"}  # los de book vacío quedaron fuera
+
+
+def test_parse_event_quotes_all_asks_100_drops_event():
+    """Si TODOS los outcomes tienen el book vacío (asks=100), el evento entero se descarta
+    (<2 usables) → el funnel lo cuenta como no-matcheable en vez de envenenar best_edge=-100."""
+    markets = [
+        _market(f"{EV}-ARG", "Argentina", "1.0000", "1.0000"),
+        _market(f"{EV}-JOR", "Jordan", "1.0000", "1.0000"),
+    ]
+    assert _parse_event_quotes(EV, markets) is None
+
+
 def test_parse_event_quotes_skips_resolved_closed_markets():
     """GUARDARRAÍL: un market resuelto/cerrado (status != open/active) se saltea — sus
     precios colapsan a 0/100 y generan edges fantasma contra una odds API pre-partido."""

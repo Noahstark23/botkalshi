@@ -1,4 +1,4 @@
-﻿"""
+"""
 Inspect raw WebSocket messages from Kalshi.
 
 Standalone diagnostic tool. NO importa del bot productivo para evitar
@@ -15,6 +15,7 @@ NOTA: "orderbook_snapshot" NO es un canal — es un TIPO DE MENSAJE que Kalshi e
 al suscribirse a `orderbook_delta` (el snapshot inicial). Suscribirse a él devuelve
 code 8 "Unknown channel name". El script valida esto y rechaza canales desconocidos.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,6 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass  # Container usa env vars directamente, no .env
@@ -46,6 +48,7 @@ _DEFAULT_SERIES = ["KXMLB", "KXNBA"]
 # =====================================================
 # Signing (replicado de src/auth/signer.py sin importarlo)
 # =====================================================
+
 
 def _load_private_key(path: str):
     return serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
@@ -72,6 +75,7 @@ def _sign(private_key, method: str, path: str, api_key_id: str) -> dict[str, str
 # =====================================================
 # Discovery via REST
 # =====================================================
+
 
 async def discover_tickers(
     private_key,
@@ -134,6 +138,7 @@ async def discover_tickers(
 # =====================================================
 # WS Inspector
 # =====================================================
+
 
 async def inspect_ws(
     ws_url: str,
@@ -265,10 +270,14 @@ async def inspect_ws(
         print("     Action: check channel names, auth credentials, and account permissions.")
     elif delta_count > 0:
         print(f"  ✅ orderbook_delta received: {delta_count} messages")
-        print("     The subscription IS working. Bug is in _on_orderbook_delta handler or DB write.")
+        print(
+            "     The subscription IS working. Bug is in _on_orderbook_delta handler or DB write."
+        )
         print("     Check: msg.get('msg') structure, OrderbookEvent fields, get_session() commits.")
     elif snapshot_count > 0 and delta_count == 0:
-        print(f"  ⚠️  orderbook_snapshot messages received ({snapshot_count}), but ZERO orderbook_delta.")
+        print(
+            f"  ⚠️  orderbook_snapshot messages received ({snapshot_count}), but ZERO orderbook_delta."
+        )
         print("     (orderbook_snapshot es el snapshot inicial que llega al suscribir a")
         print("      orderbook_delta — recibirlo confirma que la suscripción al canal funciona.)")
         print("     Possible causes:")
@@ -293,6 +302,7 @@ async def inspect_ws(
 # =====================================================
 # Main
 # =====================================================
+
 
 async def main() -> int:
     parser = argparse.ArgumentParser(
@@ -329,12 +339,8 @@ async def main() -> int:
 
     api_key_id = os.getenv("KALSHI_API_KEY_ID")
     private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
-    ws_url = os.getenv(
-        "KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2"
-    )
-    rest_base = os.getenv(
-        "KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
-    )
+    ws_url = os.getenv("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+    rest_base = os.getenv("KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
     ws_path = "/trade-api/ws/v2"
 
     if not api_key_id or not private_key_path:
