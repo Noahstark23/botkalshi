@@ -192,3 +192,39 @@ async def test_disable_log_reports_real_progress_not_postcleanup_artifact():
     disabled = next(m for m in crit if "v2.recovery_disabled" in m)
     assert "recovered=0/2" in disabled
     assert "recovered=2/2" not in disabled  # el artefacto NO debe aparecer
+
+
+# =====================================================
+# (e) all_tickers_settled: el MISMO artefacto por OTRA causa (pending nunca se pobló)
+# =====================================================
+
+
+async def test_all_settled_disable_reports_real_progress_not_artifact():
+    """Ruta all_tickers_settled: el sid entero cerró, `live=[]` → NO se pide snapshot, así que
+    _pending_snapshot_requests jamás se pobla. Si _disable_recovery recomputara el progress,
+    pending=0 → 'recovered=N/N' FALSO (el mismo artefacto del ticket 2026-07-10, pero por otra
+    causa: allá lo borraba el cleanup, acá nunca existió). Debe reportar recovered=0/N. Y como es
+    settlement esperado, el disable es WARNING (no CRITICAL, no ensucia BotState)."""
+    ws = _CountingWs()
+    manager = OrderbookManagerV2(ws)
+    # Poblar el sid con 3 tickers y marcarlos TODOS dead → live=[] en _start_recovery.
+    for i, t in enumerate(["A", "B", "C"], start=1):
+        await manager.handle_message(_snapshot(t, sid=1, seq=i))
+    manager._dead_tickers |= {"A", "B", "C"}
+
+    warns, wsink = _capture("WARNING")
+    crit, csink = _capture("CRITICAL")
+    try:
+        with pytest.raises(SidGapError):
+            await manager.handle_message(_delta("A", sid=1, seq=99))  # gap → recovery
+    finally:
+        logger.remove(wsink)
+        logger.remove(csink)
+
+    assert 1 in manager._recovery_disabled_sids  # circuit breaker (sid cerrado)
+    assert 1 not in manager._recovering  # nunca entró en recovery (no se pidió snapshot)
+    disabled = next(m for m in warns if "v2.recovery_disabled" in m)
+    assert "recovered=0/3" in disabled  # realidad: 0 recuperados de 3 (todos settled)
+    assert "recovered=3/3" not in disabled  # el artefacto NO debe aparecer
+    assert "elapsed=n/a" in disabled  # el timer nunca arrancó
+    assert crit == []  # settlement esperado → WARNING, jamás CRITICAL
