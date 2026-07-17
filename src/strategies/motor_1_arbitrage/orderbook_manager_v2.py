@@ -406,9 +406,19 @@ class OrderbookManagerV2:
                 f"v2.recovery_all_settled sid={sid}: los {len(all_tickers)} tickers están "
                 "settled/dead → circuit breaker (no se pide snapshot)."
             )
-            # Settlement esperado, no degradación: WARNING (no CRITICAL). progress fresco es válido
-            # acá (aún no se entró en _recovering, no hay pending que el cleanup haya borrado).
-            await self._disable_recovery(sid, "all_tickers_settled", expected_settlement=True)
+            # Settlement esperado, no degradación: WARNING (no CRITICAL). Progress EXPLÍCITO:
+            # NO dejar que _disable_recovery lo recompute — acá _pending_snapshot_requests nunca
+            # se pobló (no se pidió snapshot) → _recovery_progress daría pending=0 → recovered=
+            # total/total, el MISMO artefacto que el fix 2026-07-10 mató en timeout/code15 (por
+            # otra causa: allá lo borraba el cleanup, acá nunca existió). La realidad es 0
+            # recuperados de N (todos settled) y elapsed n/a (el timer nunca arrancó).
+            total = len(all_tickers)
+            await self._disable_recovery(
+                sid,
+                "all_tickers_settled",
+                progress=f"recovered=0/{total} elapsed=n/a",
+                expected_settlement=True,
+            )
             return
 
         self._recovering.add(sid)
