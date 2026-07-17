@@ -405,6 +405,13 @@ class ProductionRunner:
                         min_books=self.settings.MOTOR_2_MIN_BOOKS,
                         max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
                         fee_at_stake_count=self.settings.MOTOR_2_FEE_AT_STAKE_COUNT,
+                        # Re-cableado 2026-07-17: el merge de #155 (7396b9e) borró estos
+                        # tres kwargs (agregados en #156/#157) y el hotfix #166 restauró
+                        # SOLO fee_at_stake_count — burst y Motor 6 quedaron como env vars
+                        # INERTES semanas enteras. Test de regresión los pinnea.
+                        burst_interval_sec=self.settings.MOTOR_2_BURST_INTERVAL_SEC,
+                        burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
+                        linemove=self._build_motor6_shadow(),
                     )
                     await poller.run(self._stop_event)
             else:
@@ -419,6 +426,10 @@ class ProductionRunner:
                     min_books=self.settings.MOTOR_2_MIN_BOOKS,
                     max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
                     fee_at_stake_count=self.settings.MOTOR_2_FEE_AT_STAKE_COUNT,
+                    # Re-cableado 2026-07-17 (ver rama con executor): perdidos en #155.
+                    burst_interval_sec=self.settings.MOTOR_2_BURST_INTERVAL_SEC,
+                    burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
+                    linemove=self._build_motor6_shadow(),
                 )
                 await poller.run(self._stop_event)
         except Exception as e:
