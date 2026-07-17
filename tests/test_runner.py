@@ -300,6 +300,57 @@ async def test_motor2_entry_requires_both_flags(
         mock_client.assert_not_called()
 
 
+@pytest.mark.parametrize("m6_enabled", [True, False])
+@pytest.mark.asyncio
+async def test_motor2_poller_wiring_includes_burst_and_linemove(mock_runner_settings, m6_enabled):
+    """REGRESIÓN #155 (2026-07-17): el merge 7396b9e borró del runner los kwargs
+    burst_interval_sec / burst_window_min / linemove (agregados en #156/#157) y el
+    hotfix #166 restauró SOLO fee_at_stake_count — burst y Motor 6 quedaron como env
+    vars INERTES sin que ningún test lo detectara. Este test pinnea el CALL SITE:
+    los tres kwargs deben llegar al poller con los valores de settings."""
+    s = mock_runner_settings
+    s.MOTOR_2_SPORTSBOOK_ENABLED = True
+    s.TRADING_ENABLED = False
+    s.MOTOR2_SERIES = "KXMLBGAME"
+    s.ODDS_API_KEY = ""
+    s.MOTOR_2_MIN_EDGE_PCT = 3.0
+    s.MOTOR_2_MAX_EDGE_PCT = 8.0
+    s.MOTOR_2_MAX_STAKE_PCT = 1.0
+    s.MOTOR_2_MIN_BOOKS = 3
+    s.MOTOR_2_MAX_BOOK_AGE_MIN = 15.0
+    s.MOTOR_2_FEE_AT_STAKE_COUNT = True
+    s.MOTOR_2_BURST_INTERVAL_SEC = 60.0
+    s.MOTOR_2_BURST_WINDOW_MIN = 45.0
+    s.MOTOR_6_LINEMOVE_ENABLED = m6_enabled
+    s.MOTOR_6_MOVE_MIN_PP = 3.0
+    s.MOTOR_6_EDGE_MIN_PP = 2.0
+    s.MOTOR_6_MAX_EDGE_PP = 10.0
+    runner = ProductionRunner()
+    runner._capture = MagicMock()
+
+    fake_poller = MagicMock()
+    fake_poller.run = AsyncMock()
+    with (
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+        patch("src.runner.RiskManager"),
+        patch(
+            "src.strategies.motor_2_consensus.poller.Motor2ShadowPoller",
+            return_value=fake_poller,
+        ) as mock_poller_cls,
+    ):
+        await runner._run_motor2_shadow()
+
+    kwargs = mock_poller_cls.call_args.kwargs
+    assert kwargs["burst_interval_sec"] == 60.0
+    assert kwargs["burst_window_min"] == 45.0
+    if m6_enabled:
+        from src.strategies.motor_6_linemove.shadow import Motor6LineMoveShadow
+
+        assert isinstance(kwargs["linemove"], Motor6LineMoveShadow)
+    else:
+        assert kwargs["linemove"] is None
+
+
 @pytest.mark.asyncio
 async def test_motor1_arb_aborts_when_manager_missing(mock_runner_settings):
     """Sin OrderbookManagerV2 en el capture → log + return (no crash, no engine)."""
