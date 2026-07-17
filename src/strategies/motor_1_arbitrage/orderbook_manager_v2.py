@@ -98,6 +98,12 @@ class OrderbookManagerV2:
     # de ese sid (book queda stale + alerta) en vez del loop infinito (incidente: ~6764 fallos/día).
     # El contador se resetea cuando una recovery del sid completa OK.
     MAX_RECOVERY_FAILURES = 5
+    # Tamaño de lote del get_snapshot de recovery (incidente 2026-07-17): un get_snapshot de un
+    # sid GRANDE (sid=1 con 223 tickers) NUNCA devolvía un snapshot en 30s → timeout_x5 →
+    # circuit breaker, mientras sids de 26 y 199 recuperaban bien (umbral de fallo medido entre
+    # 199 y 223). El WS dropea/no responde la request masiva entera. Se parte `live` en lotes de
+    # este tamaño, cada uno con su propio req_id/pending set — un lote frágil no condena al sid.
+    DEFAULT_RECOVERY_CHUNK_SIZE = 50
 
     def __init__(
         self,
@@ -105,10 +111,12 @@ class OrderbookManagerV2:
         *,
         recovery_timeout_sec: float = DEFAULT_RECOVERY_TIMEOUT_SEC,
         max_recovery_buffer: int = DEFAULT_MAX_RECOVERY_BUFFER,
+        recovery_chunk_size: int = DEFAULT_RECOVERY_CHUNK_SIZE,
     ) -> None:
         self._ws = ws
         self._recovery_timeout_sec = recovery_timeout_sec
         self._max_recovery_buffer = max_recovery_buffer
+        self._recovery_chunk_size = max(1, recovery_chunk_size)
         self._books: dict[str, OrderbookState] = {}
         self._last_seq_by_sid: dict[int, int] = {}
         self._tickers_by_sid: dict[int, set[str]] = {}
@@ -425,12 +433,25 @@ class OrderbookManagerV2:
         self._pending_deltas[sid] = []
         self._recovery_started_at[sid] = time.monotonic()
 
-        req_id = await self._ws.send_command(
-            "update_subscription",
-            action="get_snapshot",
-            params={"market_tickers": live, "sids": [sid]},
-        )
-        self._pending_snapshot_requests[req_id] = (sid, set(live))
+        # CHUNKING (incidente 2026-07-17): un get_snapshot masivo (223 tickers) nunca vuelve; se
+        # parte en lotes. Cada lote lleva su propio req_id y pending set — la recovery del sid
+        # completa cuando TODOS los lotes drenaron (ver _handle_recovery_snapshot). Un solo lote
+        # (live ≤ chunk_size) = comportamiento idéntico al anterior (un req_id).
+        chunk = self._recovery_chunk_size
+        n_chunks = (len(live) + chunk - 1) // chunk
+        if n_chunks > 1:
+            logger.info(
+                f"v2.recovery_chunked sid={sid} live={len(live)} → {n_chunks} lotes de ≤{chunk} "
+                "(request masiva se dropea entera; los lotes recuperan)."
+            )
+        for i in range(0, len(live), chunk):
+            batch = live[i : i + chunk]
+            req_id = await self._ws.send_command(
+                "update_subscription",
+                action="get_snapshot",
+                params={"market_tickers": batch, "sids": [sid]},
+            )
+            self._pending_snapshot_requests[req_id] = (sid, set(batch))
 
     async def _guard_stuck_recovery(self, sid: int) -> None:
         """
@@ -618,15 +639,28 @@ class OrderbookManagerV2:
         return None
 
     async def _handle_recovery_snapshot(self, raw_msg: dict, req_id: int) -> None:
-        """Apply a recovery snapshot. Drain buffer when all tickers in the sid recovered."""
-        sid, tickers_pending = self._pending_snapshot_requests[req_id]
+        """Apply a recovery snapshot. Con CHUNKING un sid tiene varios req_id (lotes): la
+        recovery del sid completa cuando NINGÚN lote queda pendiente, no cuando se vacía el
+        primero (si no, cerraría con la mayoría de books aún stale)."""
+        entry = self._pending_snapshot_requests.get(req_id)
+        if entry is None:
+            return  # req_id ya completado/desconocido (snapshot duplicado o tardío)
+        sid = entry[0]
         ticker: str = raw_msg["msg"]["market_ticker"]
 
         self._apply_snapshot_msg(raw_msg)
-        tickers_pending.discard(ticker)
+        # Descartar el ticker de SU lote buscándolo por ticker (robusto: el fallback sin id pasa
+        # el primer req_id del sid, pero el ticker puede vivir en OTRO lote). Se vacía el lote →
+        # se borra su req_id.
+        for rid, (s, pend) in list(self._pending_snapshot_requests.items()):
+            if s == sid and ticker in pend:
+                pend.discard(ticker)
+                if not pend:
+                    del self._pending_snapshot_requests[rid]
+                break
 
-        if not tickers_pending:
-            del self._pending_snapshot_requests[req_id]
+        # ¿Quedan lotes pendientes del sid? Si no, la recovery COMPLETÓ.
+        if not any(s == sid for s, _ in self._pending_snapshot_requests.values()):
             self._recovering.discard(sid)
             self._recovery_started_at.pop(sid, None)
             # Recovery OK → resetea el circuit breaker del sid (y lo re-habilita si estaba off).

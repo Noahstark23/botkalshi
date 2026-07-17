@@ -709,6 +709,7 @@ class DataCaptureService:
             self.ws,
             recovery_timeout_sec=self.settings.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC,
             max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
+            recovery_chunk_size=self.settings.ORDERBOOK_V2_RECOVERY_CHUNK_SIZE,
         )
         BotState.v2_manager = self._v2_manager
         logger.info("OrderbookManagerV2 creado + publicado en BotState (pre-discovery)")
