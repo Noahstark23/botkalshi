@@ -343,6 +343,12 @@ class Settings(BaseSettings):
     ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC: float = Field(
         default=30.0, gt=0, description="Timeout (s) de una recovery atascada de OrderbookManagerV2"
     )
+    # Tamaño de lote del get_snapshot de recovery (incidente 2026-07-17): un sid grande (223
+    # tickers) en un solo get_snapshot nunca vuelve → timeout_x5 → circuit breaker; sids de 26/199
+    # recuperan bien. Se parte en lotes de este tamaño. Bajar si el umbral de fallo resulta <50.
+    ORDERBOOK_V2_RECOVERY_CHUNK_SIZE: int = Field(
+        default=50, ge=1, description="Tickers por lote del get_snapshot de recovery de V2"
+    )
 
     # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
     # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe
