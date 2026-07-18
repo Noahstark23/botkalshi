@@ -349,6 +349,12 @@ class Settings(BaseSettings):
     ORDERBOOK_V2_RECOVERY_CHUNK_SIZE: int = Field(
         default=50, ge=1, description="Tickers por lote del get_snapshot de recovery de V2"
     )
+    # Tope del buffer de bootstrap por ticker (OOM 2026-07-18): los deltas que llegan antes del
+    # snapshot inicial se encolan sin tope → si el snapshot nunca llega (sid grande sin recovery),
+    # el feed live lo llena hasta OOM. deque(maxlen) descarta los deltas más viejos.
+    ORDERBOOK_V2_BOOTSTRAP_BUFFER_CAP: int = Field(
+        default=1000, ge=1, description="Tope de deltas por ticker esperando snapshot inicial"
+    )
 
     # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
     # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe

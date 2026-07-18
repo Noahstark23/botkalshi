@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
@@ -104,6 +105,14 @@ class OrderbookManagerV2:
     # 199 y 223). El WS dropea/no responde la request masiva entera. Se parte `live` en lotes de
     # este tamaño, cada uno con su propio req_id/pending set — un lote frágil no condena al sid.
     DEFAULT_RECOVERY_CHUNK_SIZE = 50
+    # Tope del buffer de BOOTSTRAP por ticker (OOM 2026-07-18): los deltas que llegan antes del
+    # snapshot inicial de un ticker se encolan en _bootstrap_buffer[ticker]. A diferencia de
+    # _pending_deltas (que tiene max_recovery_buffer), este buffer NO tenía tope → si el snapshot
+    # inicial NUNCA llega (sid grande cuyo get_snapshot masivo se dropea), el feed live de esos
+    # mercados lo llena SIN LÍMITE → crash-loop por OOM (~75 min a 1GB). Un deque(maxlen) descarta
+    # los deltas MÁS VIEJOS: no se pierde info útil (el snapshot, cuando llegue, ya contiene los
+    # seq bajos; _drain descarta seq <= snapshot_seq de todos modos). Lección del repo: nada sin tope.
+    DEFAULT_BOOTSTRAP_BUFFER_CAP = 1000
 
     def __init__(
         self,
@@ -112,11 +121,13 @@ class OrderbookManagerV2:
         recovery_timeout_sec: float = DEFAULT_RECOVERY_TIMEOUT_SEC,
         max_recovery_buffer: int = DEFAULT_MAX_RECOVERY_BUFFER,
         recovery_chunk_size: int = DEFAULT_RECOVERY_CHUNK_SIZE,
+        bootstrap_buffer_cap: int = DEFAULT_BOOTSTRAP_BUFFER_CAP,
     ) -> None:
         self._ws = ws
         self._recovery_timeout_sec = recovery_timeout_sec
         self._max_recovery_buffer = max_recovery_buffer
         self._recovery_chunk_size = max(1, recovery_chunk_size)
+        self._bootstrap_buffer_cap = max(1, bootstrap_buffer_cap)
         self._books: dict[str, OrderbookState] = {}
         self._last_seq_by_sid: dict[int, int] = {}
         self._tickers_by_sid: dict[int, set[str]] = {}
@@ -125,9 +136,12 @@ class OrderbookManagerV2:
         # sid → time.monotonic() de inicio de la recovery EN CURSO (para el watchdog).
         self._recovery_started_at: dict[int, float] = {}
         # Deltas que llegan antes del snapshot inicial de un ticker (bootstrap).
-        # Se encolan por ticker y se drenan en _drain_bootstrap_buffer al llegar
-        # el snapshot, en vez de descartarse (causa del desync de attempt #3).
-        self._bootstrap_buffer: dict[str, list[dict]] = {}
+        # Se encolan por ticker y se drenan en _drain_bootstrap_buffer al llegar el snapshot,
+        # en vez de descartarse (causa del desync de attempt #3). deque(maxlen) por ticker:
+        # tope duro contra el OOM 2026-07-18 (un ticker cuyo snapshot no llega no crece sin fin).
+        self._bootstrap_buffer: dict[str, deque[dict]] = {}
+        # Tickers que YA saturaron su buffer de bootstrap (log one-shot + telemetría del leak).
+        self._bootstrap_capped: set[str] = set()
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
         # Tickers que NO se vuelven a pedir en recovery: settled/expirados (close_time vencido,
@@ -307,6 +321,10 @@ class OrderbookManagerV2:
             "stale_tickers": sum(1 for b in self._books.values() if b.is_stale),
             "recovering_sids": list(self._recovering),
             "pending_buffer_msgs": sum(len(b) for b in self._pending_deltas.values()),
+            # Bootstrap buffer (anti-OOM 2026-07-18): msgs encolados esperando snapshot inicial +
+            # cuántos tickers ya saturaron su tope. capados>0 sostenido = snapshots que no llegan.
+            "bootstrap_buffer_msgs": sum(len(b) for b in self._bootstrap_buffer.values()),
+            "bootstrap_capped_tickers": len(self._bootstrap_capped),
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
             "gaps_last_60s": gaps_last_60s,
@@ -746,12 +764,12 @@ class OrderbookManagerV2:
         el resto en orden de seq. Avanza el baseline del sid al mayor seq aplicado
         para no generar un falso gap en el próximo delta en vivo.
         """
-        buffered = self._bootstrap_buffer.pop(ticker, [])
+        buffered = self._bootstrap_buffer.pop(ticker, None)
+        self._bootstrap_capped.discard(ticker)  # el snapshot llegó → el ticker ya no está capado
         if not buffered:
             return
 
-        buffered.sort(key=lambda m: m["seq"])
-        for m in buffered:
+        for m in sorted(buffered, key=lambda m: m["seq"]):  # deque → sorted (no tiene .sort())
             if m["seq"] <= snapshot_seq:
                 continue  # ya incluido en el snapshot
             self._apply_delta_msg(m)
@@ -772,10 +790,24 @@ class OrderbookManagerV2:
 
         state = self._books.get(ticker)
         if state is None or not state.is_initialized:
-            # Encolar (no descartar): el snapshot inicial del ticker aún no se
-            # aplicó. Un delta con seq > snapshot_seq es una actualización real que
-            # se perdería si se descartara, dejando el book sub-construido.
-            self._bootstrap_buffer.setdefault(ticker, []).append(raw_msg)
+            # Encolar (no descartar): el snapshot inicial del ticker aún no se aplicó. Un delta
+            # con seq > snapshot_seq es una actualización real que se perdería si se descartara.
+            # deque(maxlen): tope duro (OOM 2026-07-18). Si el buffer se llena, descarta el MÁS
+            # VIEJO — cuando el snapshot llegue, _drain ya descarta los seq bajos, así que solo
+            # se pierde lo que igual se iba a descartar. Que un ticker sature = su snapshot no
+            # llega (síntoma del sid grande sin recovery) → log one-shot para el forense.
+            buf = self._bootstrap_buffer.get(ticker)
+            if buf is None:
+                buf = deque(maxlen=self._bootstrap_buffer_cap)
+                self._bootstrap_buffer[ticker] = buf
+            if len(buf) == self._bootstrap_buffer_cap and ticker not in self._bootstrap_capped:
+                self._bootstrap_capped.add(ticker)
+                logger.warning(
+                    f"v2.bootstrap_buffer_capped ticker={ticker} cap={self._bootstrap_buffer_cap} "
+                    "— el snapshot inicial no llega; se descartan deltas viejos (anti-OOM). "
+                    f"tickers_capados={len(self._bootstrap_capped)}"
+                )
+            buf.append(raw_msg)
             return False
         if state.is_stale:
             # CAUSA RAÍZ del desync constante (~10% de los logs): tras una recovery que NO completó
