@@ -188,21 +188,31 @@ async def status() -> dict[str, Any]:
             ).all()
         )
 
-    # V2 manager metrics
+    # V2 manager metrics. OJO (fix observabilidad 2026-07-17): el estado se reporta si la
+    # INSTANCIA existe, NO si el flag USE_ORDERBOOK_MANAGER_V2 está on — porque Motor 1 crea
+    # el manager sin el flag (data_capture: OR con MOTOR_1_ARBITRAGE_ENABLED). Antes, con el
+    # flag off el status decía solo {"enabled": false} y ESCONDÍA books/recovery/sids
+    # deshabilitados aunque el manager estuviera corriendo y sufriendo timeouts de recovery
+    # → se volaba ciego sobre V2 (incidente sid=1 stale por request masiva).
     v2_enabled = settings.USE_ORDERBOOK_MANAGER_V2
     v2_mgr = BotState.v2_manager
-    if not v2_enabled:
-        v2_info: dict[str, Any] = {"enabled": False}
-    elif v2_mgr is None:
-        BotState.record_error("v2 flag enabled but instance missing")
-        v2_info = {"enabled": True, "instance": "missing"}
+    if v2_mgr is None:
+        # Sin instancia: reportar el flag. Con el flag ON pero sin instancia = bug real.
+        v2_info: dict[str, Any] = {"enabled": v2_enabled}
+        if v2_enabled:
+            BotState.record_error("v2 flag enabled but instance missing")
+            v2_info["instance"] = "missing"
     else:
         s = v2_mgr.stats()
         v2_info = {
-            "enabled": True,
+            "enabled": v2_enabled,  # el flag (compat) — puede ser False con el manager corriendo
+            "running": True,  # la instancia EXISTE y procesa books (aunque el flag esté off)
             "books_initialized": s.get("initialized_tickers", 0),
             "sids_tracked": len(v2_mgr._tickers_by_sid),
             "sids_recovering": len(v2_mgr._recovering),
+            # sids en circuit breaker (recovery deshabilitada → books STALE hasta el redeploy):
+            # el dato que faltaba para ver el sid=1 muerto por timeout_x5. Antes, invisible.
+            "sids_disabled": sorted(v2_mgr._recovery_disabled_sids),
             "gaps_last_60s": s.get("gaps_last_60s", 0),
             "last_gap_at": s.get("last_gap_at"),
         }
