@@ -67,12 +67,12 @@ tests/                           # pytest espejo de src/ (~1175+, asyncio auto)
 
 | Motor | Qué hace | Veredicto vigente (no re-litigar sin datos nuevos) |
 |---|---|---|
-| M1 arb binario | yes+no mismo ticker < $1 (WS) | ⚫ **La señal casi no existe**: 0 ventanas binarias en TODA la historia (requiere book auto-cruzado). Recomendado shadow. Sus rollbacks históricos vinieron de books desincronizados (→ cuarentena V2). No tunearlo esperando volumen. |
-| M2 consenso | direccional vs fair no-vig de sportsbooks | 🟡 **Único generador direccional real.** PUEDE PERDER (2026-06-28: −$390). Edges honestos: raros y TRANSITORIOS (~3 señales/11 días >3pp). Flags: `MOTOR_2_SPORTSBOOK_ENABLED` (corre) / `MOTOR_2_ENTRY_EXECUTION_ENABLED` (ENTRADAS) / `MOTOR_2_EXECUTION_ENABLED` (solo VENTAS de salida) — **no confundirlos**. |
+| M1 arb binario | yes+no mismo ticker < $1 (WS) | ⚫ **No es alpha (auditoría 2026-07-18).** +$33.63 en jun→jul sobre 517 trades = +$0.065/trade, win 48.9%: ruido alrededor de cero. Y el +$33 es UN día — el incidente 07-07 (186 trades liquidando favorable); sin él, +$3.7, y las 2 últimas semanas gotean negativo (07-09/12/18 todos en rojo). 0 ventanas binarias en TODA la historia (requiere book auto-cruzado). **Vigilar, NO proteger; su volumen es riesgo operativo por retorno cero.** |
+| M2 consenso | direccional vs fair no-vig de sportsbooks | 🔴 **SIN edge estructural (auditoría 2026-07-18): −$432.95, el 100% de la sangría del proyecto.** El edge techa en 0.15pp (p99=0.13pp) sobre 35.129 detecciones — CERO por encima de 2pp — contra un umbral de 3pp: el consenso de sportsbooks es idéntico a Kalshi, no hay ineficiencia. Win 54% pero avg_loss ≫ avg_win. No se arregla con código → **apagar entradas (`MOTOR_2_ENTRY_EXECUTION_ENABLED=false`)**. Flags: `MOTOR_2_SPORTSBOOK_ENABLED` (corre) / `_ENTRY_EXECUTION_ENABLED` (ENTRADAS) / `_EXECUTION_ENABLED` (solo VENTAS) — **no confundirlos**. |
 | M3 CLV | NO abre — cierra (TP/trailing/T-30) | ✅ Estable. Regla de oro: jamás vender la pata de un hedge (atribución estricta). |
 | M5 MM | quotes GTC post_only alrededor del fair | F1 shadow. Riesgo distintivo: quote RESTING sin gestión. No saltear fases. |
-| M6 line-move | compra la dirección del salto del consenso que Kalshi no digirió | F1 shadow (pasajero del ciclo M2, cero API extra). Gate F2: ROI simulado sobre `edge_windows kind=linemove` — **archivar si no rinde es resultado válido**. |
-| REST arb | multi-outcome winner-take-all ≥3 patas + settlement | 🟡 Su path binario está matemáticamente MUERTO; el vivo es el multi. Universo tunable: `MOTOR_REST_MULTI_SERIES` (SOLO series excluyentes-y-exhaustivas; props/totals = "arb" falso). Post-fee real exige `sum_asks ≤ ~94¢` — raro por naturaleza. |
+| M6 line-move | compra la dirección del salto del consenso que Kalshi no digirió | ⚫ **MUDO (auditoría 2026-07-18): 0 filas `linemove` en un mes** — el fair no se mueve ≥3pp con Kalshi rezagado en este universo. Candidato a archivar. (Nota: recién cableado real 2026-07-17 vía #173; darle una ventana corta antes de sepultar, pero la tesis luce muerta.) |
+| REST arb | multi-outcome winner-take-all ≥3 patas + settlement | ⚫ **INEJECUTABLE (auditoría 2026-07-18): edge real 3.13pp en detección, pero 73% rollback (11/15) — Caso A confirmado por `leg_states`.** El FOK no llena 3-4 patas atómicamente en books finos (no hay depth simultáneo); el hard-first (#85) protege 1 pata, las baratas se disparan en paralelo sin protección mutua. La pérdida en DB (−$31.89) SOBREESTIMA la real (registro pesimista a 1¢), pero el motor no puede capturar su edge. **Ningún diff lo arregla; apagar ejecución (`MOTOR_REST_EXECUTION_ENABLED=false`).** Path binario ya estaba muerto; ahora el multi también. |
 
 **Regla transversal:** un motor selectivo que casi no opera con edge negativo ESTÁ funcionando
 bien (186 trades/6min fue el incidente, no el objetivo). El sizing lo gobierna el capital
@@ -192,3 +192,20 @@ Patrón validado con el Motor 6 — seguirlo SIEMPRE:
   diario $5.40 con capital $180 = ruido que apagaba todo → pisos USD + breach diario soft.
   (c) auditoría de motores: M1 sin señal, M2 dormido por flag de ENTRADAS, REST con universo
   hardcodeado → los veredictos de la tabla de motores.
+- **2026-07-17/18** — (a) OOM crash-loop (container 1GB al 99.99%, kill cada ~75min):
+  `_bootstrap_buffer` por ticker SIN TOPE — el sid grande cuyo `get_snapshot` masivo se
+  dropeaba dejaba 223 books sin inicializar y el feed llenaba la RAM. Fix triple: chunking
+  del recovery (request masiva → lotes de 50), cap `deque(maxlen)` del bootstrap buffer, y
+  observabilidad de V2 en `/status` (`sids_disabled`/`bootstrap_capped_tickers`). Misma
+  lección que el disco: nada sin tope. (b) **AUDITORÍA DE RENTABILIDAD jun→jul (PnL real,
+  no detección)** → los veredictos ⚫/🔴 de la tabla. Neto del mes: **−$431, el 100% es M2**.
+  Probado con SQL, no sugerido: M2 edge techa 0.15pp/35k muestras (sin edge); M1 +$33 es
+  el incidente 07-07 y gotea negativo desde (no alpha); REST 73% rollback por `leg_states`
+  Caso A (edge real, inejecutable en books finos multi-pata); M6 0 señales/mes (mudo); M8
+  única promesa viva (p50 +3.18pp, n=130, recién destapado en mercados líquidos con el fix
+  del sid=1). **Conclusión honesta: hoy el proyecto no tiene fuente de alpha comprobada;
+  apagar M2+REST lleva de −$431 a ~$0 (parar la hemorragia, no rentabilidad). La única
+  hipótesis viva es M8 — se decide con más muestra, no con un diff.** Queries que lo prueban:
+  PnL/motor por día (`GROUP BY strategy, date(settled_at)`), distribución de edge de M2
+  (`motor2_funnel_snapshots`), y `SELECT leg_states FROM edge_windows WHERE kind='multi_outcome'`
+  (0 ERROR_RED = descarta bug de red; todo FILL/KILL = books finos).
