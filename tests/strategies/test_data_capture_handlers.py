@@ -48,6 +48,7 @@ def test_ensure_v2_manager_publishes_botstate_early_and_idempotent():
         s.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC = 30.0
         s.ORDERBOOK_V2_MAX_RECOVERY_BUFFER = 25000
         s.ORDERBOOK_V2_RECOVERY_CHUNK_SIZE = 50
+        s.ORDERBOOK_V2_BOOTSTRAP_BUFFER_CAP = 1000
         svc = DataCaptureService()
         assert svc._v2_manager is None
 
