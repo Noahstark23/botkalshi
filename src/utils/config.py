@@ -633,6 +633,32 @@ class Settings(BaseSettings):
         default=120.0, gt=0, description="Silencio por ticker tras una señal (anti-ráfaga)."
     )
 
+    # === Motor 9 (Derrame / spillover) — F1 SHADOW auto-validante ===
+    # Tesis a validar (auditoría 2026-07-18: la única búsqueda de edge que queda es la
+    # microestructura): en un evento multi-outcome la probabilidad se conserva — un salto
+    # fuerte en un market debe ajustar a sus HERMANOS. Si el ajuste llega con REZAGO, la
+    # ventana es capturable; si es instantáneo, no hay nada (y el shadow lo mide, no lo
+    # supone: captura el mid del hermano AL trigger y mide qué se movió DESPUÉS, firmado
+    # desde la dirección esperada = inversa del salto). EdgeWindow kind="spillover".
+    # Pasajero del mismo feed de deltas que M8: cero API extra.
+    MOTOR_9_SPILLOVER_ENABLED: bool = Field(
+        default=False,
+        description="Corre el shadow de derrame (Motor 9) sobre el feed de deltas. Solo observa y mide.",
+    )
+    MOTOR_9_TRIGGER_MOVE_CENTS: float = Field(
+        default=5.0,
+        gt=0,
+        description="Salto mínimo del mid (¢) dentro de la ventana para disparar.",
+    )
+    MOTOR_9_WINDOW_SEC: float = Field(
+        default=60.0, gt=0, description="Ventana rodante (s) contra la que se mide el salto."
+    )
+    MOTOR_9_COOLDOWN_SEC: float = Field(
+        default=300.0,
+        gt=0,
+        description="Silencio por ticker Y por evento tras un trigger (anti-cascada: el ajuste del hermano no es un trigger nuevo).",
+    )
+
     # === Analyst Loop (loop engineering — ADVISORY ONLY, no tradea) ===
     # Bucle agendado que observa EdgeWindow + el embudo de Motor 2, computa un veredicto
     # (eficiente / matching_bug / edge_candidato), lo persiste (memoria día-a-día) y manda

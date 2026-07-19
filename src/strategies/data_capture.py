@@ -210,6 +210,21 @@ class DataCaptureService:
                 cooldown_sec=self.settings.MOTOR_8_OFI_COOLDOWN_SEC,
             )
             logger.info("motor8.ofi shadow armado (F1: solo observa y mide)")
+        # Motor 9 (F1 shadow, opcional): derrame entre hermanos del mismo evento, pasajero
+        # del mismo feed de deltas que M8. Mide si el ajuste del hermano llega con REZAGO
+        # (capturable) o instantáneo (nada que capturar) — auto-validante, patrón M8.
+        self._spillover = None
+        if self.settings.MOTOR_9_SPILLOVER_ENABLED:
+            from src.strategies.motor_9_spillover.shadow import Motor9SpilloverShadow
+
+            self._spillover = Motor9SpilloverShadow(
+                self._mid_of,
+                self._siblings_of,
+                trigger_move_cents=self.settings.MOTOR_9_TRIGGER_MOVE_CENTS,
+                window_sec=self.settings.MOTOR_9_WINDOW_SEC,
+                cooldown_sec=self.settings.MOTOR_9_COOLDOWN_SEC,
+            )
+            logger.info("motor9.spillover shadow armado (F1: solo observa y mide)")
 
     def _mid_of(self, ticker: str) -> float | None:
         """MID del ticker en cents desde el manager V2 (memoria). None si el book no está
@@ -226,6 +241,15 @@ class DataCaptureService:
         if not (1 <= yes_bid <= 99 and 1 <= yes_ask <= 99):
             return None
         return (yes_bid + yes_ask) / 2.0
+
+    def _siblings_of(self, ticker: str) -> set[str]:
+        """Tickers TRACKEADOS del mismo evento que `ticker` (excluyéndolo). Para el shadow
+        de M9: solo se invoca en un TRIGGER (raro), así que el scan lineal sobre ~300
+        trackeados es barato. Sin red, sin DB."""
+        from src.strategies.motor_9_spillover.shadow import event_key_of
+
+        event = event_key_of(ticker)
+        return {t for t in self._tracked_tickers if t != ticker and event_key_of(t) == event}
 
     def multi_event_universe(self) -> dict[str, set[str]]:
         """
@@ -317,6 +341,13 @@ class DataCaptureService:
             # jamás rompe la captura.
             if self._ofi is not None:
                 self._ofi.observe_delta(ticker, side, delta_size)
+
+            # Motor 9 (F1 shadow, opcional): derrame — lee el mid del V2 y mide el
+            # follow-through de los hermanos. OJO: este handler corre ANTES que el del V2
+            # (orden de registro), así que el mid va UN delta rezagado — inmaterial para
+            # saltos de ≥5¢ en ventana de 60s (el próximo delta lo ve). Best-effort adentro.
+            if self._spillover is not None:
+                self._spillover.observe(ticker)
 
             # Persistir orderbook_events es OPT-IN (default off, incidente disco-lleno 2026-07-10):
             # una fila por cada delta del WS (~240 tickers, 24/7) = millones/día, y NADIE la lee
