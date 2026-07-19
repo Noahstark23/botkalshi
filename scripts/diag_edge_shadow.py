@@ -9,7 +9,8 @@ la microestructura: el FLUJO (M8 OFI) y los SALTOS de línea (M6). Este script l
 shadows ya persistieron y da un veredicto por motor, sin más intuición.
 
 `report_edge_windows.py` cubre el Motor REST (kind binary/multi_outcome); este cubre el hueco
-de kind='ofi' y kind='linemove'. Read-only: solo lee edge_windows. NO toca capital ni red.
+de kind='ofi', kind='linemove' y kind='spillover' (M9, derrame entre hermanos — 2026-07-18).
+Read-only: solo lee edge_windows. NO toca capital ni red.
 
 QUÉ MIDE CADA UNO (asimetría IMPORTANTE — no confundir señal con resultado):
   - M8 OFI es AUTO-VALIDANTE: cada fila trae el movimiento REAL del precio DESPUÉS de la
@@ -111,6 +112,49 @@ def summarize_ofi(rows: list[EdgeWindow]) -> OfiVerdict:
     return OfiVerdict(n, mean30, mean60, tstat, pct_pos, verdict, rec)
 
 
+def summarize_spillover(rows: list[EdgeWindow]) -> OfiVerdict:
+    """Veredicto del derrame (M9): mismo SHAPE de datos que OFI (follow-through firmado en
+    gross_spread=T+60 / magnitude=T+120) y misma matemática (media + t-stat), pero con su
+    semántica propia — acá el follow está firmado desde la dirección ESPERADA (inversa del
+    salto), así que >0 = el hermano ajustó DESPUÉS del trigger (rezago capturable)."""
+    m60_rows = [float(r.gross_spread_cents) for r in rows if r.gross_spread_cents is not None]
+    m120 = [float(r.magnitude_cents) for r in rows if r.magnitude_cents is not None]
+    n = len(m60_rows)
+    if n == 0:
+        return OfiVerdict(
+            0, 0.0, 0.0, 0.0, 0.0, "SIN DATOS", "El shadow no persistió filas spillover."
+        )
+    mean60 = statistics.fmean(m60_rows)
+    mean120 = statistics.fmean(m120) if m120 else 0.0
+    tstat = _tstat(m60_rows)
+    pct_pos = 100.0 * sum(1 for v in m60_rows if v > 0) / n
+
+    if n < _MIN_SIGNALS_FOR_VERDICT:
+        verdict = "ACUMULANDO"
+        rec = f"{n}/{_MIN_SIGNALS_FOR_VERDICT} mediciones — sin muestra para veredicto. Esperar."
+    elif abs(mean60) < _NOISE_BAND_CENTS or abs(tstat) < 2.0:
+        verdict = "AJUSTE INSTANTÁNEO / SIN PROPAGACIÓN → ARCHIVAR"
+        rec = (
+            f"follow60 medio {mean60:+.2f}¢ (t={tstat:.1f}): el hermano no se mueve (o ya se "
+            "movió ANTES del trigger). No hay rezago capturable. Archivar M9 es válido y barato."
+        )
+    elif mean60 > 0:
+        verdict = "DERRAME REZAGADO (edge potencial)"
+        rec = (
+            f"el hermano ajusta DESPUÉS del trigger: follow60 medio {mean60:+.2f}¢ "
+            f"(t={tstat:.1f}, {pct_pos:.0f}% positivos). Candidato a F2 completo: verificar "
+            "contra el ASK (no el mid — lección del REST: detectado ≠ capturable) y fees."
+        )
+    else:
+        verdict = "TESIS INVERTIDA"
+        rec = (
+            f"el hermano se mueve AL REVÉS de lo esperado: follow60 medio {mean60:+.2f}¢ "
+            f"(t={tstat:.1f}). Probable: el 'hermano' LIDERA y el trigger es el eco. NO operar "
+            "contrarian sin re-derivar el mecanismo."
+        )
+    return OfiVerdict(n, mean60, mean120, tstat, pct_pos, verdict, rec)
+
+
 @dataclass(frozen=True, slots=True)
 class LinemoveSummary:
     n: int
@@ -163,13 +207,14 @@ def main() -> None:
         rows = list(
             s.exec(
                 select(EdgeWindow).where(
-                    col(EdgeWindow.kind).in_(["ofi", "linemove"]),
+                    col(EdgeWindow.kind).in_(["ofi", "linemove", "spillover"]),
                     col(EdgeWindow.created_at) >= since,
                 )
             )
         )
     ofi_rows = [r for r in rows if r.kind == "ofi"]
     lm_rows = [r for r in rows if r.kind == "linemove"]
+    sp_rows = [r for r in rows if r.kind == "spillover"]
 
     print(f"{'=' * 68}\nVEREDICTO DE EDGE SHADOW · últimas {args.hours}h · {len(rows)} filas")
     print("Pregunta: si el pre-match está eficiente, ¿hay edge en la microestructura?\n")
@@ -192,16 +237,37 @@ def main() -> None:
         )
     print(f"  → VEREDICTO: {ofi.verdict}\n    {ofi.recommendation}")
 
+    print(
+        f"\n{'-' * 68}\nMOTOR 9 · DERRAME — AUTO-VALIDANTE, mide el follow del hermano "
+        "post-trigger (firmado desde la dirección esperada)"
+    )
+    sp = summarize_spillover(sp_rows)
+    _print_dist(
+        "follow hermano T+60 (firmado)",
+        [float(r.gross_spread_cents) for r in sp_rows if r.gross_spread_cents is not None],
+        "¢",
+    )
+    _print_dist(
+        "follow hermano T+120 (firmado)",
+        [float(r.magnitude_cents) for r in sp_rows if r.magnitude_cents is not None],
+        "¢",
+    )
+    if sp.n:
+        print(
+            f"  positivos a T+60: {sp.pct_move60_positive:.0f}%  ·  t-stat: {sp.move60_tstat:.1f}"
+        )
+    print(f"  → VEREDICTO: {sp.verdict}\n    {sp.recommendation}")
+
     print(f"\n{'-' * 68}\nMOTOR 6 · LINE-MOVE — dimensiona señal (el ROI real es fase siguiente)")
     lm = summarize_linemove(lm_rows)
     _print_dist("edge neto detectado", lm.edge_pp, "pp")
     print(f"  → VEREDICTO: {lm.verdict}\n    {lm.recommendation}")
 
     print(
-        f"\n{'=' * 68}\nLECTURA: M8 con veredicto MOMENTUM significativo = el edge está en el "
-        "flujo\n(candidato a F2). M8 RUIDO/ADVERSE o M6 sin señal tras días = la respuesta "
-        "honesta\nes que no hay edge microestructural a esta escala — y eso también es un "
-        "resultado.\n"
+        f"\n{'=' * 68}\nLECTURA: M8 MOMENTUM o M9 DERRAME REZAGADO con significancia = el edge "
+        "está en la\nmicroestructura (candidato a F2). Todo en RUIDO/INSTANTÁNEO tras días de "
+        "muestra = la\nrespuesta honesta es que no hay edge microestructural a esta escala — y "
+        "eso también\nes un resultado.\n"
     )
 
 

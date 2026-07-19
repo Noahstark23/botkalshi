@@ -8,8 +8,19 @@ correctamente a momentum / adverse / ruido (el error que costaría plata sería 
 
 from __future__ import annotations
 
-from scripts.diag_edge_shadow import summarize_linemove, summarize_ofi
+from scripts.diag_edge_shadow import summarize_linemove, summarize_ofi, summarize_spillover
 from src.storage.models import EdgeWindow
+
+
+def _sp(follow60: int, follow120: int, trigger_move: float = 6.0) -> EdgeWindow:
+    return EdgeWindow(
+        market_ticker="KXMLBGAME-X-WSH",
+        magnitude_cents=follow120,  # T+120 firmado desde la dirección esperada
+        gross_spread_cents=follow60,  # T+60 firmado
+        edge_pct=trigger_move,
+        kind="spillover",
+        leg_states="src=HOU",
+    )
 
 
 def _ofi(move30: int, move60: int, z: float = 3.5) -> EdgeWindow:
@@ -86,3 +97,34 @@ def test_linemove_zero_is_honest_about_arranque_vs_archivar():
     v = summarize_linemove([])
     assert v.n == 0 and "SIN SEÑAL" in v.verdict
     assert "arrancó" in v.recommendation or "archivar" in v.recommendation
+
+
+# ── Spillover (M9): misma matemática, semántica propia ───────────────────────
+
+
+def test_spillover_lagged_followthrough_is_capturable():
+    """MECANISMO: el hermano ajusta consistente DESPUÉS del trigger (+3¢) → DERRAME
+    REZAGADO, con la advertencia de verificar contra el ASK (detectado ≠ capturable)."""
+    v = summarize_spillover([_sp(3, 3) for _ in range(25)])
+    assert "DERRAME REZAGADO" in v.verdict
+    assert "ASK" in v.recommendation  # la lección del REST, explícita
+
+
+def test_spillover_instant_adjust_archives():
+    """CONTROL: follow ~0 (ajuste instantáneo o sin propagación) → ARCHIVAR — no debe
+    leerse como 'esperar más': el mercado ya dijo que no hay rezago."""
+    v = summarize_spillover([_sp(0, 0) for _ in range(30)])
+    assert "ARCHIVAR" in v.verdict
+
+
+def test_spillover_inverted_thesis_never_says_capturable():
+    """CONTROL CRÍTICO (plata): hermano moviéndose AL REVÉS → TESIS INVERTIDA, jamás
+    'derrame capturable' — y sin recomendar contrarian a ciegas."""
+    v = summarize_spillover([_sp(-4, -5) for _ in range(25)])
+    assert "INVERTIDA" in v.verdict
+    assert "DERRAME REZAGADO" not in v.verdict
+
+
+def test_spillover_small_sample_accumulates():
+    v = summarize_spillover([_sp(3, 3) for _ in range(5)])
+    assert "ACUMULANDO" in v.verdict
