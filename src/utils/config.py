@@ -355,6 +355,25 @@ class Settings(BaseSettings):
     ORDERBOOK_V2_BOOTSTRAP_BUFFER_CAP: int = Field(
         default=1000, ge=1, description="Tope de deltas por ticker esperando snapshot inicial"
     )
+    # Backoff del circuit breaker por sid (incidente 2026-07-21): el disable era permanente hasta
+    # el redeploy — sid=1 (189 mercados futuros sin book operable) quedaba ciego para siempre tras
+    # timeout_x5. Con backoff, el próximo gap tras el cooldown reintenta UNA ventana de recovery;
+    # cada fracaso duplica el cooldown: base·factor^(streak−1), capado (30s→2min→8min→30min).
+    ORDERBOOK_V2_RECOVERY_BACKOFF_BASE_SEC: float = Field(
+        default=30.0,
+        gt=0,
+        description="Cooldown inicial (s) antes de reintentar un sid con breaker",
+    )
+    ORDERBOOK_V2_RECOVERY_BACKOFF_FACTOR: float = Field(
+        default=4.0,
+        ge=1.0,
+        description="Multiplicador exponencial del cooldown por fracaso seguido",
+    )
+    ORDERBOOK_V2_RECOVERY_BACKOFF_CAP_SEC: float = Field(
+        default=1800.0,
+        gt=0,
+        description="Techo (s) del cooldown de reintento de un sid con breaker",
+    )
 
     # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
     # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe

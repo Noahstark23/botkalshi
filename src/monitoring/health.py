@@ -210,9 +210,11 @@ async def status() -> dict[str, Any]:
             "books_initialized": s.get("initialized_tickers", 0),
             "sids_tracked": len(v2_mgr._tickers_by_sid),
             "sids_recovering": len(v2_mgr._recovering),
-            # sids en circuit breaker (recovery deshabilitada → books STALE hasta el redeploy):
-            # el dato que faltaba para ver el sid=1 muerto por timeout_x5. Antes, invisible.
+            # sids en circuit breaker (recovery deshabilitada → books STALE hasta que venza el
+            # backoff de reintento, 2026-07-21; antes era hasta el redeploy): el dato que faltaba
+            # para ver el sid=1 muerto por timeout_x5. retry_in = countdown del próximo reintento.
             "sids_disabled": sorted(v2_mgr._recovery_disabled_sids),
+            "recovery_retry_in_sec": s.get("recovery_retry_in_sec", {}),
             "gaps_last_60s": s.get("gaps_last_60s", 0),
             "last_gap_at": s.get("last_gap_at"),
         }

@@ -77,6 +77,7 @@ def test_status_reports_running_manager_even_with_flag_false(client):
         "initialized_tickers": 220,
         "gaps_last_60s": 1,
         "last_gap_at": "2026-07-17T21:42:20+00:00",
+        "recovery_retry_in_sec": {1: 25.0},  # backoff 2026-07-21: countdown del reintento
     }
     mock_mgr._tickers_by_sid = {1: set(range(223))}
     mock_mgr._recovering = set()
@@ -95,6 +96,7 @@ def test_status_reports_running_manager_even_with_flag_false(client):
     assert v2["running"] is True  # PERO el manager corre y ahora se ve
     assert v2["books_initialized"] == 220
     assert v2["sids_disabled"] == [1]  # el gap cerrado: el sid muerto es VISIBLE
+    assert v2["recovery_retry_in_sec"] == {"1": 25.0}  # y CUÁNDO reintenta (JSON: key str)
 
 
 def test_status_shows_v2_metrics_when_enabled(client):

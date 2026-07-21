@@ -113,6 +113,15 @@ class OrderbookManagerV2:
     # los deltas MÁS VIEJOS: no se pierde info útil (el snapshot, cuando llegue, ya contiene los
     # seq bajos; _drain descarta seq <= snapshot_seq de todos modos). Lección del repo: nada sin tope.
     DEFAULT_BOOTSTRAP_BUFFER_CAP = 1000
+    # Backoff del circuit breaker por sid (incidente 2026-07-21): el disable era PERMANENTE hasta
+    # el redeploy — un sid deshabilitado por una condición transitoria (p.ej. mercados futuros aún
+    # sin book que luego abren, o un feed degradado que se recupera) quedaba CIEGO para siempre.
+    # Con backoff, el próximo gap del sid tras el cooldown reintenta la recovery UNA vez; si vuelve
+    # a fallar, el cooldown crece exponencialmente (30s→2min→8min→30min cap). Ni loop de reintentos
+    # calientes ni ceguera permanente.
+    DEFAULT_RECOVERY_BACKOFF_BASE_SEC = 30.0
+    DEFAULT_RECOVERY_BACKOFF_FACTOR = 4.0
+    DEFAULT_RECOVERY_BACKOFF_CAP_SEC = 1800.0
 
     def __init__(
         self,
@@ -122,12 +131,20 @@ class OrderbookManagerV2:
         max_recovery_buffer: int = DEFAULT_MAX_RECOVERY_BUFFER,
         recovery_chunk_size: int = DEFAULT_RECOVERY_CHUNK_SIZE,
         bootstrap_buffer_cap: int = DEFAULT_BOOTSTRAP_BUFFER_CAP,
+        recovery_backoff_base_sec: float = DEFAULT_RECOVERY_BACKOFF_BASE_SEC,
+        recovery_backoff_factor: float = DEFAULT_RECOVERY_BACKOFF_FACTOR,
+        recovery_backoff_cap_sec: float = DEFAULT_RECOVERY_BACKOFF_CAP_SEC,
     ) -> None:
         self._ws = ws
         self._recovery_timeout_sec = recovery_timeout_sec
         self._max_recovery_buffer = max_recovery_buffer
         self._recovery_chunk_size = max(1, recovery_chunk_size)
         self._bootstrap_buffer_cap = max(1, bootstrap_buffer_cap)
+        self._recovery_backoff_base_sec = max(1.0, recovery_backoff_base_sec)
+        self._recovery_backoff_factor = max(1.0, recovery_backoff_factor)
+        self._recovery_backoff_cap_sec = max(
+            self._recovery_backoff_base_sec, recovery_backoff_cap_sec
+        )
         self._books: dict[str, OrderbookState] = {}
         self._last_seq_by_sid: dict[int, int] = {}
         self._tickers_by_sid: dict[int, set[str]] = {}
@@ -149,9 +166,21 @@ class OrderbookManagerV2:
         # Kalshi que los nombró. Evita pedir snapshot de mercados cerrados → code 15.
         self._close_time_by_ticker: dict[str, datetime] = {}
         self._dead_tickers: set[str] = set()
+        # Metadata adicional de discovery (incidente 2026-07-21, sid=1 con 189 futuros): un mercado
+        # que AÚN NO ABRIÓ (open_time futuro) o cuyo status dejó de ser active/open no tiene book
+        # operable — pedirle snapshot es el mismo loop que los settled sin close_time. Solo se filtra
+        # con conocimiento POSITIVO: ausente → recuperable (discovery a veces no trae los campos;
+        # invertir el default purgaría sids VIVOS enteros, cf. close_times_known=0/223 el 07-17).
+        self._open_time_by_ticker: dict[str, datetime] = {}
+        self._status_by_ticker: dict[str, str] = {}
         # Circuit breaker por sid: fallos consecutivos de recovery + sids deshabilitados.
         self._recovery_failures_by_sid: dict[int, int] = {}
         self._recovery_disabled_sids: set[int] = set()
+        # Backoff del breaker (incidente 2026-07-21): cuándo se deshabilitó cada sid (monotonic) y
+        # cuántas veces SEGUIDAS se deshabilitó (escala el cooldown exponencialmente). Una recovery
+        # que completa OK resetea ambos.
+        self._recovery_disabled_at: dict[int, float] = {}
+        self._disable_streak_by_sid: dict[int, int] = {}
         # Gap rate tracking (monotonic timestamps within last 60s)
         self._gap_timestamps: list[float] = []
         self._consecutive_warning: int = 0
@@ -249,10 +278,14 @@ class OrderbookManagerV2:
             expected_seq = self._last_seq_by_sid[sid] + 1
             if new_seq != expected_seq:
                 # Circuit breaker activo para este sid: ya se dio por vencido (book stale + alerta).
-                # Avanzar el baseline y salir silencioso — ni recovery ni buffer ni spam de gaps.
+                # Dentro del cooldown de backoff: avanzar el baseline y salir silencioso — ni
+                # recovery ni buffer ni spam de gaps (una línea por reintento, no por ciclo).
+                # Cooldown cumplido: re-habilitar y dejar que ESTE gap dispare el reintento.
                 if sid in self._recovery_disabled_sids:
-                    self._last_seq_by_sid[sid] = new_seq
-                    return
+                    if not self._disabled_backoff_elapsed(sid):
+                        self._last_seq_by_sid[sid] = new_seq
+                        return
+                    self._rearm_recovery_after_backoff(sid)
                 await self._start_recovery(sid)
                 # Solo bufferear si la recovery ARRANCÓ (no si _start_recovery la deshabilitó por
                 # quedarse sin tickers vivos → el sid no entra en _recovering).
@@ -329,6 +362,13 @@ class OrderbookManagerV2:
             "last_seq_by_sid": dict(self._last_seq_by_sid),
             "gaps_last_60s": gaps_last_60s,
             "last_gap_at": self._last_gap_at.isoformat() if self._last_gap_at else None,
+            # Breaker con backoff (2026-07-21): sids deshabilitados + en cuántos segundos vence su
+            # cooldown de reintento (0 = ya venció, reintenta en el próximo gap del sid).
+            "sids_disabled": sorted(self._recovery_disabled_sids),
+            "recovery_retry_in_sec": {
+                sid: round(self._retry_remaining_sec(sid), 1)
+                for sid in sorted(self._recovery_disabled_sids)
+            },
         }
 
     # =====================================================
@@ -394,13 +434,38 @@ class OrderbookManagerV2:
             if parsed is not None:
                 self._close_time_by_ticker[ticker] = parsed
 
+    def set_market_metadata(self, metadata: dict[str, dict]) -> None:
+        """Alimenta open_time (ISO 8601) y status por ticker desde discovery, para que la recovery
+        no pida snapshot de mercados que AÚN NO ABRIERON (incidente 2026-07-21: sid=1 con 189
+        futuros — World Cup/MLB — sin book operable → timeout_x5 → breaker en cada reinicio) ni de
+        los que transicionaron fuera de active/open. Best-effort: campo ausente/inválido se ignora
+        (ese ticker no se filtra por ese criterio)."""
+        for ticker, meta in metadata.items():
+            raw_open = meta.get("open_time")
+            parsed = _parse_iso_naive_utc(raw_open) if raw_open else None
+            if parsed is not None:
+                self._open_time_by_ticker[ticker] = parsed
+            status = meta.get("status")
+            if isinstance(status, str) and status:
+                self._status_by_ticker[ticker] = status
+
     def _is_unrecoverable(self, ticker: str) -> bool:
-        """True si NO tiene sentido pedir snapshot de este ticker: marcado muerto, o con close_time
-        ya vencido (settled). None/desconocido → recuperable (no sobre-filtrar)."""
+        """True si NO tiene sentido pedir snapshot de este ticker: marcado muerto, con close_time
+        ya vencido (settled), con open_time FUTURO (mercado que aún no abrió → sin book operable,
+        incidente 2026-07-21), o con status conocido fuera de active/open (transicionó a closed/
+        settled/determined). None/desconocido → recuperable (no sobre-filtrar: discovery a veces
+        no trae los campos y purgar por ausencia cegaría sids vivos enteros)."""
         if ticker in self._dead_tickers:
             return True
+        status = self._status_by_ticker.get(ticker)
+        if status is not None and status not in ("active", "open"):
+            return True
+        now = datetime.now(UTC).replace(tzinfo=None)
+        open_time = self._open_time_by_ticker.get(ticker)
+        if open_time is not None and open_time > now:
+            return True
         close_time = self._close_time_by_ticker.get(ticker)
-        return close_time is not None and close_time <= datetime.now(UTC).replace(tzinfo=None)
+        return close_time is not None and close_time <= now
 
     async def _start_recovery(self, sid: int) -> None:
         """Marca los tickers del sid stale y pide get_snapshot SOLO de los recuperables.
@@ -414,14 +479,18 @@ class OrderbookManagerV2:
         all_tickers = self._tickers_by_sid.get(sid, set())
         live = [t for t in all_tickers if not self._is_unrecoverable(t)]
         purged = len(all_tickers) - len(live)
-        # DIAG: cuántos tickers del sid tienen close_time conocido. Si known=0, los close_time NO
-        # están llegando desde discovery (get_event no trae el campo) → por eso purged=0 siempre.
+        # DIAG: cuántos tickers del sid tienen cada metadata conocida. known=0 en un campo = ese
+        # campo NO está llegando desde discovery → el filtro correspondiente nunca tiene con qué
+        # purgar (por eso purged=0 con mercados settled el 07-17, o futuros sin abrir el 07-21).
         known_ct = sum(1 for t in all_tickers if t in self._close_time_by_ticker)
+        known_ot = sum(1 for t in all_tickers if t in self._open_time_by_ticker)
+        known_st = sum(1 for t in all_tickers if t in self._status_by_ticker)
         # Gap individual = evento benigno AUTO-RECUPERADO → INFO (la escalada por FRECUENCIA sigue
         # en _record_gap_and_should_alert).
         logger.info(
             f"Sid {sid} gap detected (auto-recovery). live={len(live)} purged={purged} "
-            f"close_times_known={known_ct}/{len(all_tickers)} — requesting WS recovery snapshot."
+            f"close_times_known={known_ct}/{len(all_tickers)} open_times_known={known_ot} "
+            f"statuses_known={known_st} — requesting WS recovery snapshot."
         )
         for ticker in all_tickers:
             if ticker in self._books:
@@ -557,10 +626,16 @@ class OrderbookManagerV2:
             progress = self._recovery_progress(sid)  # solo válido si aún no se limpió
         self._cleanup_recovery(sid)
         self._recovery_disabled_sids.add(sid)
+        # Backoff (2026-07-21): registrar CUÁNDO y CUÁNTAS veces seguidas — el próximo gap del sid
+        # tras el cooldown reintenta (ver handle_message), con cooldown exponencial por streak.
+        self._recovery_disabled_at[sid] = time.monotonic()
+        self._disable_streak_by_sid[sid] = self._disable_streak_by_sid.get(sid, 0) + 1
         fails = self._recovery_failures_by_sid.get(sid, 0)
+        backoff = self._backoff_delay_sec(sid)
         msg = (
             f"sid={sid} recovery DESHABILITADA ({reason}, {fails} fallos, {progress}) — "
-            "book stale, sin reintentos"
+            f"book stale; reintento tras backoff de {backoff:.0f}s "
+            f"(streak={self._disable_streak_by_sid[sid]})"
         )
         if expected_settlement:
             # Settlement esperado (mercado cerrado / sid entero settled): el book queda stale por
@@ -570,6 +645,42 @@ class OrderbookManagerV2:
             logger.critical(f"v2.recovery_disabled {msg}")
             BotState.record_error(f"v2.recovery_disabled {msg}")
         await self._fire_alert("recovery_disabled", msg)
+
+    def _backoff_delay_sec(self, sid: int) -> float:
+        """Cooldown vigente del sid según su streak de disables: base·factor^(streak−1), capado.
+        Defaults: 30s→2min→8min→30min (cap). streak=0/1 → base."""
+        streak = max(1, self._disable_streak_by_sid.get(sid, 1))
+        return min(
+            self._recovery_backoff_cap_sec,
+            self._recovery_backoff_base_sec * self._recovery_backoff_factor ** (streak - 1),
+        )
+
+    def _retry_remaining_sec(self, sid: int) -> float:
+        """Segundos hasta que venza el cooldown del sid deshabilitado (0 = vencido). Un sid sin
+        timestamp (estado legado/inconsistente) se considera vencido: mejor UN reintento acotado
+        que ceguera permanente."""
+        disabled_at = self._recovery_disabled_at.get(sid)
+        if disabled_at is None:
+            return 0.0
+        return max(0.0, self._backoff_delay_sec(sid) - (time.monotonic() - disabled_at))
+
+    def _disabled_backoff_elapsed(self, sid: int) -> bool:
+        """True si el cooldown del sid deshabilitado ya venció (toca reintentar)."""
+        return self._retry_remaining_sec(sid) <= 0.0
+
+    def _rearm_recovery_after_backoff(self, sid: int) -> None:
+        """Re-habilita la recovery del sid tras el cooldown (UNA línea de log, no una por ciclo).
+        Resetea el contador de fallos consecutivos (ventana fresca de MAX_RECOVERY_FAILURES
+        intentos) pero CONSERVA el streak de disables — si esta ventana también fracasa, el
+        próximo cooldown es más largo (exponencial). Solo una recovery OK resetea el streak."""
+        streak = self._disable_streak_by_sid.get(sid, 0)
+        logger.info(
+            f"v2.recovery_retry sid={sid} tras backoff de {self._backoff_delay_sec(sid):.0f}s "
+            f"(streak={streak}) — reintentando recovery."
+        )
+        self._recovery_disabled_sids.discard(sid)
+        self._recovery_disabled_at.pop(sid, None)
+        self._recovery_failures_by_sid.pop(sid, None)
 
     async def _handle_recovery_rejected(self, req_id: int, raw_msg: dict) -> None:
         """FIX 2 — code 15 sobre un get_snapshot pendiente: la request fue RECHAZADA. En vez de
@@ -681,9 +792,12 @@ class OrderbookManagerV2:
         if not any(s == sid for s, _ in self._pending_snapshot_requests.values()):
             self._recovering.discard(sid)
             self._recovery_started_at.pop(sid, None)
-            # Recovery OK → resetea el circuit breaker del sid (y lo re-habilita si estaba off).
+            # Recovery OK → resetea el circuit breaker del sid (y lo re-habilita si estaba off),
+            # incluido el streak de backoff: el próximo disable arranca de nuevo en el cooldown base.
             self._recovery_failures_by_sid.pop(sid, None)
             self._recovery_disabled_sids.discard(sid)
+            self._recovery_disabled_at.pop(sid, None)
+            self._disable_streak_by_sid.pop(sid, None)
             self._drain_buffer(sid)
 
     def _drain_buffer(self, sid: int) -> None:
