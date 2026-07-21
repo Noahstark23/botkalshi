@@ -484,8 +484,29 @@ class Settings(BaseSettings):
     # (ojo: cada sport_key extra consume más créditos). Confirmá el key con get_sports() la 1ra vez.
     ODDS_API_SPORT_KEYS: str = "baseball_mlb"
     # Regiones de casas. "eu" incluye Pinnacle (la más afilada) → fair-value más preciso;
-    # se suma "us" por cobertura. 1 crédito por región por call (h2h).
+    # se suma "us" por cobertura. ⚠️ COSTO (incidente créditos 2026-07-19): The Odds API
+    # cobra 1 crédito POR REGIÓN por call — "eu,us" cuesta el DOBLE que una región sola.
+    # Con la cuota de 20k quemándose en días, RECOMENDADO "us" (una región) salvo que el
+    # fair de Pinnacle esté justificado por edge medido (hoy el edge de M2 es ~0.06pp vs
+    # umbral 3pp: no lo está).
     ODDS_API_REGIONS: str = "eu,us"
+    # Caché con TTL del cliente odds (incidente créditos 2026-07-19): el poller pedía las
+    # MISMAS cuotas por sport_key cada ciclo (y el burst acelera a 60s) — dentro del TTL
+    # se sirve la respuesta cacheada sin gastar créditos. Las cuotas no se mueven cada
+    # segundo; 60s es conservador.
+    ODDS_API_CACHE_TTL_SEC: float = Field(
+        default=60.0,
+        gt=0,
+        description="TTL (s) del caché in-memory de get_odds por (sport, región).",
+    )
+    # Breaker de cuota (mata el loop de 544 WARNINGs/día): tras un 401 OUT_OF_USAGE_CREDITS
+    # no se toca la API hasta que pase el cooldown o cambie el MES UTC (la cuota resetea
+    # mensual). Una línea de log al entrar y una al salir.
+    ODDS_API_QUOTA_COOLDOWN_SEC: float = Field(
+        default=3600.0,
+        gt=0,
+        description="Silencio total hacia The Odds API tras agotar la cuota (s); mes nuevo también rearma.",
+    )
     # Series de Kalshi que MOTOR 2 consume (su universo de quotes). DESACOPLADO de
     # MULTI_SERIES (Motor REST, winner-take-all ≥3 legs): Motor 2 también opera 2-way
     # (MLB/NBA moneyline) que el arb NO toca. Coma-separado, tuneable por env — sumar
@@ -572,8 +593,13 @@ class Settings(BaseSettings):
     # Burst polling pre-kickoff (auditoría 2026-07-12): los edges reales del funnel son
     # transitorios y se concentran cerca del inicio del partido; con el ritmo base (300s)
     # se ven de casualidad. Con burst > 0, el poller acelera a ese intervalo cuando hay un
-    # kickoff dentro de la ventana. Costo: más requests a The Odds API SOLO en esas
-    # ventanas (tarifa plana hoy). 0 = off (comportamiento histórico).
+    # kickoff dentro de la ventana. ⚠️ COSTO (incidente créditos 2026-07-19): el burst es
+    # el MAYOR consumidor de créditos de The Odds API — a 60s con ventanas de partidos
+    # solapadas (MLB: ~15 juegos/día) multiplica ×5 el gasto del ciclo base y quemó la
+    # cuota de 20k en días. RECOMENDADO subirlo o dejar 0 (off) mientras M2 no tenga edge
+    # validado (auditoría 2026-07-18: edge medido ~0.06pp vs umbral 3pp — hoy NO lo tiene;
+    # acelerar el muestreo de un edge inexistente solo acelera el gasto). El caché con TTL
+    # del cliente (ODDS_API_CACHE_TTL_SEC) amortigua, pero no elimina, este costo.
     MOTOR_2_BURST_INTERVAL_SEC: float = Field(
         default=0.0,
         ge=0.0,
