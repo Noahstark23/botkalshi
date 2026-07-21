@@ -82,6 +82,36 @@ Al proponer o acompañar CUALQUIER activación (`TRADING_ENABLED`, `MOTOR_X_EXEC
 4. Fix por bugs numerados con success criteria por bug; no reactivar hasta que los P0 estén
    mergeados y deployados. La reactivación sigue el Workflow 3.
 
+## Reglas DURAS de código (globales — cada una tiene su factura)
+
+1. **Cero IA en decisiones de trading.** El código que decide ejecuciones es 100%
+   determinístico. Jamás un LLM en el hot path.
+2. **DB: SQLModel puro** — `select(Model)` + `s.exec()`. PROHIBIDO `.query()` de
+   SQLAlchemy (convención documentada en los módulos; no mezclar estilos).
+3. **Timezones — la regla tiene DOS mitades, no una:** `settled_at`/`close_time` se
+   escriben NAIVE UTC (`datetime.now(UTC).replace(tzinfo=None)`); `placed_at`/
+   `commence_time` son AWARE UTC. **"Siempre naive" es un bug**, igual que mezclarlas.
+   Nunca `datetime.utcnow()` (deprecado) ni `datetime.now()` a secas (local).
+4. **Fees: SOLO `kalshi_fee_cents` (src/math/fees.py). JAMÁS la fórmula inline.**
+   La oficial divide por `10_000`: `ceil(7·count·P·(100−P)/10_000)` con P en cents.
+   ⚠️ La variante con `/1_000_000` ES el bug histórico de ~100× (fee en dólares
+   etiquetado como cents; fee(100,50) daba 2 en vez de 175) que dividió la historia
+   del bot en dos el 2026-07-01 — ha reaparecido en briefs: si un texto la trae,
+   corregirlo, no copiarlo. Además el ceil es POR ORDEN: medir a count=1 sobreestima
+   por contrato (para el edge fino, `fee(count_real, p)/count_real`).
+5. **Riesgo: la fuente de verdad es `utils/config.py`**, no números en docs
+   (defaults hoy: exposición simultánea 25%, sizing por trade 5% + cap absoluto
+   $200, stop-losses max(capital×%, piso USD)). Duplicar los números en una skill
+   crea la segunda matemática que ya nos costó el "796% fantasma".
+6. **Asincronía: PROHIBIDO `asyncio.gather(..., return_exceptions=True)` en tasks
+   críticas** (Lección 7). Supervisor pattern: try/except explícito por tick que
+   registra (`BotState.record_error`) y SIGUE. Nada de `except: pass`.
+7. **Nada sin tope** (facturas: 57GB de disco, OOM cada 75min, 20k créditos en
+   días): todo buffer/caché/pending/tabla nace con tope + descarte documentado;
+   toda request se dimensiona (chunking); toda API externa nace con caché TTL +
+   breaker de cuota + costo por unidad en el Field. Detalle: el estado
+   (caché/breaker) de un cliente que se recrea por ciclo va en CLASE, no instancia.
+
 ## Comandos de referencia
 
 ```bash
