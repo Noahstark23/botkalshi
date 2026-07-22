@@ -113,4 +113,6 @@ docker-compose.override.yml
 # =====================================================
 # Claude Code (worktrees efímeros de agentes, estado local)
 # =====================================================
-.claude/
+# Config de Claude Code: settings/hooks/agents compartidos SÍ se versionan
+# (los necesita Claude Code web al clonar); solo lo local queda fuera.
+.claude/settings.local.json
