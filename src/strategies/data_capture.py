@@ -190,6 +190,11 @@ class DataCaptureService:
         # close_time (ISO) por ticker desde discovery → se alimenta al v2_manager para que la
         # recovery NO pida snapshot de mercados settled (causa del loop de code 15).
         self._market_close_times: dict[str, str] = {}
+        # open_time + status por ticker (incidente 2026-07-21): un mercado FUTURO que aún no abrió
+        # (open_time > now) no tiene book operable — la recovery del sid=1 (189 futuros) pedía sus
+        # snapshots en loop tras cada reinicio (timeout_x5 → breaker). También captura transiciones
+        # a closed/settled que el filtro por status del discovery dejaba de reportar.
+        self._market_meta: dict[str, dict] = {}
         self._market_keys_logged = False  # DIAG: loguear una vez qué campos trae get_event
         self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
         # Cliente REST persistente inyectado por el runner SOLO con TRADING_ENABLED=true.
@@ -480,7 +485,19 @@ class DataCaptureService:
                                 if ticker and status in ("open", "active"):
                                     self._tracked_tickers.add(ticker)
                                     self._market_close_times[ticker] = market.get("close_time")
+                                    self._market_meta[ticker] = {
+                                        "open_time": market.get("open_time"),
+                                        "status": status,
+                                    }
                                     per_series[prefix] = per_series.get(prefix, 0) + 1
+                                elif ticker and ticker in self._tracked_tickers:
+                                    # Transición fuera de active/open de un ticker YA trackeado:
+                                    # actualizar su metadata para que la recovery de V2 lo purgue
+                                    # (antes se salteaba y el status quedaba rancio en "active").
+                                    self._market_meta[ticker] = {
+                                        "open_time": market.get("open_time"),
+                                        "status": status,
+                                    }
                         except Exception as e:
                             logger.warning(
                                 f"get_event({event_ticker}) error: {type(e).__name__}: {e}"
@@ -492,9 +509,11 @@ class DataCaptureService:
 
         if errors_by_prefix:
             logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
-        # Alimentar close_time al v2_manager (si ya existe) para purgar settled de la recovery.
+        # Alimentar close_time + open_time/status al v2_manager (si ya existe) para purgar de la
+        # recovery los settled Y los futuros que aún no abrieron (incidente 2026-07-21).
         if self._v2_manager is not None:
             self._v2_manager.set_close_times(self._market_close_times)
+            self._v2_manager.set_market_metadata(self._market_meta)
         new_tickers = self._tracked_tickers - before
         BotState.tracked_markets_count = len(self._tracked_tickers)
         logger.success(
@@ -742,6 +761,9 @@ class DataCaptureService:
             max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
             recovery_chunk_size=self.settings.ORDERBOOK_V2_RECOVERY_CHUNK_SIZE,
             bootstrap_buffer_cap=self.settings.ORDERBOOK_V2_BOOTSTRAP_BUFFER_CAP,
+            recovery_backoff_base_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_BASE_SEC,
+            recovery_backoff_factor=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_FACTOR,
+            recovery_backoff_cap_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_CAP_SEC,
         )
         BotState.v2_manager = self._v2_manager
         logger.info("OrderbookManagerV2 creado + publicado en BotState (pre-discovery)")
@@ -874,6 +896,7 @@ class DataCaptureService:
         # descubiertos al boot (la discovery previa corrió sin manager).
         if self._v2_manager is not None:
             self._v2_manager.set_close_times(self._market_close_times)
+            self._v2_manager.set_market_metadata(self._market_meta)
 
         # Encolar suscripciones (se aplicaran al conectar el WS)
         ticker_list = list(self._tracked_tickers)
