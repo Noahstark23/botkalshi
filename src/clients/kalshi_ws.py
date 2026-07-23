@@ -284,8 +284,14 @@ class KalshiWebSocket:
         cmd_id = self._next_id
         self._next_id += 1
         msg: dict[str, Any] = {"id": cmd_id, "cmd": cmd}
+        # DRIFT DE SPEC (incidente 2026-07-23): `action` va DENTRO de `params`, no en el
+        # top-level del mensaje. El server de mayo aceptaba el top-level (probe 2026-05-19,
+        # fixtures ws/); el vigente lo busca en params y si no lo encuentra rechaza el
+        # comando entero con code 15 "Action required" — TODOS los get_snapshot de recovery
+        # rechazados en ms → books_initialized=0 → M1/M5/M8 ciegos. La firma se mantiene
+        # (los callers no cambian); solo cambia el wire format, pineado por test.
         if action is not None:
-            msg["action"] = action
+            params = {**(params or {}), "action": action}
         if params is not None:
             msg["params"] = params
         await self._ws.send(json.dumps(msg))
