@@ -23,8 +23,11 @@ NO cablea ejecución: emite señales, no coloca órdenes. TRADING_ENABLED=false.
 
 from __future__ import annotations
 
+import contextlib
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from statistics import median
 
 from loguru import logger
 from pydantic import BaseModel
@@ -33,7 +36,13 @@ from src.clients.odds_api import OddsEvent
 from src.math.fees import kalshi_fee_cents
 from src.math.kelly import quarter_kelly_size
 from src.math.no_vig import implied_prob, remove_vig_multiplicative
-from src.strategies.motor_2_consensus.matcher import canonical_name, match_outcomes
+from src.strategies.motor_2_consensus.matcher import (
+    canonical_name,
+    match_outcomes,
+    parse_event_key_start,
+    series_sport_compatible,
+    start_time_et,
+)
 
 MIN_EDGE_PCT = 0.03  # 3pp neto post-comisión
 SIZING_MAX_PCT = 5.0  # cap duro de exposición por trade (% del capital activo)
@@ -77,6 +86,10 @@ class ConsensusSignal(BaseModel):
     """Señal de edge Motor 2 (no ejecuta — registro analítico)."""
 
     market_ticker: str
+    # Evento Kalshi al que pertenece el market (ej. "KXMLBGAME-26JUN27NYMPHI").
+    # Lo estampa find_signals; el executor lo usa para el dedup cross-ciclo por evento
+    # ("" en señales construidas a mano → el dedup cae al scope por ticker).
+    event_key: str = ""
     kalshi_side: str  # "YES" | "NO"
     odds_api_fair_prob: float  # probabilidad JUSTA (post-no-vig) del lado señalado
     kalshi_price_cents: int  # ask de Kalshi del lado señalado
@@ -94,56 +107,148 @@ class ConsensusSignal(BaseModel):
 
 
 def _h2h_outcome_names(odds_event: OddsEvent) -> list[str]:
-    """Nombres de outcome del primer bookmaker con mercado h2h (cardinalidad + nombres)."""
+    """Set de referencia = los outcomes del set canónico MÁS FRECUENTE entre las casas
+    con h2h (auditoría rentabilidad 2026-07-07: antes se tomaba la PRIMERA casa del
+    array — si esa listaba un set atípico (nombre sin alias, 2-way donde el resto es
+    3-way), TODAS las demás se descartaban por 'set distinto' y el evento moría en
+    reject_no_fair, dependiendo del orden arbitrario del JSON de la API)."""
+    sets_vistos: Counter[frozenset[str]] = Counter()
+    primero_por_set: dict[frozenset[str], list[str]] = {}
     for bk in odds_event.bookmakers:
         for mk in bk.markets:
             if mk.key == "h2h" and mk.outcomes:
-                return [o.name for o in mk.outcomes]
-    return []
+                names = [o.name for o in mk.outcomes]
+                key = frozenset(canonical_name(n) for n in names)
+                sets_vistos[key] += 1
+                primero_por_set.setdefault(key, names)
+    if not sets_vistos:
+        return []
+    ganador = sets_vistos.most_common(1)[0][0]
+    return primero_por_set[ganador]
 
 
-def _consensus_fair_probs(odds_event: OddsEvent) -> dict[str, float]:
+def _consensus_fair_probs(
+    odds_event: OddsEvent,
+    *,
+    min_books: int = 1,
+    max_book_age_min: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, float]:
     """
-    Probabilidad JUSTA por outcome canónico: promedia la prob implícita de cada
-    bookmaker (consenso) y le quita el vig (multiplicativo). {} si no hay h2h usable.
+    Probabilidad JUSTA por outcome canónico: MEDIANA de la prob implícita de cada
+    bookmaker (consenso) y le quita el vig (multiplicativo). {} si no hay h2h usable,
+    si el consenso lo forman menos de `min_books` casas, o si todas las líneas están
+    vencidas.
+
+    Auditoría rentabilidad 2026-07-07 (tres endurecimientos de la MEDICIÓN):
+      - MEDIANA en vez de media simple: una sola casa soft/desviada movía el fair
+        entero (la media equiponderada no tiene resistencia a outliers; la mediana sí).
+      - min_books: el único gate previo era >=2 OUTCOMES — UNA casa podía formar el
+        "consenso" entero. Con pocas casas el fair hereda el shading recreativo y el
+        edge medido puede ser 100% ruido (n_books solo se logueaba).
+      - Frescura: una línea congelada/suspendida (last_update viejo) entra igual que
+        una fresca. Books sin last_update NO se filtran (fail-open, fixtures/tests).
     """
-    sums: dict[str, float] = {}
-    counts: dict[str, int] = {}
+    # Set de REFERENCIA (set canónico más frecuente entre casas). Cada casa entra al
+    # consenso solo con el set COMPLETO e IDÉNTICO (deuda auditoría 2026-07-01: agregar
+    # outcomes sueltos de casas parciales normalizaba el no-vig sobre el conjunto
+    # equivocado → fair inflado, p.ej. 1X2 sin Draw daba A=0.60/B=0.40 vs ~0.50/0.33/0.17).
+    reference = {canonical_name(n) for n in _h2h_outcome_names(odds_event)}
+    if len(reference) < 2:
+        return {}
+    probs_por_outcome: dict[str, list[float]] = {}
+    book_keys: set[str] = set()
+    skipped_books = 0
+    stale_books = 0
+    ref_now = now or datetime.now(UTC)
     for bk in odds_event.bookmakers:
+        if max_book_age_min is not None and bk.last_update is not None:
+            age_min = (ref_now - bk.last_update).total_seconds() / 60.0
+            if age_min > max_book_age_min:
+                stale_books += 1
+                continue  # línea vencida: no aporta información fresca al consenso
         for mk in bk.markets:
             if mk.key != "h2h":
                 continue
+            probs: dict[str, float] = {}
             for o in mk.outcomes:
-                cn = canonical_name(o.name)
-                try:
-                    p = implied_prob(o.price)
-                except ValueError:
-                    continue  # cuota inválida → ignorar ese outcome
-                sums[cn] = sums.get(cn, 0.0) + p
-                counts[cn] = counts.get(cn, 0) + 1
-    if len(sums) < 2:
+                # Cuota inválida → el set de esta casa queda incompleto → se descarta abajo.
+                with contextlib.suppress(ValueError):
+                    probs[canonical_name(o.name)] = implied_prob(o.price)
+            if set(probs) != reference:
+                skipped_books += 1
+                continue  # set distinto/incompleto → esta casa NO entra al consenso
+            book_keys.add(bk.key)
+            for cn, p in probs.items():
+                probs_por_outcome.setdefault(cn, []).append(p)
+    if skipped_books or stale_books:
+        logger.info(
+            f"motor2.consensus.books_descartadas event={getattr(odds_event, 'id', '?')} "
+            f"set_distinto={skipped_books} stale={stale_books}"
+        )
+    if len(probs_por_outcome) < 2:
         return {}
-    names = list(sums)
-    avg_implied = [sums[n] / counts[n] for n in names]
-    fair = remove_vig_multiplicative(avg_implied)
+    if len(book_keys) < min_books:
+        logger.info(
+            f"motor2.consensus.pocas_casas event={getattr(odds_event, 'id', '?')} "
+            f"n_books={len(book_keys)} < min={min_books} → sin fair (consenso degenerado)"
+        )
+        return {}
+    names = list(probs_por_outcome)
+    med_implied = [median(probs_por_outcome[n]) for n in names]
+    fair = remove_vig_multiplicative(med_implied)
+    logger.info(
+        f"motor2.consensus event={getattr(odds_event, 'id', '?')} n_books={len(book_keys)} "
+        f"outcomes={len(names)} fair={ {n: round(p, 4) for n, p in zip(names, fair, strict=True)} }"
+    )
     return dict(zip(names, fair, strict=True))
 
 
-def _net_edge_pct(fair_prob: float, ask_cents: int) -> float:
+def _net_edge_pct(fair_prob: float, ask_cents: int, count: int = 1) -> float:
     """
     Edge NETO (fracción) de comprar un lado a `ask_cents` con prob justa `fair_prob`.
 
-    EV por contrato (¢) = fair_prob*100 − ask − comisión; /100 → fracción del payout $1.
+    EV por contrato (¢) = fair_prob*100 − ask − comisión_por_contrato; /100 → fracción del
+    payout $1.
+
+    `count` = contratos que la orden REALMENTE compraría (del stake flat). La fee de Kalshi
+    es ceil POR ORDEN: medirla con count=1 sobreestima la fee por contrato hasta +0.78pp en
+    asks bajos (auditoría 2026-07-12: el funnel mostraba edges más pesimistas que lo que la
+    orden real pagaría). Con count real: fee_por_contrato = ceil(fee(count))/count — la
+    misma economía que ejecuta el executor. Default 1 = comportamiento histórico.
     """
     if not (1 <= ask_cents <= 99):
         return -1.0  # ask fuera de rango → sin edge
-    fee = kalshi_fee_cents(1, ask_cents)
+    n = max(1, count)
+    fee = kalshi_fee_cents(n, ask_cents) / n
     net_ev_cents = fair_prob * 100.0 - ask_cents - fee
     return net_ev_cents / 100.0
 
 
-def _size_usd(true_prob: float, ask_cents: int, capital_usd: float) -> float:
-    """¼ Kelly con cap 5% del capital → USD recomendados. El cap lo aplica quarter_kelly_size."""
+def _stake_count(ask_cents: int, capital_usd: float, max_stake_pct: float) -> int:
+    """Contratos que el stake FLAT compraría a este ask (mismo redondeo que el executor:
+    int(stake·100 // ask)). Mínimo 1 para que la fee por contrato esté siempre definida."""
+    if not (1 <= ask_cents <= 99) or max_stake_pct <= 0 or capital_usd <= 0:
+        return 1
+    stake_usd = round(capital_usd * max_stake_pct / 100.0, 2)
+    return max(1, int(stake_usd * 100 // ask_cents))
+
+
+def _size_usd(
+    true_prob: float, ask_cents: int, capital_usd: float, *, max_stake_pct: float = 0.0
+) -> float:
+    """Stake recomendado en USD para UNA señal.
+
+    max_stake_pct > 0 → FLAT: fracción FIJA del bankroll por trade (capital_usd * pct/100),
+    DESACOPLADA del edge. Kelly escala el stake con (true_prob − ask); si el `true_prob` está
+    sobreestimado (consenso ruidoso, MLB con pocas casas), Kelly sobre-apuesta justo donde el edge
+    es falso → la asimetría que sangró −19% ROI (sim sobre 141 settled: flat constante +22.9%).
+    El flat corta ese acoplamiento. El count entero lo deriva el executor (size·100/price) y el
+    RiskManager lo re-capea aguas abajo (capital efectivo + MAX_TRADE_SIZE_USD).
+
+    max_stake_pct == 0 → fallback ¼ Kelly con cap 5% (comportamiento previo)."""
+    if max_stake_pct > 0:
+        return round(capital_usd * max_stake_pct / 100.0, 2)
     bankroll_cents = int(capital_usd * 100)
     count = quarter_kelly_size(
         true_prob, ask_cents, bankroll_cents, kelly_fraction=0.25, max_pct=SIZING_MAX_PCT
@@ -159,6 +264,13 @@ def find_signals(
     min_edge: float = MIN_EDGE_PCT,
     now: datetime | None = None,
     diag: dict[str, float] | None = None,
+    one_per_event: bool = True,
+    max_stake_pct: float = 0.0,
+    fair_out: dict[str, float] | None = None,
+    max_edge: float | None = None,
+    min_books: int = 1,
+    max_book_age_min: float | None = None,
+    fee_at_stake_count: bool = False,
 ) -> list[ConsensusSignal]:
     """
     Emite ConsensusSignal por cada outcome con edge neto > min_edge. Puro y testeable.
@@ -177,6 +289,14 @@ def find_signals(
       - reject_cardinality: mismo partido pero distinto nº de outcomes (2-way vs 3-way).
       - reject_names: mismo partido, set de nombres difiere → FIXABLE con alias (loguea ambos).
       - reject_no_fair: matcheó pero no hubo consenso usable.
+      - reject_date: candidatos por nombres pero ninguno en la fecha del event_key (serie).
+      - reject_ambiguous: >1 candidato sin desambiguar (doubleheader) → descarta.
+      - reject_started: el candidato correcto ya arrancó (in-play) → descarta.
+      - skip_out_of_horizon / skip_multi_outcome: PRE-funnel — el evento ni compite
+        (fecha sin cobertura del feed / >3 outcomes inmatchable contra h2h).
+    La clasificación por overlap solo considera candidatos del MISMO día ET que el
+    event_key (si trae fecha): un partido de otro día que comparte un equipo no es
+    evidencia de "falta un alias" sino de "este partido no está en el feed".
     """
     now = now or datetime.now(UTC)
     if diag is not None:
@@ -189,57 +309,143 @@ def find_signals(
             reject_cardinality=0.0,
             reject_names=0.0,
             reject_no_fair=0.0,
+            reject_date=0.0,  # candidato(s) por nombres pero ninguno en la fecha del event_key
+            reject_ambiguous=0.0,  # >1 candidato sin desambiguar (doubleheader/serie) → descarta
+            reject_started=0.0,  # el candidato correcto ya arrancó (Kalshi in-play) → descarta
+            skip_out_of_horizon=0.0,  # la fecha del event_key ni siquiera está en el feed de odds
+            skip_multi_outcome=0.0,  # evento Kalshi >3 outcomes: inmatchable contra feed h2h
+            reject_high_edge=0.0,  # señal sobre el techo de ejecución (anti-fantasma)
             best_net_edge=-1.0,  # fracción; -1 = no se evaluó ningún outcome
         )
     signals: list[ConsensusSignal] = []
     name_debug_budget = 3  # cap de logs name_debug por ciclo (evita spam)
+    # FILTRO PRE-FUNNEL (fix observabilidad 2026-07-02): las fechas (ET) que el feed de
+    # odds cubre. Un evento Kalshi de un día SIN cobertura (p.ej. el universo trae los
+    # partidos de mañana pero la odds API solo los de hoy) no es un rechazo interesante —
+    # antes inflaba reject_date/reject_absent y tapaba los mismatches reales del embudo.
+    odds_dates = {start_time_et(oe.commence_time).date() for oe in odds_events}
+    multi_outcome_log_budget = 1  # un log por ciclo alcanza para el trend
     for ke in kalshi_events:
+        # FILTRO PRE-FUNNEL (medición post-deploy 2026-07-02): un evento Kalshi
+        # MULTI-OUTCOME (ganador de grupo/torneo, >3 outcomes) JAMÁS matchea un feed
+        # h2h (2-way / 1X2 = máx 3): match_outcomes exige igualdad exacta de conjuntos.
+        # Dejarlos entrar solo inflaba reject_cardinality/reject_names cada ciclo y el
+        # embudo señalaba "poblar aliases" donde no había nada que poblar.
+        if len(ke.outcomes) > 3:
+            if diag is not None:
+                diag["skip_multi_outcome"] = diag.get("skip_multi_outcome", 0.0) + 1.0
+            if multi_outcome_log_budget > 0:
+                multi_outcome_log_budget -= 1
+                logger.info(
+                    f"motor2.skip_multi_outcome event={ke.event_key} "
+                    f"n_outcomes={len(ke.outcomes)} (feed h2h es 2/3-way → fuera del funnel)"
+                )
+            continue
+        parsed_key = parse_event_key_start(ke.event_key)
+        if parsed_key is not None and odds_dates and parsed_key[0] not in odds_dates:
+            if diag is not None:
+                diag["skip_out_of_horizon"] = diag.get("skip_out_of_horizon", 0.0) + 1.0
+            continue
         k_names = [q.outcome_name for q in ke.outcomes]
         k_canon = {canonical_name(n) for n in k_names}
         matched = False
         best_overlap = -1
         best_reason = "absent"
         best_pair: tuple[set[str], set[str]] | None = None
+        # PASADA 1 — candidatos por NOMBRES. Incluye partidos YA INICIADOS a propósito: la
+        # fecha y la ambigüedad se resuelven en la selección (fix auditoría 2026-07-01 —
+        # ignorarlos acá permitía que el evento Kalshi in-play del juego 1 de un doubleheader
+        # matcheara la línea pre-match del juego 2: precios en vivo vs línea de OTRO juego).
+        candidates: list[OddsEvent] = []
         for oe in odds_events:
-            # PRE-MATCH ONLY: partido ya iniciado → comparación inválida, se saltea.
-            if oe.commence_time <= now:
+            # Gate serie↔deporte (deuda auditoría 2026-07-01): los aliases de ciudad son
+            # MLB-scoped pero el matcher es global — sin esto, onboardear NBA cruzaba
+            # "Boston" (Celtics) contra el set canónico de los Red Sox.
+            if not series_sport_compatible(ke.event_key, oe.sport_key):
                 continue
             odds_names = _h2h_outcome_names(oe)
             if not odds_names:
                 continue
-            o_canon = {canonical_name(n) for n in odds_names}
-            # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
-            overlap = len(k_canon & o_canon)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_pair = (k_canon, o_canon)
-                if overlap == 0:
-                    best_reason = "absent"
-                elif len(k_names) != len(odds_names):
-                    best_reason = "cardinality"
-                elif k_canon != o_canon:
-                    best_reason = "names"
-                else:
-                    best_reason = "no_fair"  # set igual → si no matchea/no fair, es esto
+            if oe.commence_time > now and (
+                # Coherencia de FECHA del diagnóstico (medición post-deploy 2026-07-02): un
+                # candidato de OTRO día ET que comparte un equipo (rotación de series MLB:
+                # Cubs@Cardinals mañana vs Braves@Cardinals hoy) etiquetaba el rechazo como
+                # 'names' ("falta un alias") cuando la verdad es 'absent' ("el partido del
+                # key no está en el feed"). Solo el MISMO día ET del key califica para el
+                # diagnóstico; key sin fecha → sin restricción (legacy).
+                parsed_key is None or start_time_et(oe.commence_time).date() == parsed_key[0]
+            ):
+                o_canon = {canonical_name(n) for n in odds_names}
+                # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
+                overlap = len(k_canon & o_canon)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_pair = (k_canon, o_canon)
+                    if overlap == 0:
+                        best_reason = "absent"
+                    elif len(k_names) != len(odds_names):
+                        best_reason = "cardinality"
+                    elif k_canon != o_canon:
+                        best_reason = "names"
+                    else:
+                        best_reason = "no_fair"  # set igual → si no matchea/no fair, es esto
             # Regla del matcher: cardinalidad + conjuntos exactos. None → no es el partido.
             if match_outcomes(k_names, odds_names) is None:
                 continue
-            fair = _consensus_fair_probs(oe)
+            candidates.append(oe)
+
+        # PASADA 2 — selección con fecha del event_key + "ambigüedad → descarta" (antes se
+        # tomaba el PRIMER candidato pre-match: en una serie MLB de 3-4 juegos del mismo
+        # par, el evento Kalshi del miércoles apostaba contra la línea del martes).
+        chosen, select_reject = _select_candidate(ke.event_key, candidates, now)
+        if chosen is not None:
+            fair = _consensus_fair_probs(
+                chosen, min_books=min_books, max_book_age_min=max_book_age_min, now=now
+            )
             if not fair:
                 best_reason = "no_fair"
-                continue
-            matched = True
-            if diag is not None:
-                diag["events_matched"] += 1.0
-            for q in ke.outcomes:
-                cn = canonical_name(q.outcome_name)
-                fp = fair.get(cn)
-                if fp is None:
-                    continue
-                signals.extend(_signals_for_outcome(q, fp, capital_usd, min_edge, diag))
-            break  # ya emparejado este evento Kalshi
+            else:
+                matched = True
+                if diag is not None:
+                    diag["events_matched"] += 1.0
+                # Candidatos de TODOS los outcomes del partido (cada uno en su market_ticker),
+                # luego colapsados a UNA apuesta direccional (_collapse_event_signals).
+                event_signals: list[ConsensusSignal] = []
+                for q in ke.outcomes:
+                    cn = canonical_name(q.outcome_name)
+                    fp = fair.get(cn)
+                    if fp is None:
+                        continue
+                    # Canal Motor 5 (plan MM §1.2): el fair de TODO outcome matcheado se
+                    # expone vía out-param (no solo los que superan el umbral de señal) —
+                    # el market maker cotiza alrededor del fair, no del edge. Puro: el
+                    # caller decide si publicarlo (el poller solo lo hace con odds LIVE).
+                    if fair_out is not None:
+                        fair_out[q.market_ticker] = fp
+                    event_signals.extend(
+                        _signals_for_outcome(
+                            q,
+                            fp,
+                            capital_usd,
+                            min_edge,
+                            diag,
+                            max_stake_pct=max_stake_pct,
+                            max_edge=max_edge,
+                            fee_at_stake_count=fee_at_stake_count,
+                        )
+                    )
+                for es in event_signals:
+                    es.event_key = ke.event_key  # para el dedup cross-ciclo del executor
+                signals.extend(_collapse_event_signals(event_signals, one_per_event, ke.event_key))
         if not matched and diag is not None:
-            diag["reject_" + best_reason] = diag.get("reject_" + best_reason, 0.0) + 1.0
+            reason = select_reject or best_reason
+            diag["reject_" + reason] = diag.get("reject_" + reason, 0.0) + 1.0
+            if select_reject in ("date", "ambiguous"):
+                logger.warning(
+                    f"motor2.match.rejected_{select_reject} event={ke.event_key} "
+                    f"candidatos={len(candidates)} (matching conservador: el partido "
+                    "equivocado es la falla catastrófica → descarta)"
+                )
             # name_debug SOLO para el caso fixable (mismo partido, nombres distintos): muestra
             # los dos sets canónicos → se ve EXACTO qué alias falta agregar a TEAM_ALIASES.
             if best_reason in ("names", "cardinality") and best_pair and name_debug_budget > 0:
@@ -255,6 +461,58 @@ def find_signals(
     return signals
 
 
+def _select_candidate(
+    event_key: str, candidates: list[OddsEvent], now: datetime
+) -> tuple[OddsEvent | None, str | None]:
+    """Elige el ÚNICO odds event que corresponde al evento Kalshi, o (None, motivo).
+
+    Reglas conservadoras (emparejar el partido equivocado es la falla catastrófica):
+      1. Si el event_key trae fecha ("...-26JUN27..."), el candidato debe empezar ESE día
+         en hora del Este. Mata el bug de series MLB: el evento Kalshi del miércoles ya no
+         matchea la línea del martes.
+      2. >1 candidato en la fecha (doubleheader): desambigua por la hora ET embebida en el
+         key ("...1610..."); sin hora única que coincida → 'ambiguous' (descarta ambos).
+      3. Key sin fecha parseable: solo se acepta candidato ÚNICO; 2+ → 'ambiguous'.
+      4. El elegido debe ser PRE-MATCH (commence_time > now); si ya arrancó → 'started'
+         (precios in-play de Kalshi vs línea de odds = comparación inválida).
+
+    Motivos → embudo: reject_date | reject_ambiguous | reject_started. (None, None) si
+    no había candidatos (la clasificación cae al best_reason por overlap).
+    """
+    if not candidates:
+        return None, None
+    parsed = parse_event_key_start(event_key)
+    if parsed is not None:
+        key_date, key_hhmm = parsed
+        dated = [oe for oe in candidates if start_time_et(oe.commence_time).date() == key_date]
+        if not dated:
+            return None, "date"
+        if len(dated) == 1:
+            chosen = dated[0]
+        else:
+            timed = []
+            if key_hhmm is not None:
+                timed = [
+                    oe
+                    for oe in dated
+                    if (
+                        start_time_et(oe.commence_time).hour,
+                        start_time_et(oe.commence_time).minute,
+                    )
+                    == key_hhmm
+                ]
+            if len(timed) != 1:
+                return None, "ambiguous"
+            chosen = timed[0]
+    else:
+        if len(candidates) > 1:
+            return None, "ambiguous"
+        chosen = candidates[0]
+    if chosen.commence_time <= now:
+        return None, "started"
+    return chosen, None
+
+
 def _emit_if_plausible(
     out: list[ConsensusSignal],
     q: KalshiQuote,
@@ -264,9 +522,25 @@ def _emit_if_plausible(
     edge: float,
     capital_usd: float,
     min_edge: float,
+    max_stake_pct: float = 0.0,
+    max_edge: float | None = None,
+    diag: dict[str, float] | None = None,
 ) -> None:
-    """Emite la señal si min_edge < edge ≤ MAX_PLAUSIBLE_EDGE; un edge monstruoso se descarta."""
+    """Emite la señal si min_edge < edge ≤ techo(s); un edge alto/monstruoso se descarta."""
     if edge <= min_edge:
+        return
+    # Techo de EJECUCIÓN configurable (anti-fantasma, MOTOR_2_MAX_EDGE_PCT — espejo de
+    # MOTOR_1_MAX_EDGE_PCT). Evidencia de trades settled: bucket edge ~5% rentable
+    # (+$189, 59% win) pero 12-13% sangró (−$621, ≤54% win) — un edge consensus alto en
+    # un binario líquido es casi siempre consenso mal calibrado, no valor. Estricto `>`.
+    # DISTINTO del backstop MAX_PLAUSIBLE_EDGE de abajo (artefactos monstruosos, 15%).
+    if max_edge is not None and edge > max_edge:
+        if diag is not None:
+            diag["reject_high_edge"] = diag.get("reject_high_edge", 0.0) + 1.0
+        logger.info(
+            f"motor2.signal.rej_high ticker={q.market_ticker} side={side} "
+            f"edge={edge:.3f} > techo={max_edge:.3f} (anti-fantasma)"
+        )
         return
     if edge > MAX_PLAUSIBLE_EDGE:
         # Backstop: edge implausible = artefacto (mercado resuelto/stale) → NO graba ni apuesta.
@@ -275,7 +549,9 @@ def _emit_if_plausible(
             f"edge={edge:.3f} (> {MAX_PLAUSIBLE_EDGE} → artefacto probable: mercado stale/in-play)"
         )
         return
-    out.append(_build(q, side, fair_prob, ask_cents, edge, capital_usd))
+    out.append(
+        _build(q, side, fair_prob, ask_cents, edge, capital_usd, max_stake_pct=max_stake_pct)
+    )
 
 
 def _signals_for_outcome(
@@ -284,26 +560,97 @@ def _signals_for_outcome(
     capital_usd: float,
     min_edge: float,
     diag: dict[str, float] | None = None,
+    *,
+    max_stake_pct: float = 0.0,
+    max_edge: float | None = None,
+    fee_at_stake_count: bool = False,
 ) -> list[ConsensusSignal]:
-    """Evalúa YES (prob justa) y NO (complemento) para un outcome; emite el/los que superen el edge."""
+    """Candidatos YES (prob justa) y NO (complemento) de UN outcome con edge neto > umbral.
+
+    Genera SOLO candidatos; la mutua exclusión la aplica find_signals a nivel EVENTO
+    (_collapse_event_signals) sobre el conjunto del partido — no acá, porque las patas
+    correlacionadas viven en market_tickers DISTINTOS (ej. yes@-PHI y no@-NYM son la misma
+    dirección 'PHI gana') y este helper solo ve un market a la vez."""
     out: list[ConsensusSignal] = []
+    # fee_at_stake_count (2026-07-12): la fee del edge medida al count REAL que el stake
+    # flat compraría (fee ceil por ORDEN repartida) en vez de count=1 (que la sobreestima
+    # hasta +0.78pp en asks bajos). Off = comportamiento histórico exacto.
+    yes_n = _stake_count(q.yes_ask_cents, capital_usd, max_stake_pct) if fee_at_stake_count else 1
+    no_n = _stake_count(q.no_ask_cents, capital_usd, max_stake_pct) if fee_at_stake_count else 1
     # YES: comprar a yes_ask si el mercado lo subvalúa frente al fair.
-    yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents)
+    yes_edge = _net_edge_pct(fair_prob, q.yes_ask_cents, count=yes_n)
     # NO: comprar a no_ask con la prob complementaria.
-    no_edge = _net_edge_pct(1.0 - fair_prob, q.no_ask_cents)
+    no_edge = _net_edge_pct(1.0 - fair_prob, q.no_ask_cents, count=no_n)
     if diag is not None:
         # Mejor edge NETO visto (aunque no supere el umbral) → distingue "mercado eficiente"
         # (best_edge ~1-2pp) de "filtro angosto" (sin outcomes evaluados / best_edge alto pero 0 señales).
         diag["best_net_edge"] = max(diag.get("best_net_edge", -1.0), yes_edge, no_edge)
-    _emit_if_plausible(out, q, "YES", fair_prob, q.yes_ask_cents, yes_edge, capital_usd, min_edge)
     _emit_if_plausible(
-        out, q, "NO", 1.0 - fair_prob, q.no_ask_cents, no_edge, capital_usd, min_edge
+        out,
+        q,
+        "YES",
+        fair_prob,
+        q.yes_ask_cents,
+        yes_edge,
+        capital_usd,
+        min_edge,
+        max_stake_pct,
+        max_edge=max_edge,
+        diag=diag,
+    )
+    _emit_if_plausible(
+        out,
+        q,
+        "NO",
+        1.0 - fair_prob,
+        q.no_ask_cents,
+        no_edge,
+        capital_usd,
+        min_edge,
+        max_stake_pct,
+        max_edge=max_edge,
+        diag=diag,
     )
     return out
 
 
+def _collapse_event_signals(
+    event_signals: list[ConsensusSignal], one_per_event: bool, event_key: str
+) -> list[ConsensusSignal]:
+    """Mutua exclusión POR EVENTO (no por market). Un partido tiene outcomes mutuamente
+    excluyentes en market_tickers DISTINTOS (ej. ...-PHI y ...-NYM). Apostar yes en el market de
+    un equipo y no en el del otro = MISMA dirección → doble exposición correlacionada al mismo
+    resultado (el caso que sangró −$218: PHI con yes@-PHI + no@-NYM, ambos 'PHI gana'). Un dedup
+    por market_ticker NO lo agarra; por eso se colapsa a nivel EVENTO.
+
+    Motor 2 es DIRECCIONAL → UNA sola apuesta por evento: se queda con la de MAYOR edge neto y
+    descarta el resto. Esto además acota la EXPOSICIÓN por partido a un solo trade (ya capeado al
+    5% por _size_usd), en vez de sumar stake sobre varias patas del mismo evento."""
+    if not one_per_event or len(event_signals) <= 1:
+        return event_signals
+    best = max(event_signals, key=lambda s: s.edge_pct)
+    dropped = [
+        f"{s.market_ticker}/{s.kalshi_side}@{s.edge_pct:.3f}"
+        for s in event_signals
+        if s is not best
+    ]
+    logger.warning(
+        f"motor2.signal.event_collapsed event={event_key} "
+        f"kept={best.market_ticker}/{best.kalshi_side}@{best.edge_pct:.3f} dropped={dropped} "
+        "(1 apuesta direccional por evento → exposición del partido capeada a un trade)"
+    )
+    return [best]
+
+
 def _build(
-    q: KalshiQuote, side: str, fair_prob: float, ask_cents: int, edge: float, capital_usd: float
+    q: KalshiQuote,
+    side: str,
+    fair_prob: float,
+    ask_cents: int,
+    edge: float,
+    capital_usd: float,
+    *,
+    max_stake_pct: float = 0.0,
 ) -> ConsensusSignal:
     fee_cents = kalshi_fee_cents(1, ask_cents)
     gross_edge_cents = int(round(fair_prob * 100.0 - ask_cents))
@@ -313,7 +660,9 @@ def _build(
         odds_api_fair_prob=round(fair_prob, 4),
         kalshi_price_cents=ask_cents,
         edge_pct=edge,
-        recommended_size_usd=_size_usd(fair_prob, ask_cents, capital_usd),
+        recommended_size_usd=_size_usd(
+            fair_prob, ask_cents, capital_usd, max_stake_pct=max_stake_pct
+        ),
         gross_edge_cents=gross_edge_cents,
         fee_cents=fee_cents,
     )
@@ -321,6 +670,7 @@ def _build(
         f"motor2.signal ticker={sig.market_ticker} side={sig.kalshi_side} "
         f"fair_prob={sig.odds_api_fair_prob} kalshi={sig.kalshi_price_cents}c "
         f"gross={gross_edge_cents}c fee={fee_cents}c edge={sig.edge_pct:.3f} "
-        f"size=${sig.recommended_size_usd}"
+        f"sizing={'flat' if max_stake_pct > 0 else 'kelly'} "
+        f"recommended_size_usd=${sig.recommended_size_usd}"
     )
     return sig

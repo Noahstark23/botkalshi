@@ -27,13 +27,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.fees import kalshi_fee_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, engage_kill_switch, get_session
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 
 STRATEGY = "motor_2_consensus"
@@ -86,9 +87,15 @@ class Motor2Executor:
         *,
         min_entry_cents: int = 1,
         underdog_filter_enabled: bool = False,
+        one_bet_per_event: bool = True,
     ) -> None:
         self.client = client
         self.risk = risk_manager
+        # Scope del dedup cross-ciclo (fix auditoría 2026-07-01): True → una posición
+        # abierta por EVENTO (la promesa del flag MOTOR_2_ONE_BET_PER_EVENT); False →
+        # por market_ticker. Sin esto, un edge de consenso persistente (dura horas) se
+        # re-apostaba cada ciclo de 5 min hasta chocar con el cap global de exposición.
+        self._one_bet_per_event = one_bet_per_event
         # Filtro underdog (FASE 3): las entradas <40c sangraron −$110,77 en el histórico
         # (17 de 21 perdedoras). min_entry_cents=1 + filter off = no-op (default seguro).
         self._min_entry_cents = min_entry_cents
@@ -111,28 +118,74 @@ class Motor2Executor:
             if self._underdog_filter_enabled:
                 return Motor2ExecutionOutcome(False, False, reason="underdog_filter")
 
-        # Sizing deseado desde el ¼-Kelly del detector; el RiskManager es la autoridad
-        # final (cap por trade + exposición) y puede recortarlo.
+        # DEDUP CROSS-CICLO: si ya hay una posición viva (pending/filled) de Motor 2 en
+        # este evento (o ticker), NO se re-apuesta el mismo edge en el próximo ciclo.
+        # Una fila 'settled' (resuelta o cerrada por exit) libera el evento de nuevo.
+        if self._open_position_exists(signal):
+            logger.info(
+                f"motor2.exec.dedup_skip ticker={signal.market_ticker} "
+                f"event={signal.event_key or '(sin event_key → scope ticker)'} "
+                "(posición abierta previa en el evento — no se re-apuesta)"
+            )
+            return Motor2ExecutionOutcome(False, False, reason="already_open")
+
+        # Sizing deseado desde el detector; el RiskManager es la autoridad final (cap por
+        # trade + exposición) y puede recortarlo. FLOOR, no round (deuda auditoría
+        # 2026-07-01: round subía hasta medio contrato sobre el stake y max(1,...)
+        # forzaba 1 contrato aunque el stake fuera menor que el precio → hasta 1.5×
+        # el cap de sizing diseñado).
         if signal.recommended_size_usd <= 0:
             return Motor2ExecutionOutcome(False, False, reason="size recomendado 0")
-        desired = max(1, round(signal.recommended_size_usd * 100 / price))
+        desired = int(signal.recommended_size_usd * 100 // price)
+        if desired <= 0:
+            logger.info(
+                f"motor2.exec.stake_below_one_contract ticker={signal.market_ticker} "
+                f"stake=${signal.recommended_size_usd:.2f} < price={price}c (no se fuerza 1 contrato)"
+            )
+            return Motor2ExecutionOutcome(False, False, reason="stake_below_one_contract")
+
+        # RE-VALIDACIÓN PRE-PLACE (auditoría rentabilidad 2026-07-07, selección adversa):
+        # el ask de la señal se leyó al INICIO del ciclo (fetch serial de quotes + odds +
+        # detección = decenas de segundos antes) — un IOC limit a ese precio viejo SOLO
+        # llena si el mercado ya bajó, o sea: los fills se concentran exactamente cuando
+        # el fair también bajó (lineup/noticia). Se re-lee el book justo antes de reservar:
+        # ask actual > precio de la señal → señal STALE, abort limpio; y el count se capea
+        # al size visible (el edge se midió sobre un ask sin profundidad). FAIL-OPEN si la
+        # lectura falla (un hiccup no apaga el motor; el IOC limit sigue acotando el precio).
+        fresh_ask, fresh_size = await self._current_ask(signal.market_ticker, side)
+        if fresh_ask is not None and fresh_ask > price:
+            logger.info(
+                f"motor2.exec.stale_quote ticker={signal.market_ticker} side={side} "
+                f"señal={price}c ask_actual={fresh_ask}c (el precio se fue — no se persigue)"
+            )
+            return Motor2ExecutionOutcome(False, False, reason="stale_quote")
+        if fresh_size is not None and fresh_size < desired:
+            logger.info(
+                f"motor2.exec.depth_capped ticker={signal.market_ticker} side={side} "
+                f"desired={desired} → {fresh_size} (size visible al ask)"
+            )
+            desired = fresh_size
+            if desired <= 0:
+                return Motor2ExecutionOutcome(False, False, reason="no_depth_at_ask")
 
         opp = self._as_single_leg_opp(signal, side, price, desired)
-        decision = await self.risk.check_pre_trade(opp)
+        # A.1 — intent PRE-red, ahora BAJO EL MISMO LOCK que el check (deuda auditoría
+        # 2026-07-01: con la fila escrita después de soltar el lock, dos motores podían
+        # aprobarse contra la misma exposición leída). bet_id (uuid) como prefijo del
+        # coid; NO se marca 'arb_id=' en notes (direccional: el RiskManager lo cuenta
+        # ENTERO, sin descuento de hedge). Si el persist falla → ABORT sin colocar.
+        bet_id = str(uuid.uuid4())
+        coid = f"{bet_id}-{side}"
+        decision = await self.risk.check_and_reserve(
+            opp,
+            lambda d: self._persist_intent(signal, side, price, d.max_allowed_count, coid),
+        )
         if not decision.approved:
             logger.info(
                 f"motor2.exec.rejected ticker={signal.market_ticker} reason={decision.reason}"
             )
             return Motor2ExecutionOutcome(False, False, reason=decision.reason)
         count = decision.max_allowed_count
-
-        # A.1 — intent PRE-red. bet_id (uuid) como prefijo del coid; NO se marca como
-        # 'arb_id=' en notes (es direccional: el RiskManager debe contarlo ENTERO, sin
-        # descuento de hedge). Si el persist falla → ABORT sin colocar (fail-safe).
-        bet_id = str(uuid.uuid4())
-        coid = f"{bet_id}-{side}"
-        if not self._persist_intent(signal, side, price, count, coid):
-            return Motor2ExecutionOutcome(False, False, reason="persist_intent_failed")
 
         try:
             resp = await self.client.place_order(
@@ -182,7 +235,31 @@ class Motor2Executor:
 
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = str(order.get("order_id", "")) or None
-        fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+        # Coalesce por is-not-None (deuda auditoría 2026-07-01): fill_count PRESENTE con
+        # null enmascaraba el fallback fill_count_fp.
+        fill_raw = order.get("fill_count")
+        if fill_raw is None:
+            fill_raw = order.get("fill_count_fp")
+        fill_count = _as_int(fill_raw)
+        if fill_count is None:
+            # HTTP 200 con fill ILEGIBLE en ambos shapes: NO asumir no-fill (la orden pudo
+            # llenar — tratarla como 'cancelled' dejaba una posible posición viva INVISIBLE
+            # al RiskManager). La fila queda 'pending' (exposición conservadora, mismo
+            # trato que ERROR_RED); el settlement/reconcile la resuelve.
+            self._update_trade(coid, critical=False, notes_append="fill_unreadable")
+            logger.warning(
+                f"motor2.exec.fill_unreadable ticker={signal.market_ticker} coid={coid} "
+                f"keys={sorted(order.keys())} (200 OK con fill ilegible → fila pending)"
+            )
+            try:
+                from src.monitoring.health import BotState
+
+                BotState.record_error(f"motor2.exec fill_unreadable coid={coid}")
+            except Exception:  # pragma: no cover - visibilidad best-effort
+                pass
+            return Motor2ExecutionOutcome(
+                True, False, uncertain=True, reason="fill_unreadable", client_order_id=coid
+            )
 
         if fill_count > 0:
             # Posición real abierta. Precio: se usa el LÍMITE (la IOC marketable llena
@@ -246,6 +323,51 @@ class Motor2Executor:
             net_profit_cents=0,
             edge_pct=signal.edge_pct,
         )
+
+    async def _current_ask(self, ticker: str, side: str) -> tuple[int | None, int | None]:
+        """(ask actual, size disponible) para COMPRAR `side`, del book VIVO. El ask de
+        comprar yes es sintético contra el mejor bid de no (100 − no_bid) y viceversa
+        (convención del proyecto: el book de Kalshi lista bids por lado). (None, None)
+        si la lectura falla o el lado opuesto está vacío — FAIL-OPEN: el caller procede
+        (el IOC limit sigue acotando el precio; un book vacío = no-fill limpio)."""
+        try:
+            ob = await self.client.get_orderbook(ticker)
+        except Exception as exc:
+            logger.warning(f"motor2.exec.revalidation_error ticker={ticker}: {exc} (fail-open)")
+            return None, None
+        # rest_orderbook_sides: shape 2026-07-15 — sin él la revalidación devolvía
+        # (None, None) siempre (fail-open declarado, pero sin el techo del book vivo).
+        opposite = "no" if side == "yes" else "yes"
+        bid, size = _top_bid(rest_orderbook_sides(ob)[opposite])
+        if bid is None:
+            return None, None
+        return 100 - bid, size
+
+    def _open_position_exists(self, signal: ConsensusSignal) -> bool:
+        """True si hay un Trade vivo (pending/filled) de Motor 2 en el evento/ticker.
+
+        Scope EVENTO (default, `one_bet_per_event=True`): cualquier market del mismo
+        evento bloquea (los outcomes de un partido viven en tickers DISTINTOS pero son
+        el mismo riesgo direccional — ver _collapse_event_signals). Scope TICKER si el
+        flag está off o la señal no trae event_key. Fail-safe: un error de DB bloquea
+        la apuesta (mejor perder una señal que apilar exposición sin saberlo).
+        """
+        try:
+            with get_session() as s:
+                stmt = select(Trade).where(
+                    Trade.strategy == STRATEGY,
+                    col(Trade.status).in_(("pending", "filled")),
+                )
+                if self._one_bet_per_event and signal.event_key:
+                    stmt = stmt.where(col(Trade.ticker).like(f"{signal.event_key}-%"))
+                else:
+                    stmt = stmt.where(Trade.ticker == signal.market_ticker)
+                return s.exec(stmt.limit(1)).first() is not None
+        except Exception:
+            logger.exception(
+                f"motor2.exec.dedup_check_failed ticker={signal.market_ticker} → skip conservador"
+            )
+            return True
 
     def _persist_intent(
         self, signal: ConsensusSignal, side: str, price: int, count: int, coid: str

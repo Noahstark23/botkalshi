@@ -53,8 +53,8 @@ def client():
     return TestClient(app, raise_server_exceptions=True)
 
 
-def test_status_shows_v2_disabled_when_flag_false(client):
-    """USE_ORDERBOOK_MANAGER_V2=False → orderbook_manager_v2: {enabled: false}."""
+def test_status_shows_v2_disabled_when_flag_false_and_no_instance(client):
+    """Flag False Y sin instancia → orderbook_manager_v2: {enabled: false}."""
     session = mock_db_session()
     with (
         patch("src.monitoring.health.get_settings", return_value=mock_settings(v2_enabled=False)),
@@ -67,6 +67,38 @@ def test_status_shows_v2_disabled_when_flag_false(client):
     assert v2 == {"enabled": False}
 
 
+def test_status_reports_running_manager_even_with_flag_false(client):
+    """FIX observabilidad 2026-07-17: Motor 1 crea el manager SIN el flag. Con el flag off
+    pero la instancia presente, el status DEBE mostrar el estado real (books, recovery, sids
+    deshabilitados) — antes se escondía tras {enabled: false} y se volaba ciego sobre el
+    sid=1 muerto por timeout_x5."""
+    mock_mgr = MagicMock()
+    mock_mgr.stats.return_value = {
+        "initialized_tickers": 220,
+        "gaps_last_60s": 1,
+        "last_gap_at": "2026-07-17T21:42:20+00:00",
+        "recovery_retry_in_sec": {1: 25.0},  # backoff 2026-07-21: countdown del reintento
+    }
+    mock_mgr._tickers_by_sid = {1: set(range(223))}
+    mock_mgr._recovering = set()
+    mock_mgr._recovery_disabled_sids = {1}  # el sid muerto por request masiva
+    BotState.v2_manager = mock_mgr
+
+    session = mock_db_session()
+    with (
+        patch("src.monitoring.health.get_settings", return_value=mock_settings(v2_enabled=False)),
+        patch("src.monitoring.health.get_session", return_value=session),
+    ):
+        resp = client.get("/status")
+    assert resp.status_code == 200
+    v2 = resp.json()["orderbook_manager_v2"]
+    assert v2["enabled"] is False  # el flag sigue off (compat)
+    assert v2["running"] is True  # PERO el manager corre y ahora se ve
+    assert v2["books_initialized"] == 220
+    assert v2["sids_disabled"] == [1]  # el gap cerrado: el sid muerto es VISIBLE
+    assert v2["recovery_retry_in_sec"] == {"1": 25.0}  # y CUÁNDO reintenta (JSON: key str)
+
+
 def test_status_shows_v2_metrics_when_enabled(client):
     """USE_ORDERBOOK_MANAGER_V2=True + instance present → full metrics object."""
     mock_mgr = MagicMock()
@@ -77,6 +109,7 @@ def test_status_shows_v2_metrics_when_enabled(client):
     }
     mock_mgr._tickers_by_sid = {1: {"A", "B", "C"}}
     mock_mgr._recovering = set()
+    mock_mgr._recovery_disabled_sids = set()
 
     BotState.v2_manager = mock_mgr
 

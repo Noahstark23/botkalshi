@@ -11,8 +11,11 @@ Features:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
 
@@ -27,6 +30,47 @@ from tenacity import (
 
 from src.auth.signer import KalshiSigner
 from src.utils.config import get_settings
+
+
+class _WriteThrottle:
+    """
+    Token bucket para WRITES de órdenes (place/cancel/batch) — Motor 5 F2.
+
+    Kalshi limita ~20 writes/seg; el techo interno es 5/seg (25%) con burst = capacidad.
+    acquire(n) espera lo necesario (n>capacidad se degrada a esperar n/rate). Es
+    PREVENTIVO: el retry del 429 sigue existiendo como red reactiva aguas abajo.
+    time_fn/sleep_fn inyectables para tests determinísticos.
+    """
+
+    def __init__(
+        self,
+        rate_per_sec: float = 5.0,
+        burst: float = 5.0,
+        *,
+        time_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        self._rate = rate_per_sec
+        self._capacity = burst
+        self._tokens = burst
+        self._last: float | None = None
+        self._time = time_fn
+        self._sleep = sleep_fn or asyncio.sleep
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, n: int = 1) -> None:
+        async with self._lock:
+            now = self._time()
+            if self._last is not None:
+                self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens >= n:
+                self._tokens -= n
+                return
+            wait = (n - self._tokens) / self._rate
+            self._tokens = 0.0
+            await self._sleep(wait)
+            self._last = self._time()
 
 
 class KalshiAPIError(Exception):
@@ -116,6 +160,72 @@ def _extract_error_code(response_text: str) -> str | None:
     return None
 
 
+def build_order_body(
+    *,
+    ticker: str,
+    side: str,  # "yes" | "no"
+    action: str,  # "buy" | "sell"
+    count: int,
+    yes_price: int | None = None,
+    no_price: int | None = None,
+    client_order_id: str | None = None,
+    time_in_force: str = "gtc",
+    post_only: bool = False,
+) -> dict[str, Any]:
+    """
+    Traducción (side yes/no, action buy/sell, precio en ¢) → body del contrato V2.
+
+    Extraída de place_order (Motor 5 F2) para que el batch create use EXACTAMENTE la
+    misma semántica de mapeo — dos traducciones divergentes serían un bug de plata real.
+
+    Kalshi deprecó el endpoint legacy /portfolio/orders (410 deprecated_v1_order_endpoint).
+    V2 cotiza TODO desde el libro YES: `side` ∈ {bid = comprar YES, ask = vender YES},
+    un ÚNICO `price` en DÓLARES (string fixed-point, ej. "0.52"), SIN campos `action`
+    ni `type`. Mapeo con la identidad comprar-NO @ P¢ ≡ vender-YES @ (100−P)¢:
+      yes + buy  → bid,  precio = yes_price
+      yes + sell → ask,  precio = yes_price
+      no  + buy  → ask,  precio = 100 − no_price   (comprar NO = vender YES al complemento)
+      no  + sell → bid,  precio = 100 − no_price   (vender  NO = comprar YES al complemento)
+
+    post_only=True agrega el campo al body (solo cuando se pide: los callers existentes
+    no cambian ni un byte de su payload). Semántica a validar contra demo (plan §1.4).
+    """
+    if side == "yes":
+        if yes_price is None:
+            raise ValueError("build_order_body: side='yes' requiere yes_price")
+        price_cents = yes_price
+        book_side = "bid" if action == "buy" else "ask"
+    elif side == "no":
+        if no_price is None:
+            raise ValueError("build_order_body: side='no' requiere no_price")
+        price_cents = 100 - no_price
+        book_side = "ask" if action == "buy" else "bid"
+    else:
+        raise ValueError(f"build_order_body: side inválido {side!r} (esperado 'yes'|'no')")
+    if not (1 <= price_cents <= 99):
+        raise ValueError(f"build_order_body: precio fuera de rango [1,99]: {price_cents}c")
+
+    # V2 solo acepta los TIF completos; normalizar el atajo histórico 'gtc'. order_type
+    # ('limit'/'market') NO existe en V2: la inmediatez la da el time_in_force (FOK/IOC).
+    tif = "good_till_canceled" if time_in_force == "gtc" else time_in_force
+    # FixedPointDollars: dólares como string (Decimal exacto, NUNCA float), 2 decimales
+    # (el precio es en ¢ enteros → exacto). 52¢ → "0.52", 40¢ → "0.40".
+    body: dict[str, Any] = {
+        "ticker": ticker,
+        # client_order_id es REQUERIDO en V2 (idempotencia); los callers siempre lo pasan.
+        "client_order_id": client_order_id or str(uuid.uuid4()),
+        "side": book_side,
+        "count": str(count),  # FixedPointCount: acepta "10"
+        "price": f"{Decimal(price_cents) / 100:.2f}",
+        "time_in_force": tif,
+        # Cancela la pata taker si se auto-cruzaría (lo ya matcheado igual ejecuta).
+        "self_trade_prevention_type": "taker_at_cross",
+    }
+    if post_only:
+        body["post_only"] = True
+    return body
+
+
 class KalshiRestClient:
     """
     Cliente REST asíncrono para Kalshi.
@@ -133,6 +243,10 @@ class KalshiRestClient:
         )
         self.base_url = self.settings.rest_url
         self._client: httpx.AsyncClient | None = None
+        # Throttle preventivo de WRITES (Motor 5 F2): hoy solo hay retry REACTIVO al 429;
+        # un MM que cotiza N tickers por tick puede rafaguear writes. Techo interno ~25%
+        # del límite de Kalshi (20 writes/s) = 5/s. Los READS no se limitan.
+        self._write_throttle = _WriteThrottle()
 
     async def __aenter__(self) -> KalshiRestClient:
         self._client = httpx.AsyncClient(
@@ -239,6 +353,16 @@ class KalshiRestClient:
         """Balance de la cuenta. Retorna `{'balance': cents}`."""
         return await self._request("GET", "/portfolio/balance")
 
+    async def get_available_balance_usd(self) -> float:
+        """Cash disponible en USD (Bug 1, incidente 2026-07-07: pre-check antes de colocar
+        patas de arb — el balance REAL de Kalshi es lo único que decide si acepta la orden).
+        Lanza ValueError si la respuesta no trae 'balance' (el caller decide fail-open)."""
+        data = await self.get_balance()
+        cents = data.get("balance") if isinstance(data, dict) else None
+        if cents is None:
+            raise ValueError(f"get_balance sin campo 'balance': {data!r}")
+        return float(cents) / 100.0
+
     async def get_positions(self, *, limit: int = 100, cursor: str | None = None) -> dict:
         """Posiciones abiertas, paginadas."""
         params: dict[str, Any] = {"limit": limit}
@@ -343,9 +467,15 @@ class KalshiRestClient:
         no_price: int | None = None,
         client_order_id: str | None = None,
         time_in_force: str = "gtc",
+        post_only: bool = False,
     ) -> dict:
         """
         Coloca una orden vía el endpoint V2 (POST /portfolio/events/orders).
+
+        post_only (Motor 5 F2): la orden solo entra si NO cruza el spread (maker puro);
+        si cruzaría, la API la rechaza en vez de ejecutarla como taker. ⚠️ Semántica a
+        VALIDAR contra demo (plan motor_5 §1.4 residual) — si la API no soporta el campo,
+        el fallback documentado es el chequeo pre-envío del book (el quoter ya lo emula).
 
         La firma sigue siendo (side yes/no, action buy/sell, yes_price/no_price en ¢):
         internamente se traduce al contrato V2 (side bid/ask, price único en dólares). Ver
@@ -383,60 +513,70 @@ class KalshiRestClient:
                 f"(action={action} ticker={ticker} count={count})"
             )
 
-        # ── Traducción al contrato V2 (POST /portfolio/events/orders) ──────────────
-        # Kalshi deprecó el endpoint legacy /portfolio/orders (410 deprecated_v1_order_endpoint).
-        # V2 cotiza TODO desde el libro YES: `side` ∈ {bid = comprar YES, ask = vender YES},
-        # un ÚNICO `price` en DÓLARES (string fixed-point, ej. "0.52"), SIN campos `action`
-        # ni `type`. El bot razona en (side yes/no, action buy/sell, precio en ¢ del lado);
-        # se mapea con la identidad comprar-NO @ P¢ ≡ vender-YES @ (100−P)¢:
-        #   yes + buy  → bid,  precio = yes_price
-        #   yes + sell → ask,  precio = yes_price
-        #   no  + buy  → ask,  precio = 100 − no_price   (comprar NO = vender YES al complemento)
-        #   no  + sell → bid,  precio = 100 − no_price   (vender  NO = comprar YES al complemento)
-        if side == "yes":
-            if yes_price is None:
-                raise ValueError("place_order: side='yes' requiere yes_price")
-            price_cents = yes_price
-            book_side = "bid" if action == "buy" else "ask"
-        elif side == "no":
-            if no_price is None:
-                raise ValueError("place_order: side='no' requiere no_price")
-            price_cents = 100 - no_price
-            book_side = "ask" if action == "buy" else "bid"
-        else:
-            raise ValueError(f"place_order: side inválido {side!r} (esperado 'yes'|'no')")
-        if not (1 <= price_cents <= 99):
-            raise ValueError(f"place_order: precio fuera de rango [1,99]: {price_cents}c")
-
-        # V2 solo acepta los TIF completos; normalizar el atajo histórico 'gtc'. order_type
-        # ('limit'/'market') NO existe en V2: la inmediatez la da el time_in_force (FOK/IOC).
-        tif = "good_till_canceled" if time_in_force == "gtc" else time_in_force
-        # FixedPointDollars: dólares como string (Decimal exacto, NUNCA float), 2 decimales
-        # (el precio es en ¢ enteros → exacto). 52¢ → "0.52", 40¢ → "0.40".
-        price_dollars = f"{Decimal(price_cents) / 100:.2f}"
-
-        body: dict[str, Any] = {
-            "ticker": ticker,
-            # client_order_id es REQUERIDO en V2 (idempotencia); los callers siempre lo pasan.
-            "client_order_id": client_order_id or str(uuid.uuid4()),
-            "side": book_side,
-            "count": str(count),  # FixedPointCount: acepta "10"
-            "price": price_dollars,
-            "time_in_force": tif,
-            # Cancela la pata taker si se auto-cruzaría (lo ya matcheado igual ejecuta).
-            "self_trade_prevention_type": "taker_at_cross",
-        }
-
-        logger.info(
-            f"Placing order (V2): {action} {count} {side} {ticker} @ {price_cents}c "
-            f"→ side={book_side} price=${price_dollars} tif={tif}"
+        body = build_order_body(
+            ticker=ticker,
+            side=side,
+            action=action,
+            count=count,
+            yes_price=yes_price,
+            no_price=no_price,
+            client_order_id=client_order_id,
+            time_in_force=time_in_force,
+            post_only=post_only,
         )
+        logger.info(
+            f"Placing order (V2): {action} {count} {side} {ticker} "
+            f"→ side={body['side']} price=${body['price']} tif={body['time_in_force']}"
+            f"{' post_only' if post_only else ''}"
+        )
+        await self._write_throttle.acquire()
         return await self._request("POST", "/portfolio/events/orders", json=body)
 
     async def cancel_order(self, order_id: str) -> dict:
         """Cancela una orden por ID."""
         logger.info(f"Cancelling order: {order_id}")
+        await self._write_throttle.acquire()
         return await self._request("DELETE", f"/portfolio/orders/{order_id}")
+
+    async def batch_create_orders(self, orders: list[dict]) -> dict:
+        """
+        Crea órdenes en batch (POST /portfolio/orders/batched) — Motor 5 F2.
+
+        `orders` = bodies V2 construidos con build_order_body (misma traducción que
+        place_order, una sola fuente de verdad). ⚠️ Semántica del endpoint a VALIDAR
+        contra demo con respuestas crudas (plan §4 gate: matriz de validación API) —
+        por eso se loguea el response completo (truncado).
+
+        GUARD (más estricto que la Capa C de place_order): con TRADING_ENABLED=false
+        se bloquea TODO el batch, incluidos asks. Un ask del MM NO es un sell protector:
+        vender YES sin posición ABRE una posición NO (identidad V2) — es una ENTRADA.
+        Ningún flujo de rollback usa batch, así que no hay sell legítimo que frenar.
+        """
+        if not self.settings.TRADING_ENABLED:
+            raise TradingDisabledError(
+                f"batch_create_orders bloqueado: TRADING_ENABLED=false (n={len(orders)})"
+            )
+        if not orders:
+            return {"orders": []}
+        await self._write_throttle.acquire(len(orders))
+        resp = await self._request("POST", "/portfolio/orders/batched", json={"orders": orders})
+        logger.info(f"batch_create_orders n={len(orders)} → {str(resp)[:400]}")
+        return resp
+
+    async def batch_cancel_orders(self, order_ids: list[str]) -> dict:
+        """
+        Cancela órdenes en batch (DELETE /portfolio/orders/batched) — Motor 5 F2.
+
+        Cancelar es SIEMPRE protector (reduce exposición pendiente) → sin gate de
+        trading. Es la pieza del cancel-all <5s del kill-switch del MM. ⚠️ Semántica a
+        validar contra demo (response crudo logueado).
+        """
+        if not order_ids:
+            return {"ids": []}
+        await self._write_throttle.acquire(len(order_ids))
+        resp = await self._request("DELETE", "/portfolio/orders/batched", json={"ids": order_ids})
+        logger.info(f"batch_cancel_orders n={len(order_ids)} → {str(resp)[:400]}")
+        return resp
 
     async def get_orders(
         self,

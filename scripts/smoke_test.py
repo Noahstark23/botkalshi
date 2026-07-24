@@ -13,6 +13,7 @@ Verifica:
 
 Si todo pasa, el bot está listo para arrancar en modo producción.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -73,10 +74,7 @@ async def run_smoke_test() -> int:
             markets = markets_resp.get("markets", [])
             logger.success(f"✓ {len(markets)} markets sample disponibles")
             for m in markets[:3]:
-                logger.info(
-                    f"  - {m.get('ticker')}: "
-                    f"YES {m.get('yes_bid')}/{m.get('yes_ask')}"
-                )
+                logger.info(f"  - {m.get('ticker')}: YES {m.get('yes_bid')}/{m.get('yes_ask')}")
 
     except Exception:
         logger.exception("✗ Kalshi API falló")

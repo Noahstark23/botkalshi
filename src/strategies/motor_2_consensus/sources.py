@@ -56,15 +56,20 @@ class FakeOddsSource:
 
     is_live = False
 
-    def __init__(self, events: list[OddsEvent]):
+    def __init__(self, events: list[OddsEvent] | Callable[[], list[OddsEvent]]):
+        # Callable (deuda auditoría 2026-07-01): con una lista congelada al boot, el
+        # commence_time del fixture (now+1d) quedaba en el pasado tras >24h de uptime y
+        # el gate pre-match apagaba el cable de humo en silencio. Una factory regenera
+        # los eventos (con fechas frescas) en CADA fetch.
         self._events = events
 
     async def fetch(self) -> list[OddsEvent]:
+        events = self._events() if callable(self._events) else list(self._events)
         logger.warning(
-            f"motor2.odds FAKE source — {len(self._events)} eventos fixture "
+            f"motor2.odds FAKE source — {len(events)} eventos fixture "
             "(edges NO reales; cambiar a LiveOddsSource al pagar la API)"
         )
-        return list(self._events)
+        return events
 
 
 class LiveOddsSource:
@@ -129,12 +134,25 @@ def _parse_event_quotes(event_key: str, markets: list[dict]) -> KalshiEventQuote
     for m in markets:
         ticker = m.get("ticker")
         status = str(m.get("status", "")).lower()
-        if status and status not in ("open", "active"):
-            continue  # mercado resuelto/cerrado → quotes no confiables
+        if status not in ("open", "active"):
+            # FAIL-CLOSED (deuda auditoría 2026-07-01): antes un market SIN status pasaba
+            # el filtro ("if status and ...") — un shape-drift de la API colaba quotes de
+            # mercados resueltos (colapsados a ~1/99c) como si estuvieran abiertos. El
+            # docstring promete "solo se confía en open/active": ausente → no confiable.
+            continue  # resuelto/cerrado/desconocido → quotes no confiables
         name = m.get("yes_sub_title") or m.get("yes_subtitle") or ""
         yes_ask = parse_price_to_cents(m.get("yes_ask_dollars") or m.get("yes_ask"))
         no_ask = parse_price_to_cents(m.get("no_ask_dollars") or m.get("no_ask"))
-        if ticker and name and yes_ask and no_ask:
+        # Rango operable 1..99: Kalshi reporta ask=100 cuando el lado ask del book está VACÍO
+        # (no hay a quién comprarle → jamás puede emitir señal). El truthiness previo lo dejaba
+        # pasar y _net_edge_pct lo colapsaba a -1.0, INDISTINGUIBLE del sentinel "nada evaluado"
+        # del funnel (auditoría 2026-07-03: única causa posible de matched>0 + best_edge=-100pp).
+        # Filtrarlo acá mantiene limpio el discriminador del funnel; si el evento queda con <2
+        # outcomes operables se descarta entero (mismo fail-safe de siempre).
+        ok_asks = (
+            yes_ask is not None and 1 <= yes_ask <= 99 and no_ask is not None and 1 <= no_ask <= 99
+        )
+        if ticker and name and ok_asks:
             quotes.append(
                 KalshiQuote(
                     market_ticker=ticker,

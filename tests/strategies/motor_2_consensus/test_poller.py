@@ -9,6 +9,7 @@ ejecuta capital; el loop respeta stop_event.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlmodel import select
@@ -16,9 +17,21 @@ from sqlmodel import select
 import src.storage.models as models
 from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 from src.strategies.motor_2_consensus.detector import KalshiEventQuotes, KalshiQuote
+from src.strategies.motor_2_consensus.matcher import start_time_et
 from src.strategies.motor_2_consensus.poller import Motor2ShadowPoller
 
-EV = "KXWCGAME-26JUN27JORARG"
+# El matching ahora exige que la fecha del event_key coincida con el commence_time (en ET);
+# el datestamp se deriva del commence del test para que la coherencia se mantenga sola.
+_KEY_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
+def _key_datestamp(dt) -> str:
+    et = start_time_et(dt)
+    return f"{et.year % 100:02d}{_KEY_MONTHS[et.month - 1]}{et.day:02d}"
+
+
+_COMMENCE = datetime.now(UTC) + timedelta(hours=2)
+EV = f"KXWCGAME-{_key_datestamp(_COMMENCE)}JORARG"
 
 
 class _FakeKalshiSource:
@@ -83,7 +96,10 @@ async def test_poll_once_emits_signals_for_matched_event():
         capital_usd=300.0,
     )
     signals = await poller.poll_once()
-    assert any(s.market_ticker == f"{EV}-ARG" and s.kalshi_side == "YES" for s in signals)
+    # Con one_per_event (default), el evento colapsa a UNA sola apuesta direccional (la de
+    # mayor edge neto) — antes emitía una por cada outcome/lado con edge.
+    assert len(signals) == 1
+    assert signals[0].market_ticker.startswith(EV)
 
 
 @pytest.mark.asyncio
@@ -298,3 +314,45 @@ async def test_run_loop_stops_on_event():
 
     await asyncio.gather(poller.run(stop), _stop_soon())
     assert stop.is_set()
+
+
+@pytest.mark.asyncio
+async def test_execute_cycle_counts_outcomes_by_reason():
+    """Fix observabilidad 2026-07-02: los desenlaces del ciclo de ejecución (dedup,
+    stake bajo, rechazos, fills) salen agregados — 'el bot no apostó hoy' se diagnostica
+    en UNA línea, no grepeando señal por señal."""
+    from src.strategies.motor_2_consensus.detector import ConsensusSignal
+
+    class _Outcome:
+        def __init__(self, filled, reason=""):
+            self.filled = filled
+            self.reason = reason
+            self.filled_count = 5 if filled else 0
+
+    outcomes = iter(
+        [_Outcome(True), _Outcome(False, "already_open"), _Outcome(False, "already_open")]
+    )
+
+    class _Exec:
+        async def execute(self, sig):
+            return next(outcomes)
+
+    poller = Motor2ShadowPoller(
+        _FakeKalshiSource([]),
+        _StubOdds([], is_live=True),
+        capital_usd=300.0,
+        executor=_Exec(),
+    )
+    sigs = [
+        ConsensusSignal(
+            market_ticker=f"T-{i}",
+            kalshi_side="YES",
+            odds_api_fair_prob=0.6,
+            kalshi_price_cents=50,
+            edge_pct=0.05 - i * 0.001,
+            recommended_size_usd=5.0,
+        )
+        for i in range(3)
+    ]
+    counts = await poller._execute(sigs)
+    assert counts == {"filled": 1, "already_open": 2}

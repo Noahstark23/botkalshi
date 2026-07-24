@@ -188,21 +188,33 @@ async def status() -> dict[str, Any]:
             ).all()
         )
 
-    # V2 manager metrics
+    # V2 manager metrics. OJO (fix observabilidad 2026-07-17): el estado se reporta si la
+    # INSTANCIA existe, NO si el flag USE_ORDERBOOK_MANAGER_V2 está on — porque Motor 1 crea
+    # el manager sin el flag (data_capture: OR con MOTOR_1_ARBITRAGE_ENABLED). Antes, con el
+    # flag off el status decía solo {"enabled": false} y ESCONDÍA books/recovery/sids
+    # deshabilitados aunque el manager estuviera corriendo y sufriendo timeouts de recovery
+    # → se volaba ciego sobre V2 (incidente sid=1 stale por request masiva).
     v2_enabled = settings.USE_ORDERBOOK_MANAGER_V2
     v2_mgr = BotState.v2_manager
-    if not v2_enabled:
-        v2_info: dict[str, Any] = {"enabled": False}
-    elif v2_mgr is None:
-        BotState.record_error("v2 flag enabled but instance missing")
-        v2_info = {"enabled": True, "instance": "missing"}
+    if v2_mgr is None:
+        # Sin instancia: reportar el flag. Con el flag ON pero sin instancia = bug real.
+        v2_info: dict[str, Any] = {"enabled": v2_enabled}
+        if v2_enabled:
+            BotState.record_error("v2 flag enabled but instance missing")
+            v2_info["instance"] = "missing"
     else:
         s = v2_mgr.stats()
         v2_info = {
-            "enabled": True,
+            "enabled": v2_enabled,  # el flag (compat) — puede ser False con el manager corriendo
+            "running": True,  # la instancia EXISTE y procesa books (aunque el flag esté off)
             "books_initialized": s.get("initialized_tickers", 0),
             "sids_tracked": len(v2_mgr._tickers_by_sid),
             "sids_recovering": len(v2_mgr._recovering),
+            # sids en circuit breaker (recovery deshabilitada → books STALE hasta que venza el
+            # backoff de reintento, 2026-07-21; antes era hasta el redeploy): el dato que faltaba
+            # para ver el sid=1 muerto por timeout_x5. retry_in = countdown del próximo reintento.
+            "sids_disabled": sorted(v2_mgr._recovery_disabled_sids),
+            "recovery_retry_in_sec": s.get("recovery_retry_in_sec", {}),
             "gaps_last_60s": s.get("gaps_last_60s", 0),
             "last_gap_at": s.get("last_gap_at"),
         }
@@ -237,7 +249,11 @@ async def status() -> dict[str, Any]:
             "motors_enabled": {
                 "motor_1_arbitrage": settings.MOTOR_1_ARBITRAGE_ENABLED,
                 "motor_2_sportsbook": settings.MOTOR_2_SPORTSBOOK_ENABLED,
+                "motor_2_execution": settings.MOTOR_2_EXECUTION_ENABLED,
                 "motor_3_clv": settings.MOTOR_3_CLV_ENABLED,
+                "motor_3_execution": settings.MOTOR_3_EXECUTION_ENABLED,
+                "motor_5_mm": settings.MOTOR_MM_ENABLED,
+                "motor_5_execution": settings.MOTOR_MM_EXECUTION_ENABLED,
             },
         },
         "capital": RiskManager.capital_status(),
@@ -305,7 +321,33 @@ async def pause_bot(reason: str = Query(..., min_length=1, max_length=200)) -> d
 
 @app.post("/admin/resume")
 async def resume_bot() -> dict[str, str]:
-    """Reanuda trading después de pausa manual."""
+    """Reanuda trading después de pausa manual.
+
+    Auditoría 2026-07-07 (P1): si el kill-switch PERSISTENTE está engaged (stop-loss o
+    rollback abortado), este endpoint NO puede levantarlo — un curl saltearía la
+    verificación de posiciones=0 de scripts/clear_kill_switch.py y además la pausa
+    volvería sola en el próximo redeploy (_rehydrate_kill_switch), dejando el bot en un
+    estado a medias. FAIL-CLOSED: si la DB no se puede leer, tampoco se resume.
+    """
+    from src.storage.models import kill_switch_engaged
+
+    try:
+        engaged, ks_reason = kill_switch_engaged()
+    except Exception as exc:
+        logger.error(f"/admin/resume: no se pudo leer el kill-switch: {exc} (fail-closed)")
+        raise HTTPException(
+            status_code=503, detail="No se pudo verificar el kill-switch — resume denegado"
+        ) from exc
+    if engaged:
+        logger.warning(f"/admin/resume RECHAZADO: kill-switch persistente engaged ({ks_reason})")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Kill-switch persistente engaged: {ks_reason}. "
+                "Levantarlo SOLO con scripts/clear_kill_switch.py (verifica posiciones=0)."
+            ),
+        )
+
     if not BotState.is_paused:
         return {"status": "already_running"}
 

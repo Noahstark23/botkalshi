@@ -11,7 +11,7 @@ conocido-bueno: list_events(series_ticker=X) + get_event por evento. La firma DE
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -33,8 +33,16 @@ def _events_resp(prefix: str, n_events: int = 1) -> dict:
     return {"events": [{"event_ticker": f"{prefix}-E{i}"} for i in range(n_events)]}
 
 
-def _event_detail(event_ticker: str, n_markets: int = 2, status: str = "active") -> dict:
-    markets = [{"ticker": f"{event_ticker}-T{i}", "status": status} for i in range(n_markets)]
+def _event_detail(
+    event_ticker: str,
+    n_markets: int = 2,
+    status: str = "active",
+    open_time: str | None = None,
+) -> dict:
+    markets = [
+        {"ticker": f"{event_ticker}-T{i}", "status": status, "open_time": open_time}
+        for i in range(n_markets)
+    ]
     return {"event": {"event_ticker": event_ticker}, "markets": markets}
 
 
@@ -115,6 +123,50 @@ async def test_discovery_skips_closed_markets(service):
     ):
         new = await service._discover_markets()
     assert new == set()
+
+
+# ── Metadata para la purga de recovery de V2 (incidente 2026-07-21) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_discovery_collects_metadata_and_feeds_v2_manager(service):
+    """open_time + status llegan al v2_manager vía set_market_metadata (además del
+    set_close_times legado): el insumo de la purga de futuros sin abrir."""
+    service._v2_manager = MagicMock()
+    client = _client(
+        [_events_resp("KXMLB")],
+        _event_detail("KXMLB-E0", 1, status="active", open_time="2099-01-01T00:00:00Z"),
+    )
+    with (
+        patch("src.strategies.data_capture.KalshiRestClient", return_value=client),
+        patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB"]),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
+        await service._discover_markets()
+
+    assert service._market_meta["KXMLB-E0-T0"] == {
+        "open_time": "2099-01-01T00:00:00Z",
+        "status": "active",
+    }
+    service._v2_manager.set_market_metadata.assert_called_once_with(service._market_meta)
+    service._v2_manager.set_close_times.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_updates_metadata_of_transitioned_tracked_ticker(service):
+    """Un ticker YA trackeado que transicionó fuera de active/open actualiza su metadata
+    (antes se salteaba y el status quedaba rancio en 'active' → la recovery jamás lo purgaba)."""
+    service._tracked_tickers = {"KXNBA-E0-T0"}
+    client = _client([_events_resp("KXNBA")], _event_detail("KXNBA-E0", 1, status="settled"))
+    with (
+        patch("src.strategies.data_capture.KalshiRestClient", return_value=client),
+        patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXNBA"]),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
+        new = await service._discover_markets()
+
+    assert new == set()  # no se trackea nada nuevo
+    assert service._market_meta["KXNBA-E0-T0"]["status"] == "settled"  # pero la meta se refresca
 
 
 # ── Re-discovery (#41, se conserva: independiente del método interno) ─────────────

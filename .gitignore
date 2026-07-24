@@ -113,6 +113,9 @@ docker-compose.override.yml
 # =====================================================
 # Claude Code (worktrees efímeros de agentes, estado local)
 # =====================================================
-# Config de Claude Code: settings/hooks/agents compartidos SÍ se versionan
-# (los necesita Claude Code web al clonar); solo lo local queda fuera.
-.claude/settings.local.json
+# OJO: `.claude/` entero ignoraba TAMBIÉN las skills — 8 skills de motores creadas en
+# jul-2026 nunca llegaron al repo (vivían solo en el workspace del agente) y el operador
+# no las veía en GitHub. Las skills SON parte del proyecto (protocolo + una por motor);
+# el resto de .claude/ (estado local, settings) sigue ignorado.
+.claude/*
+!.claude/skills/

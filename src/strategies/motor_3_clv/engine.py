@@ -18,9 +18,11 @@ from loguru import logger
 from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiRestClient
+from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
+from src.risk.manager import RiskManager
 from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
-from src.strategies.data_capture import _top_bid
+from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.detector import detect_and_log, summarize_exits
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.poller import PortfolioPoller
@@ -33,7 +35,11 @@ from src.strategies.motor_3_clv.trailing_stop import (
 
 # Estrategias de las patas BUY que un exit cierra (= _settle_originals). El entry del trailing
 # se deriva del primer BUY filled de estas (FIFO).
-_ENTRY_ORIGIN = ("motor_2_consensus", "motor_rest_arb")
+# ⚠️ motor_rest_arb EXCLUIDO (fix auditoría 2026-07-01): una posición respaldada por una leg
+# de arb hedged NUNCA se liquida suelta — vender la leg ganadora (TP a bid≥90 o salida T-30)
+# rompe el hedge y convierte profit lockeado en pérdida realizada. Esas posiciones las
+# resuelve el SettlementPoller del Motor REST por resolución de mercado.
+_ENTRY_ORIGIN = ("motor_2_consensus",)
 
 
 class Motor3Engine:
@@ -49,6 +55,8 @@ class Motor3Engine:
         tp_threshold: int = DEFAULT_TAKE_PROFIT_CENTS,
         trailing_enabled: bool = False,
         trailing_drop: int = DEFAULT_TRAILING_DROP_CENTS,
+        manages_orphans: bool = False,
+        min_sell_bid_cents: int = 0,
     ) -> None:
         self._poller = PortfolioPoller()
         self._trading_enabled = trading_enabled
@@ -56,6 +64,14 @@ class Motor3Engine:
         self._tp_threshold = tp_threshold
         self._trailing_enabled = trailing_enabled
         self._trailing_drop = trailing_drop
+        # Bug 4 (incidente 2026-07-07): gestionar también las HUÉRFANAS de Motor 1 (arb sin
+        # pata hermana). El count gestionado se CAPEA al total huérfano — el resto de la
+        # posición (pares hedged) jamás se vende. Default off.
+        self._manages_orphans = manages_orphans
+        self._min_sell_bid_cents = min_sell_bid_cents
+        # (ticker, side) → (count huérfano, entry FIFO) — se refresca por tick en
+        # _attributable_positions y alimenta el cap + _entry_bid_for.
+        self._orphan_by_pair: dict[tuple[str, str], tuple[int, int]] = {}
         self._executor: Motor3ExitExecutor | None = None
         self._client: KalshiRestClient | None = None
 
@@ -71,7 +87,12 @@ class Motor3Engine:
         async with KalshiRestClient() as client:
             self._client = client
             if self._trading_enabled:
-                self._executor = Motor3ExitExecutor(client)
+                self._executor = Motor3ExitExecutor(
+                    client,
+                    entry_origin=_ENTRY_ORIGIN,
+                    include_motor1_orphans=self._manages_orphans,
+                    min_sell_bid_cents=self._min_sell_bid_cents,
+                )
             await self._loop(stop_event)
 
     async def _loop(self, stop_event: asyncio.Event) -> None:
@@ -86,10 +107,25 @@ class Motor3Engine:
 
     async def _tick(self) -> None:
         """Un ciclo: refresca cartera, detecta salidas (tiempo + take-profit), y liquida."""
-        await self._poller.sync_once()
+        try:
+            await self._poller.sync_once()
+        except Exception as exc:
+            # Deuda auditoría 2026-07-01: el aislamiento "un fallo se registra y el loop
+            # sigue" vivía en poller.run(), que producción NO usa. Un outage de la API en
+            # la ventana T-30 abortaba el tick entero y costaba la salida. El tick sigue
+            # con el cache de PortfolioPosition en DB (stale de <=60s, decidible igual).
+            logger.warning(
+                f"motor3.engine.sync_failed {type(exc).__name__}: {exc} → tick con cache"
+            )
+            BotState.record_error(f"motor3.poller: {type(exc).__name__}: {exc}")
         now = _naive_utc_now()
         with get_session() as s:
             positions = list(s.exec(select(PortfolioPosition)))
+        # ATRIBUCIÓN (fix auditoría 2026-07-01): PortfolioPosition es la posición NETA de la
+        # CUENTA — no distingue qué motor la abrió. Motor 3 solo gestiona posiciones
+        # respaldadas por BUYs abiertos de _ENTRY_ORIGIN; una leg de arb REST o una posición
+        # manual del dueño NO se toca (ni siquiera en shadow logs — no son salidas nuestras).
+        positions = self._attributable_positions(positions)
         # DIAG: por qué dispara (o no) este tick — evita el silencio total cuando nada es debido.
         logger.info(f"[MOTOR 3 DIAG] {summarize_exits(positions, now).one_line()}")
         due = detect_and_log(positions, now)  # SHADOW: siempre loguea las salidas por tiempo
@@ -102,10 +138,14 @@ class Motor3Engine:
         if self._take_profit_enabled:
             for p in positions:
                 bid = await self._current_bid(p, bid_cache)
-                if take_profit_due(p, bid, self._tp_threshold):
+                # El entry se resuelve ANTES del check: el TP solo asegura ganancia neta
+                # sobre el entry (nunca liquida en pérdida una entrada cara).
+                entry = self._entry_bid_for(p)
+                if take_profit_due(p, bid, self._tp_threshold, entry_cents=entry):
                     logger.info(
                         f"[MOTOR 3 TP SHADOW] take_profit {p.ticker} {p.count}c "
-                        f"side={p.side} bid={bid}c >= {self._tp_threshold}c"
+                        f"side={p.side} bid={bid}c >= {self._tp_threshold}c "
+                        f"{self._shadow_pnl_str(p, bid, entry)}"
                     )
                     exits.setdefault(p.ticker, p)
 
@@ -127,7 +167,7 @@ class Motor3Engine:
                     logger.info(
                         f"[MOTOR 3 TRAIL SHADOW] {p.ticker} {p.count}c side={p.side} "
                         f"peak={peak}c bid={bid}c entry={entry}c drop={self._trailing_drop}c "
-                        f"-> cerraría"
+                        f"-> cerraría {self._shadow_pnl_str(p, bid, entry)}"
                     )
                     exits.setdefault(p.ticker, p)
 
@@ -135,29 +175,135 @@ class Motor3Engine:
             for position in exits.values():
                 await self._executor.exit_position(position)
 
-    def _entry_bid_for(self, position: PortfolioPosition) -> int | None:
-        """Entry del lado abierto = primer BUY filled (FIFO por placed_at), igual criterio que
-        _settle_originals. None si no hay pata BUY (→ el trailing no se arma; fail-safe). Best-
-        effort: un fallo de DB loguea y devuelve None (no rompe el tick — Lección 7)."""
+    def _attributable_positions(
+        self, positions: list[PortfolioPosition]
+    ) -> list[PortfolioPosition]:
+        """Filtra a las posiciones que Motor 3 tiene derecho a gestionar.
+
+        Reglas (fix auditoría 2026-07-01 — PortfolioPosition es la posición NETA de la
+        cuenta, sin atribución de origen):
+          - Ticker con CUALQUIER pata abierta de motor_rest_arb (cualquier side) → SKIP:
+            es (parte de) un arb hedged; venderla suelta rompe el hedge.
+          - (ticker, side) sin ningún BUY filled abierto de _ENTRY_ORIGIN → SKIP: posición
+            manual del dueño o de origen desconocido — Motor 3 no la abrió, no la vende.
+        Fail-safe: error de DB → lista vacía (ante la duda, este tick no gestiona nada).
+        """
+        if not positions:
+            return positions
         try:
             with get_session() as s:
-                buy = s.exec(
-                    select(Trade)
-                    .where(
-                        Trade.ticker == position.ticker,
-                        Trade.side == position.side,
-                        Trade.action == "buy",
-                        Trade.status == "filled",
-                        col(Trade.strategy).in_(_ENTRY_ORIGIN),
+                open_buys = list(
+                    s.exec(
+                        select(Trade).where(
+                            Trade.action == "buy",
+                            Trade.status == "filled",
+                            col(Trade.closed_by_clv).is_(False),
+                        )
                     )
-                    .order_by(col(Trade.placed_at))
-                ).first()
+                )
+        except Exception as exc:
+            logger.warning(f"motor3.attribution.load_error: {exc} → tick sin posiciones")
+            return []
+        rest_tickers = {b.ticker for b in open_buys if b.strategy == "motor_rest_arb"}
+        attributable = {
+            (b.ticker, b.side) for b in open_buys if b.strategy in _ENTRY_ORIGIN and b.count > 0
+        }
+        # Bug 4: pares (ticker, side) con HUÉRFANAS de Motor 1 → gestionables, pero con el
+        # count CAPEADO al total huérfano (la posición neta puede incluir pares hedged que
+        # jamás se venden — 433 = 412 hedged + 21 huérfanos en el incidente).
+        self._orphan_by_pair = {}
+        if self._manages_orphans:
+            from src.strategies.motor_3_clv.orphans import motor1_orphan_buys
+
+            for b in sorted(motor1_orphan_buys(open_buys), key=lambda t: t.placed_at):
+                key = (b.ticker, b.side)
+                count, entry = self._orphan_by_pair.get(
+                    key, (0, b.fill_price_cents or b.price_cents)
+                )
+                self._orphan_by_pair[key] = (count + b.count, entry)  # entry = FIFO (el 1ro)
+        kept: list[PortfolioPosition] = []
+        skipped_rest, skipped_foreign, orphan_capped = 0, 0, 0
+        for p in positions:
+            if p.ticker in rest_tickers:
+                skipped_rest += 1
+                continue
+            if (p.ticker, p.side) in attributable:
+                kept.append(p)
+                continue
+            orphan = self._orphan_by_pair.get((p.ticker, p.side))
+            if orphan is not None:
+                # Copia NO persistida con el count capeado al huérfano: el executor además
+                # re-capea contra sus BUYs atribuibles (doble red).
+                orphan_capped += 1
+                kept.append(
+                    PortfolioPosition(
+                        ticker=p.ticker,
+                        side=p.side,
+                        count=min(p.count, orphan[0]),
+                        close_time=p.close_time,
+                        peak_bid_cents=p.peak_bid_cents,
+                    )
+                )
+                continue
+            skipped_foreign += 1
+        if skipped_rest or skipped_foreign or orphan_capped:
+            logger.info(
+                f"motor3.attribution kept={len(kept)} skip_rest_arb={skipped_rest} "
+                f"skip_foreign={skipped_foreign} orphan_capped={orphan_capped} "
+                f"(legs de arb hedged y posiciones ajenas no se gestionan)"
+            )
+        return kept
+
+    def _entry_bid_for(self, position: PortfolioPosition) -> int | None:
+        """Entry del lado abierto = promedio PONDERADO de TODAS las patas BUY filled
+        abiertas (auditoría rentabilidad 2026-07-07: el primer BUY FIFO subestimaba el
+        entry cuando había multi-leg a precios crecientes — el gate net>0 de TP/trailing
+        aprobaba contra la pata barata una venta que las patas caras realizaban en
+        pérdida; la venta cierra TODAS las patas, así que el entry de la DECISIÓN es el
+        wavg, mismo criterio que Motor2Position.entry_cents). El settle sigue FIFO.
+        None si no hay pata BUY (→ el trailing no se arma; fail-safe). Best-effort: un
+        fallo de DB loguea y devuelve None (no rompe el tick — Lección 7)."""
+        try:
+            with get_session() as s:
+                buys = [
+                    b
+                    for b in s.exec(
+                        select(Trade).where(
+                            Trade.ticker == position.ticker,
+                            Trade.side == position.side,
+                            Trade.action == "buy",
+                            Trade.status == "filled",
+                            col(Trade.strategy).in_(_ENTRY_ORIGIN),
+                        )
+                    )
+                    if not b.closed_by_clv and b.count > 0
+                ]
         except Exception as exc:
             logger.warning(f"motor3.trail.entry_error ticker={position.ticker}: {exc}")
             return None
-        if buy is None:
-            return None
-        return buy.fill_price_cents or buy.price_cents
+        if not buys:
+            # Bug 4: posición gestionada como HUÉRFANA de Motor 1 (sin BUY de _ENTRY_ORIGIN) →
+            # el entry sale del primer BUY huérfano (FIFO), cacheado por tick en attribution.
+            orphan = self._orphan_by_pair.get((position.ticker, position.side))
+            return orphan[1] if orphan is not None else None
+        total = sum(b.count for b in buys)
+        wavg = sum((b.fill_price_cents or b.price_cents) * b.count for b in buys) / total
+        return round(wavg)
+
+    def _shadow_pnl_str(self, position: PortfolioPosition, bid: int, entry: int | None) -> str:
+        """PnL realizado NETO de fees si la posición se cerrara al bid ahora — para validar el
+        shadow contra el backtest 'contando fees reales' antes de prender la venta. Usa el entry
+        de la pata BUY (FIFO) y kalshi_fee_cents en ambos lados (igual que _settle_originals).
+        Si no hay entry, no se puede calcular."""
+        if entry is None:
+            return "entry=? net_pnl=?"
+        gross_cents = position.count * (bid - entry)
+        fees_cents = kalshi_fee_cents(position.count, bid) + kalshi_fee_cents(position.count, entry)
+        net_cents = gross_cents - fees_cents
+        return (
+            f"entry={entry}c gross=${gross_cents / 100:+.2f} "
+            f"fees=${fees_cents / 100:.2f} net=${net_cents / 100:+.2f}"
+        )
 
     def _persist_peak(self, position: PortfolioPosition, peak: int) -> None:
         """Persiste el nuevo pico en portfolio_positions (UPDATE por ticker, único). Refleja el
@@ -187,8 +333,12 @@ class Motor3Engine:
         if self._client is not None:
             try:
                 ob = await self._client.get_orderbook(position.ticker)
-                book = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
-                bid, _ = _top_bid(book.get(position.side) or [])
+                # rest_orderbook_sides: shape 2026-07-15 (orderbook_fp/yes_dollars) dejaba
+                # esto ciego → bid=None perpetuo → TP/trailing jamás decidibles.
+                bid, _ = _top_bid(rest_orderbook_sides(ob)[position.side])
+                # Pasajero (2026-07-17): publica el mark para el gate MTM del RiskManager
+                # (cero I/O extra — el bid ya se leyó para el TP). Best-effort adentro.
+                RiskManager.record_mark(position.ticker, position.side, bid)
             except Exception as exc:
                 logger.warning(f"motor3.tp.orderbook_error ticker={position.ticker}: {exc}")
                 bid = None

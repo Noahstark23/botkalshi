@@ -7,16 +7,40 @@ por-ticker que descarta una venta concurrente. `place_order` mockeado (no toca r
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import src.storage.models as models
 from src.storage.models import PortfolioPosition
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 
 
 def _pos(side: str = "yes", count: int = 10) -> PortfolioPosition:
     return PortfolioPosition(ticker="KXTEST", side=side, count=count)
+
+
+def _seed_open_buy(
+    *, side: str = "yes", count: int = 10, strategy: str = "motor_2_consensus"
+) -> None:
+    """Pata BUY filled que respalda la posición: el executor re-verifica DENTRO del lock
+    contra las filas Trade (atribución) y capea la venta al total abierto — sin respaldo,
+    exit_position devuelve already_closed (fix auditoría 2026-07-01)."""
+    with models.get_session() as s:
+        s.add(
+            models.Trade(
+                client_order_id=f"seed-{side}-{count}",
+                ticker="KXTEST",
+                side=side,
+                action="buy",
+                count=count,
+                price_cents=45,
+                fill_price_cents=45,
+                strategy=strategy,
+                status="filled",
+            )
+        )
+        s.commit()
 
 
 def _client(orderbook: dict, *, place_resp: dict | None = None) -> MagicMock:
@@ -29,9 +53,9 @@ def _client(orderbook: dict, *, place_resp: dict | None = None) -> MagicMock:
 @pytest.mark.asyncio
 async def test_no_bid_does_not_place():
     """Orderbook sin bids en nuestro lado → no hay con quién cerrar → no se coloca orden."""
+    _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(_client({"orderbook": {"yes": [], "no": []}}))
-    with patch.object(ex, "_record_exit"):
-        out = await ex.exit_position(_pos("yes"))
+    out = await ex.exit_position(_pos("yes"))
     assert out.reason == "no_bid" and out.placed is False
     ex.client.place_order.assert_not_called()
 
@@ -43,9 +67,9 @@ async def test_filled_sells_at_bid_with_ioc():
         {"orderbook": {"yes": [["0.55", "100"], ["0.60", "50"]], "no": []}},
         place_resp={"order": {"order_id": "o1", "fill_count": 10}},
     )
+    _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
-    with patch.object(ex, "_record_exit"):
-        out = await ex.exit_position(_pos("yes", count=10))
+    out = await ex.exit_position(_pos("yes", count=10))
 
     assert out.filled is True and out.filled_count == 10 and out.sell_price_cents == 60
     kwargs = c.place_order.call_args.kwargs
@@ -64,9 +88,9 @@ async def test_no_side_uses_no_price():
         {"orderbook": {"yes": [], "no": [["0.40", "30"]]}},
         place_resp={"order": {"fill_count": 5}},
     )
+    _seed_open_buy(side="no", count=5)
     ex = Motor3ExitExecutor(c)
-    with patch.object(ex, "_record_exit"):
-        out = await ex.exit_position(_pos("no", count=5))
+    out = await ex.exit_position(_pos("no", count=5))
     assert out.filled is True and out.sell_price_cents == 40
     kwargs = c.place_order.call_args.kwargs
     assert kwargs["side"] == "no" and kwargs["no_price"] == 40 and kwargs["yes_price"] is None
@@ -80,6 +104,7 @@ async def test_lock_released_after_exit_allows_reattempt():
         {"orderbook": {"yes": [["0.60", "50"]], "no": []}},
         place_resp={"order": {"fill_count": 4}},  # parcial: vende 4 de 10
     )
+    _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
     pos = _pos("yes", count=10)
     out = await ex.exit_position(pos)
@@ -103,3 +128,43 @@ async def test_concurrent_exit_skips_busy():
         ex._lock_for(pos.ticker).release()
     assert out.reason == "busy"
     c.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bid_below_floor_does_not_sell():
+    """Auditoría rentabilidad 2026-07-07: vender polvo (bid < piso) recupera centavos
+    menos el fee (ceil >=1c) y dona el spread — debajo del piso la posición va a settle
+    (que no paga fee)."""
+    _seed_open_buy(side="yes", count=10)
+    c = _client({"orderbook": {"yes": [[3, 100]], "no": []}})
+    ex = Motor3ExitExecutor(c, min_sell_bid_cents=5)
+    out = await ex.exit_position(_pos("yes"))
+    assert out.reason == "bid_below_floor" and out.placed is False
+    c.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bid_at_floor_sells():
+    """CONTROL: bid == piso → vende normal (el piso es estrictamente 'debajo de')."""
+    _seed_open_buy(side="yes", count=10)
+    c = _client(
+        {"orderbook": {"yes": [[5, 100]], "no": []}},
+        place_resp={"order": {"order_id": "k1", "fill_count": 10}},
+    )
+    ex = Motor3ExitExecutor(c, min_sell_bid_cents=5)
+    out = await ex.exit_position(_pos("yes"))
+    assert out.placed is True
+    assert c.place_order.await_args.kwargs["yes_price"] == 5
+
+
+@pytest.mark.asyncio
+async def test_floor_zero_keeps_previous_behavior():
+    """CONTROL legacy: min_sell_bid_cents=0 (default) → vende a cualquier bid 1..99."""
+    _seed_open_buy(side="yes", count=10)
+    c = _client(
+        {"orderbook": {"yes": [[1, 100]], "no": []}},
+        place_resp={"order": {"order_id": "k1", "fill_count": 10}},
+    )
+    ex = Motor3ExitExecutor(c)
+    out = await ex.exit_position(_pos("yes"))
+    assert out.placed is True

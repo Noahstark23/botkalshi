@@ -2,7 +2,7 @@
 Tests del Trailing-stop detector (Motor 3, FASE 2) — salida por retroceso pura.
 
 Cubre: trailing solo en ganancia (peak>entry), boundary del retroceso, defensa current>peak,
-None no decidible, count<=0, drop<=0; evolución del peak; y la precedencia de decide_exit.
+None no decidible, count<=0, drop<=0; y la evolución del peak.
 Lógica síncrona/pura (sin red ni await), igual que test_take_profit.py.
 """
 
@@ -13,7 +13,6 @@ import pytest
 from src.storage.models import PortfolioPosition
 from src.strategies.motor_3_clv.trailing_stop import (
     DEFAULT_TRAILING_DROP_CENTS,
-    decide_exit,
     next_peak_bid,
     trailing_stop_due,
 )
@@ -95,17 +94,51 @@ def test_peak_then_trailing_flow():
     assert trailing_stop_due(_pos(), peak, 84, entry, 5) is True
 
 
-# --- decide_exit ---------------------------------------------------------------------------
+# =====================================================
+# Fix auditoría 2026-07-01: armado con margen — nunca stop-loss encubierto
+# =====================================================
 
 
-@pytest.mark.parametrize(
-    ("tp", "trail", "time", "expected"),
-    [
-        (True, True, True, "take_profit"),  # TP gana
-        (False, True, True, "trailing_stop"),  # trailing > tiempo
-        (False, False, True, "time"),
-        (False, False, False, None),
-    ],
-)
-def test_decide_exit_precedence(tp, trail, time, expected):
-    assert decide_exit(take_profit_due=tp, trailing_due=trail, time_due=time) == expected
+def test_trailing_not_armed_when_peak_barely_above_entry():
+    """peak = entry+1 con drop=5 permitía vender hasta entry−4 (stop-loss encubierto,
+    contradiciendo el docstring del módulo). El armado exige peak >= entry + drop:
+    el precio de disparo (peak − drop) nunca queda debajo del entry."""
+    assert (
+        trailing_stop_due(_pos(), peak_bid=61, current_bid=56, entry_bid=60, drop_cents=5) is False
+    )
+
+
+def test_trailing_breakeven_bruto_no_dispara_net_negativo():
+    """Auditoría rentabilidad 2026-07-07: peak = entry + drop armaba el trailing y el
+    disparo en el borde vendía EXACTAMENTE al entry — break-even bruto = −2 fees NETOS
+    garantizados. Ahora el gate net>0 (el mismo del TP) lo corta: vender al entry o
+    debajo jamás dispara."""
+    # bid == entry: net = 0 − 2 fees < 0 → NO dispara (antes: True)
+    assert (
+        trailing_stop_due(_pos(), peak_bid=65, current_bid=60, entry_bid=60, drop_cents=5) is False
+    )
+    # sin margen de armado (peak−entry < drop) → tampoco
+    assert (
+        trailing_stop_due(_pos(), peak_bid=64, current_bid=59, entry_bid=60, drop_cents=5) is False
+    )
+
+
+def test_trailing_gap_debajo_del_entry_no_vende():
+    """El caso del GAP: armado legítimo (peak 70 > entry+drop) pero el bid saltó a 30 —
+    la versión anterior disparaba y REALIZABA −30c/contrato (stop-loss encubierto).
+    Con el gate net>0, no se vende debajo del entry: la pérdida la maneja el settle."""
+    assert (
+        trailing_stop_due(_pos(), peak_bid=70, current_bid=30, entry_bid=60, drop_cents=5) is False
+    )
+
+
+def test_trailing_dispara_solo_con_ganancia_neta():
+    """CONTROL del gate: retroceso válido Y net>0 → sigue disparando (el trailing no
+    quedó muerto). entry 60, peak 90, bid 85: net = 25 − fee(85) − fee(60) > 0."""
+    assert (
+        trailing_stop_due(_pos(), peak_bid=90, current_bid=85, entry_bid=60, drop_cents=5) is True
+    )
+    # margen mínimo REAL: bid apenas sobre el entry, net <= 0 por fees → no dispara
+    assert (
+        trailing_stop_due(_pos(), peak_bid=67, current_bid=62, entry_bid=60, drop_cents=5) is False
+    )

@@ -7,7 +7,8 @@ _request REAL (apiKey en la query, retries, clasificación de errores) sin red.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from datetime import UTC, datetime
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -17,6 +18,24 @@ from src.clients.odds_api import (
     OddsAPIClient,
     OddsAPIRateLimitError,
 )
+
+
+@pytest.fixture(autouse=True)
+def _odds_settings_and_class_state():
+    """Settings mockeados (get_settings real exige la key privada de Kalshi) + reset del
+    estado de CLASE del cliente (caché/breaker compartidos entre instancias — sin esto,
+    un test contamina al siguiente con respuestas cacheadas)."""
+    OddsAPIClient._cache = {}
+    OddsAPIClient._quota_exhausted_at = None
+    s = MagicMock()
+    s.ODDS_API_CACHE_TTL_SEC = 60.0
+    s.ODDS_API_QUOTA_COOLDOWN_SEC = 3600.0
+    s.ODDS_API_KEY = "TESTKEY"
+    with patch("src.clients.odds_api.get_settings", return_value=s):
+        yield s
+    OddsAPIClient._cache = {}
+    OddsAPIClient._quota_exhausted_at = None
+
 
 # Shape REAL de The Odds API v4 (un evento de fútbol 3-way con Pinnacle).
 _ODDS_FIXTURE = [
@@ -157,3 +176,170 @@ async def test_get_sports_returns_list():
     async with _client(handler) as client:
         sports = await client.get_sports()
     assert sports[0]["key"] == "soccer_fifa_world_cup"
+
+
+# =====================================================
+# Caché con TTL + breaker de cuota (incidente créditos 2026-07-19: 20k quemados en días)
+# =====================================================
+
+
+def _counting_handler(counter: dict):
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] = counter.get("n", 0) + 1
+        return httpx.Response(200, json=_ODDS_FIXTURE)
+
+    return handler
+
+
+class _FrozenDatetime(datetime):
+    """datetime congelado y avanzable para el breaker (now inyectable sin dormir)."""
+
+    current = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: D102
+        return cls.current if tz else cls.current.replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_cache_serves_within_ttl_single_http_call():
+    """(a) MECANISMO del caché: dos get_odds del mismo (sport, región) dentro del TTL →
+    UNA sola llamada HTTP (la segunda sale del caché de clase, cero créditos)."""
+    counter: dict = {}
+    async with _client(_counting_handler(counter)) as client:
+        first = await client.get_odds("soccer_fifa_world_cup")
+        second = await client.get_odds("soccer_fifa_world_cup")
+    assert counter["n"] == 1
+    assert first == second and len(first) == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_is_keyed_by_sport_and_region():
+    """CONTROL: sport_key o región distintos NO comparten entrada (cada uno su crédito)."""
+    counter: dict = {}
+    async with _client(_counting_handler(counter)) as client:
+        await client.get_odds("soccer_fifa_world_cup")
+        await client.get_odds("baseball_mlb")  # otro sport → llamada nueva
+        await client.get_odds("baseball_mlb", regions="eu")  # otra región → llamada nueva
+    assert counter["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_cache_expires_after_ttl():
+    """(c) El caché EXPIRA: pasado el TTL, la próxima llamada vuelve a la API."""
+    counter: dict = {}
+    t = {"now": 1000.0}
+    with patch("src.clients.odds_api.time") as mock_time:
+        mock_time.monotonic = lambda: t["now"]
+        async with _client(_counting_handler(counter)) as client:
+            await client.get_odds("soccer_fifa_world_cup")
+            t["now"] += 61.0  # TTL=60 vencido
+            await client.get_odds("soccer_fifa_world_cup")
+    assert counter["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_survives_client_recreation():
+    """CLAVE del diseño: sources crea un cliente NUEVO por ciclo — el caché es de CLASE
+    y sobrevive entre instancias (si fuera de instancia, sería inútil)."""
+    counter: dict = {}
+    handler = _counting_handler(counter)
+    async with _client(handler) as c1:
+        await c1.get_odds("soccer_fifa_world_cup")
+    async with _client(handler) as c2:  # instancia NUEVA, mismo ciclo de TTL
+        await c2.get_odds("soccer_fifa_world_cup")
+    assert counter["n"] == 1  # la segunda instancia sirvió del caché de clase
+
+
+@pytest.mark.asyncio
+async def test_quota_breaker_stops_all_calls_and_logs_once():
+    """(b) MECANISMO del breaker: tras un 401 OUT_OF_USAGE_CREDITS, get_odds devuelve []
+    SIN tocar la red durante el cooldown, con UNA sola línea de log de entrada (mata el
+    loop de 544 WARNINGs/día)."""
+    from loguru import logger as _logger
+
+    counter: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] = counter.get("n", 0) + 1
+        return httpx.Response(
+            401, json={"error_code": "OUT_OF_USAGE_CREDITS", "message": "Usage quota reached"}
+        )
+
+    records: list[str] = []
+    sink = _logger.add(records.append, level="WARNING", format="{message}")
+    try:
+        with patch("src.clients.odds_api.datetime", _FrozenDatetime):
+            async with _client(handler) as client:
+                with pytest.raises(OddsAPIAuthError):
+                    await client.get_odds("soccer_fifa_world_cup")  # dispara el breaker
+                calls_after_trip = counter["n"]
+                # Ciclos siguientes (incluso otro sport): [] inmediato, CERO red, CERO logs.
+                assert await client.get_odds("soccer_fifa_world_cup") == []
+                assert await client.get_odds("baseball_mlb") == []
+            assert counter["n"] == calls_after_trip  # ni una llamada más
+    finally:
+        _logger.remove(sink)
+    assert sum(1 for r in records if "CUOTA AGOTADA" in r) == 1  # entrada one-shot
+
+
+@pytest.mark.asyncio
+async def test_quota_breaker_rearms_after_cooldown():
+    """El breaker REARMA al vencer el cooldown (con log de salida) y vuelve a la API."""
+    counter: dict = {}
+    responses = [
+        httpx.Response(401, json={"error_code": "OUT_OF_USAGE_CREDITS"}),
+        httpx.Response(200, json=_ODDS_FIXTURE),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] = counter.get("n", 0) + 1
+        return responses[min(counter["n"] - 1, 1)]
+
+    with patch("src.clients.odds_api.datetime", _FrozenDatetime):
+        _FrozenDatetime.current = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+        async with _client(handler) as client:
+            with pytest.raises(OddsAPIAuthError):
+                await client.get_odds("soccer_fifa_world_cup")
+            assert await client.get_odds("soccer_fifa_world_cup") == []  # breaker activo
+            _FrozenDatetime.current = datetime(2026, 7, 19, 13, 1, tzinfo=UTC)  # +cooldown
+            events = await client.get_odds("soccer_fifa_world_cup")  # rearma → API
+    assert len(events) == 1 and counter["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_quota_breaker_rearms_on_month_change():
+    """La cuota de The Odds API resetea por MES: el cambio de mes UTC rearma el breaker
+    aunque el cooldown no haya vencido."""
+    counter: dict = {}
+    responses = [
+        httpx.Response(401, json={"error_code": "OUT_OF_USAGE_CREDITS"}),
+        httpx.Response(200, json=_ODDS_FIXTURE),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        counter["n"] = counter.get("n", 0) + 1
+        return responses[min(counter["n"] - 1, 1)]
+
+    with patch("src.clients.odds_api.datetime", _FrozenDatetime):
+        _FrozenDatetime.current = datetime(2026, 7, 31, 23, 59, tzinfo=UTC)
+        async with _client(handler) as client:
+            with pytest.raises(OddsAPIAuthError):
+                await client.get_odds("soccer_fifa_world_cup")
+            _FrozenDatetime.current = datetime(2026, 8, 1, 0, 5, tzinfo=UTC)  # +6min, mes NUEVO
+            events = await client.get_odds("soccer_fifa_world_cup")
+    assert len(events) == 1 and counter["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_plain_401_does_not_trip_quota_breaker():
+    """CONTROL: un 401 común (key inválida) NO activa el breaker de cuota — son fallas
+    distintas (la key mala no se arregla esperando el mes)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"message": "Invalid API key"})
+
+    async with _client(handler) as client:
+        with pytest.raises(OddsAPIAuthError):
+            await client.get_odds("soccer_fifa_world_cup")
+    assert OddsAPIClient._quota_exhausted_at is None

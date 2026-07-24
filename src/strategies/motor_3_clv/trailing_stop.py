@@ -4,8 +4,9 @@ Trailing-stop detector (Motor 3, FASE 2) — salida por RETROCESO del bid desde 
 Evolución del take-profit fijo: en vez de asegurar a un umbral duro, deja correr la ganancia y
 cierra solo cuando el bid retrocede `drop_cents` desde el pico observado (`peak_bid`). Para no
 convertir esto en un stop-loss encubierto, **solo se arma como protección de GANANCIA**: el pico
-tiene que haber superado el entry (`peak_bid > entry_bid`). Las pérdidas las maneja el
-RiskManager, no esto.
+tiene que superar el entry POR AL MENOS `drop_cents` (fix auditoría 2026-07-01 — con solo
+`peak > entry`, un pico de entry+1 permitía vender hasta entry−(drop−1)). Así el precio de
+disparo (peak − drop) nunca queda debajo del entry. Las pérdidas las maneja el RiskManager.
 
 Funciones puras (espejo de take_profit.py): reciben el bid live y el entry YA resueltos (el engine
 los trae del orderbook y de la pata BUY), no tocan red ni DB → testeables sin mocks. El `peak_bid`
@@ -14,6 +15,7 @@ lo persiste el engine en `PortfolioPosition.peak_bid_cents` entre ticks.
 
 from __future__ import annotations
 
+from src.math.fees import kalshi_fee_cents
 from src.storage.models import PortfolioPosition
 
 # Retroceso (cents) desde el pico que dispara el cierre. Placeholder calibrable desde la
@@ -40,9 +42,16 @@ def trailing_stop_due(
     - drop_cents <= 0 → False (trailing apagado por config inválida).
     - count <= 0 → False (posición cerrada/inconsistente).
     - peak/current/entry None → False (no decidible: falta el orderbook o la pata BUY).
-    - peak_bid <= entry_bid → False (nunca estuvo en ganancia → no es trailing, sería stop-loss).
+    - peak_bid − entry_bid < drop_cents → False (sin margen suficiente: el disparo quedaría
+      debajo del entry → sería stop-loss encubierto, no trailing).
     - current_bid > peak_bid → False (defensa: el pico es el máximo; si current lo supera, el
       caller no actualizó el peak — no disparar con datos incoherentes).
+    - vender al bid ACTUAL no deja ganancia neta de fees → False (auditoría rentabilidad
+      2026-07-07: el armado garantiza que el DISPARO (peak−drop) no quede bajo el entry,
+      pero el FILL es al bid real — en el borde exacto (bid == entry) vendía al entry
+      realizando −2 fees seguros, y en un GAP (bid muy por debajo del peak) vendía DEBAJO
+      del entry: el stop-loss encubierto que este módulo promete no ser. Mismo gate net>0
+      que ya usa el take-profit).
     - current_bid <= peak_bid - drop_cents → True (retroceso suficiente → asegurar).
     """
     if drop_cents <= 0:
@@ -51,23 +60,13 @@ def trailing_stop_due(
         return False
     if peak_bid is None or current_bid is None or entry_bid is None:
         return False
-    if peak_bid <= entry_bid:
+    if peak_bid - entry_bid < drop_cents:
         return False
     if current_bid > peak_bid:
         return False
+    net_per_contract = (
+        current_bid - entry_bid - kalshi_fee_cents(1, current_bid) - kalshi_fee_cents(1, entry_bid)
+    )
+    if net_per_contract <= 0:
+        return False
     return current_bid <= peak_bid - drop_cents
-
-
-def decide_exit(*, take_profit_due: bool, trailing_due: bool, time_due: bool) -> str | None:
-    """Precedencia de salida cuando varias condiciones coinciden: take-profit > trailing > tiempo.
-
-    Helper puro/testeable. En el engine el dedup equivalente lo da el dict `exits` (una salida por
-    ticker por tick); como exit_position no recibe `reason`, la precedencia solo importa para
-    logging/análisis, no cambia QUÉ se vende."""
-    if take_profit_due:
-        return "take_profit"
-    if trailing_due:
-        return "trailing_stop"
-    if time_due:
-        return "time"
-    return None

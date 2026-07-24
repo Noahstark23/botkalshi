@@ -262,8 +262,13 @@ src/
 ### Comisiones (CRÍTICO para cálculo de edge)
 - **~7% sobre profit aproximación high-level** (para Kelly sizing rough).
 - **Fórmula real (USAR para Motor 1 / arbitraje):**
-  `fee_cents = ceil(7 * count * price_yes_cents * (100 - price_yes_cents) / 1_000_000)`
+  `fee_cents = ceil(7 * count * price_yes_cents * (100 - price_yes_cents) / 10_000)`
   (Integer arithmetic. Mergeado en `src/math/fees.py`.)
+  ⚠️ **Corregido 2026-07-01 (auditoría Motor 2):** la versión anterior de esta línea
+  (y del código y sus tests) usaba denominador `1_000_000`, que produce el fee en
+  DÓLARES ceileados etiquetados como centavos — ~100× subestimado (fee(100, 50)
+  daba 2¢; el oficial es $1.75 = 175¢). Todo análisis de PnL/edge previo a esa
+  fecha subestima fees. Verificado contra el fee schedule oficial de Kalshi.
 - Aplica solo a trades rentables.
 - **Cualquier cálculo de edge en arbitraje debe usar la fórmula real, no la
   aproximación.** En arbitrajes con profit gross de pocos centavos, la

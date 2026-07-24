@@ -81,6 +81,15 @@ class Motor1Engine:
         # graba SOLO cuando la oportunidad cambió (magnitude, count) desde la última grabada
         # para ese ticker. ticker → (magnitude_cents, count) de la última fila grabada.
         self._last_recorded: dict[str, tuple[int, int]] = {}
+        # Auditoría rentabilidad 2026-07-07: el "arb" binario intra-ticker equivale a un
+        # book AUTO-CRUZADO (yes_bid + no_bid > 100) — un estado que el matching engine
+        # elimina en ms; casi toda señal de 1 tick es book local stale. Dos defensas:
+        # (a) CONFIRMACIÓN: ejecutar solo si el cruce persistió MOTOR_1_CONFIRM_TICKS
+        #     ticks consecutivos (el arb real de varios cents no muere en 1s; el fantasma sí);
+        # (b) COOLDOWN por ticker tras una ejecución fallida (KILL/rollback): sin esto el
+        #     engine re-martillaba el mismo cruce stale cada ~1s hasta el circuit breaker.
+        self._streak: dict[str, int] = {}  # ticker → ticks consecutivos con el cruce vivo
+        self._cooldown_until: dict[str, float] = {}  # ticker → monotonic hasta el que no ejecutar
 
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "LIVE" if self._executor is not None else "SHADOW"
@@ -131,7 +140,10 @@ class Motor1Engine:
             no_ask_cents=no_ask_synth,
             no_available_size=yes_bid.size,
             max_count=self._max_count,
-            min_edge_pct=self.settings.MIN_EDGE_PCT,
+            # min(detección, ejecución) — auditoría rentabilidad 2026-07-07: detectar solo
+            # a MIN_EDGE_PCT (2.0) hacía INALCANZABLE el piso de ejecución (1.5): los edges
+            # en [1.5, 2.0) ni se grababan en EdgeWindow → shadow sesgado y piso ficticio.
+            min_edge_pct=min(self.settings.MIN_EDGE_PCT, self.settings.MOTOR_1_EXECUTION_EDGE_PCT),
         )
 
     async def _tick(self) -> None:
@@ -146,9 +158,11 @@ class Motor1Engine:
         for ticker in self._manager.tracked_tickers:
             opp = self._detect(ticker)
             if opp is None:
+                self._streak.pop(ticker, None)  # el cruce murió → la confirmación arranca de 0
                 continue
 
             self._signals_seen += 1
+            self._streak[ticker] = self._streak.get(ticker, 0) + 1
             # La detección se GRABA SIEMPRE primero (de-dupe interno evita el flood).
             edge_id = self._record_edge_window(ticker, opp)
 
@@ -172,6 +186,25 @@ class Motor1Engine:
                     f"motor1.exec.edge_too_high ticker={ticker} "
                     f"edge={opp.edge_pct:.2f}% > {self.settings.MOTOR_1_MAX_EDGE_PCT}% "
                     "(sospecha de fantasma: pata ~0¢ / mercado por resolver) → NO ejecuta"
+                )
+                continue
+
+            # CONFIRMACIÓN (auditoría rentabilidad 2026-07-07): el cruce tiene que
+            # persistir N ticks consecutivos — un book auto-cruzado real de varios cents
+            # no muere en 1s; el fantasma por book stale sí.
+            if self._streak.get(ticker, 0) < self.settings.MOTOR_1_CONFIRM_TICKS:
+                logger.info(
+                    f"motor1.exec.awaiting_confirm ticker={ticker} "
+                    f"streak={self._streak.get(ticker, 0)}/{self.settings.MOTOR_1_CONFIRM_TICKS}"
+                )
+                continue
+            # COOLDOWN por ticker tras una ejecución fallida: no re-martillar el mismo
+            # cruce stale cada ~1s (el circuit breaker era el único freno → 3 pérdidas).
+            now_mono = asyncio.get_event_loop().time()
+            if now_mono < self._cooldown_until.get(ticker, 0.0):
+                logger.info(
+                    f"motor1.exec.cooldown ticker={ticker} "
+                    f"restan={self._cooldown_until[ticker] - now_mono:.0f}s"
                 )
                 continue
 
@@ -244,6 +277,13 @@ class Motor1Engine:
                     f"motor1.exec.outcome edge_id={edge_id} ticker={ticker} "
                     f"filled={filled} net_profit={opp.net_profit_cents}c"
                 )
+                if not filled and ticker != "?":
+                    # Ejecución fallida (KILL/rollback/rechazo): cooldown — si el cruce
+                    # sigue "vivo" en el book tras fallar, es casi seguro book stale.
+                    self._cooldown_until[ticker] = (
+                        asyncio.get_event_loop().time() + self.settings.MOTOR_1_TICKER_COOLDOWN_SEC
+                    )
+                    self._streak.pop(ticker, None)
                 self._update_edge_window_outcome(edge_id, filled)
         except Exception:
             logger.exception("motor1.exec.error")

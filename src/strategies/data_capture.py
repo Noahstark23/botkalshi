@@ -26,6 +26,7 @@ from loguru import logger
 from src.clients.kalshi_rest import KalshiRestClient
 from src.clients.kalshi_ws import KalshiWebSocket
 from src.monitoring.health import BotState
+from src.storage.disk_guard import DiskGuard
 from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
 
@@ -129,6 +130,45 @@ def _top_bid(levels: list[Any]) -> tuple[int | None, int | None]:
     return best_price_cents, best_size
 
 
+# Generaciones de shape del REST GET /markets/{t}/orderbook (incidente 2026-07-15: la API
+# migró a 'orderbook_fp' + 'yes_dollars'/'no_dollars' con precios en dólares-string y dejó
+# ciegos a TODOS los consumidores que buscaban 'orderbook' + 'yes'/'no' — M5 sin cotizar,
+# y peor: los brazos de salida de M2/M3 en fail-closed sin poder vender). Los VALORES los
+# convierte parse_price_to_cents (int cents, float, o dólares-string); acá solo se
+# normalizan las CLAVES, en orden nuevo→viejo.
+_BOOK_WRAPPER_KEYS = ("orderbook_fp", "orderbook")
+_BOOK_SIDE_KEYS: dict[str, tuple[str, ...]] = {
+    "yes": ("yes_dollars", "yes_dollars_fp", "yes"),
+    "no": ("no_dollars", "no_dollars_fp", "no"),
+}
+
+
+def rest_orderbook_sides(ob: object) -> dict[str, list]:
+    """Normaliza el response del REST /orderbook a {'yes': levels, 'no': levels}.
+
+    Tolera cualquier generación de shape (wrapper 'orderbook_fp' o 'orderbook', o el book
+    ya desenvuelto) y cualquier variante de claves de lado. Los niveles quedan tal cual
+    (los convierte _top_bid/parse_price_to_cents). Fail-safe: input raro → lados vacíos.
+    """
+    outer = ob if isinstance(ob, dict) else {}
+    book = outer
+    for wrapper in _BOOK_WRAPPER_KEYS:
+        inner = outer.get(wrapper)
+        if isinstance(inner, dict):
+            book = inner
+            break
+    sides: dict[str, list] = {}
+    for side, keys in _BOOK_SIDE_KEYS.items():
+        levels: list = []
+        for key in keys:
+            value = book.get(key)
+            if isinstance(value, list) and value:
+                levels = value
+                break
+        sides[side] = levels
+    return sides
+
+
 class DataCaptureService:
     """Captura de datos en tiempo real, sin trading."""
 
@@ -147,11 +187,74 @@ class DataCaptureService:
         self._delta_shape_logged = False
         self._snapshot_shape_logged = False
         self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
+        # close_time (ISO) por ticker desde discovery → se alimenta al v2_manager para que la
+        # recovery NO pida snapshot de mercados settled (causa del loop de code 15).
+        self._market_close_times: dict[str, str] = {}
+        # open_time + status por ticker (incidente 2026-07-21): un mercado FUTURO que aún no abrió
+        # (open_time > now) no tiene book operable — la recovery del sid=1 (189 futuros) pedía sus
+        # snapshots en loop tras cada reinicio (timeout_x5 → breaker). También captura transiciones
+        # a closed/settled que el filtro por status del discovery dejaba de reportar.
+        self._market_meta: dict[str, dict] = {}
+        self._market_keys_logged = False  # DIAG: loguear una vez qué campos trae get_event
         self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
         # Cliente REST persistente inyectado por el runner SOLO con TRADING_ENABLED=true.
         # None en shadow. La Capa 2 lo pasará al RestExecutor del Motor REST.
         self._rest_client = rest_client
         self._ws_zombie_count = 0  # detecciones consecutivas de WS zombie (reset al recuperar)
+        # Motor 8 (F1 shadow, opcional): OFI en memoria, pasajero del feed de deltas.
+        # Requiere el manager V2 para medir mids (sin él, el experimento no tiene resultado).
+        self._ofi = None
+        if self.settings.MOTOR_8_OFI_ENABLED:
+            from src.strategies.motor_8_ofi.shadow import Motor8OfiShadow
+
+            self._ofi = Motor8OfiShadow(
+                self._mid_of,
+                window_sec=self.settings.MOTOR_8_OFI_WINDOW_SEC,
+                z_min=self.settings.MOTOR_8_OFI_Z_MIN,
+                min_baseline=self.settings.MOTOR_8_OFI_MIN_BASELINE,
+                cooldown_sec=self.settings.MOTOR_8_OFI_COOLDOWN_SEC,
+            )
+            logger.info("motor8.ofi shadow armado (F1: solo observa y mide)")
+        # Motor 9 (F1 shadow, opcional): derrame entre hermanos del mismo evento, pasajero
+        # del mismo feed de deltas que M8. Mide si el ajuste del hermano llega con REZAGO
+        # (capturable) o instantáneo (nada que capturar) — auto-validante, patrón M8.
+        self._spillover = None
+        if self.settings.MOTOR_9_SPILLOVER_ENABLED:
+            from src.strategies.motor_9_spillover.shadow import Motor9SpilloverShadow
+
+            self._spillover = Motor9SpilloverShadow(
+                self._mid_of,
+                self._siblings_of,
+                trigger_move_cents=self.settings.MOTOR_9_TRIGGER_MOVE_CENTS,
+                window_sec=self.settings.MOTOR_9_WINDOW_SEC,
+                cooldown_sec=self.settings.MOTOR_9_COOLDOWN_SEC,
+            )
+            logger.info("motor9.spillover shadow armado (F1: solo observa y mide)")
+
+    def _mid_of(self, ticker: str) -> float | None:
+        """MID del ticker en cents desde el manager V2 (memoria). None si el book no está
+        sano (uninit/stale/cuarentena) — el experimento OFI descarta antes que medir basura."""
+        v2 = self._v2_manager
+        if v2 is None:
+            return None
+        yes = v2.get_top_of_book(ticker, "yes")
+        no = v2.get_top_of_book(ticker, "no")
+        if yes is None or no is None or yes.best_bid is None or no.best_bid is None:
+            return None
+        yes_bid = yes.best_bid.price_cents
+        yes_ask = 100 - no.best_bid.price_cents
+        if not (1 <= yes_bid <= 99 and 1 <= yes_ask <= 99):
+            return None
+        return (yes_bid + yes_ask) / 2.0
+
+    def _siblings_of(self, ticker: str) -> set[str]:
+        """Tickers TRACKEADOS del mismo evento que `ticker` (excluyéndolo). Para el shadow
+        de M9: solo se invoca en un TRIGGER (raro), así que el scan lineal sobre ~300
+        trackeados es barato. Sin red, sin DB."""
+        from src.strategies.motor_9_spillover.shadow import event_key_of
+
+        event = event_key_of(ticker)
+        return {t for t in self._tracked_tickers if t != ticker and event_key_of(t) == event}
 
     def multi_event_universe(self) -> dict[str, set[str]]:
         """
@@ -161,7 +264,7 @@ class DataCaptureService:
         """
         from src.strategies.motor_rest_arb.engine import RestArbEngine
 
-        return self._event_universe_for(RestArbEngine.MULTI_SERIES)
+        return self._event_universe_for(RestArbEngine.multi_series_from_settings())
 
     def motor2_event_universe(self, series: frozenset[str]) -> dict[str, set[str]]:
         """
@@ -239,15 +342,33 @@ class DataCaptureService:
                 BotState.record_error(f"orderbook_delta unknown shape: keys={sample_keys}")
                 return
 
-            with get_session() as s:
-                event = OrderbookEvent(
-                    ticker=ticker,
-                    side=side,
-                    price_cents=price_cents,
-                    delta=delta_size,
-                )
-                s.add(event)
-                s.commit()
+            # Motor 8 (F1 shadow, opcional): OFI pasajero del feed — internamente best-effort,
+            # jamás rompe la captura.
+            if self._ofi is not None:
+                self._ofi.observe_delta(ticker, side, delta_size)
+
+            # Motor 9 (F1 shadow, opcional): derrame — lee el mid del V2 y mide el
+            # follow-through de los hermanos. OJO: este handler corre ANTES que el del V2
+            # (orden de registro), así que el mid va UN delta rezagado — inmaterial para
+            # saltos de ≥5¢ en ventana de 60s (el próximo delta lo ve). Best-effort adentro.
+            if self._spillover is not None:
+                self._spillover.observe(ticker)
+
+            # Persistir orderbook_events es OPT-IN (default off, incidente disco-lleno 2026-07-10):
+            # una fila por cada delta del WS (~240 tickers, 24/7) = millones/día, y NADIE la lee
+            # (telemetry write-only). Los books viven en memoria (OrderbookManagerV2). Solo se graba
+            # si PERSIST_ORDERBOOK_EVENTS=true (debug puntual, con retención via _run_db_maintenance).
+            # DiskGuard: en disco CRITICAL la telemetría se descarta (backpressure) — trading no.
+            if self.settings.PERSIST_ORDERBOOK_EVENTS and DiskGuard.diagnostics_allowed():
+                with get_session() as s:
+                    event = OrderbookEvent(
+                        ticker=ticker,
+                        side=side,
+                        price_cents=price_cents,
+                        delta=delta_size,
+                    )
+                    s.add(event)
+                    s.commit()
         except Exception:
             logger.exception("Error procesando orderbook_delta")
             BotState.record_error("orderbook_delta processing error")
@@ -292,6 +413,10 @@ class DataCaptureService:
             # En Kalshi modelo reciproco: ask de yes = 100 - bid de no
             yes_ask_cents = (100 - no_bid_cents) if no_bid_cents is not None else None
             no_ask_cents = (100 - yes_bid_cents) if yes_bid_cents is not None else None
+
+            # DiskGuard: market_snapshots es DIAGNÓSTICO — en disco critical se descarta.
+            if not DiskGuard.diagnostics_allowed():
+                return
 
             with get_session() as s:
                 snap = MarketSnapshot(
@@ -348,9 +473,31 @@ class DataCaptureService:
                             for market in markets:
                                 ticker = market.get("ticker")
                                 status = market.get("status", "")
+                                # DIAG (una vez): qué campos trae el market de get_event — confirma
+                                # si 'close_time' está presente (si no, el filtro de purga nunca
+                                # tiene con qué marcar settled → purged=0).
+                                if not self._market_keys_logged and ticker:
+                                    self._market_keys_logged = True
+                                    logger.info(
+                                        f"v2.discovery market keys={sorted(market.keys())} "
+                                        f"close_time={market.get('close_time')!r}"
+                                    )
                                 if ticker and status in ("open", "active"):
                                     self._tracked_tickers.add(ticker)
+                                    self._market_close_times[ticker] = market.get("close_time")
+                                    self._market_meta[ticker] = {
+                                        "open_time": market.get("open_time"),
+                                        "status": status,
+                                    }
                                     per_series[prefix] = per_series.get(prefix, 0) + 1
+                                elif ticker and ticker in self._tracked_tickers:
+                                    # Transición fuera de active/open de un ticker YA trackeado:
+                                    # actualizar su metadata para que la recovery de V2 lo purgue
+                                    # (antes se salteaba y el status quedaba rancio en "active").
+                                    self._market_meta[ticker] = {
+                                        "open_time": market.get("open_time"),
+                                        "status": status,
+                                    }
                         except Exception as e:
                             logger.warning(
                                 f"get_event({event_ticker}) error: {type(e).__name__}: {e}"
@@ -362,6 +509,11 @@ class DataCaptureService:
 
         if errors_by_prefix:
             logger.warning(f"Discovery con {len(errors_by_prefix)} errores: {errors_by_prefix}")
+        # Alimentar close_time + open_time/status al v2_manager (si ya existe) para purgar de la
+        # recovery los settled Y los futuros que aún no abrieron (incidente 2026-07-21).
+        if self._v2_manager is not None:
+            self._v2_manager.set_close_times(self._market_close_times)
+            self._v2_manager.set_market_metadata(self._market_meta)
         new_tickers = self._tracked_tickers - before
         BotState.tracked_markets_count = len(self._tracked_tickers)
         logger.success(
@@ -440,6 +592,10 @@ class DataCaptureService:
     async def _take_snapshots(self) -> None:
         """Una pasada de snapshots."""
         if not self._tracked_tickers:
+            return
+        # DiskGuard: market_snapshots es DIAGNÓSTICO — en disco critical se saltea la pasada
+        # entera (ni siquiera pega a la API: el snapshot solo existe para persistirse).
+        if not DiskGuard.diagnostics_allowed():
             return
 
         async with KalshiRestClient() as client:
@@ -586,6 +742,32 @@ class DataCaptureService:
     # Lifecycle
     # =====================================================
 
+    def _ensure_v2_manager(self) -> None:
+        """Crea el OrderbookManagerV2 y lo publica en BotState. IDEMPOTENTE. Se llama TEMPRANO (en
+        run(), antes del discovery) para cerrar la condición de carrera del /status: el discovery
+        puede tardar minutos (o devolver 0 y reintentar), y hasta que corría _register_ws_handlers
+        el BotState.v2_manager quedaba None → /status reportaba instance=missing pese a estar
+        habilitado. Con la creación temprana, la instancia existe desde el arranque; los handlers
+        del WS se registran aparte en _register_ws_handlers."""
+        if self._v2_manager is not None:
+            return
+        if not (self.settings.USE_ORDERBOOK_MANAGER_V2 or self.settings.MOTOR_1_ARBITRAGE_ENABLED):
+            return
+        from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
+
+        self._v2_manager = OrderbookManagerV2(
+            self.ws,
+            recovery_timeout_sec=self.settings.ORDERBOOK_V2_RECOVERY_TIMEOUT_SEC,
+            max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
+            recovery_chunk_size=self.settings.ORDERBOOK_V2_RECOVERY_CHUNK_SIZE,
+            bootstrap_buffer_cap=self.settings.ORDERBOOK_V2_BOOTSTRAP_BUFFER_CAP,
+            recovery_backoff_base_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_BASE_SEC,
+            recovery_backoff_factor=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_FACTOR,
+            recovery_backoff_cap_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_CAP_SEC,
+        )
+        BotState.v2_manager = self._v2_manager
+        logger.info("OrderbookManagerV2 creado + publicado en BotState (pre-discovery)")
+
     def _register_ws_handlers(self) -> None:
         """
         Registra los handlers del WS. Separado de run() para testear el wiring.
@@ -600,16 +782,12 @@ class DataCaptureService:
         self.ws.on("ticker", self._on_ticker)
         self.ws.on("trade", self._on_trade)
 
-        # Orderbook manager — V2 cuando el flag V2 está on O Motor 1 está on. data_capture
-        # SIEMPRE construye el manager y registra sus 4 handlers en el WS (lifecycle del
-        # feed = del WS). Motor 1 lo LEE desde el servicio (self._v2_manager) y BotState;
-        # NO lo reconstruye. Con MOTOR_1_ARBITRAGE_ENABLED=False y V2=False no se construye
-        # nada (path idéntico al previo).
-        if self.settings.USE_ORDERBOOK_MANAGER_V2 or self.settings.MOTOR_1_ARBITRAGE_ENABLED:
-            from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import OrderbookManagerV2
-
-            self._v2_manager = OrderbookManagerV2(self.ws)
-            BotState.v2_manager = self._v2_manager
+        # Orderbook manager V2: la INSTANCIA ya se creó (idempotente) — típicamente en run() ANTES
+        # del discovery, para que /status no reporte instance=missing durante el arranque. Acá solo
+        # se registran sus 4 handlers en el WS (lifecycle del feed = del WS). Motor 1 lo LEE desde
+        # self._v2_manager / BotState; NO lo reconstruye.
+        self._ensure_v2_manager()
+        if self._v2_manager is not None:
             self.ws.on("orderbook_delta", self._v2_manager.handle_message)
             self.ws.on("orderbook_snapshot", self._v2_manager.handle_message)
             self.ws.on("ok", self._v2_manager.handle_message)
@@ -682,6 +860,10 @@ class DataCaptureService:
 
     async def run(self) -> None:
         """Loop principal del servicio."""
+        # Publicar el OrderbookManagerV2 en BotState ANTES del discovery: el discovery puede tardar
+        # minutos (o devolver 0 y reintentar), y hasta que corría _register_ws_handlers el /status
+        # reportaba instance=missing por la carrera. Idempotente con el registro posterior.
+        self._ensure_v2_manager()
         # Discovery con retry: la primera llamada al arranque suele topar 429
         # si Kalshi tiene rate limit acumulado por deploys/restarts previos.
         backoff = 5.0
@@ -709,6 +891,12 @@ class DataCaptureService:
             return
 
         self._register_ws_handlers()
+
+        # El v2_manager recién se creó en _register_ws_handlers → empujarle los close_time ya
+        # descubiertos al boot (la discovery previa corrió sin manager).
+        if self._v2_manager is not None:
+            self._v2_manager.set_close_times(self._market_close_times)
+            self._v2_manager.set_market_metadata(self._market_meta)
 
         # Encolar suscripciones (se aplicaran al conectar el WS)
         ticker_list = list(self._tracked_tickers)

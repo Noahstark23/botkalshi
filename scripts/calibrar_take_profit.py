@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from sqlmodel import col, select
 
+from src.math.fees import kalshi_fee_cents
 from src.storage.models import MarketSnapshot, PortfolioPosition, Trade, get_session
 
 # Mismas estrategias de origen que _settle_originals: las patas BUY que un exit cerraría.
@@ -66,12 +67,19 @@ def run() -> int:
             entry = _entry_bid_cents(s, p.ticker, p.side)
             rows.append((p.ticker, p.side, p.count, bid, entry))
 
+    # PnL NETO de fees (auditoría rentabilidad 2026-07-07: la versión anterior computaba
+    # count·(bid−entry) SIN fees — sobreestimaba cada cierre en ~2 fees y sesgaba la
+    # calibración hacia umbrales más bajos, justo los peores). Vender paga fee de salida;
+    # el entry ya pagó la suya al comprar (se descuenta para comparar contra capital real).
+    def _net_cents(count: int, bid: int, entry: int) -> int:
+        return count * (bid - entry) - kalshi_fee_cents(count, bid) - kalshi_fee_cents(count, entry)
+
     print(f"Posiciones abiertas: {len(rows)}\n")
-    print(f"{'ticker':<32} {'side':<4} {'count':>6} {'bid':>5} {'entry':>6} {'pnl_si_sale':>12}")
+    print(f"{'ticker':<32} {'side':<4} {'count':>6} {'bid':>5} {'entry':>6} {'net_si_sale':>12}")
     print("-" * 72)
     for ticker, side, count, bid, entry in rows:
         pnl = (
-            f"${count * (bid - entry) / 100:>10.2f}"
+            f"${_net_cents(count, bid, entry) / 100:>10.2f}"
             if bid is not None and entry is not None
             else f"{'—':>11}"
         )
@@ -79,12 +87,16 @@ def run() -> int:
         entry_s = str(entry) if entry is not None else "—"
         print(f"{ticker:<32} {side:<4} {count:>6} {bid_s:>5} {entry_s:>6} {pnl:>12}")
 
-    print(f"\n{'umbral':>6} {'cerraría':>9} {'pnl_estimado':>14}")
+    print(f"\n{'umbral':>6} {'cerraría':>9} {'net_estimado':>14}")
     print("-" * 32)
     for thr in THRESHOLDS:
         hit = [(c, b, e) for _, _, c, b, e in rows if b is not None and b >= thr]
-        pnl_cents = sum(c * (b - e) for c, b, e in hit if e is not None)
+        pnl_cents = sum(_net_cents(c, b, e) for c, b, e in hit if e is not None)
         print(f"{thr:>5}c {len(hit):>9} {f'${pnl_cents / 100:.2f}':>14}")
+    print(
+        "\nNOTA: la alternativa a vender es HOLD-TO-SETTLE, que NO paga fee — para el "
+        "veredicto final comparar contra el payout real de los tickers ya resueltos."
+    )
 
     print(
         "\n⚠️  Snapshot aproximado (market_snapshots ~cada 5min). La calibración REAL sale de "

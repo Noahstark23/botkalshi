@@ -66,6 +66,10 @@ class MotorPnL:
     losses: int  # pnl_cents < 0
     contracts: int
     fees_cents: int
+    # Derivados (read-only, NO cambian los totales): ticket promedio ganador/perdedor en cents.
+    # avg_loss_cents es negativo (promedio de los pnl < 0). Revela la asimetría avg_loss ≫ avg_win.
+    avg_win_cents: float = 0.0
+    avg_loss_cents: float = 0.0
 
     @property
     def win_rate_pct(self) -> float:
@@ -108,18 +112,47 @@ def aggregate_daily_pnl(session: Session, day_start: datetime, day_end: datetime
     for t in rows:
         by_strategy.setdefault(t.strategy, []).append(t)
 
+    # Fees de SALIDA (deuda auditoría 2026-07-01): la fila SELL de audit de los exits
+    # (settled, pnl_cents=None → excluida del agregado de PnL a propósito) lleva las fees
+    # de la venta. Sin esto, el renglón "fees" del digest solo mostraba las de entrada.
+    # El PnL NO cambia (las fees de salida ya están netas dentro del pnl de las BUY);
+    # solo el desglose informativo de fees pagadas se completa.
+    exit_fee_rows = list(
+        session.exec(
+            select(Trade).where(
+                Trade.status == "settled",
+                col(Trade.settled_at) >= day_start,
+                col(Trade.settled_at) < day_end,
+                col(Trade.pnl_cents).is_(None),
+                Trade.action == "sell",
+                col(Trade.fees_cents).is_not(None),
+            )
+        )
+    )
+    exit_fees_by_strategy: dict[str, int] = {}
+    for t in exit_fee_rows:
+        exit_fees_by_strategy[t.strategy] = exit_fees_by_strategy.get(t.strategy, 0) + (
+            t.fees_cents or 0
+        )
+
     motors: list[MotorPnL] = []
-    for strategy, trades in by_strategy.items():
+    for strategy in by_strategy.keys() | exit_fees_by_strategy.keys():
+        trades = by_strategy.get(strategy, [])
         pnls = [t.pnl_cents or 0 for t in trades]
+        wins_p = [p for p in pnls if p > 0]
+        losses_p = [p for p in pnls if p < 0]
         motors.append(
             MotorPnL(
                 strategy=strategy,
                 pnl_cents=sum(pnls),
                 n_trades=len(trades),
-                wins=sum(1 for p in pnls if p > 0),
-                losses=sum(1 for p in pnls if p < 0),
+                wins=len(wins_p),
+                losses=len(losses_p),
                 contracts=sum(t.count for t in trades),
-                fees_cents=sum(t.fees_cents or 0 for t in trades),
+                fees_cents=sum(t.fees_cents or 0 for t in trades)
+                + exit_fees_by_strategy.get(strategy, 0),
+                avg_win_cents=(sum(wins_p) / len(wins_p)) if wins_p else 0.0,
+                avg_loss_cents=(sum(losses_p) / len(losses_p)) if losses_p else 0.0,
             )
         )
 
@@ -165,11 +198,22 @@ class DailyPnLLoop:
     def __init__(
         self, *, interval_sec: float | None = None, capital_usd: float | None = None
     ) -> None:
-        s = get_settings() if (interval_sec is None or capital_usd is None) else None
+        s = get_settings() if interval_sec is None else None
         self._interval = (
             interval_sec if interval_sec is not None else s.DAILY_PNL_REPORT_INTERVAL_SEC
         )
-        self._capital = capital_usd if capital_usd is not None else s.ACTIVE_CAPITAL_USD
+        # None → capital EFECTIVO real por reporte (fix 2026-07-01: el retorno % se
+        # calculaba sobre el param estático — con cash real $561 y config $1200, el %
+        # del digest quedaba subestimado ~2×). El override explícito queda para tests.
+        self._capital_override = capital_usd
+
+    @property
+    def _capital(self) -> float:
+        if self._capital_override is not None:
+            return self._capital_override
+        from src.risk.manager import RiskManager
+
+        return RiskManager().effective_capital_usd()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         logger.info(f"daily_pnl loop started interval={self._interval:.0f}s")
@@ -210,13 +254,20 @@ class DailyPnLLoop:
                 return False  # ya reportado → idempotente (también lo blinda el unique de date)
             agg = aggregate_daily_pnl(s, day_start, day_end)
             pnl_usd = agg.total_pnl_cents / 100
+            # Auditoría rentabilidad 2026-07-07: starting_capital era el capital efectivo
+            # AL MOMENTO DEL REPORTE (incluso en backfill de días viejos) → la curva de
+            # equity persistida no encadenaba (ending(d) != starting(d+1)) y el % de un
+            # día viejo se dividía por el capital de HOY. Ahora ENCADENA: starting =
+            # ending de la última fila persistida (fallback: capital actual, sin historia).
+            prev = s.exec(select(DailyPnL).order_by(col(DailyPnL.date).desc())).first()
+            starting = prev.ending_capital if prev is not None else self._capital
             s.add(
                 DailyPnL(
                     date=day.isoformat(),
-                    starting_capital=self._capital,
-                    ending_capital=self._capital + pnl_usd,
+                    starting_capital=starting,
+                    ending_capital=starting + pnl_usd,
                     pnl=pnl_usd,
-                    pnl_pct=(pnl_usd / self._capital * 100) if self._capital else 0.0,
+                    pnl_pct=(pnl_usd / starting * 100) if starting else 0.0,
                     trades_count=agg.total_trades,
                     winning_trades=agg.total_wins,
                     losing_trades=agg.total_losses,
