@@ -11,8 +11,17 @@ fi
 
 cd "$CLAUDE_PROJECT_DIR"
 
+# El repo exige Python >=3.12 y el python del sistema del runner web es 3.11:
+# instalar directo fallaba en TODAS las sesiones ("requires a different Python").
+# Fix: venv con python3.12, primero en el PATH y persistido para el resto de la
+# sesion via CLAUDE_ENV_FILE. .venv/ ya esta ignorado por git.
+VENV="$CLAUDE_PROJECT_DIR/.venv"
+[ -x "$VENV/bin/python" ] || python3.12 -m venv "$VENV"
+export PATH="$VENV/bin:$PATH"
+echo "export PATH=\"$VENV/bin:\$PATH\"" >> "$CLAUDE_ENV_FILE"
+
 echo "[session-start] Installing kalshi-bot deps (pip install -e .[dev])..."
-pip install --quiet -e ".[dev]"
+pip install --quiet --timeout 60 -e ".[dev]"
 
 # Sanity check: los dos comandos que usa CI deben existir y las deps importar.
 python -c "import loguru, pydantic, websockets, httpx" \
