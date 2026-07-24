@@ -68,11 +68,13 @@ tests/                           # pytest espejo de src/ (~1175+, asyncio auto)
 | Motor | Qué hace | Veredicto vigente (no re-litigar sin datos nuevos) |
 |---|---|---|
 | M1 arb binario | yes+no mismo ticker < $1 (WS) | ⚫ **No es alpha (auditoría 2026-07-18).** +$33.63 en jun→jul sobre 517 trades = +$0.065/trade, win 48.9%: ruido alrededor de cero. Y el +$33 es UN día — el incidente 07-07 (186 trades liquidando favorable); sin él, +$3.7, y las 2 últimas semanas gotean negativo (07-09/12/18 todos en rojo). 0 ventanas binarias en TODA la historia (requiere book auto-cruzado). **Vigilar, NO proteger; su volumen es riesgo operativo por retorno cero.** |
-| M2 consenso | direccional vs fair no-vig de sportsbooks | 🔴 **SIN edge estructural (auditoría 2026-07-18): −$432.95, el 100% de la sangría del proyecto.** El edge techa en 0.15pp (p99=0.13pp) sobre 35.129 detecciones — CERO por encima de 2pp — contra un umbral de 3pp: el consenso de sportsbooks es idéntico a Kalshi, no hay ineficiencia. Win 54% pero avg_loss ≫ avg_win. No se arregla con código → **apagar entradas (`MOTOR_2_ENTRY_EXECUTION_ENABLED=false`)**. Flags: `MOTOR_2_SPORTSBOOK_ENABLED` (corre) / `_ENTRY_EXECUTION_ENABLED` (ENTRADAS) / `_EXECUTION_ENABLED` (solo VENTAS) — **no confundirlos**. |
+| M2 consenso | HOY: solo productor de FAIR para M5 (ambos brazos de órdenes APAGADOS 2026-07-23) | 🔴 **SIN edge estructural (auditoría 2026-07-18): −$432.95, el 100% de la sangría del proyecto.** El edge techa en 0.15pp (p99=0.13pp) sobre 35.129 detecciones — CERO por encima de 2pp — contra un umbral de 3pp: el consenso de sportsbooks es idéntico a Kalshi. **EJECUTADO 2026-07-23: `_ENTRY_EXECUTION_ENABLED=false` Y `_EXECUTION_ENABLED=false` (0 posiciones legacy verificadas por DB — el brazo de ventas no protegía nada).** Corre solo `MOTOR_2_SPORTSBOOK_ENABLED=true` porque el shadow de M5 necesita su fair: **el costo de The Odds API está atado al A/B de M5** — si el A/B fracasa, apagar el ciclo entero + la API. Flags homónimos: `_SPORTSBOOK` (ciclo) / `_ENTRY_EXECUTION` (entradas) / `_EXECUTION` (ventas) — **no confundirlos**. |
 | M3 CLV | NO abre — cierra (TP/trailing/T-30) | ✅ Estable. Regla de oro: jamás vender la pata de un hedge (atribución estricta). |
-| M5 MM | quotes GTC post_only alrededor del fair | F1 shadow. Riesgo distintivo: quote RESTING sin gestión. No saltear fases. |
-| M6 line-move | compra la dirección del salto del consenso que Kalshi no digirió | ⚫ **MUDO (auditoría 2026-07-18): 0 filas `linemove` en un mes** — el fair no se mueve ≥3pp con Kalshi rezagado en este universo. Candidato a archivar. (Nota: recién cableado real 2026-07-17 vía #173; darle una ventana corta antes de sepultar, pero la tesis luce muerta.) |
-| REST arb | multi-outcome winner-take-all ≥3 patas + settlement | ⚫ **INEJECUTABLE (auditoría 2026-07-18): edge real 3.13pp en detección, pero 73% rollback (11/15) — Caso A confirmado por `leg_states`.** El FOK no llena 3-4 patas atómicamente en books finos (no hay depth simultáneo); el hard-first (#85) protege 1 pata, las baratas se disparan en paralelo sin protección mutua. La pérdida en DB (−$31.89) SOBREESTIMA la real (registro pesimista a 1¢), pero el motor no puede capturar su edge. **Ningún diff lo arregla; apagar ejecución (`MOTOR_REST_EXECUTION_ENABLED=false`).** Path binario ya estaba muerto; ahora el multi también. |
+| M5 MM | quotes GTC post_only alrededor del fair | F1 shadow, **A/B en curso desde 2026-07-23** (`HALF_SPREAD_CENTS` 3→5; el mtm con spread=3 acumuló −$7.27). ⚠️ Confound anotado: el fair corre degradado (regions=us, burst=0) — si el A/B da negativo, primera palanca = devolver burst SOLO para el fair, no bajar spread. Riesgo distintivo: quote RESTING sin gestión. No saltear fases (F3 exige llave `MOTOR_MM_F3_ACK`). |
+| M6 line-move | compra la dirección del salto del consenso que Kalshi no digirió | ⚫ **ARCHIVADO (2026-07-23): 0 filas `linemove` en toda su vida útil**, incluso tras el cableado real de #173 y con el feed sano — el fair no se mueve ≥3pp con Kalshi rezagado en este universo. Tesis muerta con datos; no revivir sin una observación nueva medida. |
+| REST arb | multi-outcome winner-take-all ≥3 patas + settlement | ⚫ **INEJECUTABLE (auditoría 2026-07-18): edge real 3.13pp en detección, pero 73% rollback (11/15) — Caso A confirmado por `leg_states`.** El FOK no llena 3-4 patas atómicamente en books finos (no hay depth simultáneo); el hard-first (#85) protege 1 pata, las baratas se disparan en paralelo sin protección mutua. La pérdida en DB (−$31.89) SOBREESTIMA la real (registro pesimista a 1¢), pero el motor no puede capturar su edge. **EJECUTADO 2026-07-23: `MOTOR_REST_EXECUTION_ENABLED=false`.** Path binario ya estaba muerto; ahora el multi también. |
+| M8 OFI | desequilibrio anómalo del flujo de órdenes, shadow auto-validante (T+30/T+60) | 🟡 **La ÚNICA promesa viva** (p50 +3.18pp; ~238 señales al 07-23, tasa ~80/día con el feed sano). Gate: n≥500 antes de decidir contrarian/momentum/archivar → **veredicto estimado ~27-jul→10-ago**. Se decide con la tabla, no con un diff. |
+| M9 spillover | salto ≥5¢ en un market → mide el ajuste del HERMANO (T+60/T+120) | Shadow armado 2026-07-23 (`MOTOR_9_SPILLOVER_ENABLED=true`). Sin datos aún; veredicto DERRAME/INSTANTÁNEO/INVERTIDO con `diag_edge_shadow.py` cuando haya n≥20. |
 
 **Regla transversal:** un motor selectivo que casi no opera con edge negativo ESTÁ funcionando
 bien (186 trades/6min fue el incidente, no el objetivo). El sizing lo gobierna el capital
@@ -209,3 +211,21 @@ Patrón validado con el Motor 6 — seguirlo SIEMPRE:
   PnL/motor por día (`GROUP BY strategy, date(settled_at)`), distribución de edge de M2
   (`motor2_funnel_snapshots`), y `SELECT leg_states FROM edge_windows WHERE kind='multi_outcome'`
   (0 ERROR_RED = descarta bug de red; todo FILL/KILL = books finos).
+- **2026-07-21/23** — (a) sid=1 con 189 mercados FUTUROS sin book operable en loop de recovery
+  tras cada boot → #183: purga por `open_time`/`status` de discovery (conocimiento POSITIVO
+  solamente — ausente sigue recuperable) + backoff exponencial del breaker (30s→30min; antes
+  el disable era permanente). (b) **DRIFT DE PROTOCOLO ×3 de Kalshi en julio** — la lección
+  grande: shape del REST /orderbook (#171), envelope del error WS ANIDADO que dejaba MUERTO
+  el manejo de code 15 (#186), y `action` que ya no va en el top-level del comando sino DENTRO
+  de `params` (#187 — "Action required" era literal). La cadena cegó los books DÍAS
+  (`books_initialized=0`, 351 rechazos/día cayendo como ruido, recovery muriendo por timeout).
+  Fix + **wire format PINEADO por test** (la próxima mudanza de Kalshi se ve en CI, no en prod).
+  (c) Pipeline de 3 patas estrenado (operador + agente web con skill `agente-web` + agente de
+  código): cazó un batch de env vars aplicado a la app equivocada (polybot vs botkalshi — 4/7
+  sin tomar, los brazos de sangría seguían prendidos), descartó hipótesis con discriminadores
+  y aisló los drifts en horas. Protocolo de escritura: lista literal `NOMBRE=valor` aprobada
+  por Noel → aplicar → verificar `env` en el container (el toast de Coolify NO es verificación).
+  (d) Estado final del día: M2 sin NINGÚN brazo de órdenes (entradas y ventas off, 0 posiciones
+  legacy por DB); REST off; `ACTIVE_CAPITAL_USD=100` (fallback alineado al cash real ~$99);
+  `capital.is_paused=true` por piso $100 — NADIE abre posiciones nuevas hasta decisión de
+  recapitalizar, que solo se toma si M8 (o el A/B de M5) gradúa con datos.
