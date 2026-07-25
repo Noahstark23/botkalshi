@@ -2,7 +2,9 @@
 Telegram alerts.
 
 Notifica eventos importantes al chat configurado.
-Falla silenciosa si Telegram no está configurado (opcional).
+Best-effort: sin Telegram configurado NO envía, pero lo dice UNA vez en el log
+(incidente 2026-07-25: "falla silenciosa" total dejó el disco llegar a 0.03GB
+sin un solo aviso — el silencio absoluto de las alertas es en sí una alerta).
 """
 
 from __future__ import annotations
@@ -18,6 +20,9 @@ if TYPE_CHECKING:
     from src.math.arbitrage import ArbOpportunity
     from src.strategies.motor_rest_arb.executor import ExecutionOutcome
 
+# One-shot: avisar una sola vez por proceso que las alertas están desactivadas.
+_unconfigured_warned = False
+
 
 async def send_alert(message: str, *, urgent: bool = False) -> bool:
     """
@@ -32,6 +37,18 @@ async def send_alert(message: str, *, urgent: bool = False) -> bool:
     """
     settings = get_settings()
     if not settings.telegram_configured:
+        # Incidente 2026-07-25: el disco llegó a 0.03GB libres y NINGUNA alerta salió —
+        # este return silencioso era el agujero: sin Telegram configurado, TODAS las
+        # alertas del bot (disco, riesgo, breakers) morían mudas sin dejar rastro.
+        # One-shot por proceso (no spamear el log por cada alerta descartada).
+        global _unconfigured_warned
+        if not _unconfigured_warned:
+            _unconfigured_warned = True
+            logger.warning(
+                "telegram.alertas_DESACTIVADAS: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID sin "
+                "configurar — NINGÚN aviso (disco, riesgo, breakers) va a llegar. "
+                f"Alerta descartada: {message[:120]!r}"
+            )
         return False
 
     prefix = "🚨 " if urgent else ""

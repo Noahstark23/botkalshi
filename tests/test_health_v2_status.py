@@ -35,6 +35,7 @@ def mock_settings(*, v2_enabled: bool):
     s.MOTOR_1_ARBITRAGE_ENABLED = False
     s.MOTOR_2_SPORTSBOOK_ENABLED = False
     s.MOTOR_3_CLV_ENABLED = False
+    s.telegram_configured = False  # incidente 2026-07-25: visible en /status
     return s
 
 
@@ -129,6 +130,8 @@ def test_status_shows_v2_metrics_when_enabled(client):
     assert v2["sids_recovering"] == 0
     assert v2["gaps_last_60s"] == 2
     assert v2["last_gap_at"] == "2026-05-22T10:00:00+00:00"
+    # Incidente 2026-07-25: si las alertas están desactivadas, el /status lo DICE.
+    assert data["config"]["telegram_alerts_configured"] is False
 
 
 def test_status_handles_missing_manager_gracefully(client):

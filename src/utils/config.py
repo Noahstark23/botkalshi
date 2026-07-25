@@ -194,6 +194,13 @@ class Settings(BaseSettings):
 
     # === Logging ===
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # Nivel del sink de ARCHIVO (incidente 2026-07-25: en DEBUG fijo escribió 8.5GB/día —
+    # dumps de payload por snapshot — y llenó el disco). Default INFO; subir a DEBUG por
+    # env SOLO mientras se diagnostica un incidente, y volverlo a bajar.
+    LOG_FILE_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
+        default="INFO",
+        description="Nivel del log a archivo (/app/logs). DEBUG solo para diagnóstico puntual.",
+    )
 
     # === Operational toggles ===
     TRADING_ENABLED: bool = False

@@ -36,11 +36,16 @@ def setup_logging() -> None:
     logs_dir = Path("/app/logs")
     logs_dir.mkdir(exist_ok=True, parents=True)
 
+    # Incidente 2026-07-25: este sink en DEBUG con rotación SOLO diaria escribió 8.5GB en
+    # un día (dumps de payload por snapshot en tormentas de recovery) y llenó el disco que
+    # el .OLD ya venía comiendo. "Nada sin tope" aplica a los logs: nivel configurable
+    # (default INFO; subir a DEBUG por env SOLO mientras se diagnostica) + rotación por
+    # TAMAÑO (un día verboso rota varias veces y la retención poda igual).
     logger.add(
         logs_dir / "bot_{time:YYYY-MM-DD}.log",
-        level="DEBUG",
-        rotation="00:00",  # rotate diario a medianoche
-        retention="30 days",
+        level=settings.LOG_FILE_LEVEL,
+        rotation="500 MB",
+        retention="14 days",
         compression="gz",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
         backtrace=True,
