@@ -59,3 +59,74 @@ async def test_alert_bet_placed_silent_when_telegram_not_configured(monkeypatch)
     await telegram_alerts.alert_bet_placed(
         motor="Motor 2", ticker="T", side="yes", count=1, price_cents=50, edge_pct=2.0
     )
+
+
+# =====================================================
+# Incidente 2026-07-25: alertas MUDAS con Telegram sin configurar
+# =====================================================
+
+
+@pytest.fixture(autouse=True)
+def _reset_unconfigured_warned():
+    telegram_alerts._unconfigured_warned = False
+    yield
+    telegram_alerts._unconfigured_warned = False
+
+
+def _capture_warnings():
+    from loguru import logger
+
+    records: list[str] = []
+    sink = logger.add(lambda m: records.append(str(m)), level="WARNING")
+    return records, sink
+
+
+@pytest.mark.asyncio
+async def test_send_alert_unconfigured_warns_once(monkeypatch):
+    """Sin Telegram configurado, send_alert loguea UNA VEZ que las alertas están
+    desactivadas (el disco llegó a 0.03GB sin un solo aviso y sin rastro del porqué)
+    y no spamea en llamadas siguientes."""
+    from loguru import logger
+
+    monkeypatch.setattr(
+        telegram_alerts, "get_settings", lambda: type("S", (), {"telegram_configured": False})()
+    )
+    records, sink = _capture_warnings()
+    try:
+        assert await telegram_alerts.send_alert("disco critical") is False
+        assert await telegram_alerts.send_alert("otra alerta") is False
+        assert await telegram_alerts.send_alert("y otra") is False
+    finally:
+        logger.remove(sink)
+
+    warns = [r for r in records if "alertas_DESACTIVADAS" in r]
+    assert len(warns) == 1  # one-shot: una línea, no una por alerta
+    assert "disco critical" in warns[0]  # incluye la primera alerta descartada
+
+
+@pytest.mark.asyncio
+async def test_send_alert_configured_does_not_warn(monkeypatch):
+    """CONTROL: con Telegram configurado no aparece el aviso de desactivadas."""
+    from unittest.mock import MagicMock, patch
+
+    from loguru import logger
+
+    s = type(
+        "S",
+        (),
+        {"telegram_configured": True, "TELEGRAM_BOT_TOKEN": "t0k3n", "TELEGRAM_CHAT_ID": "42"},
+    )()
+    monkeypatch.setattr(telegram_alerts, "get_settings", lambda: s)
+    records, sink = _capture_warnings()
+    resp = MagicMock(status_code=200)
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.post = AsyncMock(return_value=resp)
+    try:
+        with patch.object(telegram_alerts.httpx, "AsyncClient", return_value=client):
+            assert await telegram_alerts.send_alert("hola") is True
+    finally:
+        logger.remove(sink)
+
+    assert not any("alertas_DESACTIVADAS" in r for r in records)
