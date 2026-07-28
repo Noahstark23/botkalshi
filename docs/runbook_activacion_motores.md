@@ -19,7 +19,7 @@ Estos no son opinión: son incoherencias verificadas en el código.
 
 | # | Env var | Valor actual | Poner | Por qué |
 |---|---|---|---|---|
-| 1 | `MAX_DAILY_LOSS_PCT` | 9 | **3** | `_evaluate_windows()` (`src/risk/manager.py:595-615`) evalúa mensual → semanal → diario. Con 9 > 8 el semanal SIEMPRE dispara primero: **el stop diario nunca se ejecuta**. Encender motores sin freno de corto plazo es el peor escenario posible. |
+| 1 | `MAX_DAILY_LOSS_PCT` | 9 | **3** ✅ aplicado | `_evaluate_windows()` (`manager.py:595-615`) evalúa mensual → semanal → diario. Con 9 > 8 el semanal dispara antes que el diario **cuando los porcentajes dominan** (ver 0.c: hoy no dominan). Bug LATENTE, no activo — se materializaba arriba de ~$500 de capital. Corregido igual: ahora el orden es coherente a cualquier nivel. |
 | 2 | `MAX_SIMULTANEOUS_EXPOSURE_PCT` | 50 | **25** | Duplicar exposición simultánea justo cuando se multiplican los motores acumula riesgo dos veces. 25 es el valor de preview y del diseño original. |
 | 3 | `SENTRY_DSN` | vacío | **configurar** | Sin monitoreo de errores no hay forma de ver un crash-loop de un motor recién encendido. |
 | 4 | `DAILY_PNL_REPORT_ENABLED` | false | **true** | Es el reporte que detecta la sangría diaria. Sin él, el mes se evalúa recién al final. |
@@ -49,6 +49,33 @@ Mecánica (`manager.py:87-134`), para leer ese bloque con criterio:
 (5%), exposición (25%) y los stop-losses. Anotar ese número en el baseline: si
 cambia durante el mes (depósitos/retiros mueven el cash real), los umbrales
 absolutos de la línea defensiva se recalculan proporcionalmente.
+
+**Baseline medido 2026-07-28 21:26 UTC: `effective_usd = $270.11`**
+(cash real $300.12 × 90% de factor de seguridad, modo dynamic).
+
+### PASO 0.c — Los PISOS USD mandan, no los porcentajes (verificado en vivo)
+
+`manager.py:577`: `limit = max(capital_usd * (pct/100), floor)`. Con $270.11 de
+capital efectivo y los `MAX_*_LOSS_FLOOR_USD` en sus defaults (20/40/60, no
+seteados en Coolify):
+
+| Ventana | % configurado | % en USD | Piso | **Límite real** | = % efectivo |
+|---|---|---|---|---|---|
+| Diario | 3% | $8.10 | $20 | **$20** | 7.4% |
+| Semanal | 8% | $21.61 | $40 | **$40** | 14.8% |
+| Mensual | 15% | $40.52 | $60 | **$60** | 22.2% |
+
+**El freno diario real es $20 (7.4%), no 3%.** El cambio del PASO 0 igual
+apretó ~18% (antes: `max(24.31, 20) = $24.31`). Si querés que el diario sea
+realmente 3% del capital, hay que bajar también `MAX_DAILY_LOSS_FLOOR_USD`
+(p. ej. a 8). Decisión pendiente del owner — **con capital chico los pisos son
+una protección deliberada** (un stop de $8 se dispara con ruido normal), así
+que dejarlos también es defendible. Lo que NO es defendible es no saber cuál
+manda: ahora está medido.
+
+Gate adicional visto en el arranque: **Rolling30d está al 65% de su límite pero
+`gate_off`** — mide pero no actúa. Si se quiere ese freno activo durante el mes,
+hay que encenderlo explícitamente (`ROLLING_DRAWDOWN_STOP_ENABLED`).
 
 ---
 

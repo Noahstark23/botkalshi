@@ -38,20 +38,40 @@ async def send_alert(message: str, *, urgent: bool = False) -> bool:
     text = f"{prefix}{message}"[:4000]  # Telegram cap
 
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    base_payload = {
         "chat_id": settings.TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
 
+    # Incidente 2026-07-28 (boot 21:26): HTTP 400 "can't parse entities". El parse_mode
+    # Markdown legacy revienta con cualquier _ * [ ` sin balancear, y los tickers y montos
+    # que interpolamos los traen. Un canal de ALERTAS no puede perder el mensaje por el
+    # formato — se reintenta en texto plano. Regla del proyecto: acotar y alertar, nunca
+    # quedarse mudo. Crítico ahora: el digest diario de PnL sale por este mismo canal y es
+    # el instrumento de vigilancia del mes de prueba.
+    attempts = [
+        {**base_payload, "parse_mode": "Markdown"},
+        base_payload,  # fallback sin formato: imposible que falle por parseo
+    ]
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code != 200:
-                logger.warning(f"Telegram falló {resp.status_code}: {resp.text[:200]}")
-                return False
-            return True
+            for i, payload in enumerate(attempts):
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    if i > 0:
+                        logger.warning(
+                            "Telegram: Markdown rechazado, enviado en texto plano "
+                            "(revisar formato del mensaje)"
+                        )
+                    return True
+                is_parse_error = resp.status_code == 400 and "parse" in resp.text.lower()
+                if not is_parse_error:
+                    logger.warning(f"Telegram falló {resp.status_code}: {resp.text[:200]}")
+                    return False
+            logger.error("Telegram: mensaje PERDIDO — falló incluso en texto plano")
+            return False
     except Exception as e:
         logger.warning(f"Telegram error: {e}")
         return False
