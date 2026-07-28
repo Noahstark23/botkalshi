@@ -28,6 +28,28 @@ Estos no son opinión: son incoherencias verificadas en el código.
 Verificación tras el redeploy: `GET :18080/status` debe mostrar los límites
 nuevos, y `/health` responder 200.
 
+### PASO 0.b — Leer el capital EFECTIVO antes de fijar umbrales
+
+No hay que adivinar si el sizing usa `ACTIVE_CAPITAL_USD` (100) o el bankroll
+(1200): `GET :18080/status` → bloque **`capital`** ya lo dice:
+
+```
+capital: { mode: dynamic|fixed, raw_balance_usd, effective_usd, is_paused }
+```
+
+Mecánica (`manager.py:87-134`), para leer ese bloque con criterio:
+- `DYNAMIC_CAPITAL_ENABLED=false` → efectivo = `ACTIVE_CAPITAL_USD` ($100).
+- `true` con balance cacheado → `cash_real × CAPITAL_SAFETY_FACTOR_PCT`,
+  **capado por `CAPITAL_CAP_USD` y con piso `CAPITAL_FLOOR_USD`**, más el hard
+  cap de $5k en producción.
+- `true` sin balance todavía (refresh no corrió o la API falló) → fallback a
+  `ACTIVE_CAPITAL_USD` con WARNING.
+
+**`effective_usd` es la única fuente de verdad**: de ahí salen sizing por trade
+(5%), exposición (25%) y los stop-losses. Anotar ese número en el baseline: si
+cambia durante el mes (depósitos/retiros mueven el cash real), los umbrales
+absolutos de la línea defensiva se recalculan proporcionalmente.
+
 ---
 
 ## PASO 1 — Orden de encendido (uno por redeploy)
@@ -87,9 +109,18 @@ Cadencia sugerida del mes de prueba:
   mantener todo encendido 30 días.
 - **Cierre del mes**: `/stats/motors?days=30` vs el baseline del PASO 1.
   Criterio de éxito por motor, definido ahora (anti confirmation bias):
-  - **Sigue**: PnL neto > 0 Y PnL/trade > $0.15 (arriba del ruido)
+  - **Sigue**: PnL neto > 0 **Y** `pnl_per_trade_usd` > 2 × fee promedio por
+    trade (`fees_usd / settled_trades`, ambos en la respuesta de
+    `/stats/motors`)
   - **Se apaga**: PnL neto < 0
   - **Se archiva**: 0 señales en el mes (caso M6 hoy)
+
+  > El umbral de "ruido" es **relativo al fee, no un absoluto en dólares**: un
+  > PnL/trade fijo significaría cosas distintas según el capital efectivo del
+  > momento (ver PASO 0.b), y contaminaría justo la métrica con la que se
+  > decide. Contra el fee es auto-escalante: si el motor no le gana varias
+  > veces a su propio costo de transacción, es ruido — que es exactamente lo
+  > que mostró M1 en julio (+$0.065/trade).
 
 ## Nota honesta para el cierre del mes
 
