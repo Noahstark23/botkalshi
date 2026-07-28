@@ -104,9 +104,9 @@ def arb_group_key(trade: Trade) -> str:
     return coid  # grupo unitario
 
 
-def _leg_pnl_cents(trade: Trade, result: str) -> int:
+def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int, int]:
     """
-    PnL realizado de una pata al resolverse el mercado.
+    PnL realizado de una pata al resolverse el mercado, y el fee usado para calcularlo.
 
     Ganadora (side == result): payout 100¢/contrato − costo − fees.
     Perdedora: −costo − fees. Usa fill_price_cents si existe (precio real), si no el
@@ -117,6 +117,12 @@ def _leg_pnl_cents(trade: Trade, result: str) -> int:
     no cambia: P(100−P) es simétrico). Count: filled_count si existe (Motor 5 registra
     ahí el fill REAL de una quote parcial); las filas de los otros motores lo dejan
     None y caen a count, sin cambios.
+
+    DEVUELVE EL FEE (2026-07-28): el fallback recomputado se usaba y se tiraba, así que
+    las filas que llegaban con fees_cents NULL settleaban con fee descontado del PnL
+    pero SIN dejarlo registrado (caso M1: 519 trades con fees $0.00, ver
+    docs/runbook_activacion_motores.md §PASO 3). El caller lo persiste: el PnL no
+    cambia, pero el fee deja de ser invisible para las métricas del mes de prueba.
     """
     price = trade.fill_price_cents or trade.price_cents
     count = trade.filled_count if trade.filled_count is not None else trade.count
@@ -126,8 +132,13 @@ def _leg_pnl_cents(trade: Trade, result: str) -> int:
         price = 100 - price
     fees = trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(count, price)
     if side == result:
-        return (100 - price) * count - fees
-    return -price * count - fees
+        return (100 - price) * count - fees, fees
+    return -price * count - fees, fees
+
+
+def _leg_pnl_cents(trade: Trade, result: str) -> int:
+    """Compat: solo el PnL (lo consumen tests y análisis)."""
+    return _leg_pnl_and_fees_cents(trade, result)[0]
 
 
 class SettlementPoller:
@@ -228,7 +239,12 @@ class SettlementPoller:
                     ).first()
                     if row is None or row.status != "filled":
                         continue  # carrera benigna: otro proceso la cerró
-                    row.pnl_cents = _leg_pnl_cents(row, resolutions[t.id])  # type: ignore[index]
+                    pnl, fee = _leg_pnl_and_fees_cents(row, resolutions[t.id])  # type: ignore[index]
+                    row.pnl_cents = pnl
+                    # Solo si falta: nunca pisar un fee ya registrado (M3 lo ajusta por
+                    # tramos al cerrar por CLV; sobrescribirlo rompería esa contabilidad).
+                    if row.fees_cents is None:
+                        row.fees_cents = fee
                     row.status = "settled"
                     row.settled_at = now
                     row.notes = f"{row.notes or ''} settled_by_poller".strip()[:500]

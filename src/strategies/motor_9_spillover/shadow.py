@@ -222,6 +222,10 @@ class Motor9SpilloverShadow:
                         gross_spread_cents=int(round(follow60)),
                         fees_cents=None,
                         count=int(max(min(move, 99), -99)),
+                        # UNIDAD: CENTAVOS del move del trigger, NO porcentaje (columna
+                        # polimórfica; ver _EDGE_UNITS en monitoring/health.py). El trigger
+                        # tiene umbral mínimo, así que tampoco hay valores entre 0 y ese
+                        # umbral: no leer esta serie con buckets de puntos porcentuales.
                         edge_pct=move,
                         kind="spillover",
                         leg_states=f"src={src_suffix}"[:50],

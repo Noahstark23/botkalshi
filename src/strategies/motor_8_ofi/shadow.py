@@ -130,6 +130,11 @@ class Motor8OfiShadow:
                         gross_spread_cents=int(round(move30)),
                         fees_cents=None,
                         count=int(max(min(p.signal.ofi, 2**30), -(2**30))),
+                        # UNIDAD: z-score, NO porcentaje (la columna se llama edge_pct por
+                        # los kinds binarios). Además el detector solo emite con |z| >= z_min,
+                        # así que esta serie NO tiene valores entre 0 y z_min: leerla con
+                        # buckets de puntos porcentuales produce un hueco que parece
+                        # artefacto de datos y no lo es (_EDGE_UNITS en monitoring/health.py).
                         edge_pct=p.signal.zscore,
                         kind="ofi",
                     )

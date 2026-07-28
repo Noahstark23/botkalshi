@@ -133,15 +133,53 @@ def test_stats_edges_distribucion_por_kind():
         body = client.get("/stats/edges").json()
     ofi = body["by_kind"]["ofi"]
     assert ofi["rows_total"] == 2
-    assert ofi["gt_1pp"] == 1  # solo el de 3.2pp
-    assert ofi["gt_3pp"] == 1
-    assert ofi["gt_8pp_sospechosos"] == 0
-    assert ofi["edge_pct_max"] == pytest.approx(3.2)
+    assert ofi["value_max"] == pytest.approx(3.2)
     legacy = body["by_kind"]["binary"]
     assert legacy["rows_total"] == 1
-    assert legacy["rows_with_edge_pct"] == 0  # NULL excluido de buckets
-    assert body["top_10_edges"][0]["edge_pct"] == pytest.approx(3.2)
-    assert body["top_10_edges"][0]["kind"] == "ofi"
+    assert legacy["rows_with_value"] == 0  # NULL excluido de buckets
+
+
+class TestEdgesUnidadPorKind:
+    """
+    Incidente 2026-07-28: `/stats/edges` aplicaba buckets en PUNTOS PORCENTUALES a
+    una columna polimórfica. M8 guarda z-scores en `edge_pct` y M9 centavos → el
+    reporte mostraba "max 2678.83pp" y 1349 filas "sospechosas >8pp" que eran
+    z-scores normales, y los contadores >0/>1/>3 idénticos (el detector solo emite
+    con |z| >= z_min, así que no existe señal entre 0 y el umbral). Ese hueco se
+    leyó como artefacto de datos; era la unidad equivocada.
+    """
+
+    def test_ofi_no_reporta_buckets_en_pp(self):
+        _seed()
+        with TestClient(app) as client:
+            ofi = client.get("/stats/edges").json()["by_kind"]["ofi"]
+        assert ofi["unit"] == "zscore"
+        # Los buckets en pp NO se calculan para una serie que no está en %
+        assert "gt_8pp_sospechosos" not in ofi
+        assert "gt_3pp" not in ofi
+        assert "nota_unidad" in ofi
+
+    def test_binarios_si_reportan_buckets_en_pp(self):
+        with get_session() as s:
+            s.add(EdgeWindow(market_ticker="K-1", magnitude_cents=3, kind="binary", edge_pct=9.5))
+            s.add(EdgeWindow(market_ticker="K-2", magnitude_cents=1, kind="binary", edge_pct=2.0))
+            s.commit()
+        with TestClient(app) as client:
+            b = client.get("/stats/edges").json()["by_kind"]["binary"]
+        assert b["unit"] == "pct"
+        assert b["gt_1pp"] == 2
+        assert b["gt_3pp"] == 1
+        assert b["gt_8pp_sospechosos"] == 1  # el guardarraíl SOLO tiene sentido acá
+
+    def test_top_10_excluye_unidades_que_no_son_pct(self):
+        """Un z-score de 40 no puede encabezar un ranking de 'edges'."""
+        with get_session() as s:
+            s.add(EdgeWindow(market_ticker="K-OFI", magnitude_cents=1, kind="ofi", edge_pct=40.0))
+            s.add(EdgeWindow(market_ticker="K-BIN", magnitude_cents=3, kind="binary", edge_pct=4.0))
+            s.commit()
+        with TestClient(app) as client:
+            top = client.get("/stats/edges").json()["top_10_edges"]
+        assert [r["ticker"] for r in top] == ["K-BIN"]
 
 
 def test_param_days_clamp_fastapi():
@@ -211,6 +249,57 @@ def test_stats_motors_detecta_ruido_y_peor_dia():
     assert m1["verdict_hint"].startswith("ruido")
     two_ago = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
     assert m1["worst_day"]["date"] == two_ago
+
+
+class TestFeeCoverageEnStatsMotors:
+    """
+    Incidente 2026-07-28: M1 reportaba `fees_usd: 0.00` sobre 519 trades settleados
+    porque nadie persistía `fees_cents`. El criterio de cierre del mes de prueba
+    ("PnL/trade > 2 × fee promedio") comparaba contra CERO → aprobaba exactamente al
+    motor que estaba diseñado para descartar. El endpoint tiene que DECIR que el dato
+    falta, no rellenar el hueco con un absoluto.
+    """
+
+    def test_expone_cuantos_trades_no_tienen_fee(self):
+        with get_session() as s:
+            t = _settled_trade("motor_1_arbitrage", 10, oid="nofee")
+            t.fees_cents = None
+            s.add(t)
+            s.add(_settled_trade("motor_1_arbitrage", 10, oid="confee"))
+            s.commit()
+        with TestClient(app) as client:
+            m1 = client.get("/stats/motors").json()["by_motor"]["motor_1_arbitrage"]
+        assert m1["fees_missing_trades"] == 1
+        assert m1["fees_coverage_pct"] == 50.0
+        assert m1["verdict_hint"].startswith("indeterminado")
+
+    def test_umbral_de_ruido_es_relativo_al_fee(self):
+        """+$0.10/trade con fee $0.20 es ruido aunque el PnL neto sea positivo."""
+        with get_session() as s:
+            for i in range(3):
+                t = _settled_trade("motor_1_arbitrage", 10, oid=f"r{i}")
+                t.fees_cents = 20  # $0.20 de fee por trade → umbral $0.40
+                s.add(t)
+            s.commit()
+        with TestClient(app) as client:
+            m1 = client.get("/stats/motors").json()["by_motor"]["motor_1_arbitrage"]
+        assert m1["fees_coverage_pct"] == 100.0
+        assert m1["fee_per_trade_usd"] == pytest.approx(0.20)
+        assert m1["ruido_umbral_usd"] == pytest.approx(0.40)
+        assert m1["verdict_hint"].startswith("ruido")
+
+    def test_fee_cero_real_no_hace_el_umbral_cero(self):
+        """Piso anti-degenerado: sin él, fee=0 aprobaría +$0.01/trade como 'positivo'."""
+        with get_session() as s:
+            for i in range(3):
+                t = _settled_trade("motor_5_mm", 1, oid=f"z{i}")
+                t.fees_cents = 0
+                s.add(t)
+            s.commit()
+        with TestClient(app) as client:
+            m5 = client.get("/stats/motors").json()["by_motor"]["motor_5_mm"]
+        assert m5["ruido_umbral_usd"] == pytest.approx(0.15)
+        assert m5["verdict_hint"].startswith("ruido")
 
 
 def test_stats_motors_ignora_no_settleados():

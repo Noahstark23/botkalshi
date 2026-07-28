@@ -525,11 +525,11 @@ class ArbitrageExecutor:
         from src.math.fees import kalshi_fee_cents
 
         now = _naive_utc_now()
-        pnl = (
-            sold * (sell_price_cents - leg.price_cents)
-            - kalshi_fee_cents(sold, sell_price_cents)
-            - kalshi_fee_cents(sold, leg.price_cents)
-        )
+        # Fee del round-trip (entrada + salida): ya estaba descontado del PnL pero se
+        # perdía sin registrar. Se guarda para que /stats/motors pueda medir el costo
+        # de transacción del motor, no solo su resultado neto.
+        fees = kalshi_fee_cents(sold, sell_price_cents) + kalshi_fee_cents(sold, leg.price_cents)
+        pnl = sold * (sell_price_cents - leg.price_cents) - fees
         note = f"rollback_sell~{sell_price_cents}c"
         try:
             with get_session() as s:
@@ -541,10 +541,17 @@ class ArbitrageExecutor:
                     t.status = "settled"
                     t.settled_at = now
                     t.pnl_cents = pnl
+                    t.fees_cents = fees  # round-trip completo, reemplaza el estimado de entrada
                     t.notes = f"{t.notes or ''} {note}".strip()[:500]
                     s.add(t)
                 else:
                     t.count = t.count - sold  # remanente sigue abierto (filled)
+                    if t.fees_cents is not None:
+                        # El tramo vendido se lleva su fee de entrada a la hija: sin esto
+                        # el fee de esos contratos quedaría contado dos veces (patrón de
+                        # _settle_originals en M3).
+                        entry_tramo = kalshi_fee_cents(sold, leg.price_cents)
+                        t.fees_cents = max(0, t.fees_cents - entry_tramo)
                     s.add(t)
                     s.add(
                         Trade(
@@ -559,6 +566,7 @@ class ArbitrageExecutor:
                             status="settled",
                             settled_at=now,
                             pnl_cents=pnl,
+                            fees_cents=fees,
                             notes=f"{t.notes or ''} {note} split".strip()[:500],
                         )
                     )
@@ -712,6 +720,8 @@ class ArbitrageExecutor:
         riesgo neto ~$0 contaba su notional BRUTO como exposición direccional — el par
         243×243 del 30-jun copó $235 del cap compartido y dejó a Motor 2 en 0 contratos.
         """
+        from src.math.fees import kalshi_fee_cents
+
         arb_id = str(uuid.uuid4())
         with get_session() as s:
             for leg, coid in zip(opp.legs, client_ids, strict=True):
@@ -722,6 +732,12 @@ class ArbitrageExecutor:
                     action="buy",
                     count=count,
                     price_cents=leg.price_cents,
+                    # Fee de entrada estimado, como ya hacían M2 y REST al persistir la
+                    # intención. Faltaba SOLO acá → los 519 trades settleados de M1
+                    # reportaban fees $0.00 y un criterio "PnL/trade vs fee" lo aprobaba
+                    # por comparar contra cero (2026-07-28). El PnL no cambia: el
+                    # settlement ya descontaba este mismo fee vía fallback.
+                    fees_cents=kalshi_fee_cents(count, leg.price_cents),
                     strategy="motor_1_arbitrage",
                     estimated_edge_pct=opp.edge_pct,
                     status="pending",

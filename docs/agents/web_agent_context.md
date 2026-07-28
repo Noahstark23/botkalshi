@@ -56,6 +56,16 @@ preguntá, no asumas.
   muestra), M9 spillover (shadow), REST multi-outcome (inejecutable).
 - **Guardarraíl de plausibilidad:** en binarios líquidos ningún edge >15pp es
   real y >8pp ya es sospechoso — repórtalos como data podrida, no oportunidad.
+  **Aplica SOLO donde `/stats/edges` dice `"unit": "pct"`.** Los bloques con
+  `unit: zscore` (M8/ofi) o `unit: cents` (M9/spillover) no están en porcentaje:
+  un "9" ahí es un z-score normal, no un edge sospechoso. Esos bloques traen los
+  buckets en pp omitidos a propósito — no los reconstruyas ni los compares
+  contra 8. Si ves valores de tres o cuatro cifras, mirá `unit` antes de
+  reportar una anomalía.
+- **Cobertura de fees:** en `/stats/motors`, `fees_coverage_pct < 100` significa
+  que ese motor tiene trades viejos sin el fee registrado (filas anteriores al
+  fix del 2026-07-28). Su `verdict_hint` va a decir `indeterminado`: reportalo
+  tal cual, no lo traduzcas a "ruido" ni a "positivo".
 
 ## Tareas típicas
 
