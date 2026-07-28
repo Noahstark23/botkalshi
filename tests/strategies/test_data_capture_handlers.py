@@ -671,3 +671,83 @@ async def test_disk_ok_snapshot_still_persists(mock_session, service):
     await service._on_orderbook_snapshot(msg)
 
     assert mock_db.add.called
+
+
+# =====================================================
+# Incidente 2026-07-28: market_snapshots 1,83M → 13,33M filas/día en 3 días
+# =====================================================
+
+
+def _snap_msg(ticker: str, yes_px: str, no_px: str) -> dict:
+    return {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": ticker,
+            "yes_dollars_fp": [[yes_px, "100.00"]],
+            "no_dollars_fp": [[no_px, "100.00"]],
+        },
+    }
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_snapshot_repetido_no_escribe_otra_fila(mock_session, service):
+    """
+    Este handler grababa UNA fila por frame del WS, con su propio commit. Kalshi
+    reemite el snapshot completo en cada (re)suscripción, así que cada recovery del
+    manager V2 disparaba una ráfaga de filas IDÉNTICAS — ~154 inserts/seg contra la
+    misma SQLite del trading, y el full scan de esa tabla congeló el bot.
+    """
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    for _ in range(50):  # una ráfaga de resuscripción: el mismo libro 50 veces
+        await service._on_orderbook_snapshot(_snap_msg("KXT-1", "0.4000", "0.5500"))
+
+    assert mock_db.add.call_count == 1  # solo la primera
+    assert service._snaps_deduped == 49
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_snapshot_con_libro_distinto_si_escribe(mock_session, service):
+    """CONTROL: el de-dupe no puede tragarse un movimiento real del libro."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    await service._on_orderbook_snapshot(_snap_msg("KXT-1", "0.4000", "0.5500"))
+    await service._on_orderbook_snapshot(_snap_msg("KXT-1", "0.4100", "0.5500"))  # se movió
+    await service._on_orderbook_snapshot(_snap_msg("KXT-1", "0.4100", "0.5500"))  # quieto otra vez
+
+    assert mock_db.add.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_dedupe_es_por_ticker(mock_session, service):
+    """CONTROL: dos mercados distintos con el mismo libro son dos filas, no una."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    await service._on_orderbook_snapshot(_snap_msg("KXT-1", "0.4000", "0.5500"))
+    await service._on_orderbook_snapshot(_snap_msg("KXT-2", "0.4000", "0.5500"))
+
+    assert mock_db.add.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("src.strategies.data_capture.get_session")
+async def test_cache_del_dedupe_tiene_tope(mock_session, service):
+    """Nada sin tope: el cache se vacía al pasar el cap en vez de crecer sin fin."""
+    mock_db = MagicMock()
+    mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
+    mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+    service.MAX_DEDUPE_ENTRIES = 3
+    for i in range(10):
+        await service._on_orderbook_snapshot(_snap_msg(f"KXT-{i}", "0.4000", "0.5500"))
+
+    assert len(service._last_snap_book) <= 3

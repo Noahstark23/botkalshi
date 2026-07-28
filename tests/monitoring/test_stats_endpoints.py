@@ -233,12 +233,13 @@ def test_stats_motors_desglosa_pnl_por_motor():
     assert m2["verdict_hint"] == "sangra"
     m1 = body["by_motor"]["motor_1_arbitrage"]
     assert m1["pnl_usd"] == pytest.approx(3.0)
-    assert m1["verdict_hint"] == "positivo"
+    # n=1 → ningún estadístico decide: se dice, no se inventa un veredicto
+    assert m1["verdict_hint"].startswith("muestra insuficiente")
     # ordenado del peor al mejor: el que sangra primero
     assert next(iter(body["by_motor"])) == "motor_2_consensus"
 
 
-def test_stats_motors_detecta_ruido_y_peor_dia():
+def test_stats_motors_peor_dia():
     with get_session() as s:
         s.add(_settled_trade("motor_1_arbitrage", 5, days_ago=0, oid="d"))  # +$0.05
         s.add(_settled_trade("motor_1_arbitrage", -3, days_ago=2, oid="e"))  # -$0.03
@@ -246,18 +247,68 @@ def test_stats_motors_detecta_ruido_y_peor_dia():
     with TestClient(app) as client:
         body = client.get("/stats/motors").json()
     m1 = body["by_motor"]["motor_1_arbitrage"]
-    assert m1["verdict_hint"].startswith("ruido")
     two_ago = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
     assert m1["worst_day"]["date"] == two_ago
+
+
+class TestCriterioDeRuidoEstadistico:
+    """
+    2026-07-28, segunda corrección del mismo criterio. El umbral en dólares falló dos
+    veces por el mismo motivo: es un número elegido a dedo sobre la MEDIA.
+      - absoluto ($0.15): depende del sizing y del capital del momento.
+      - relativo (2 × fee): con los fees de Kalshi da centavos ($0.028 para M2), así
+        que el piso absoluto lo tapaba — medido en producción, el criterio "relativo"
+        no estaba actuando en 2 de 3 motores.
+    La pregunta correcta es si la media se distingue de CERO dada la dispersión:
+    t = media / error estándar. No depende ni del capital ni del fee.
+    """
+
+    @staticmethod
+    def _n_trades(strategy: str, pnls: list[int]) -> None:
+        with get_session() as s:
+            for i, p in enumerate(pnls):
+                s.add(_settled_trade(strategy, p, oid=f"t{i}"))
+            s.commit()
+
+    def test_media_positiva_pero_indistinguible_de_cero_es_ruido(self):
+        """El caso M1: media +$0.02/trade con dispersión enorme → t chico → ruido."""
+        self._n_trades("motor_1_arbitrage", [500, -496] * 30)  # media +2c, sd ~498c
+        with TestClient(app) as client:
+            m1 = client.get("/stats/motors").json()["by_motor"]["motor_1_arbitrage"]
+        assert m1["settled_trades"] == 60
+        assert m1["pnl_per_trade_usd"] > 0  # media POSITIVA
+        assert abs(m1["pnl_t_stat"]) < 2
+        assert m1["verdict_hint"].startswith("ruido")
+
+    def test_media_chica_pero_consistente_no_es_ruido(self):
+        """CONTROL: la misma media, sin dispersión, SÍ se distingue de cero."""
+        self._n_trades("motor_3_clv", [4] * 40)  # +$0.04/trade, siempre igual
+        with TestClient(app) as client:
+            m3 = client.get("/stats/motors").json()["by_motor"]["motor_3_clv"]
+        assert m3["pnl_t_stat"] is None or abs(m3["pnl_t_stat"]) >= 2
+        assert not m3["verdict_hint"].startswith("ruido")
+
+    def test_muestra_chica_no_se_declara_ruido_ni_positivo(self):
+        """15 trades (caso REST) → ningún estadístico salva la decisión: falta muestra."""
+        self._n_trades("motor_rest_arb", [10] * 15)
+        with TestClient(app) as client:
+            rest = client.get("/stats/motors").json()["by_motor"]["motor_rest_arb"]
+        assert rest["muestra_suficiente"] is False
+        assert rest["verdict_hint"].startswith("muestra insuficiente")
+
+    def test_sangra_manda_sobre_todo_lo_demas(self):
+        """CONTROL: un motor que perdió >$20 se marca sangra aunque la muestra sea chica."""
+        self._n_trades("motor_2_consensus", [-3000])
+        with TestClient(app) as client:
+            m2 = client.get("/stats/motors").json()["by_motor"]["motor_2_consensus"]
+        assert m2["verdict_hint"] == "sangra"
 
 
 class TestFeeCoverageEnStatsMotors:
     """
     Incidente 2026-07-28: M1 reportaba `fees_usd: 0.00` sobre 519 trades settleados
-    porque nadie persistía `fees_cents`. El criterio de cierre del mes de prueba
-    ("PnL/trade > 2 × fee promedio") comparaba contra CERO → aprobaba exactamente al
-    motor que estaba diseñado para descartar. El endpoint tiene que DECIR que el dato
-    falta, no rellenar el hueco con un absoluto.
+    porque nadie persistía `fees_cents`. El criterio ya no depende del fee, pero un
+    motor con el COSTO subregistrado tiene que decirlo: cambia cómo se lee su PnL.
     """
 
     def test_expone_cuantos_trades_no_tienen_fee(self):
@@ -271,35 +322,17 @@ class TestFeeCoverageEnStatsMotors:
             m1 = client.get("/stats/motors").json()["by_motor"]["motor_1_arbitrage"]
         assert m1["fees_missing_trades"] == 1
         assert m1["fees_coverage_pct"] == 50.0
-        assert m1["verdict_hint"].startswith("indeterminado")
+        assert "fee sin registrar en 1/2" in m1["verdict_hint"]
 
-    def test_umbral_de_ruido_es_relativo_al_fee(self):
-        """+$0.10/trade con fee $0.20 es ruido aunque el PnL neto sea positivo."""
+    def test_cobertura_completa_no_agrega_aviso(self):
+        """CONTROL: con todos los fees registrados el veredicto va limpio."""
         with get_session() as s:
-            for i in range(3):
-                t = _settled_trade("motor_1_arbitrage", 10, oid=f"r{i}")
-                t.fees_cents = 20  # $0.20 de fee por trade → umbral $0.40
-                s.add(t)
+            s.add(_settled_trade("motor_1_arbitrage", 10, oid="ok"))
             s.commit()
         with TestClient(app) as client:
             m1 = client.get("/stats/motors").json()["by_motor"]["motor_1_arbitrage"]
         assert m1["fees_coverage_pct"] == 100.0
-        assert m1["fee_per_trade_usd"] == pytest.approx(0.20)
-        assert m1["ruido_umbral_usd"] == pytest.approx(0.40)
-        assert m1["verdict_hint"].startswith("ruido")
-
-    def test_fee_cero_real_no_hace_el_umbral_cero(self):
-        """Piso anti-degenerado: sin él, fee=0 aprobaría +$0.01/trade como 'positivo'."""
-        with get_session() as s:
-            for i in range(3):
-                t = _settled_trade("motor_5_mm", 1, oid=f"z{i}")
-                t.fees_cents = 0
-                s.add(t)
-            s.commit()
-        with TestClient(app) as client:
-            m5 = client.get("/stats/motors").json()["by_motor"]["motor_5_mm"]
-        assert m5["ruido_umbral_usd"] == pytest.approx(0.15)
-        assert m5["verdict_hint"].startswith("ruido")
+        assert "fee sin registrar" not in m1["verdict_hint"]
 
 
 def test_stats_motors_ignora_no_settleados():

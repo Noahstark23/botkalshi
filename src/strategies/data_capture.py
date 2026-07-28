@@ -178,6 +178,7 @@ class DataCaptureService:
     WS_ZOMBIE_ALERT_THRESHOLD = 2  # detecciones consecutivas antes de alertar a Telegram
     # P2 — re-discovery periódico (el método interno volvió a series exactas; hotfix)
     REDISCOVERY_INTERVAL_SEC = 6 * 3600  # re-discovery cada 6h (markets nuevos del torneo)
+    MAX_DEDUPE_ENTRIES = 5000  # tope del cache anti-flood de snapshots (~205 tickers hoy)
 
     def __init__(self, rest_client: KalshiRestClient | None = None) -> None:
         self.settings = get_settings()
@@ -196,6 +197,10 @@ class DataCaptureService:
         # a closed/settled que el filtro por status del discovery dejaba de reportar.
         self._market_meta: dict[str, dict] = {}
         self._market_keys_logged = False  # DIAG: loguear una vez qué campos trae get_event
+        # ANTI-FLOOD de market_snapshots (incidente 2026-07-28): último book PERSISTIDO por
+        # ticker → {ticker: (yes_bid, yes_ask, no_bid, no_ask)}. Ver _on_orderbook_snapshot.
+        self._last_snap_book: dict[str, tuple[int, int, int, int]] = {}
+        self._snaps_deduped = 0
         self._rest_engine = None  # RestArbEngine | None, set if MOTOR_REST_ENABLED (shadow)
         # Cliente REST persistente inyectado por el runner SOLO con TRADING_ENABLED=true.
         # None en shadow. La Capa 2 lo pasará al RestExecutor del Motor REST.
@@ -436,6 +441,27 @@ class DataCaptureService:
             if not DiskGuard.diagnostics_allowed():
                 return
 
+            # DE-DUPE por ticker (incidente 2026-07-28: market_snapshots pasó de 1,83M a
+            # 13,33M filas/día en 3 días). Este handler grababa UNA fila por cada frame
+            # `orderbook_snapshot` del WS, con su propio commit: ~154 inserts/seg contra la
+            # misma SQLite que usa el trading. Kalshi reemite el snapshot completo en cada
+            # (re)suscripción, así que cada recovery del manager V2 disparaba una ráfaga de
+            # una fila por mercado seguido — casi todas IDÉNTICAS a la anterior.
+            # La retención de 7 días no era el freno: el problema es el ritmo de escritura,
+            # no la ventana. Solo se persiste cuando el top-of-book CAMBIÓ; un book quieto
+            # no aporta información y ahora no escribe nada (mismo patrón anti-flood que
+            # _record_edge_window en Motor 1).
+            book = (yes_bid_cents or 0, yes_ask_cents or 0, no_bid_cents or 0, no_ask_cents or 0)
+            if self._last_snap_book.get(ticker) == book:
+                self._snaps_deduped += 1
+                return
+            # Nada sin tope: el dict crece con el churn de tickers (re-discovery cada 6h).
+            # Al pasar el cap se vacía entero — el costo es una fila extra por ticker vivo,
+            # no un leak de memoria.
+            if len(self._last_snap_book) >= self.MAX_DEDUPE_ENTRIES:
+                self._last_snap_book.clear()
+            self._last_snap_book[ticker] = book
+
             with get_session() as s:
                 snap = MarketSnapshot(
                     ticker=ticker,
@@ -609,6 +635,12 @@ class DataCaptureService:
 
     async def _take_snapshots(self) -> None:
         """Una pasada de snapshots."""
+        # Visibilidad del anti-flood: cuántos frames del WS se descartaron por libro sin
+        # cambios desde el último ciclo. Si esto es ~0 y market_snapshots igual crece,
+        # el de-dupe no es el freno correcto y hay que volver a mirar.
+        if self._snaps_deduped:
+            logger.info(f"capture.snapshots_deduped={self._snaps_deduped} (libro sin cambios)")
+            self._snaps_deduped = 0
         if not self._tracked_tickers:
             return
         # DiskGuard: market_snapshots es DIAGNÓSTICO — en disco critical se saltea la pasada
