@@ -22,6 +22,7 @@ from src.storage.models import (
     MarketSnapshot,
     Motor2FunnelSnapshot,
     OrderbookEvent,
+    Trade,
     get_session,
 )
 
@@ -157,3 +158,69 @@ def test_db_vacia_no_rompe():
     assert daily["daily"] == {}
     assert edges["by_kind"] == {}
     assert edges["top_10_edges"] == []
+
+
+def _settled_trade(strategy: str, pnl_cents: int, days_ago: int = 0, oid: str = "x") -> Trade:
+    return Trade(
+        client_order_id=f"{strategy}-{oid}-{pnl_cents}-{days_ago}",
+        ticker="KXT-1",
+        side="yes",
+        action="buy",
+        count=1,
+        price_cents=50,
+        strategy=strategy,
+        status="settled",
+        pnl_cents=pnl_cents,
+        fees_cents=1,
+        settled_at=_naive(days_ago),
+    )
+
+
+def test_stats_motors_desglosa_pnl_por_motor():
+    """El neto enmascara: un motor que sangra junto a otro positivo."""
+    with get_session() as s:
+        s.add(_settled_trade("motor_2_consensus", -4000, oid="a"))  # -$40
+        s.add(_settled_trade("motor_2_consensus", -1000, oid="b"))  # -$10
+        s.add(_settled_trade("motor_1_arbitrage", 300, oid="c"))  # +$3
+        s.commit()
+    with TestClient(app) as client:
+        body = client.get("/stats/motors").json()
+
+    assert body["net_pnl_usd"] == pytest.approx(-47.0)
+    m2 = body["by_motor"]["motor_2_consensus"]
+    assert m2["pnl_usd"] == pytest.approx(-50.0)
+    assert m2["settled_trades"] == 2
+    assert m2["losses"] == 2
+    assert m2["win_rate_pct"] == 0.0
+    assert m2["verdict_hint"] == "sangra"
+    m1 = body["by_motor"]["motor_1_arbitrage"]
+    assert m1["pnl_usd"] == pytest.approx(3.0)
+    assert m1["verdict_hint"] == "positivo"
+    # ordenado del peor al mejor: el que sangra primero
+    assert next(iter(body["by_motor"])) == "motor_2_consensus"
+
+
+def test_stats_motors_detecta_ruido_y_peor_dia():
+    with get_session() as s:
+        s.add(_settled_trade("motor_1_arbitrage", 5, days_ago=0, oid="d"))  # +$0.05
+        s.add(_settled_trade("motor_1_arbitrage", -3, days_ago=2, oid="e"))  # -$0.03
+        s.commit()
+    with TestClient(app) as client:
+        body = client.get("/stats/motors").json()
+    m1 = body["by_motor"]["motor_1_arbitrage"]
+    assert m1["verdict_hint"].startswith("ruido")
+    two_ago = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
+    assert m1["worst_day"]["date"] == two_ago
+
+
+def test_stats_motors_ignora_no_settleados():
+    with get_session() as s:
+        t = _settled_trade("motor_rest_arb", -5000, oid="f")
+        t.settled_at = None  # placed pero sin settlear
+        t.status = "filled"
+        s.add(t)
+        s.commit()
+    with TestClient(app) as client:
+        body = client.get("/stats/motors").json()
+    assert body["by_motor"] == {}
+    assert body["net_pnl_usd"] == 0

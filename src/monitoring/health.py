@@ -519,3 +519,85 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
             "plausibilidad). Filas con edge_pct NULL son pre-deploy del campo."
         ),
     }
+
+
+@app.get("/stats/motors")
+async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str, Any]:
+    """
+    PnL REALIZADO por motor en una ventana (read-only). El stop-loss es global y
+    el neto ENMASCARA qué motor sangra (auditoría 2026-07-18: M2 -$432 mientras
+    M1 +$34). Este corte es el instrumento para evaluar motores de a uno —
+    imprescindible cuando corren varios en ejecución a la vez.
+
+    Por motor: trades settleados, PnL neto USD, fees, win-rate, PnL por trade y
+    el peor día. `verdict_hint` es descriptivo (sangra/ruido/positivo), NO gatea
+    nada: la decisión de apagar un motor es humana.
+    """
+    from sqlalchemy import text as _text
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+    motors: dict[str, dict[str, Any]] = {}
+    with get_session() as s:
+        for row in s.execute(
+            _text(
+                "SELECT strategy, COUNT(*), "
+                "ROUND(COALESCE(SUM(pnl_cents), 0) / 100.0, 2), "
+                "ROUND(COALESCE(SUM(fees_cents), 0) / 100.0, 2), "
+                "SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN pnl_cents < 0 THEN 1 ELSE 0 END) "
+                "FROM trades WHERE settled_at IS NOT NULL "
+                "AND date(settled_at) >= :cutoff GROUP BY 1"
+            ),
+            {"cutoff": cutoff},
+        ):
+            strategy, n, pnl, fees, wins, losses = row
+            n = n or 0
+            motors[str(strategy)] = {
+                "settled_trades": n,
+                "pnl_usd": pnl,
+                "fees_usd": fees,
+                "wins": wins or 0,
+                "losses": losses or 0,
+                "win_rate_pct": round((wins or 0) / n * 100, 1) if n else None,
+                "pnl_per_trade_usd": round(pnl / n, 4) if n else None,
+            }
+
+        # Peor día por motor: dónde se concentró la sangría
+        for row in s.execute(
+            _text(
+                "SELECT strategy, date(settled_at) AS d, "
+                "ROUND(SUM(pnl_cents) / 100.0, 2) AS day_pnl "
+                "FROM trades WHERE settled_at IS NOT NULL AND date(settled_at) >= :cutoff "
+                "GROUP BY 1, 2 ORDER BY day_pnl ASC"
+            ),
+            {"cutoff": cutoff},
+        ):
+            bucket = motors.get(str(row[0]))
+            if bucket is not None and "worst_day" not in bucket:
+                bucket["worst_day"] = {"date": str(row[1]), "pnl_usd": row[2]}
+
+    for data in motors.values():
+        pnl = data["pnl_usd"] or 0.0
+        per_trade = data["pnl_per_trade_usd"]
+        if pnl < -20:
+            data["verdict_hint"] = "sangra"
+        elif per_trade is not None and abs(per_trade) < 0.15:
+            data["verdict_hint"] = "ruido (PnL/trade despreciable)"
+        elif pnl > 0:
+            data["verdict_hint"] = "positivo"
+        else:
+            data["verdict_hint"] = "negativo leve"
+
+    total = round(sum(m["pnl_usd"] or 0.0 for m in motors.values()), 2)
+    return {
+        "days_requested": days,
+        "cutoff": cutoff,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "net_pnl_usd": total,
+        "by_motor": dict(sorted(motors.items(), key=lambda kv: kv[1]["pnl_usd"] or 0.0)),
+        "note": (
+            "PnL realizado de trades settleados. El neto global enmascara motores "
+            "individuales: mirar by_motor (ordenado del peor al mejor). "
+            "verdict_hint es descriptivo, no gatea nada."
+        ),
+    }
