@@ -228,6 +228,7 @@ class DataCaptureService:
                 trigger_move_cents=self.settings.MOTOR_9_TRIGGER_MOVE_CENTS,
                 window_sec=self.settings.MOTOR_9_WINDOW_SEC,
                 cooldown_sec=self.settings.MOTOR_9_COOLDOWN_SEC,
+                quote_fn=self._quote_of,  # F2: puntas ejecutables (ask/bid), no solo mid
             )
             logger.info("motor9.spillover shadow armado (F1: solo observa y mide)")
 
@@ -246,6 +247,23 @@ class DataCaptureService:
         if not (1 <= yes_bid <= 99 and 1 <= yes_ask <= 99):
             return None
         return (yes_bid + yes_ask) / 2.0
+
+    def _quote_of(self, ticker: str) -> tuple[int, int] | None:
+        """(yes_bid, no_bid) en cents desde el manager V2 — las dos puntas con las que se
+        reconstruyen los cuatro precios ejecutables (yes_ask = 100 − no_bid, etc.). Mismos
+        guards de salud que _mid_of: book uninit/stale/cuarentena → None, jamás basura."""
+        v2 = self._v2_manager
+        if v2 is None:
+            return None
+        yes = v2.get_top_of_book(ticker, "yes")
+        no = v2.get_top_of_book(ticker, "no")
+        if yes is None or no is None or yes.best_bid is None or no.best_bid is None:
+            return None
+        yes_bid = yes.best_bid.price_cents
+        no_bid = no.best_bid.price_cents
+        if not (1 <= yes_bid <= 99 and 1 <= no_bid <= 99):
+            return None
+        return (yes_bid, no_bid)
 
     def _siblings_of(self, ticker: str) -> set[str]:
         """Tickers TRACKEADOS del mismo evento que `ticker` (excluyéndolo). Para el shadow

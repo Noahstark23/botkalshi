@@ -155,6 +155,50 @@ def summarize_spillover(rows: list[EdgeWindow]) -> OfiVerdict:
     return OfiVerdict(n, mean60, mean120, tstat, pct_pos, verdict, rec)
 
 
+def summarize_spillover_exec(rows: list[EdgeWindow]) -> OfiVerdict:
+    """Veredicto F2 del derrame EJECUTABLE (kind='spillover_exec', 2026-07-28): a diferencia
+    del mid, acá gross_spread = bid_salida(T+60) − ask_entrada(T0) y magnitude = NETO por
+    contrato tras fee de ida y vuelta a count real. Es el número que decide F3: el mid puede
+    dar +2.69¢ y este dar ≤0 si el spread se lo come (exactamente donde murió REST arb)."""
+    gross = [float(r.gross_spread_cents) for r in rows if r.gross_spread_cents is not None]
+    net = [float(r.magnitude_cents) for r in rows if r.magnitude_cents is not None]
+    n = len(net)
+    if n == 0:
+        return OfiVerdict(
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            "SIN DATOS",
+            "Sin filas spillover_exec: el shadow F2 aún no midió puntas ejecutables "
+            "(requiere deploy del quote_fn + books sanos con ambas puntas).",
+        )
+    mean_gross = statistics.fmean(gross) if gross else 0.0
+    mean_net = statistics.fmean(net)
+    stdev = statistics.stdev(net) if n > 1 else 0.0
+    tstat = (mean_net / (stdev / n**0.5)) if stdev > 0 else 0.0
+    pct_pos = 100.0 * sum(1 for v in net if v > 0) / n
+    if n < _MIN_SIGNALS_FOR_VERDICT:
+        verdict = "ACUMULANDO"
+        rec = f"{n}/{_MIN_SIGNALS_FOR_VERDICT} mediciones ejecutables — esperar."
+    elif mean_net > 0 and tstat >= 2.0:
+        verdict = "CAPTURABLE AL ASK (gate F2 VERDE)"
+        rec = (
+            f"neto medio {mean_net:+.2f}¢/contrato post-fees roundtrip (t={tstat:.1f}, "
+            f"{pct_pos:.0f}% positivos; bruto ejecutable {mean_gross:+.2f}¢). Discutir F3 "
+            "con el operador: Capa A doble-flag, canary, one-per-event — y capital."
+        )
+    else:
+        verdict = "EL SPREAD SE LO COME → ARCHIVAR"
+        rec = (
+            f"neto medio {mean_net:+.2f}¢ (t={tstat:.1f}; bruto ejecutable {mean_gross:+.2f}¢): "
+            "el edge del mid no sobrevive al ask+fees. Mismo final que REST arb: detectado ≠ "
+            "capturable. Archivar M9 es un resultado válido y barato."
+        )
+    return OfiVerdict(n, mean_gross, mean_net, tstat, pct_pos, verdict, rec)
+
+
 @dataclass(frozen=True, slots=True)
 class LinemoveSummary:
     n: int
@@ -207,7 +251,7 @@ def main() -> None:
         rows = list(
             s.exec(
                 select(EdgeWindow).where(
-                    col(EdgeWindow.kind).in_(["ofi", "linemove", "spillover"]),
+                    col(EdgeWindow.kind).in_(["ofi", "linemove", "spillover", "spillover_exec"]),
                     col(EdgeWindow.created_at) >= since,
                 )
             )
@@ -215,6 +259,7 @@ def main() -> None:
     ofi_rows = [r for r in rows if r.kind == "ofi"]
     lm_rows = [r for r in rows if r.kind == "linemove"]
     sp_rows = [r for r in rows if r.kind == "spillover"]
+    spx_rows = [r for r in rows if r.kind == "spillover_exec"]
 
     print(f"{'=' * 68}\nVEREDICTO DE EDGE SHADOW · últimas {args.hours}h · {len(rows)} filas")
     print("Pregunta: si el pre-match está eficiente, ¿hay edge en la microestructura?\n")
@@ -257,6 +302,27 @@ def main() -> None:
             f"  positivos a T+60: {sp.pct_move60_positive:.0f}%  ·  t-stat: {sp.move60_tstat:.1f}"
         )
     print(f"  → VEREDICTO: {sp.verdict}\n    {sp.recommendation}")
+
+    print(
+        f"\n{'-' * 68}\nMOTOR 9 · DERRAME EJECUTABLE (F2) — bid(T+60) − ask(T0) − fees "
+        "roundtrip (el número que decide F3)"
+    )
+    spx = summarize_spillover_exec(spx_rows)
+    _print_dist(
+        "bruto ejecutable (bid60−ask0)",
+        [float(r.gross_spread_cents) for r in spx_rows if r.gross_spread_cents is not None],
+        "¢",
+    )
+    _print_dist(
+        "NETO post-fees por contrato",
+        [float(r.magnitude_cents) for r in spx_rows if r.magnitude_cents is not None],
+        "¢",
+    )
+    if spx.n:
+        print(
+            f"  positivos netos: {spx.pct_move60_positive:.0f}%  ·  t-stat: {spx.move60_tstat:.1f}"
+        )
+    print(f"  → VEREDICTO: {spx.verdict}\n    {spx.recommendation}")
 
     print(f"\n{'-' * 68}\nMOTOR 6 · LINE-MOVE — dimensiona señal (el ROI real es fase siguiente)")
     lm = summarize_linemove(lm_rows)
