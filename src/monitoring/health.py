@@ -255,6 +255,10 @@ async def status() -> dict[str, Any]:
                 "motor_5_mm": settings.MOTOR_MM_ENABLED,
                 "motor_5_execution": settings.MOTOR_MM_EXECUTION_ENABLED,
             },
+            # Incidente 2026-07-25: el disco llegó a 0.03GB sin que llegara UNA alerta —
+            # Telegram no estaba configurado y nada lo decía. Visible acá para que el
+            # chequeo post-deploy lo vea (false = NINGÚN aviso del bot va a llegar).
+            "telegram_alerts_configured": settings.telegram_configured,
         },
         "capital": RiskManager.capital_status(),
         "today": {

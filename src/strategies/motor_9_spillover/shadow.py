@@ -30,11 +30,15 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from src.math.fees import kalshi_fee_cents
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_9_spillover.detector import SpilloverTracker, SpilloverTrigger
 
 MidFn = Callable[[str], float | None]
 SiblingsFn = Callable[[str], set[str]]  # tickers del MISMO evento (excluyendo el propio)
+# (yes_bid, no_bid) en cents del book sano, o None. Derivación Kalshi: yes_ask = 100 − no_bid,
+# no_ask = 100 − yes_bid — con los dos bids se reconstruyen las cuatro puntas ejecutables.
+QuoteFn = Callable[[str], "tuple[int, int] | None"]
 
 
 def event_key_of(market_ticker: str) -> str:
@@ -50,6 +54,13 @@ class _Pending:
     mid0: float
     t0: float
     follow60: float | None = None
+    # F2 (2026-07-28, veredicto mid: +2.69¢ t=8.2 n=518 — falta saber si es CAPTURABLE):
+    # lado que un F3 compraría (inverso al salto) y sus puntas ejecutables. ask0 al trigger;
+    # bid60 al madurar T+60. None = book sin punta ejecutable en ese momento (se mide solo
+    # el mid — cobertura parcial honesta, jamás un precio inventado).
+    exec_side: str | None = None
+    ask0: int | None = None
+    bid60: int | None = None
 
 
 class Motor9SpilloverShadow:
@@ -61,6 +72,9 @@ class Motor9SpilloverShadow:
     # Tope de mediciones simultáneas (nada sin tope): un mercado hiperactivo no debe
     # poder crecer la lista de pendings sin límite; al tope se descarta el más viejo.
     MAX_PENDING = 500
+    # F2: count al que se computa el fee del roundtrip ejecutable — el stake flat chico que
+    # usaría un F3 (lección M2: el fee a count=1 sobreestima por el ceil POR ORDEN).
+    EXEC_COUNT = 10
 
     def __init__(
         self,
@@ -70,9 +84,11 @@ class Motor9SpilloverShadow:
         trigger_move_cents: float,
         window_sec: float,
         cooldown_sec: float,
+        quote_fn: QuoteFn | None = None,
     ) -> None:
         self._mid = mid_fn
         self._siblings = siblings_fn
+        self._quote = quote_fn  # None = sin medición ejecutable (solo mid, back-compat)
         self._cooldown = cooldown_sec
         self._tracker = SpilloverTracker(
             trigger_move_cents=trigger_move_cents,
@@ -110,21 +126,58 @@ class Motor9SpilloverShadow:
         if not siblings:
             return  # evento de 1 solo market trackeado: no hay a quién derramar
         self._triggers_seen += 1
+        # F2: lado que un F3 compraría en el hermano — INVERSO al salto (conservación de
+        # probabilidad): trigger sube → hermano debe bajar → se compra NO; trigger baja → YES.
+        exec_side = "no" if trig.move_cents > 0 else "yes"
         armed = 0
         for sib in sorted(siblings):
             mid0 = self._mid(sib)
             if mid0 is None:
                 self._dropped += 1  # hermano sin book sano: sin experimento válido
                 continue
+            ask0 = self._entry_ask(sib, exec_side)
             if len(self._pending) >= self.MAX_PENDING:
                 self._pending.pop(0)
                 self._dropped += 1
-            self._pending.append(_Pending(trigger=trig, sibling=sib, mid0=mid0, t0=now))
+            self._pending.append(
+                _Pending(
+                    trigger=trig,
+                    sibling=sib,
+                    mid0=mid0,
+                    t0=now,
+                    exec_side=exec_side if ask0 is not None else None,
+                    ask0=ask0,
+                )
+            )
             armed += 1
         logger.info(
             f"[MOTOR 9 SHADOW] derrame trigger={trig.ticker} move={trig.move_cents:+.1f}¢ "
             f"hermanos_midiendo={armed} — follow a T+60/T+120 (NO ejecuta, F1)"
         )
+
+    def _entry_ask(self, ticker: str, side: str) -> int | None:
+        """Punta de ENTRADA ejecutable (ask del lado a comprar), en cents. Kalshi: el book
+        expone yes_bid y no_bid; el ask de un lado es 100 − bid del otro. None si el book
+        no tiene la punta (sin quote_fn, book stale, o lado vacío)."""
+        if self._quote is None:
+            return None
+        q = self._quote(ticker)
+        if q is None:
+            return None
+        yes_bid, no_bid = q
+        ask = 100 - no_bid if side == "yes" else 100 - yes_bid
+        return ask if 1 <= ask <= 99 else None
+
+    def _exit_bid(self, ticker: str, side: str) -> int | None:
+        """Punta de SALIDA ejecutable (bid del lado comprado) a T+60, en cents."""
+        if self._quote is None:
+            return None
+        q = self._quote(ticker)
+        if q is None:
+            return None
+        yes_bid, no_bid = q
+        bid = yes_bid if side == "yes" else no_bid
+        return bid if 1 <= bid <= 99 else None
 
     def _advance_measurements(self, now: float) -> None:
         """Madura las mediciones pendientes; el reloj lo empuja el propio flujo de deltas."""
@@ -135,6 +188,10 @@ class Motor9SpilloverShadow:
                 mid = self._mid(p.sibling)
                 if mid is not None:
                     p.follow60 = mid - p.mid0  # crudo; se firma al persistir
+                    # F2: la salida ejecutable se captura EN el mismo instante que el
+                    # follow del mid (T+60) — mismas condiciones, comparables.
+                    if p.exec_side is not None and p.bid60 is None:
+                        p.bid60 = self._exit_bid(p.sibling, p.exec_side)
             if age >= self.MEASURE_120:
                 mid120 = self._mid(p.sibling)
                 if mid120 is not None and p.follow60 is not None:
@@ -170,6 +227,28 @@ class Motor9SpilloverShadow:
                         leg_states=f"src={src_suffix}"[:50],
                     )
                 )
+                # F2 (2026-07-28): la fila EJECUTABLE, solo si hubo puntas reales en ambos
+                # extremos. gross = bid_salida − ask_entrada (lo que el mid no ve: el spread);
+                # magnitude = NETO por contrato tras fee de ida y vuelta a EXEC_COUNT. La
+                # DIFERENCIA entre esta serie y la del mid mide cuánto se come el spread —
+                # exactamente donde murió REST arb (detectado ≠ capturable).
+                if p.exec_side is not None and p.ask0 is not None and p.bid60 is not None:
+                    fee_in = kalshi_fee_cents(self.EXEC_COUNT, p.ask0)
+                    fee_out = kalshi_fee_cents(self.EXEC_COUNT, p.bid60)
+                    gross_exec = p.bid60 - p.ask0
+                    net_per_contract = gross_exec - (fee_in + fee_out) / self.EXEC_COUNT
+                    db.add(
+                        EdgeWindow(
+                            market_ticker=p.sibling,
+                            magnitude_cents=int(round(net_per_contract)),
+                            gross_spread_cents=gross_exec,
+                            fees_cents=fee_in + fee_out,
+                            count=self.EXEC_COUNT,
+                            edge_pct=move,
+                            kind="spillover_exec",
+                            leg_states=(f"src={src_suffix}|{p.exec_side}|a{p.ask0}b{p.bid60}"[:50]),
+                        )
+                    )
                 db.commit()
         except Exception:
             logger.exception("motor9.shadow persist_error (se sigue)")

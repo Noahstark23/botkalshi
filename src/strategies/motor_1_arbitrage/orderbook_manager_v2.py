@@ -216,8 +216,15 @@ class OrderbookManagerV2:
             return
 
         if msg_type == "error":
-            code = raw_msg.get("code", "?")
-            err_text = raw_msg.get("msg", "")
+            # SHAPE DRIFT (2026-07-23): el payload del error puede venir ANIDADO —
+            # {'type':'error','id':N,'msg':{'code':15,'msg':'Action required'}} — o plano
+            # ({'type':'error','code':15,'msg':'...'}). El parser plano dejaba code="?" con el
+            # shape anidado → el manejo de code 15 sobre get_snapshot pendiente NUNCA disparaba:
+            # 351 rechazos/día caían al branch genérico como ruido y la recovery esperaba
+            # snapshots que jamás llegarían → timeout_x5 → breaker con books_initialized=0.
+            # Misma clase de bug que el shape del REST /orderbook (P0 2026-07-19): parsear
+            # AMBOS shapes siempre; el anidado tiene prioridad si existe.
+            code, err_text = _parse_error_payload(raw_msg)
             req_id = raw_msg.get("id")
             # code 15 "Action required" sobre un get_snapshot de recovery PENDIENTE: NO es ruido
             # genérico — es la request RECHAZADA. Se maneja explícito (purga + circuit breaker) en
@@ -225,7 +232,7 @@ class OrderbookManagerV2:
             if code == 15 and isinstance(req_id, int) and req_id in self._pending_snapshot_requests:
                 await self._handle_recovery_rejected(req_id, raw_msg)
                 return
-            logger.error(f"WS error code={code}: {err_text}")
+            logger.error(f"WS error code={code} id={req_id}: {err_text}")
             BotState.record_error(f"WS error code={code}: {err_text}")
             return
 
@@ -691,8 +698,8 @@ class OrderbookManagerV2:
         progress = self._recovery_progress(
             sid
         )  # ANTES de cleanup (evita 'recovered' post-cleanup falso)
-        bad = raw_msg.get("market_ticker")
-        if isinstance(bad, str):
+        bad = _error_named_ticker(raw_msg)  # busca en shape plano Y anidado (drift 2026-07-23)
+        if bad is not None:
             self._dead_tickers.add(bad)
         self._cleanup_recovery(sid)
         # DIAG (por qué purged=0): para una muestra de los tickers RECHAZADOS, qué close_time
@@ -707,7 +714,7 @@ class OrderbookManagerV2:
         logger.warning(
             f"v2.recovery_rejected sid={sid} code=15 req_id={req_id} tickers={len(tickers)} "
             f"bad={bad} close_times_known={known_ct}/{len(tickers)} sample={sample} "
-            "(purga + circuit breaker; NO re-pide el set completo)"
+            f"raw={raw_msg!r} (purga + circuit breaker; NO re-pide el set completo)"
         )
         BotState.record_error(f"v2 recovery rechazada (code 15) sid={sid}")
         if await self._register_failure_and_maybe_break(sid, "code15", progress=progress):
@@ -976,6 +983,32 @@ class OrderbookManagerV2:
 # =====================================================
 # Module helpers
 # =====================================================
+
+
+def _parse_error_payload(raw_msg: dict) -> tuple[int | str, str]:
+    """Extrae (code, texto) de un mensaje WS type=error en CUALQUIERA de sus dos shapes:
+    plano ({'code':15,'msg':'...'}) o anidado ({'msg':{'code':15,'msg':'...'}}, observado en
+    producción 2026-07-23). Desconocido → ('?', repr del payload) — nunca revienta."""
+    payload = raw_msg.get("msg")
+    if isinstance(payload, dict):
+        code = payload.get("code", raw_msg.get("code", "?"))
+        err_text = payload.get("msg", "")
+        return code, str(err_text)
+    code = raw_msg.get("code", "?")
+    return code, str(payload) if payload is not None else ""
+
+
+def _error_named_ticker(raw_msg: dict) -> str | None:
+    """market_ticker nombrado en un error WS, buscándolo en el shape plano Y en el anidado."""
+    bad = raw_msg.get("market_ticker")
+    if isinstance(bad, str) and bad:
+        return bad
+    payload = raw_msg.get("msg")
+    if isinstance(payload, dict):
+        nested = payload.get("market_ticker")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
 
 
 def _parse_iso_naive_utc(value: str) -> datetime | None:
