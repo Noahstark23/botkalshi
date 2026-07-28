@@ -458,13 +458,44 @@ async def stats_daily(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
     }
 
 
+#: Qué MIDE realmente la columna `edge_pct` en cada kind de edge_windows.
+#: NO todos guardan un porcentaje — el nombre de la columna miente para M8 y M9:
+#:   - binary / multi_outcome (M1, REST): edge neto post-fee, en % → comparable con 8pp
+#:   - ofi (M8): el Z-SCORE de la señal OFI (shadow.py `edge_pct=p.signal.zscore`)
+#:   - spillover / spillover_exec (M9): el MOVE del trigger, en CENTAVOS
+#: Aplicarles los buckets de puntos porcentuales daba lecturas absurdas y
+#: "sospechosos >8pp" que no son data podrida sino z=9 perfectamente normal
+#: (detectado 2026-07-28: max 2678.83 en ofi, y los buckets >0/>1/>3 idénticos
+#: porque el detector solo emite con |z| >= z_min, así que no existe señal entre
+#: 0 y el umbral — un agujero de diseño, no una distribución).
+_EDGE_UNITS: dict[str, str] = {
+    "binary": "pct",
+    "multi_outcome": "pct",
+    "consensus": "pct",
+    "ofi": "zscore",
+    "spillover": "cents",
+    "spillover_exec": "cents",
+}
+_UNIT_LABEL = {
+    "pct": "edge neto post-fee en puntos porcentuales",
+    "zscore": "z-score de la señal OFI (NO es un %)",
+    "cents": "movimiento del trigger en centavos (NO es un %)",
+    "desconocido": "unidad no declarada para este kind",
+}
+
+
 @app.get("/stats/edges")
 async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, Any]:
     """
-    Distribución del edge por kind sobre edge_windows (read-only). Responde
+    Distribución de la señal por kind sobre edge_windows (read-only). Responde
     "¿cuánta señal dio M8/M9/consensus esta semana y de qué tamaño?" de un GET.
-    edge_pct = edge neto post-fee (%); filas NULL (pre-deploy) se excluyen de
-    los buckets pero se cuentan en rows_total.
+
+    OJO CON LA UNIDAD (fix 2026-07-28): la columna se llama `edge_pct` pero solo
+    los kinds binarios guardan un porcentaje. M8 guarda un z-score y M9 centavos.
+    Cada bloque declara su `unit`, y los buckets en puntos porcentuales —
+    incluido el guardarraíl `gt_8pp_sospechosos` — SOLO se calculan donde la
+    unidad es `pct`. Filas con valor NULL (pre-deploy) se excluyen de los buckets
+    pero se cuentan en rows_total.
     """
     from sqlalchemy import text as _text
 
@@ -483,16 +514,31 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
             ),
             {"cutoff": cutoff},
         ):
-            by_kind[str(row[0])] = {
+            kind = str(row[0])
+            unit = _EDGE_UNITS.get(kind, "desconocido")
+            block: dict[str, Any] = {
+                "unit": unit,
+                "unit_desc": _UNIT_LABEL[unit],
                 "rows_total": row[1],
-                "rows_with_edge_pct": row[2],
-                "edge_pct_avg": row[3],
-                "edge_pct_max": row[4],
-                "gt_0pp": row[5] or 0,
-                "gt_1pp": row[6] or 0,
-                "gt_3pp": row[7] or 0,
-                "gt_8pp_sospechosos": row[8] or 0,
+                "rows_with_value": row[2],
+                "value_avg": row[3],
+                "value_max": row[4],
+                "gt_0": row[5] or 0,
             }
+            if unit == "pct":
+                # Solo acá los puntos porcentuales significan algo.
+                block["gt_1pp"] = row[6] or 0
+                block["gt_3pp"] = row[7] or 0
+                block["gt_8pp_sospechosos"] = row[8] or 0
+            else:
+                block["nota_unidad"] = (
+                    f"buckets en pp OMITIDOS: esta serie no está en %, está en {unit}. "
+                    "Comparar contra el guardarraíl de 8pp no tiene sentido acá."
+                )
+            by_kind[kind] = block
+        # Ranking SOLO de los kinds que están en %: mezclar unidades hacía que los
+        # z-scores de M8 coparan el top-10 y se leyeran como "edges enormes".
+        pct_kinds = tuple(k for k, u in _EDGE_UNITS.items() if u == "pct")
         top = [
             {
                 "created_at": str(row[0]),
@@ -505,6 +551,7 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
                     "SELECT created_at, market_ticker, COALESCE(kind, 'binary'), "
                     "ROUND(edge_pct, 4) FROM edge_windows "
                     "WHERE date(created_at) >= :cutoff AND edge_pct IS NOT NULL "
+                    f"AND COALESCE(kind, 'binary') IN ({','.join(repr(k) for k in pct_kinds)}) "
                     "ORDER BY edge_pct DESC LIMIT 10"
                 ),
                 {"cutoff": cutoff},
@@ -518,9 +565,12 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
         "by_kind": by_kind,
         "top_10_edges": top,
         "note": (
-            "edge_pct = neto post-fee. gt_8pp_sospechosos: en binarios liquidos "
-            ">8pp suele ser data podrida, no oportunidad (guardarrail de "
-            "plausibilidad). Filas con edge_pct NULL son pre-deploy del campo."
+            "CADA kind declara su unit: solo 'pct' es edge neto post-fee en puntos "
+            "porcentuales. 'ofi' guarda z-scores y 'spillover' centavos — para esos "
+            "los buckets en pp se omiten a proposito y el top_10 los excluye. "
+            "gt_8pp_sospechosos: en binarios liquidos >8pp suele ser data podrida, no "
+            "oportunidad (guardarrail de plausibilidad), y solo aplica a unit='pct'. "
+            "Filas con valor NULL son pre-deploy del campo."
         ),
     }
 
@@ -548,18 +598,28 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
                 "ROUND(COALESCE(SUM(pnl_cents), 0) / 100.0, 2), "
                 "ROUND(COALESCE(SUM(fees_cents), 0) / 100.0, 2), "
                 "SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN pnl_cents < 0 THEN 1 ELSE 0 END) "
+                "SUM(CASE WHEN pnl_cents < 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN fees_cents IS NULL THEN 1 ELSE 0 END) "
                 "FROM trades WHERE settled_at IS NOT NULL "
                 "AND date(settled_at) >= :cutoff GROUP BY 1"
             ),
             {"cutoff": cutoff},
         ):
-            strategy, n, pnl, fees, wins, losses = row
+            strategy, n, pnl, fees, wins, losses, fees_null = row
             n = n or 0
+            fees_null = fees_null or 0
+            with_fee = n - fees_null
             motors[str(strategy)] = {
                 "settled_trades": n,
                 "pnl_usd": pnl,
                 "fees_usd": fees,
+                # Sin esto un motor que NO grabó el fee se ve idéntico a uno que no pagó
+                # ninguno (M1: 519 trades con fees $0.00 el 2026-07-28). El criterio de
+                # cierre del mes compara PnL/trade contra el fee promedio: con el fee sin
+                # registrar esa comparación es contra CERO y aprueba cualquier cosa.
+                "fees_missing_trades": fees_null,
+                "fees_coverage_pct": round(with_fee / n * 100, 1) if n else None,
+                "fee_per_trade_usd": round(fees / with_fee, 4) if with_fee > 0 else None,
                 "wins": wins or 0,
                 "losses": losses or 0,
                 "win_rate_pct": round((wins or 0) / n * 100, 1) if n else None,
@@ -583,10 +643,23 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
     for data in motors.values():
         pnl = data["pnl_usd"] or 0.0
         per_trade = data["pnl_per_trade_usd"]
+        fee_per_trade = data["fee_per_trade_usd"]
+        # Umbral de "ruido" RELATIVO al fee (auto-escalante: un absoluto en dólares
+        # significa cosas distintas según el capital efectivo del momento). El piso de
+        # $0.15 es solo anti-degenerado: sin él, un fee de 0 haría el umbral 0 y
+        # aprobaría cualquier PnL/trade positivo por chico que sea.
+        umbral = max(2 * fee_per_trade, 0.15) if fee_per_trade is not None else 0.15
+        data["ruido_umbral_usd"] = round(umbral, 4)
         if pnl < -20:
             data["verdict_hint"] = "sangra"
-        elif per_trade is not None and abs(per_trade) < 0.15:
-            data["verdict_hint"] = "ruido (PnL/trade despreciable)"
+        elif data["fees_missing_trades"]:
+            # No se puede decidir con el dato roto: decirlo, no rellenar con el absoluto.
+            data["verdict_hint"] = (
+                f"indeterminado (fee sin registrar en {data['fees_missing_trades']}/"
+                f"{data['settled_trades']} trades — el umbral de ruido no es calculable)"
+            )
+        elif per_trade is not None and abs(per_trade) < umbral:
+            data["verdict_hint"] = f"ruido (PnL/trade < umbral ${umbral:.2f})"
         elif pnl > 0:
             data["verdict_hint"] = "positivo"
         else:
@@ -602,6 +675,8 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
         "note": (
             "PnL realizado de trades settleados. El neto global enmascara motores "
             "individuales: mirar by_motor (ordenado del peor al mejor). "
-            "verdict_hint es descriptivo, no gatea nada."
+            "verdict_hint es descriptivo, no gatea nada. fees_coverage_pct < 100 "
+            "significa que el fee promedio (y por lo tanto el umbral de ruido) queda "
+            "subestimado: son filas anteriores al fix de fees del 2026-07-28."
         ),
     }

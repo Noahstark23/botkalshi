@@ -216,7 +216,16 @@ class EdgeWindow(SQLModel, table=True):
     # Reconstrucción EXACTA del gate (agregadas 2026-06; NULL en ventanas pre-deploy).
     count: int | None = None  # contratos del opp detectado
     fees_cents: int | None = None  # comisión total estimada (ambas patas)
-    edge_pct: float | None = None  # edge neto post-fee como % del capital comprometido
+    # OJO — COLUMNA POLIMÓRFICA: el nombre solo describe a los kinds binarios.
+    #   binary / multi_outcome (M1, REST) → edge neto post-fee, en % del capital
+    #   ofi (M8)                          → Z-SCORE de la señal (adimensional)
+    #   spillover / spillover_exec (M9)   → move del trigger, en CENTAVOS
+    # No se renombra para no reescribir las filas históricas; el mapa autoritativo de
+    # unidades es `_EDGE_UNITS` (monitoring/health.py) y /stats/edges declara la unidad
+    # de cada bloque. Todo consumidor nuevo DEBE mirar `kind` antes de interpretar este
+    # número (incidente 2026-07-28: buckets en pp aplicados a z-scores → "max 2678.83pp"
+    # y 1349 falsos "sospechosos >8pp").
+    edge_pct: float | None = None
     # Tipo de detección: "binary" (mismo market, libro cruzado) | "multi_outcome"
     # (1X2/winner: N markets del mismo evento sumando <100). NULL = pre-P3 (binary).
     kind: str | None = Field(default=None, max_length=20)

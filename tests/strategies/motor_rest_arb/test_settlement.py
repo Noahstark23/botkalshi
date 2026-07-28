@@ -375,3 +375,45 @@ async def test_mm_unresolved_market_waits():
     settled = await SettlementPoller(FakeSettlementSource({})).settle_once()
     assert settled == 0
     assert _all_trades()["m5mm-wait"].status == "filled"
+
+
+# =====================================================
+# Incidente 2026-07-28: el fee se descontaba del PnL pero NO se registraba
+# =====================================================
+
+
+@pytest.mark.asyncio
+async def test_settlement_persiste_el_fee_que_uso_cuando_la_fila_venia_en_null():
+    """
+    `/stats/motors` reportaba `fees_usd: 0.00` para M1 sobre 519 trades settleados: el
+    fallback recomputado se usaba para el PnL y se tiraba. El criterio del mes de prueba
+    ("PnL/trade > 2 × fee promedio") comparaba entonces contra CERO.
+    """
+    from src.math.fees import kalshi_fee_cents
+
+    arb_id = str(uuid.uuid4())
+    coid = _mk_trade(ticker="KXNOFEE", side="yes", arb_id=arb_id, price=40, count=5)
+    with models.get_session() as s:
+        row = s.exec(select(models.Trade).where(models.Trade.client_order_id == coid)).first()
+        row.fees_cents = None  # como las filas de M1 antes del fix
+        row.strategy = "motor_1_arbitrage"
+        s.add(row)
+        s.commit()
+
+    await SettlementPoller(FakeSettlementSource({"KXNOFEE": "yes"})).settle_once()
+
+    esperado = kalshi_fee_cents(5, 40)
+    settled = _all_trades()[coid]
+    assert settled.fees_cents == esperado  # ya no es invisible
+    assert settled.pnl_cents == (100 - 40) * 5 - esperado  # y el PnL NO cambió
+
+
+@pytest.mark.asyncio
+async def test_settlement_no_pisa_un_fee_ya_registrado():
+    """CONTROL: M3 ajusta fees_cents por tramos al cerrar por CLV — sobrescribirlo
+    rompería esa contabilidad."""
+    arb_id = _arb()
+    await SettlementPoller(FakeSettlementSource({"KXWC-ARG": "yes"})).settle_once()
+    trades = _all_trades()
+    assert trades[f"{arb_id}-yes"].fees_cents == 4  # el original, intacto
+    assert trades[f"{arb_id}-no"].fees_cents == 5

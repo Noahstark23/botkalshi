@@ -79,6 +79,25 @@ hay que encenderlo explícitamente (`ROLLING_DRAWDOWN_STOP_ENABLED`).
 
 ---
 
+### PASO 0.d — Deploy de instrumentos ANTES de encender flags
+
+Los arreglos de medición (fees por motor, unidades de `/stats/edges`) son
+**código, no flags**: van en su propio redeploy, sin tocar
+`MOTOR_*_EXECUTION_ENABLED`. Son read-only respecto del trading — no pueden
+mover un solo contrato — así que no compiten con la regla de "una cosa a la vez":
+la cosa que cambia en ESE deploy es el instrumento, no el comportamiento.
+
+Recién con el instrumento verificado se hace el PASO 1, que **no requiere
+redeploy de código**: el flag es una env var en Coolify.
+
+Verificación post-deploy del instrumento (todo por GET, sin terminal):
+- `/stats/motors?days=30` → cada motor trae `fees_coverage_pct` y
+  `ruido_umbral_usd`
+- `/stats/edges?days=7` → cada bloque trae `unit`, y solo los `pct` traen
+  `gt_8pp_sospechosos`
+
+---
+
 ## PASO 1 — Orden de encendido (uno por redeploy)
 
 Regla del propio proyecto: *"una cosa a la vez por redeploy"*. Encender los tres
@@ -119,11 +138,37 @@ caliente: primero se apaga, después se investiga (Lección 9).
 
 ---
 
+## PASO 2.b — BASELINE medido (2026-07-28 21:55 UTC, deploy `b6df916`)
+
+`GET /stats/motors?days=30`, **antes** de encender nada. Este es el número contra
+el que se compara el cierre del mes:
+
+| Motor | Trades | PnL | Win-rate | Peor día |
+|---|---|---|---|---|
+| motor_2_consensus | 16 | **−$261.28** | 6.2% | 2026-06-28 −$233.28 |
+| motor_rest_arb | 15 | **−$29.28** | — | — |
+| motor_1_arbitrage | 519 | **+$33.37** | — | — |
+| **NETO** | | **−$257.19** | | |
+
+Dos lecturas que el número crudo esconde:
+
+1. **La sangría de M2 en JULIO es ~$28, no $260.** Los −$233.28 son UN día
+   (2026-06-28) que entra por el borde de la ventana de 30 días. La ventana se
+   corre sola: mañana ese día sale y el "M2 −$261" se convierte en "M2 −$28"
+   sin que nada haya cambiado. Comparar siempre contra ESTA tabla congelada, no
+   contra el `days=30` de otro día.
+2. **M2 y REST no ejecutaron nada en el período** — sus flags están en `false`
+   y con flags apagados el executor ni se construye. Esas pérdidas son
+   settlements viejos aterrizando, no actividad. El baseline real de ambos para
+   el mes de prueba arranca en $0 el día que se enciendan.
+
+---
+
 ## PASO 3 — Medición del mes (el instrumento nuevo)
 
 `GET :18080/stats/motors?days=N` da PnL **por motor**: trades settleados, PnL
 neto, fees, win-rate, PnL por trade, peor día y un `verdict_hint` descriptivo
-(sangra / ruido / positivo / negativo leve).
+(sangra / ruido / positivo / negativo leve / indeterminado).
 
 Es el corte que la auditoría tuvo que hacer por SQL — ahora es un GET, así que
 el agente web lo puede traer sin terminal.
@@ -136,11 +181,11 @@ Cadencia sugerida del mes de prueba:
   mantener todo encendido 30 días.
 - **Cierre del mes**: `/stats/motors?days=30` vs el baseline del PASO 1.
   Criterio de éxito por motor, definido ahora (anti confirmation bias):
-  - **Sigue**: PnL neto > 0 **Y** `pnl_per_trade_usd` > 2 × fee promedio por
-    trade (`fees_usd / settled_trades`, ambos en la respuesta de
-    `/stats/motors`)
+  - **Sigue**: PnL neto > 0 **Y** `pnl_per_trade_usd` > `ruido_umbral_usd`
   - **Se apaga**: PnL neto < 0
   - **Se archiva**: 0 señales en el mes (caso M6 hoy)
+  - **No se decide**: `fees_coverage_pct` < 100 → el criterio no es aplicable
+    (ver abajo). Se arregla el dato, no se afloja el criterio.
 
   > El umbral de "ruido" es **relativo al fee, no un absoluto en dólares**: un
   > PnL/trade fijo significaría cosas distintas según el capital efectivo del
@@ -148,6 +193,70 @@ Cadencia sugerida del mes de prueba:
   > decide. Contra el fee es auto-escalante: si el motor no le gana varias
   > veces a su propio costo de transacción, es ruido — que es exactamente lo
   > que mostró M1 en julio (+$0.065/trade).
+  >
+  > `/stats/motors` ya publica el umbral calculado en `ruido_umbral_usd`
+  > (= `max(2 × fee_per_trade_usd, $0.15)`) para no tener que hacer la cuenta
+  > a mano ni discutirla al final del mes.
+
+### Por qué el criterio necesitó un piso: la división por cero (2026-07-28)
+
+El criterio relativo, tal como estaba escrito arriba, **aprobaba a M1 — el motor
+que fue diseñado para descartar**. `/stats/motors` reportaba `fees_usd: 0.00`
+sobre 519 trades settleados, así que `2 × fee promedio = 0` y cualquier
+PnL/trade positivo pasaba, incluido el +$0.0643 que la auditoría llamó ruido.
+
+No era un fee real de cero: era un **fee no registrado**. `_persist_intents` de
+M1 era el único de los tres motores que no guardaba `fees_cents` (M2 y REST sí),
+y el `SettlementPoller` recomputaba el fee, lo descontaba del PnL y lo tiraba sin
+persistirlo. El costo estaba siempre ahí, pero invisible para toda métrica.
+
+Arreglado en tres capas:
+- **Origen**: M1 guarda el fee de entrada al persistir el intent, como M2/REST.
+- **Red de seguridad**: el settlement persiste el fee que efectivamente usó, sea
+  cual sea el motor — ningún trade settleado puede volver a quedar sin fee. No
+  pisa un `fees_cents` ya escrito (M3 lo ajusta por tramos al cerrar por CLV).
+- **Honestidad del reporte**: `fees_missing_trades` y `fees_coverage_pct` en
+  `/stats/motors`. Con cobertura incompleta el `verdict_hint` dice
+  **`indeterminado`** en vez de rellenar el hueco con un absoluto y fingir un
+  veredicto. El piso de $0.15 en `ruido_umbral_usd` queda solo como guarda
+  anti-degenerada, no como criterio.
+
+Las filas históricas siguen en NULL. `python -m scripts.backfill_trade_fees`
+(dry-run por defecto) las completa con el mismo valor que el settlement ya había
+descontado — **el PnL registrado no cambia**. Correr con `--apply` solo después
+del backup con `.backup()`.
+
+### El edge de M8/M9 no estaba en puntos porcentuales (2026-07-28)
+
+`/stats/edges` mostraba para `ofi`: 32.996 filas, máximo **2.678,83pp**, 1.349
+filas sobre el guardarraíl de plausibilidad de 8pp, y los contadores >0pp, >1pp y
+>3pp **idénticos en 16.410** — o sea ni una sola observación entre 0 y 3 puntos.
+Mismo patrón en `spillover` (263 en los tres).
+
+No es data podrida ni un artefacto de captura: **la columna no mide lo que su
+nombre dice**. `edge_windows.edge_pct` es polimórfica según `kind`:
+
+| kind | qué guarda realmente |
+|---|---|
+| `binary`, `multi_outcome` (M1, REST) | edge neto post-fee, en % |
+| `ofi` (M8) | **z-score** de la señal (adimensional) |
+| `spillover`, `spillover_exec` (M9) | **centavos** del move del trigger |
+
+De ahí salen los tres síntomas: 2.678 es un z-score, los 1.349 "sospechosos" son
+z > 8 perfectamente normales, y el hueco entre 0 y 3 existe porque el detector
+solo emite con `|z| ≥ z_min` — no hay señales por debajo del umbral, por
+construcción. La distribución nunca fue rara; la regla de lectura sí.
+
+Arreglado: `/stats/edges` declara `unit` por kind, calcula los buckets en pp
+**solo** donde la unidad es `pct`, y el `top_10_edges` excluye las series que no
+están en porcentaje (antes los z-scores de M8 copaban el ranking y se leían como
+edges enormes). El mapa autoritativo de unidades vive en `_EDGE_UNITS`
+(`src/monitoring/health.py`) y está documentado en el modelo.
+
+**Consecuencia para el mes de prueba:** M8 es el motor que la auditoría marcó
+como la única promesa viva, y su métrica venía siendo ilegible. Su decisión se
+toma con el p50 del **move a T+60 en centavos** (`magnitude_cents`), que siempre
+estuvo bien; no con `edge_pct` leído como porcentaje.
 
 ## Nota honesta para el cierre del mes
 

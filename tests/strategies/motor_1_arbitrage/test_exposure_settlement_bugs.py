@@ -157,3 +157,25 @@ def test_hedged_pair_without_arb_id_counts_gross_regression():
     with patch.object(RiskManager, "__init__", lambda self: None):
         rm = RiskManager()
     assert rm._get_current_exposure_usd() == pytest.approx((40 + 57) * 243 / 100.0)
+
+
+@pytest.mark.asyncio
+async def test_persist_intents_registra_el_fee_de_entrada():
+    """
+    Incidente 2026-07-28: M1 era el ÚNICO motor que no guardaba `fees_cents` al
+    persistir el intent (M2 y REST sí) → 519 trades settleados con `fees_usd: 0.00`
+    y el criterio de ruido del mes de prueba comparando contra cero.
+    """
+    from src.math.fees import kalshi_fee_cents
+    from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+
+    opp = detect_binary_arb("T-FEE", 40, 300, 45, 300)
+    assert opp is not None
+    ex = ArbitrageExecutor.__new__(ArbitrageExecutor)
+    ex._persist_intents(opp, 10, ["coid-fee-a", "coid-fee-b"])
+    with get_session() as s:
+        rows = list(s.exec(select(Trade)))
+    assert all(r.fees_cents is not None for r in rows)
+    assert {r.fees_cents for r in rows} == {
+        kalshi_fee_cents(10, leg.price_cents) for leg in opp.legs
+    }
