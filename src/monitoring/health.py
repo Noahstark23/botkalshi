@@ -391,6 +391,15 @@ async def stats_daily(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
     Conteos diarios de telemetría (read-only) — continuidad de captura y
     actividad de motores por HTTP, sin terminal ni SQL (lo consume el agente
     web; patrón portado de Polybot). Un día ausente = agujero de captura.
+
+    INCIDENTE 2026-07-28 (el bot se congeló al consultar este endpoint): los
+    filtros eran `WHERE date(captured_at) >= :cutoff`. Envolver la columna en una
+    función ANULA el índice de `captured_at` → full scan de `market_snapshots`,
+    que para entonces crecía a 13M filas/día. El `date()` sigue en el
+    SELECT/GROUP BY (ahí hace falta), pero el WHERE compara la columna DESNUDA:
+    los naive UTC se guardan como ISO ('YYYY-MM-DD HH:MM:SS.ffffff'), así que el
+    orden lexicográfico contra 'YYYY-MM-DD' coincide con el cronológico y el
+    índice se puede usar. Regla: nunca envolver en función la columna del WHERE.
     """
     from sqlalchemy import text as _text
 
@@ -407,26 +416,26 @@ async def stats_daily(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
         _fill(
             s,
             "SELECT date(captured_at), COUNT(*) FROM market_snapshots "
-            "WHERE date(captured_at) >= :cutoff GROUP BY 1",
+            "WHERE captured_at >= :cutoff GROUP BY 1",
             ["market_snapshots"],
         )
         _fill(
             s,
             "SELECT date(received_at), COUNT(*) FROM orderbook_events "
-            "WHERE date(received_at) >= :cutoff GROUP BY 1",
+            "WHERE received_at >= :cutoff GROUP BY 1",
             ["orderbook_events"],
         )
         _fill(
             s,
             "SELECT date(created_at), COUNT(*) FROM edge_windows "
-            "WHERE date(created_at) >= :cutoff GROUP BY 1",
+            "WHERE created_at >= :cutoff GROUP BY 1",
             ["edge_windows_total"],
         )
         # Desglose por kind (binary/multi_outcome/consensus/linemove/ofi/spillover)
         for row in s.execute(
             _text(
                 "SELECT date(created_at), COALESCE(kind, 'binary'), COUNT(*) "
-                "FROM edge_windows WHERE date(created_at) >= :cutoff GROUP BY 1, 2"
+                "FROM edge_windows WHERE created_at >= :cutoff GROUP BY 1, 2"
             ),
             {"cutoff": cutoff},
         ):
@@ -434,19 +443,19 @@ async def stats_daily(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
         _fill(
             s,
             "SELECT date(created_at), COUNT(*), COALESCE(SUM(signals), 0) "
-            "FROM motor2_funnel_snapshots WHERE date(created_at) >= :cutoff GROUP BY 1",
+            "FROM motor2_funnel_snapshots WHERE created_at >= :cutoff GROUP BY 1",
             ["m2_funnel_cycles", "m2_signals"],
         )
         _fill(
             s,
             "SELECT date(created_at), COUNT(*), COALESCE(SUM(fills), 0) "
-            "FROM mm_funnel_snapshots WHERE date(created_at) >= :cutoff GROUP BY 1",
+            "FROM mm_funnel_snapshots WHERE created_at >= :cutoff GROUP BY 1",
             ["mm_funnel_cycles", "mm_fills"],
         )
         _fill(
             s,
             "SELECT date(recorded_at), COUNT(*) FROM analyst_verdicts "
-            "WHERE date(recorded_at) >= :cutoff GROUP BY 1",
+            "WHERE recorded_at >= :cutoff GROUP BY 1",
             ["analyst_verdicts"],
         )
 
@@ -510,7 +519,7 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
                 "SUM(CASE WHEN edge_pct > 1 THEN 1 ELSE 0 END), "
                 "SUM(CASE WHEN edge_pct > 3 THEN 1 ELSE 0 END), "
                 "SUM(CASE WHEN edge_pct > 8 THEN 1 ELSE 0 END) "
-                "FROM edge_windows WHERE date(created_at) >= :cutoff GROUP BY 1"
+                "FROM edge_windows WHERE created_at >= :cutoff GROUP BY 1"
             ),
             {"cutoff": cutoff},
         ):
@@ -550,7 +559,7 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
                 _text(
                     "SELECT created_at, market_ticker, COALESCE(kind, 'binary'), "
                     "ROUND(edge_pct, 4) FROM edge_windows "
-                    "WHERE date(created_at) >= :cutoff AND edge_pct IS NOT NULL "
+                    "WHERE created_at >= :cutoff AND edge_pct IS NOT NULL "
                     f"AND COALESCE(kind, 'binary') IN ({','.join(repr(k) for k in pct_kinds)}) "
                     "ORDER BY edge_pct DESC LIMIT 10"
                 ),
@@ -572,6 +581,40 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
             "oportunidad (guardarrail de plausibilidad), y solo aplica a unit='pct'. "
             "Filas con valor NULL son pre-deploy del campo."
         ),
+    }
+
+
+def _pnl_significance(n: int, pnl_usd: float, sum_sq_cents: float) -> dict[str, Any]:
+    """
+    ¿El PnL por trade se distingue de CERO? Devuelve error estándar y t.
+
+    POR QUÉ (2026-07-28): los dos umbrales que probamos para "ruido" fallan por el
+    mismo motivo — son números elegidos a dedo sobre la MEDIA, sin mirar la
+    dispersión.
+      - absoluto ($0.15/trade): depende del sizing y del capital del momento;
+        significa cosas distintas en meses distintos.
+      - relativo (2 × fee): con los fees de Kalshi el umbral queda en centavos
+        ($0.028 para M2), así que aprueba casi cualquier media positiva. Medido en
+        producción: el piso absoluto tapaba al relativo en 2 de 3 motores.
+
+    La pregunta real no es "¿la media supera X?" sino "¿esta media es distinguible
+    de cero con esta cantidad de trades y esta varianza?". Eso es `t = media / EE`,
+    y no depende ni del capital ni del fee. |t| < 2 ≈ indistinguible de cero al 95%:
+    ruido, por muy positiva que se vea la media.
+
+    n < 30 → se devuelve `t` igual pero marcado como muestra chica: con 15 trades
+    (caso REST) ningún estadístico salva la decisión, hace falta más muestra.
+    """
+    if n < 2:
+        return {"pnl_per_trade_stderr_usd": None, "pnl_t_stat": None, "muestra_suficiente": False}
+    mean_cents = (pnl_usd * 100) / n
+    # Varianza muestral vía suma de cuadrados: E[x²] − (E[x])², corregida por n−1.
+    var = max(0.0, (sum_sq_cents - n * mean_cents**2) / (n - 1))
+    stderr_cents = (var / n) ** 0.5
+    return {
+        "pnl_per_trade_stderr_usd": round(stderr_cents / 100, 4),
+        "pnl_t_stat": round(mean_cents / stderr_cents, 2) if stderr_cents > 0 else None,
+        "muestra_suficiente": n >= 30,
     }
 
 
@@ -599,13 +642,17 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
                 "ROUND(COALESCE(SUM(fees_cents), 0) / 100.0, 2), "
                 "SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END), "
                 "SUM(CASE WHEN pnl_cents < 0 THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN fees_cents IS NULL THEN 1 ELSE 0 END) "
+                "SUM(CASE WHEN fees_cents IS NULL THEN 1 ELSE 0 END), "
+                # Suma de cuadrados: con COUNT y SUM alcanza para el desvío estándar
+                # del PnL por trade, y con eso para saber si la media se distingue de
+                # cero. Sin esto, "ruido" es un umbral elegido a dedo (ver abajo).
+                "COALESCE(SUM(pnl_cents * pnl_cents), 0) "
                 "FROM trades WHERE settled_at IS NOT NULL "
-                "AND date(settled_at) >= :cutoff GROUP BY 1"
+                "AND settled_at >= :cutoff GROUP BY 1"
             ),
             {"cutoff": cutoff},
         ):
-            strategy, n, pnl, fees, wins, losses, fees_null = row
+            strategy, n, pnl, fees, wins, losses, fees_null, sum_sq = row
             n = n or 0
             fees_null = fees_null or 0
             with_fee = n - fees_null
@@ -624,6 +671,7 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
                 "losses": losses or 0,
                 "win_rate_pct": round((wins or 0) / n * 100, 1) if n else None,
                 "pnl_per_trade_usd": round(pnl / n, 4) if n else None,
+                **_pnl_significance(n, pnl, sum_sq or 0),
             }
 
         # Peor día por motor: dónde se concentró la sangría
@@ -631,7 +679,7 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
             _text(
                 "SELECT strategy, date(settled_at) AS d, "
                 "ROUND(SUM(pnl_cents) / 100.0, 2) AS day_pnl "
-                "FROM trades WHERE settled_at IS NOT NULL AND date(settled_at) >= :cutoff "
+                "FROM trades WHERE settled_at IS NOT NULL AND settled_at >= :cutoff "
                 "GROUP BY 1, 2 ORDER BY day_pnl ASC"
             ),
             {"cutoff": cutoff},
@@ -642,28 +690,32 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
 
     for data in motors.values():
         pnl = data["pnl_usd"] or 0.0
-        per_trade = data["pnl_per_trade_usd"]
-        fee_per_trade = data["fee_per_trade_usd"]
-        # Umbral de "ruido" RELATIVO al fee (auto-escalante: un absoluto en dólares
-        # significa cosas distintas según el capital efectivo del momento). El piso de
-        # $0.15 es solo anti-degenerado: sin él, un fee de 0 haría el umbral 0 y
-        # aprobaría cualquier PnL/trade positivo por chico que sea.
-        umbral = max(2 * fee_per_trade, 0.15) if fee_per_trade is not None else 0.15
-        data["ruido_umbral_usd"] = round(umbral, 4)
+        t_stat = data["pnl_t_stat"]
+        # Ruido = la media del PnL/trade NO se distingue de cero. Ver _pnl_significance:
+        # los umbrales en dólares (absoluto o 2×fee) se descartaron porque dependen del
+        # capital y del fee, y en producción el piso absoluto terminaba tapando al
+        # relativo en 2 de 3 motores — o sea, el criterio "relativo" no actuaba.
         if pnl < -20:
             data["verdict_hint"] = "sangra"
-        elif data["fees_missing_trades"]:
-            # No se puede decidir con el dato roto: decirlo, no rellenar con el absoluto.
+        elif not data["muestra_suficiente"]:
             data["verdict_hint"] = (
-                f"indeterminado (fee sin registrar en {data['fees_missing_trades']}/"
-                f"{data['settled_trades']} trades — el umbral de ruido no es calculable)"
+                f"muestra insuficiente ({data['settled_trades']} trades settleados; "
+                "hacen falta >=30 para distinguir la media de cero)"
             )
-        elif per_trade is not None and abs(per_trade) < umbral:
-            data["verdict_hint"] = f"ruido (PnL/trade < umbral ${umbral:.2f})"
+        elif t_stat is not None and abs(t_stat) < 2:
+            data["verdict_hint"] = f"ruido (t={t_stat:+.2f}: indistinguible de cero)"
         elif pnl > 0:
-            data["verdict_hint"] = "positivo"
+            data["verdict_hint"] = f"positivo (t={t_stat:+.2f})" if t_stat else "positivo"
         else:
             data["verdict_hint"] = "negativo leve"
+        # La cobertura de fees ya no gatea el veredicto (el criterio no usa el fee),
+        # pero un motor sin fees registrados tiene el PnL bien y el COSTO invisible:
+        # se sigue diciendo, porque cambia cómo se lee `pnl_usd`.
+        if data["fees_missing_trades"]:
+            data["verdict_hint"] += (
+                f" · OJO: fee sin registrar en {data['fees_missing_trades']}/"
+                f"{data['settled_trades']} trades"
+            )
 
     total = round(sum(m["pnl_usd"] or 0.0 for m in motors.values()), 2)
     return {
@@ -675,8 +727,11 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
         "note": (
             "PnL realizado de trades settleados. El neto global enmascara motores "
             "individuales: mirar by_motor (ordenado del peor al mejor). "
-            "verdict_hint es descriptivo, no gatea nada. fees_coverage_pct < 100 "
-            "significa que el fee promedio (y por lo tanto el umbral de ruido) queda "
-            "subestimado: son filas anteriores al fix de fees del 2026-07-28."
+            "verdict_hint es descriptivo, no gatea nada. 'ruido' = |pnl_t_stat| < 2, "
+            "o sea la media del PnL/trade no se distingue de cero con esta muestra "
+            "(no es un umbral en dolares: no depende del capital ni del fee). "
+            "fees_coverage_pct < 100 significa que el COSTO de ese motor esta "
+            "subregistrado — el PnL es correcto igual: son filas anteriores al fix "
+            "de fees del 2026-07-28."
         ),
     }

@@ -98,6 +98,46 @@ Verificación post-deploy del instrumento (todo por GET, sin terminal):
 
 ---
 
+### PASO 0.e — El motor que va primero ya reprobó el criterio escrito
+
+Medido el 2026-07-28, con el instrumento ya desplegado: **REST tiene
+`verdict_hint: "sangra"`**, `pnl_per_trade_usd: −1.952` sobre 15 trades y peor
+día −$22.86 (2026-07-14). El criterio del PASO 3 dice "se apaga si PnL neto < 0",
+sin excepción por causa raíz.
+
+O sea: encender REST primero es **decidir a sabiendas arrancar el mes con un
+motor que ya reprobó la regla**. Eso puede ser correcto — pero entonces la
+excepción se escribe ANTES, no después de ver el resultado. Escrita:
+
+> **Excepción REST.** Su falla documentada es de EJECUCIÓN (73% de rollback:
+> FOK no atómico en books finos), no de edge — el edge detectado era real
+> (3,13pp). Por eso su mes NO se evalúa por PnL sino por **fill-rate**: si el
+> problema es ejecución, se arregla o no se arregla, y eso se ve en días.
+>
+> - Métrica del mes: `rollback_triggered / intentos`. Meta: **< 25%**.
+> - Tripwire duro, independiente del fill-rate: PnL < **−$25** acumulado → se
+>   apaga sin discusión (misma línea que el resto en el PASO 2).
+> - Plazo: **7 días**, no 30. Un problema de ejecución se manifiesta en la
+>   primera decena de intentos; no hace falta un mes para verlo.
+> - Si a los 7 días el fill-rate no bajó de 25%, se apaga. La tesis "es
+>   ejecución, no edge" queda refutada por la vía rápida y barata.
+
+Y los 15 trades de baseline no alcanzan para nada: `muestra_suficiente: false`.
+Con n < 30 el endpoint ya no emite veredicto — la decisión de REST se toma con
+fill-rate, que sí se mide con pocos intentos.
+
+**M2 tampoco está listo para empezar.** Ocho días seguidos (07-21 → 07-28) con
+`m2_signals: 0` sobre 250–518 ciclos de embudo por día, y el analyst reporta
+`inconsistente | best_edge del embudo cruzó el umbral pero no se grabaron
+señales`. Un mes de M2 en ese estado mide CERO: no es un resultado negativo, es
+ausencia de medición. Hay que resolver primero si es umbral o persistencia.
+
+**Consecuencia:** el mes de prueba no empieza el día que se pueda, empieza el día
+que haya algo que medir. Eso no cambia la decisión de darle un mes a cada motor
+— cambia cuándo arranca el reloj de cada uno.
+
+---
+
 ## PASO 1 — Orden de encendido (uno por redeploy)
 
 Regla del propio proyecto: *"una cosa a la vez por redeploy"*. Encender los tres
@@ -181,22 +221,63 @@ Cadencia sugerida del mes de prueba:
   mantener todo encendido 30 días.
 - **Cierre del mes**: `/stats/motors?days=30` vs el baseline del PASO 1.
   Criterio de éxito por motor, definido ahora (anti confirmation bias):
-  - **Sigue**: PnL neto > 0 **Y** `pnl_per_trade_usd` > `ruido_umbral_usd`
+  - **Sigue**: PnL neto > 0 **Y** `|pnl_t_stat| >= 2`
   - **Se apaga**: PnL neto < 0
   - **Se archiva**: 0 señales en el mes (caso M6 hoy)
-  - **No se decide**: `fees_coverage_pct` < 100 → el criterio no es aplicable
-    (ver abajo). Se arregla el dato, no se afloja el criterio.
+  - **No se decide**: `muestra_suficiente: false` (< 30 trades settleados) →
+    no alcanza la muestra. Se extiende o se mide por otra vía (caso REST, 0.e).
 
-  > El umbral de "ruido" es **relativo al fee, no un absoluto en dólares**: un
-  > PnL/trade fijo significaría cosas distintas según el capital efectivo del
-  > momento (ver PASO 0.b), y contaminaría justo la métrica con la que se
-  > decide. Contra el fee es auto-escalante: si el motor no le gana varias
-  > veces a su propio costo de transacción, es ruido — que es exactamente lo
-  > que mostró M1 en julio (+$0.065/trade).
+  > **El umbral en dólares se descartó — falló dos veces por el mismo motivo.**
+  > Primero fue absoluto ($0.15/trade): depende del sizing y del capital del
+  > momento, así que significa cosas distintas en meses distintos. Después
+  > relativo (2 × fee): con los fees de Kalshi el umbral queda en centavos
+  > ($0.028 para M2), y medido en producción el piso absoluto lo tapaba en 2 de
+  > 3 motores — el criterio "relativo" no estaba actuando.
   >
-  > `/stats/motors` ya publica el umbral calculado en `ruido_umbral_usd`
-  > (= `max(2 × fee_per_trade_usd, $0.15)`) para no tener que hacer la cuenta
-  > a mano ni discutirla al final del mes.
+  > La pregunta real nunca fue "¿la media supera X?" sino **"¿esta media se
+  > distingue de cero con esta muestra y esta dispersión?"**. Eso es
+  > `t = media / error estándar`, y no depende ni del capital ni del fee.
+  > `|t| < 2` ≈ indistinguible de cero al 95%: es ruido por muy positiva que se
+  > vea la media. `/stats/motors` publica `pnl_t_stat`,
+  > `pnl_per_trade_stderr_usd` y `muestra_suficiente`.
+  >
+  > Por qué importa acá: M1 cerró julio con +$0.0643/trade sobre 519 trades y
+  > una dispersión enorme. Con el criterio en dólares esa media "aprobaba"; con
+  > el estadístico se ve si es señal o si es la varianza.
+
+### market_snapshots crecía 7× en 3 días — y no era la retención (2026-07-28)
+
+`/stats/daily`: 1,83M filas el 07-26, 7,95M el 07-27, **13,33M el 07-28 con el
+día sin terminar**. Consultar ese endpoint congeló el bot.
+
+La retención de `market_snapshots` existe y son 7 días. No era el freno que
+faltaba: **el problema es el ritmo de escritura, no la ventana.** Con dos
+escritores medidos:
+
+| Escritor | Volumen | Acotado |
+|---|---|---|
+| Ciclo REST (`_take_snapshots`) | 50 tickers × 288 ciclos = **14,4k/día** | sí, por `MAX_TICKERS_PER_SNAPSHOT_CYCLE` |
+| Handler WS (`_on_orderbook_snapshot`) | **~13,3M/día** (≈154 inserts/seg) | **no** |
+
+El handler grababa una fila por cada frame `orderbook_snapshot`, con su propio
+commit. Kalshi reemite el snapshot COMPLETO en cada (re)suscripción, así que cada
+recovery del manager V2 disparaba una ráfaga de una fila por mercado seguido —
+casi todas idénticas a la anterior. Es el mismo incidente de `orderbook_events`
+(57GB) en otra tabla: *nada sin tope*, pero el tope tiene que estar en el ritmo.
+
+Arreglado con el patrón anti-flood que ya usaba Motor 1 (`_record_edge_window`):
+solo se persiste cuando el top-of-book **cambió**. Un libro quieto no aporta
+información y ahora no escribe nada. El cache de de-dupe tiene su propio tope
+(`MAX_DEDUPE_ENTRIES`), y cada ciclo loguea `capture.snapshots_deduped=N` — si
+ese número es ~0 y la tabla igual crece, el de-dupe no es el freno correcto y hay
+que volver a mirar.
+
+**Y el freeze del endpoint tenía causa propia**, en el código que escribí yo:
+los filtros eran `WHERE date(captured_at) >= :cutoff`. Envolver la columna en una
+función anula el índice → full scan de una tabla de decenas de millones de filas.
+Ahora el `date()` está solo en el SELECT/GROUP BY y el WHERE compara la columna
+desnuda (los naive UTC se guardan como ISO, así que el orden lexicográfico es el
+cronológico). **Regla: nunca envolver en función la columna del WHERE.**
 
 ### Por qué el criterio necesitó un piso: la división por cero (2026-07-28)
 
@@ -216,10 +297,9 @@ Arreglado en tres capas:
   cual sea el motor — ningún trade settleado puede volver a quedar sin fee. No
   pisa un `fees_cents` ya escrito (M3 lo ajusta por tramos al cerrar por CLV).
 - **Honestidad del reporte**: `fees_missing_trades` y `fees_coverage_pct` en
-  `/stats/motors`. Con cobertura incompleta el `verdict_hint` dice
-  **`indeterminado`** en vez de rellenar el hueco con un absoluto y fingir un
-  veredicto. El piso de $0.15 en `ruido_umbral_usd` queda solo como guarda
-  anti-degenerada, no como criterio.
+  `/stats/motors`. El criterio final ya no usa el fee (pasó a ser estadístico),
+  pero un motor con el costo subregistrado lo dice igual en su `verdict_hint`:
+  cambia cómo se lee su `pnl_usd`.
 
 Las filas históricas siguen en NULL. `python -m scripts.backfill_trade_fees`
 (dry-run por defecto) las completa con el mismo valor que el settlement ya había
