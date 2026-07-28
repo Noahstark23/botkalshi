@@ -811,6 +811,7 @@ class DataCaptureService:
             max_recovery_buffer=self.settings.ORDERBOOK_V2_MAX_RECOVERY_BUFFER,
             recovery_chunk_size=self.settings.ORDERBOOK_V2_RECOVERY_CHUNK_SIZE,
             bootstrap_buffer_cap=self.settings.ORDERBOOK_V2_BOOTSTRAP_BUFFER_CAP,
+            max_plausible_cross_cents=self.settings.ORDERBOOK_V2_MAX_PLAUSIBLE_CROSS_CENTS,
             recovery_backoff_base_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_BASE_SEC,
             recovery_backoff_factor=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_FACTOR,
             recovery_backoff_cap_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_CAP_SEC,

@@ -113,6 +113,12 @@ class OrderbookManagerV2:
     # los deltas MÁS VIEJOS: no se pierde info útil (el snapshot, cuando llegue, ya contiene los
     # seq bajos; _drain descarta seq <= snapshot_seq de todos modos). Lección del repo: nada sin tope.
     DEFAULT_BOOTSTRAP_BUFFER_CAP = 1000
+    # Cruce MÁXIMO plausible de un book binario, en cents (invariante 2026-07-28). El cruce
+    # bruto es yes_bid + no_bid − 100: un arb REAL vive en 1-5¢ (es lo que M1 busca); 86¢
+    # significa los dos bids altos a la vez = book divergido. Alineado con
+    # MOTOR_1_MAX_EDGE_PCT (10) — el mismo umbral que el engine usa para no ejecutar, pero
+    # aplicado al BOOK, que además protege a M5/M8/M9 y dispara la recovery.
+    DEFAULT_MAX_PLAUSIBLE_CROSS_CENTS = 10
     # Backoff del circuit breaker por sid (incidente 2026-07-21): el disable era PERMANENTE hasta
     # el redeploy — un sid deshabilitado por una condición transitoria (p.ej. mercados futuros aún
     # sin book que luego abren, o un feed degradado que se recupera) quedaba CIEGO para siempre.
@@ -131,6 +137,7 @@ class OrderbookManagerV2:
         max_recovery_buffer: int = DEFAULT_MAX_RECOVERY_BUFFER,
         recovery_chunk_size: int = DEFAULT_RECOVERY_CHUNK_SIZE,
         bootstrap_buffer_cap: int = DEFAULT_BOOTSTRAP_BUFFER_CAP,
+        max_plausible_cross_cents: int = DEFAULT_MAX_PLAUSIBLE_CROSS_CENTS,
         recovery_backoff_base_sec: float = DEFAULT_RECOVERY_BACKOFF_BASE_SEC,
         recovery_backoff_factor: float = DEFAULT_RECOVERY_BACKOFF_FACTOR,
         recovery_backoff_cap_sec: float = DEFAULT_RECOVERY_BACKOFF_CAP_SEC,
@@ -140,6 +147,7 @@ class OrderbookManagerV2:
         self._max_recovery_buffer = max_recovery_buffer
         self._recovery_chunk_size = max(1, recovery_chunk_size)
         self._bootstrap_buffer_cap = max(1, bootstrap_buffer_cap)
+        self._max_plausible_cross_cents = max(1, max_plausible_cross_cents)
         self._recovery_backoff_base_sec = max(1.0, recovery_backoff_base_sec)
         self._recovery_backoff_factor = max(1.0, recovery_backoff_factor)
         self._recovery_backoff_cap_sec = max(
@@ -159,6 +167,11 @@ class OrderbookManagerV2:
         self._bootstrap_buffer: dict[str, deque[dict]] = {}
         # Tickers que YA saturaron su buffer de bootstrap (log one-shot + telemetría del leak).
         self._bootstrap_capped: set[str] = set()
+        # Cuarentena por INVARIANTE (2026-07-28): tickers cuyo book violó yes_bid+no_bid≤100+tol
+        # (precios fantasma) — one-shot hasta que un snapshot los re-basee. El contador es la
+        # MEDIDA de corrupción del feed: si sube sostenido, el problema está upstream.
+        self._incoherent_tickers: set[str] = set()
+        self._incoherent_quarantines = 0
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
         # Tickers que NO se vuelven a pedir en recovery: settled/expirados (close_time vencido,
@@ -332,8 +345,56 @@ class OrderbookManagerV2:
                 if sid not in self._recovering:
                     await self._start_recovery(sid)
                 raise
+        if applied and msg_type == "orderbook_delta":
+            # INVARIANTE DE COHERENCIA (incidente 2026-07-28): la cuarentena de arriba es
+            # REACTIVA — solo dispara cuando un delta dejaría qty<0. Un book puede divergir
+            # y servir precios FANTASMA durante minutos sin tocar nunca esa condición: el
+            # 28-jul, 30 de 130 edges binarios estaban sobre el techo anti-fantasma (máximo
+            # 86.5pp = suma de bids 186¢, imposible). Los absurdos los frena el techo del
+            # engine, pero los fantasmas DENTRO de la banda plausible pasan y producen fills
+            # parciales → patas huérfanas. Esto lo detecta en el ORIGEN, para todos los
+            # lectores (M1/M5/M8/M9), no solo para la orden que se iba a mandar.
+            await self._quarantine_if_incoherent(ticker, sid)
         if applied:
             self._last_seq_by_sid[sid] = max(self._last_seq_by_sid.get(sid, 0), new_seq)
+
+    async def _quarantine_if_incoherent(self, ticker: str, sid: int) -> None:
+        """Cuarentena PROACTIVA por invariante del book binario (incidente 2026-07-28).
+
+        Matemática (la misma del detector de M1, `engine._detect`): el ask sintético de un
+        lado es 100 − bid del otro, así que el cruce bruto en cents es exactamente
+        `yes_bid + no_bid − 100`. Un cruce REAL vive en 1-5¢ (eso es lo que M1 busca); un
+        cruce de 86¢ significa que los DOS bids quedaron altos a la vez, lo que en un
+        binario no puede pasar — es un book divergido sirviendo precios fantasma.
+
+        Fail-closed: se marca stale (deja de servir a TODOS los lectores) y se pide recovery.
+        NO se levanta excepción: el delta se aplicó bien, lo que está mal es el estado
+        resultante. One-shot por ticker (se re-arma cuando un snapshot lo re-basea) para no
+        spamear ni tormentear la recovery."""
+        state = self._books.get(ticker)
+        if state is None or not state.is_initialized or state.is_stale:
+            return
+        if ticker in self._incoherent_tickers:
+            return  # ya en cuarentena por esta causa; espera el snapshot que lo re-basee
+        yes = state.top_of_book("yes")
+        no = state.top_of_book("no")
+        if yes.best_bid is None or no.best_bid is None:
+            return  # sin las dos puntas no hay invariante que evaluar (no sobre-filtrar)
+        cross = yes.best_bid.price_cents + no.best_bid.price_cents - 100
+        if cross <= self._max_plausible_cross_cents:
+            return
+        self._incoherent_tickers.add(ticker)
+        self._incoherent_quarantines += 1
+        state.mark_stale()
+        logger.warning(
+            f"v2.book_incoherent ticker={ticker} sid={sid} yes_bid={yes.best_bid.price_cents} "
+            f"no_bid={no.best_bid.price_cents} cruce={cross}¢ > "
+            f"{self._max_plausible_cross_cents}¢ — book DIVERGIDO (edge fantasma): stale + "
+            f"recovery. total={self._incoherent_quarantines}"
+        )
+        BotState.record_error(f"v2.book_incoherent {ticker} cruce={cross}¢ (book divergido)")
+        if sid not in self._recovering:
+            await self._start_recovery(sid)
 
     @property
     def tracked_tickers(self) -> frozenset[str]:
@@ -365,6 +426,10 @@ class OrderbookManagerV2:
             # cuántos tickers ya saturaron su tope. capados>0 sostenido = snapshots que no llegan.
             "bootstrap_buffer_msgs": sum(len(b) for b in self._bootstrap_buffer.values()),
             "bootstrap_capped_tickers": len(self._bootstrap_capped),
+            # Invariante de coherencia: books en cuarentena AHORA + total acumulado. Es la
+            # medida directa de corrupción del feed (2026-07-28: 23% de edges fantasma).
+            "incoherent_books_now": len(self._incoherent_tickers),
+            "incoherent_quarantines_total": self._incoherent_quarantines,
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
             "gaps_last_60s": gaps_last_60s,
@@ -887,6 +952,9 @@ class OrderbookManagerV2:
         """
         buffered = self._bootstrap_buffer.pop(ticker, None)
         self._bootstrap_capped.discard(ticker)  # el snapshot llegó → el ticker ya no está capado
+        # El snapshot re-basea el book → se re-arma la invariante de coherencia para este
+        # ticker (si vuelve a divergir, vuelve a cuarentena y a contar).
+        self._incoherent_tickers.discard(ticker)
         if not buffered:
             return
 
