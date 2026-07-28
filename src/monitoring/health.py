@@ -379,3 +379,143 @@ async def stats() -> dict[str, Any]:
         "total_risk_events": len(risk_events),
         "uptime_seconds": int((datetime.now(UTC) - BotState.started_at).total_seconds()),
     }
+
+
+@app.get("/stats/daily")
+async def stats_daily(days: int = Query(default=30, ge=1, le=120)) -> dict[str, Any]:
+    """
+    Conteos diarios de telemetría (read-only) — continuidad de captura y
+    actividad de motores por HTTP, sin terminal ni SQL (lo consume el agente
+    web; patrón portado de Polybot). Un día ausente = agujero de captura.
+    """
+    from sqlalchemy import text as _text
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+    per_day: dict[str, dict[str, Any]] = {}
+
+    def _fill(s: Any, sql: str, keys: list[str]) -> None:
+        for row in s.execute(_text(sql), {"cutoff": cutoff}):
+            bucket = per_day.setdefault(str(row[0]), {})
+            for i, key in enumerate(keys, start=1):
+                bucket[key] = row[i]
+
+    with get_session() as s:
+        _fill(
+            s,
+            "SELECT date(captured_at), COUNT(*) FROM market_snapshots "
+            "WHERE date(captured_at) >= :cutoff GROUP BY 1",
+            ["market_snapshots"],
+        )
+        _fill(
+            s,
+            "SELECT date(received_at), COUNT(*) FROM orderbook_events "
+            "WHERE date(received_at) >= :cutoff GROUP BY 1",
+            ["orderbook_events"],
+        )
+        _fill(
+            s,
+            "SELECT date(created_at), COUNT(*) FROM edge_windows "
+            "WHERE date(created_at) >= :cutoff GROUP BY 1",
+            ["edge_windows_total"],
+        )
+        # Desglose por kind (binary/multi_outcome/consensus/linemove/ofi/spillover)
+        for row in s.execute(
+            _text(
+                "SELECT date(created_at), COALESCE(kind, 'binary'), COUNT(*) "
+                "FROM edge_windows WHERE date(created_at) >= :cutoff GROUP BY 1, 2"
+            ),
+            {"cutoff": cutoff},
+        ):
+            per_day.setdefault(str(row[0]), {})[f"edges_{row[1]}"] = row[2]
+        _fill(
+            s,
+            "SELECT date(created_at), COUNT(*), COALESCE(SUM(signals), 0) "
+            "FROM motor2_funnel_snapshots WHERE date(created_at) >= :cutoff GROUP BY 1",
+            ["m2_funnel_cycles", "m2_signals"],
+        )
+        _fill(
+            s,
+            "SELECT date(created_at), COUNT(*), COALESCE(SUM(fills), 0) "
+            "FROM mm_funnel_snapshots WHERE date(created_at) >= :cutoff GROUP BY 1",
+            ["mm_funnel_cycles", "mm_fills"],
+        )
+        _fill(
+            s,
+            "SELECT date(recorded_at), COUNT(*) FROM analyst_verdicts "
+            "WHERE date(recorded_at) >= :cutoff GROUP BY 1",
+            ["analyst_verdicts"],
+        )
+
+    return {
+        "days_requested": days,
+        "cutoff": cutoff,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "daily": dict(sorted(per_day.items())),
+    }
+
+
+@app.get("/stats/edges")
+async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, Any]:
+    """
+    Distribución del edge por kind sobre edge_windows (read-only). Responde
+    "¿cuánta señal dio M8/M9/consensus esta semana y de qué tamaño?" de un GET.
+    edge_pct = edge neto post-fee (%); filas NULL (pre-deploy) se excluyen de
+    los buckets pero se cuentan en rows_total.
+    """
+    from sqlalchemy import text as _text
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+    by_kind: dict[str, dict[str, Any]] = {}
+    with get_session() as s:
+        for row in s.execute(
+            _text(
+                "SELECT COALESCE(kind, 'binary') AS k, COUNT(*), "
+                "COUNT(edge_pct), ROUND(AVG(edge_pct), 4), ROUND(MAX(edge_pct), 4), "
+                "SUM(CASE WHEN edge_pct > 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN edge_pct > 1 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN edge_pct > 3 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN edge_pct > 8 THEN 1 ELSE 0 END) "
+                "FROM edge_windows WHERE date(created_at) >= :cutoff GROUP BY 1"
+            ),
+            {"cutoff": cutoff},
+        ):
+            by_kind[str(row[0])] = {
+                "rows_total": row[1],
+                "rows_with_edge_pct": row[2],
+                "edge_pct_avg": row[3],
+                "edge_pct_max": row[4],
+                "gt_0pp": row[5] or 0,
+                "gt_1pp": row[6] or 0,
+                "gt_3pp": row[7] or 0,
+                "gt_8pp_sospechosos": row[8] or 0,
+            }
+        top = [
+            {
+                "created_at": str(row[0]),
+                "ticker": row[1],
+                "kind": row[2],
+                "edge_pct": row[3],
+            }
+            for row in s.execute(
+                _text(
+                    "SELECT created_at, market_ticker, COALESCE(kind, 'binary'), "
+                    "ROUND(edge_pct, 4) FROM edge_windows "
+                    "WHERE date(created_at) >= :cutoff AND edge_pct IS NOT NULL "
+                    "ORDER BY edge_pct DESC LIMIT 10"
+                ),
+                {"cutoff": cutoff},
+            )
+        ]
+
+    return {
+        "days_requested": days,
+        "cutoff": cutoff,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "by_kind": by_kind,
+        "top_10_edges": top,
+        "note": (
+            "edge_pct = neto post-fee. gt_8pp_sospechosos: en binarios liquidos "
+            ">8pp suele ser data podrida, no oportunidad (guardarrail de "
+            "plausibilidad). Filas con edge_pct NULL son pre-deploy del campo."
+        ),
+    }
