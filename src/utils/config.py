@@ -366,6 +366,17 @@ class Settings(BaseSettings):
     # el redeploy — sid=1 (189 mercados futuros sin book operable) quedaba ciego para siempre tras
     # timeout_x5. Con backoff, el próximo gap tras el cooldown reintenta UNA ventana de recovery;
     # cada fracaso duplica el cooldown: base·factor^(streak−1), capado (30s→2min→8min→30min).
+    # Invariante de coherencia del book binario (incidente 2026-07-28: 30 de 130 edges
+    # binarios sobre el techo anti-fantasma, máximo 86.5pp = suma de bids 186¢). El cruce
+    # bruto es yes_bid + no_bid − 100; un arb real vive en 1-5¢. Por encima de esto el book
+    # DIVERGIÓ → stale + recovery (protege a M1/M5/M8/M9, no solo a la orden que se iba a
+    # mandar). Subirlo tolera más fantasmas; bajarlo puede cuarentenar arbs legítimos grandes.
+    ORDERBOOK_V2_MAX_PLAUSIBLE_CROSS_CENTS: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Cruce máx (¢) de un book binario antes de considerarlo divergido",
+    )
     ORDERBOOK_V2_RECOVERY_BACKOFF_BASE_SEC: float = Field(
         default=30.0,
         gt=0,

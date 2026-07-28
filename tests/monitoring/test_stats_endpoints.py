@@ -234,7 +234,7 @@ def test_stats_motors_desglosa_pnl_por_motor():
     m1 = body["by_motor"]["motor_1_arbitrage"]
     assert m1["pnl_usd"] == pytest.approx(3.0)
     # n=1 → ningún estadístico decide: se dice, no se inventa un veredicto
-    assert m1["verdict_hint"].startswith("muestra insuficiente")
+    assert m1["verdict_hint"].startswith("NO concluyente")
     # ordenado del peor al mejor: el que sangra primero
     assert next(iter(body["by_motor"])) == "motor_2_consensus"
 
@@ -288,13 +288,33 @@ class TestCriterioDeRuidoEstadistico:
         assert m3["pnl_t_stat"] is None or abs(m3["pnl_t_stat"]) >= 2
         assert not m3["verdict_hint"].startswith("ruido")
 
-    def test_muestra_chica_no_se_declara_ruido_ni_positivo(self):
-        """15 trades (caso REST) → ningún estadístico salva la decisión: falta muestra."""
+    def test_muestra_chica_sin_t_no_concluye(self):
+        """15 trades sin dispersión utilizable → no hay t que decida: se dice "no
+        concluyente", no se inventa veredicto."""
         self._n_trades("motor_rest_arb", [10] * 15)
         with TestClient(app) as client:
             rest = client.get("/stats/motors").json()["by_motor"]["motor_rest_arb"]
         assert rest["muestra_suficiente"] is False
-        assert rest["verdict_hint"].startswith("muestra insuficiente")
+        assert rest["concluyente"] is False
+        assert rest["verdict_hint"].startswith("NO concluyente")
+
+    def test_muestra_chica_con_t_fuerte_si_concluye(self):
+        """LA TRAMPA DE LECTURA (2026-07-28, cazada por el agente web): Motor REST con
+        n=15 y t=−4.73 mostraba `muestra_suficiente: false`, que se lee como "todavía no
+        sabemos, probemos otro mes" — cuando es la evidencia NEGATIVA más fuerte del
+        tablero. El t YA incorpora la n vía el error estándar: con 15 trades, llegar a
+        |t|>4 exige un efecto enorme. Con muestra chica pero t contundente el veredicto
+        DEBE ser significativo, no 'falta muestra'."""
+        # 15 trades perdedores con dispersión chica → media claramente < 0, |t| >> 2.
+        self._n_trades("motor_rest_arb", [-100, -120, -90, -110, -105] * 3)
+        with TestClient(app) as client:
+            rest = client.get("/stats/motors").json()["by_motor"]["motor_rest_arb"]
+        assert rest["settled_trades"] == 15
+        assert rest["muestra_suficiente"] is False  # n<30, dato crudo
+        assert abs(rest["pnl_t_stat"]) >= 2
+        assert rest["concluyente"] is True  # PERO la evidencia SÍ concluye
+        assert "SIGNIFICATIVO" in rest["verdict_hint"]
+        assert "falta muestra" not in rest["verdict_hint"]
 
     def test_sangra_manda_sobre_todo_lo_demas(self):
         """CONTROL: un motor que perdió >$20 se marca sangra aunque la muestra sea chica."""

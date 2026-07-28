@@ -12,6 +12,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -400,7 +401,21 @@ async def stats_daily(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
     los naive UTC se guardan como ISO ('YYYY-MM-DD HH:MM:SS.ffffff'), así que el
     orden lexicográfico contra 'YYYY-MM-DD' coincide con el cronológico y el
     índice se puede usar. Regla: nunca envolver en función la columna del WHERE.
+
+    INCIDENTE 2026-07-28 parte 2 (medido con el índice YA arreglado): la consulta
+    seguía tardando 82,8s y CONGELANDO el bot entero — 190 de sus primeros 226
+    segundos de vida sin loguear ni procesar WS, con trading_enabled=true. El
+    índice acota la búsqueda, pero contar y agrupar 13,4M filas es caro SÍ o SÍ, y
+    corría DENTRO del event loop. Regla dura del proyecto: el instrumento de
+    medición JAMÁS puede apagar lo que mide → todo el trabajo de DB pesado va a un
+    thread (`asyncio.to_thread`); el loop sigue latiendo aunque la query tarde.
+    SQLite lo permite: el engine se crea con check_same_thread=False (models.py).
     """
+    return await asyncio.to_thread(_stats_daily_sync, days)
+
+
+def _stats_daily_sync(days: int) -> dict[str, Any]:
+    """Cuerpo SÍNCRONO de /stats/daily — corre en un worker thread, nunca en el loop."""
     from sqlalchemy import text as _text
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -505,7 +520,16 @@ async def stats_edges(days: int = Query(default=30, ge=1, le=120)) -> dict[str, 
     incluido el guardarraíl `gt_8pp_sospechosos` — SOLO se calculan donde la
     unidad es `pct`. Filas con valor NULL (pre-deploy) se excluyen de los buckets
     pero se cuentan en rows_total.
+
+    Corre en THREAD (regla 2026-07-28): edge_windows crece a decenas de miles de
+    filas por día — hoy responde en 250ms, pero el instrumento no puede volver a
+    congelar el bot cuando la tabla escale.
     """
+    return await asyncio.to_thread(_stats_edges_sync, days)
+
+
+def _stats_edges_sync(days: int) -> dict[str, Any]:
+    """Cuerpo SÍNCRONO de /stats/edges — worker thread, nunca el loop."""
     from sqlalchemy import text as _text
 
     cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -602,19 +626,37 @@ def _pnl_significance(n: int, pnl_usd: float, sum_sq_cents: float) -> dict[str, 
     y no depende ni del capital ni del fee. |t| < 2 ≈ indistinguible de cero al 95%:
     ruido, por muy positiva que se vea la media.
 
-    n < 30 → se devuelve `t` igual pero marcado como muestra chica: con 15 trades
-    (caso REST) ningún estadístico salva la decisión, hace falta más muestra.
+    TRAMPA DE LECTURA CORREGIDA (2026-07-28): `muestra_suficiente=False` por n<30 se
+    leía como "todavía no sabemos, probemos otro mes" — y eso INVIERTE la conclusión
+    cuando el t ya es contundente. Caso real: Motor REST con n=15 y t=−4.73 rechaza el
+    cero con muchísima holgura (el t YA incorpora la n por el error estándar: con pocos
+    trades el EE es grande, así que llegar a |t|=4.7 exige un efecto enorme). Leerlo
+    como "falta muestra" habría llevado a re-probar un motor con la evidencia negativa
+    MÁS fuerte del tablero.
+
+    Por eso el campo que decide es `concluyente`:
+      - |t| >= 2                 → concluyente (el signo dice si gana o sangra), sea cual sea n.
+      - |t| < 2 y n >= 30        → concluyente: es RUIDO (hay poder y aun así no se distingue).
+      - |t| < 2 y n < 30         → NO concluyente: acá sí falta muestra.
+    `muestra_suficiente` se conserva como dato crudo (n>=30), pero NO es el criterio.
     """
     if n < 2:
-        return {"pnl_per_trade_stderr_usd": None, "pnl_t_stat": None, "muestra_suficiente": False}
+        return {
+            "pnl_per_trade_stderr_usd": None,
+            "pnl_t_stat": None,
+            "muestra_suficiente": False,
+            "concluyente": False,
+        }
     mean_cents = (pnl_usd * 100) / n
     # Varianza muestral vía suma de cuadrados: E[x²] − (E[x])², corregida por n−1.
     var = max(0.0, (sum_sq_cents - n * mean_cents**2) / (n - 1))
     stderr_cents = (var / n) ** 0.5
+    t_stat = round(mean_cents / stderr_cents, 2) if stderr_cents > 0 else None
     return {
         "pnl_per_trade_stderr_usd": round(stderr_cents / 100, 4),
-        "pnl_t_stat": round(mean_cents / stderr_cents, 2) if stderr_cents > 0 else None,
+        "pnl_t_stat": t_stat,
         "muestra_suficiente": n >= 30,
+        "concluyente": (t_stat is not None and abs(t_stat) >= 2.0) or n >= 30,
     }
 
 
@@ -697,10 +739,17 @@ async def stats_motors(days: int = Query(default=30, ge=1, le=180)) -> dict[str,
         # relativo en 2 de 3 motores — o sea, el criterio "relativo" no actuaba.
         if pnl < -20:
             data["verdict_hint"] = "sangra"
-        elif not data["muestra_suficiente"]:
+        elif t_stat is not None and abs(t_stat) >= 2:
+            # CONCLUYENTE aunque n sea chica: el t ya incorpora la n (caso REST 2026-07-28:
+            # n=15, t=−4.73 → evidencia negativa fuerte, NO "falta muestra").
+            signo = "positivo" if t_stat > 0 else "negativo"
             data["verdict_hint"] = (
-                f"muestra insuficiente ({data['settled_trades']} trades settleados; "
-                "hacen falta >=30 para distinguir la media de cero)"
+                f"{signo} SIGNIFICATIVO (t={t_stat:+.2f}, n={data['settled_trades']})"
+            )
+        elif not data["concluyente"]:
+            data["verdict_hint"] = (
+                f"NO concluyente ({data['settled_trades']} trades, |t|<2): falta muestra "
+                "para distinguir la media de cero"
             )
         elif t_stat is not None and abs(t_stat) < 2:
             data["verdict_hint"] = f"ruido (t={t_stat:+.2f}: indistinguible de cero)"
