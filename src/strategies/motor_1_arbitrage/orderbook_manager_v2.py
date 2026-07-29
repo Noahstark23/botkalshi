@@ -403,7 +403,12 @@ class OrderbookManagerV2:
             f"recovery. total={self._incoherent_quarantines}"
         )
         BotState.record_error(f"v2.book_incoherent {ticker} cruce={cross}¢ (book divergido)")
-        self._persist_incoherence(ticker, sid, cross)
+        # En THREAD: es una escritura de DB sobre el hot path del WS. Los eventos son raros
+        # (uno por noche) y es un solo INSERT, pero si SQLite está tomado (backup, checkpoint
+        # del WAL, query pesada) el commit bloquea el EVENT LOOP hasta el busy_timeout —
+        # misma familia del defecto que congelaba el bot con /stats/daily. Va después del
+        # mark_stale(), así que suspender acá NO abre ventana para leer precios fantasma.
+        await asyncio.to_thread(self._persist_incoherence, ticker, sid, cross)
         if sid not in self._recovering:
             await self._start_recovery(sid)
 

@@ -245,3 +245,29 @@ async def test_persistencia_falla_sin_romper_la_cuarentena(ws, monkeypatch):
 
     assert manager.get_top_of_book(TICKER, "yes") is None  # cuarentena OK pese al fallo de DB
     assert manager._incoherent_quarantines == 1
+
+
+async def test_persistencia_no_bloquea_el_event_loop(ws, monkeypatch):
+    """La escritura del RiskEvent va en THREAD: si SQLite está tomado (backup, checkpoint,
+    query pesada), el commit NO puede congelar el event loop del WS — misma lección que
+    /stats/daily. Se verifica que la persistencia corre FUERA del hilo del loop."""
+    import threading
+
+    import src.storage.models as models
+
+    hilo_de_la_persistencia: list[int] = []
+    hilo_del_loop = threading.get_ident()
+
+    def _spy_session(*a, **kw):
+        hilo_de_la_persistencia.append(threading.get_ident())
+        raise RuntimeError("DB tomada")  # además: el fallo no rompe la cuarentena
+
+    monkeypatch.setattr(models, "get_session", _spy_session)
+    manager = OrderbookManagerV2(ws, max_plausible_cross_cents=10)
+    await _seed(manager, 50, 40)
+
+    await manager.handle_message(_delta("yes", 95, 500, seq=2))
+
+    assert hilo_de_la_persistencia, "la persistencia debe haberse intentado"
+    assert hilo_de_la_persistencia[0] != hilo_del_loop, "debe correr en un worker, no en el loop"
+    assert manager.get_top_of_book(TICKER, "yes") is None  # cuarentena intacta
