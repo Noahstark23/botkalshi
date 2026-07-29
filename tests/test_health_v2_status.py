@@ -186,3 +186,37 @@ def test_status_includes_capital_block(client):
     assert cap["mode"] == "dynamic"
     assert cap["effective_usd"] == 300.0  # fallback a ACTIVE_CAPITAL_USD (sin cash real aún)
     assert cap["is_paused"] is False
+
+
+def test_status_reenvia_metricas_nuevas_del_manager(client):
+    """FIX 2026-07-29: el bloque v2 se armaba campo por campo, así que una métrica NUEVA del
+    manager (caso real: los contadores de la invariante de coherencia de #195) quedaba
+    invisible en /status aunque se estuviera contando — y se leyó como "el fix no está
+    desplegado". Ahora stats() se reenvía entero: lo que el manager mide, el status lo muestra."""
+    mock_mgr = MagicMock()
+    mock_mgr.stats.return_value = {
+        "initialized_tickers": 213,
+        "gaps_last_60s": 0,
+        "last_gap_at": None,
+        "incoherent_books_now": 2,
+        "incoherent_quarantines_total": 7,
+        "metrica_futura_cualquiera": 42,  # lo que se agregue mañana también aparece
+    }
+    mock_mgr._tickers_by_sid = {1: {"A"}}
+    mock_mgr._recovering = set()
+    mock_mgr._recovery_disabled_sids = set()
+    BotState.v2_manager = mock_mgr
+
+    session = mock_db_session()
+    with (
+        patch("src.monitoring.health.get_settings", return_value=mock_settings(v2_enabled=True)),
+        patch("src.monitoring.health.get_session", return_value=session),
+    ):
+        v2 = client.get("/status").json()["orderbook_manager_v2"]
+
+    assert v2["incoherent_books_now"] == 2
+    assert v2["incoherent_quarantines_total"] == 7
+    assert v2["metrica_futura_cualquiera"] == 42
+    # y los campos de presentación siguen mandando sobre el reenvío
+    assert v2["books_initialized"] == 213
+    assert v2["running"] is True
