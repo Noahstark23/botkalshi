@@ -205,7 +205,15 @@ async def status() -> dict[str, Any]:
             v2_info["instance"] = "missing"
     else:
         s = v2_mgr.stats()
+        # REENVÍO COMPLETO de lo que mide el manager (fix 2026-07-29): este bloque se armaba
+        # a mano campo por campo, así que toda métrica NUEVA del manager quedaba invisible en
+        # /status aunque se estuviera contando. Pasó con la invariante de coherencia (#195):
+        # `incoherent_books_now` / `incoherent_quarantines_total` existían y contaban, pero el
+        # status no los mostraba → se leyó como "el fix no está desplegado". Misma clase de bug
+        # que las env vars inertes: trabajo hecho que se pierde en el cableado. Ahora se
+        # reenvía stats() entero y solo se SOBREESCRIBEN los campos de presentación.
         v2_info = {
+            **s,
             "enabled": v2_enabled,  # el flag (compat) — puede ser False con el manager corriendo
             "running": True,  # la instancia EXISTE y procesa books (aunque el flag esté off)
             "books_initialized": s.get("initialized_tickers", 0),
