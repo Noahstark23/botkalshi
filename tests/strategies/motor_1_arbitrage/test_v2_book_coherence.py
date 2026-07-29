@@ -175,3 +175,73 @@ async def test_stats_expose_incoherence_counters(ws):
     s1 = manager.stats()
     assert s1["incoherent_books_now"] == 1
     assert s1["incoherent_quarantines_total"] == 1
+
+
+# =====================================================
+# Invariante de ORDEN y persistencia (2026-07-29)
+# =====================================================
+
+
+async def test_mark_stale_ocurre_antes_del_primer_await(ws):
+    """PINEA LA GARANTÍA DE SEGURIDAD: el book debe quedar stale ANTES del primer punto de
+    suspensión (_start_recovery). Si alguien agrega un `await` real antes del mark_stale,
+    el event loop podría dar control a M1/M5 con precios FANTASMA todavía servibles y
+    mandar una orden sobre liquidez inexistente. Este test se pone rojo si se reordena."""
+    manager = OrderbookManagerV2(ws, max_plausible_cross_cents=10)
+    await _seed(manager, 50, 40)
+    stale_al_entrar: list[bool] = []
+
+    async def _spy_start_recovery(sid: int) -> None:
+        state = manager._books[TICKER]
+        stale_al_entrar.append(state.is_stale)
+
+    manager._start_recovery = _spy_start_recovery  # type: ignore[method-assign]
+
+    await manager.handle_message(_delta("yes", 95, 500, seq=2))
+    await manager.handle_message(_delta("no", 91, 500, seq=3))
+
+    assert stale_al_entrar == [True], "el book DEBE estar stale antes del primer await"
+
+
+async def test_incoherencia_se_persiste_en_risk_events(ws, tmp_path, monkeypatch):
+    """El contador en memoria se reinicia en cada arranque del container (6 redeploys en una
+    noche = métrica del mes subestimada sin que se note). El evento se persiste en
+    risk_events para poder contarlo POR DÍA, inmune a reinicios."""
+    from sqlmodel import select
+
+    import src.storage.models as models
+
+    engine = models.create_engine(f"sqlite:///{tmp_path / 'risk.db'}")
+    models.SQLModel.metadata.create_all(engine)
+    monkeypatch.setattr(models, "_engine", engine)
+
+    manager = OrderbookManagerV2(ws, max_plausible_cross_cents=10)
+    await _seed(manager, 50, 40)
+    # Un solo delta ya rompe la invariante: yes_bid 50→95 con no_bid=40 da cruce 35¢.
+    await manager.handle_message(_delta("yes", 95, 500, seq=2))
+
+    with models.get_session() as db:
+        rows = list(db.exec(select(models.RiskEvent)))
+    assert len(rows) == 1
+    assert rows[0].event_type == "book_incoherent"
+    assert rows[0].severity == "warning"
+    assert TICKER in rows[0].message
+    assert "cruce=35¢" in rows[0].message
+
+
+async def test_persistencia_falla_sin_romper_la_cuarentena(ws, monkeypatch):
+    """FAIL-SAFE: si la DB falla, la cuarentena — que es lo que protege la plata — igual
+    ocurre. El orden importa: mark_stale ya pasó cuando se intenta persistir."""
+    import src.storage.models as models
+
+    def _boom(*a, **kw):
+        raise RuntimeError("DB caída")
+
+    manager = OrderbookManagerV2(ws, max_plausible_cross_cents=10)
+    await _seed(manager, 50, 40)
+    monkeypatch.setattr(models, "get_session", _boom)
+
+    await manager.handle_message(_delta("yes", 95, 500, seq=2))
+
+    assert manager.get_top_of_book(TICKER, "yes") is None  # cuarentena OK pese al fallo de DB
+    assert manager._incoherent_quarantines == 1
