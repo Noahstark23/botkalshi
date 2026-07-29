@@ -172,6 +172,12 @@ class OrderbookManagerV2:
         # MEDIDA de corrupción del feed: si sube sostenido, el problema está upstream.
         self._incoherent_tickers: set[str] = set()
         self._incoherent_quarantines = 0
+        # Instrumentación del ciclo de recovery (2026-07-29 — pedida por el forense de la
+        # tormenta: sin esto, "lo arreglé" y "cambió la forma del ruido" son indistinguibles
+        # en producción): ecos tardíos ignorados por el guard de época + recoveries que
+        # COMPLETARON (el cierre era silencioso: 0 hits de recovery_complete en 6.265 ciclos).
+        self._stale_snapshots_ignored = 0
+        self._recoveries_completed = 0
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
         # Tickers que NO se vuelven a pedir en recovery: settled/expirados (close_time vencido,
@@ -271,13 +277,31 @@ class OrderbookManagerV2:
             if req_id in self._pending_snapshot_requests:
                 await self._handle_recovery_snapshot(raw_msg, req_id)
                 return
+            # GUARD DE ÉPOCA (incidente 2026-07-29 — la tormenta de 6.265 recoveries/día).
+            # Un snapshot cuyo `id` NO está pendiente es un ECO TARDÍO de un intento MUERTO
+            # (abortado o ya cerrado). Antes caía al fallback por sid y TACHABA tickers del
+            # intento VIVO con bases 10-25s viejas: cada intento "completaba" en ~9.5s
+            # consumiendo ~2/3 de snapshots ajenos (el ciclo real tarda ~13.8s), el drain
+            # aplicaba deltas recientes sobre esas bases rancias → faltantes de ~575
+            # contratos (books de temporada) → desync → cuarentena → OTRA recovery. Cadena
+            # medida 1:1: 6.267 qty<0 → 5.999 cuarentenas → 6.275 gaps → 6.265 recoveries,
+            # 41% arrancando a <2s de la anterior. Se IGNORA por completo: ni tacha, ni
+            # aplica, ni dispara gap — el snapshot FRESCO que sí pedimos viene en camino, y
+            # si no viniera, el watchdog de timeout existe para eso.
+            self._stale_snapshots_ignored += 1
+            if self._stale_snapshots_ignored == 1 or self._stale_snapshots_ignored % 1000 == 0:
+                logger.warning(
+                    f"v2.stale_snapshot_ignored ticker={ticker} sid={sid} req_id={req_id} "
+                    f"(eco de intento muerto; total={self._stale_snapshots_ignored})"
+                )
+            return
 
         # Fallback por ticker/sid (incidente 2026-05-28): un orderbook_snapshot para un sid EN
-        # recovery que NO trae el id del comando (Kalshi puede omitirlo o eco-devolver uno viejo
-        # en reconnects) igual COMPLETA la recovery — se rutea por ticker/sid, no solo por id.
-        # Sin esto el snapshot caería al buffer de abajo y el sid quedaría atascado en _recovering
-        # (book stale + buffer creciendo hasta que aborta el watchdog). La invariante "el snapshot
-        # siempre eco-devuelve el id" no está garantizada por los docs públicos.
+        # recovery que NO trae id (Kalshi puede omitirlo) igual COMPLETA la recovery — se rutea
+        # por ticker/sid. Sin esto el snapshot caería al buffer y el sid quedaría atascado en
+        # _recovering (book stale + buffer creciendo hasta que aborta el watchdog). OJO: desde
+        # el guard de época este fallback es SOLO para snapshots SIN id — uno CON id viejo es
+        # un eco de otro intento y ya fue ignorado arriba (no puede tachar al intento vivo).
         if msg_type == "orderbook_snapshot" and sid in self._recovering:
             req_id = self._pending_req_id_for_sid(sid)
             if req_id is not None:
@@ -472,6 +496,12 @@ class OrderbookManagerV2:
             # medida directa de corrupción del feed (2026-07-28: 23% de edges fantasma).
             "incoherent_books_now": len(self._incoherent_tickers),
             "incoherent_quarantines_total": self._incoherent_quarantines,
+            # Guard de época (2026-07-29): ecos tardíos de intentos muertos ignorados +
+            # recoveries completadas. La predicción falsable del fix: stale_ignored > 0 con
+            # la cadena desync→cuarentena→recovery COLAPSANDO (si ignored=0 y la tormenta
+            # sigue, el mecanismo era otro).
+            "stale_snapshots_ignored_total": self._stale_snapshots_ignored,
+            "recoveries_completed_total": self._recoveries_completed,
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
             "gaps_last_60s": gaps_last_60s,
@@ -904,6 +934,16 @@ class OrderbookManagerV2:
 
         # ¿Quedan lotes pendientes del sid? Si no, la recovery COMPLETÓ.
         if not any(s == sid for s, _ in self._pending_snapshot_requests.values()):
+            started = self._recovery_started_at.get(sid)
+            elapsed = f"{time.monotonic() - started:.1f}s" if started is not None else "?"
+            self._recoveries_completed += 1
+            # El cierre era SILENCIOSO (2026-07-29): en 6.265 ciclos del día de la tormenta
+            # no había una sola línea de completion — imposible medir cuánto tarda un ciclo
+            # o si se solapa con el siguiente sin inferirlo por snapshots/seg.
+            logger.info(
+                f"v2.recovery_complete sid={sid} tickers={len(self._tickers_by_sid.get(sid, set()))} "
+                f"elapsed={elapsed} total_completadas={self._recoveries_completed}"
+            )
             self._recovering.discard(sid)
             self._recovery_started_at.pop(sid, None)
             # Recovery OK → resetea el circuit breaker del sid (y lo re-habilita si estaba off),
