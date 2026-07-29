@@ -370,7 +370,17 @@ class OrderbookManagerV2:
         Fail-closed: se marca stale (deja de servir a TODOS los lectores) y se pide recovery.
         NO se levanta excepción: el delta se aplicó bien, lo que está mal es el estado
         resultante. One-shot por ticker (se re-arma cuando un snapshot lo re-basea) para no
-        spamear ni tormentear la recovery."""
+        spamear ni tormentear la recovery.
+
+        ⚠️ INVARIANTE DE ORDEN — NO agregar ningún `await` antes de `state.mark_stale()`.
+        La garantía de que NINGÚN lector (el loop de M1, M5, M8, M9) llega a ver el book
+        fantasma no viene de "no hay await" — el caller SÍ hace `await` sobre esta corrutina
+        — sino de que **no hay PUNTO DE SUSPENSIÓN** entre aplicar el delta corruptor y
+        marcar el book stale: awaitear una corrutina que no se suspende no devuelve el
+        control al event loop. Un `await` real acá arriba (I/O, sleep, lock) abriría una
+        ventana en la que otra task puede leer precios fantasma y mandar una orden. El
+        primer punto de suspensión legítimo es `_start_recovery`, al final. Pineado por
+        test (`test_mark_stale_ocurre_antes_del_primer_await`)."""
         state = self._books.get(ticker)
         if state is None or not state.is_initialized or state.is_stale:
             return
@@ -393,8 +403,35 @@ class OrderbookManagerV2:
             f"recovery. total={self._incoherent_quarantines}"
         )
         BotState.record_error(f"v2.book_incoherent {ticker} cruce={cross}¢ (book divergido)")
+        self._persist_incoherence(ticker, sid, cross)
         if sid not in self._recovering:
             await self._start_recovery(sid)
+
+    def _persist_incoherence(self, ticker: str, sid: int, cross: int) -> None:
+        """Graba el evento en `risk_events` (2026-07-29): el contador en memoria se REINICIA
+        en cada arranque del container, y con varios redeploys en una noche la métrica más
+        importante del mes de prueba quedaba subestimada sin que se notara. Persistido se
+        puede contar POR DÍA, inmune a reinicios. Son eventos raros (no hay riesgo de flood,
+        y risk_events ya tiene retención). Best-effort: un fallo de DB jamás frena la
+        cuarentena, que es lo que protege la plata."""
+        try:
+            from src.storage.models import RiskEvent, get_session
+
+            with get_session() as db:
+                db.add(
+                    RiskEvent(
+                        event_type="book_incoherent",
+                        severity="warning",
+                        message=(
+                            f"{ticker} sid={sid} cruce={cross}¢ > "
+                            f"{self._max_plausible_cross_cents}¢ — book divergido, "
+                            "cuarentena + recovery (edge fantasma evitado)"
+                        )[:500],
+                    )
+                )
+                db.commit()
+        except Exception:
+            logger.exception("v2.book_incoherent: no se pudo persistir el RiskEvent (se sigue)")
 
     @property
     def tracked_tickers(self) -> frozenset[str]:
