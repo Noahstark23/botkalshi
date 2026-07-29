@@ -181,14 +181,19 @@ def _mut_nonmatching(snapshot, cmd_id):
     [
         pytest.param(_mut_matching, id="matching_id"),
         pytest.param(_mut_missing, id="missing_id"),
-        pytest.param(_mut_nonmatching, id="nonmatching_id"),
     ],
 )
 def test_recovery_terminates_on_orderbook_snapshot(
     manager_and_sid, canonical_snapshot, snapshot_mutator
 ):
     """Un snapshot del ticker en recovery debe terminar la recovery y drenar el buffer —
-    lleve o no un id de comando que coincida."""
+    con el id correcto o SIN id (el caso 2026-05-28).
+
+    CAMBIO DE SEMÁNTICA (2026-07-29, guard de época): el caso "id que NO coincide" se
+    movió a test_v2_epoch_guard.py con el comportamiento INVERSO — un id desconocido es
+    un ECO de un intento de recovery muerto y se IGNORA (no completa, no aplica, no
+    dispara gap). Aceptarlo era el mecanismo de la tormenta de 6.265 recoveries/día:
+    los ecos tachaban tickers del intento vivo con bases 10-25s viejas."""
     manager, sid = manager_and_sid
     cmd_id = drive_into_recovery(manager, sid, canonical_snapshot)
 
