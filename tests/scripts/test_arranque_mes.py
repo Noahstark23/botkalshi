@@ -33,13 +33,22 @@ def settings_del_mes() -> MagicMock:
     return s
 
 
-def _run(argv, *, settings, posiciones, engaged, capital=None, feed=None) -> tuple[int, str]:
+def _run(
+    argv, *, settings, posiciones, engaged, capital=None, feed=None, pausa=None
+) -> tuple[int, str]:
     capital = capital if capital is not None else {"effective_usd": 270.0, "is_paused": False}
     feed = feed if feed is not None else {"books_initialized": 215}
+    # Default: bot vivo sin pausa runtime (el punto ciego del 2026-07-30 se testea aparte).
+    pausa = (
+        pausa
+        if pausa is not None
+        else {"is_paused": False, "pause_reason": None, "verificable": True}
+    )
     with (
         patch.object(arranque_mes, "get_settings", return_value=settings),
         patch.object(arranque_mes, "_leer_posiciones", MagicMock(return_value=posiciones)),
         patch.object(arranque_mes, "_estado_capital", return_value=capital),
+        patch.object(arranque_mes, "_estado_pausa_runtime", return_value=pausa),
         patch.object(arranque_mes, "_estado_feed", return_value=feed),
         patch.object(arranque_mes.models, "kill_switch_engaged", return_value=engaged),
         patch.object(arranque_mes.models, "clear_kill_switch") as clear,
@@ -216,3 +225,82 @@ def test_flags_del_mes_existen_en_settings_real():
     campos = set(Settings.model_fields)
     faltan = [n for n in arranque_mes.FLAGS_DEL_MES if n not in campos]
     assert faltan == [], f"flags del mes que NO existen en Settings: {faltan}"
+
+
+# =====================================================
+# Punto ciego del 2026-07-30: la pausa RUNTIME
+# =====================================================
+
+
+def test_estado_pausa_runtime_parsea_status(monkeypatch):
+    """El preflight lee is_paused/pause_reason del /status del bot VIVO (el script corre
+    por docker exec = proceso aparte; BotState local no sirve). El incidente: 'todo listo'
+    con el bot pausado 12 horas por el circuit breaker."""
+    import io
+    import json
+
+    from scripts.arranque_mes import _estado_pausa_runtime
+
+    payload = json.dumps(
+        {"bot": {"is_paused": True, "pause_reason": "circuit_breaker: 3+ rollbacks"}}
+    ).encode()
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _Resp(payload))
+    estado = _estado_pausa_runtime()
+    assert estado["is_paused"] is True
+    assert "circuit_breaker" in estado["pause_reason"]
+    assert estado["verificable"] is True
+
+
+def test_estado_pausa_runtime_no_verificable_es_honesto(monkeypatch):
+    """FAIL-SAFE: /status caído → 'no verificable', jamás 'sano' inventado (el veredicto
+    lo trata como bloqueante)."""
+    import urllib.request
+
+    def _boom(*a, **kw):
+        raise OSError("connection refused")
+
+    from scripts.arranque_mes import _estado_pausa_runtime
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    estado = _estado_pausa_runtime()
+    assert estado["verificable"] is False
+    assert estado["is_paused"] is None
+
+
+def test_chequeo_bloquea_por_pausa_runtime(settings_del_mes):
+    """El incidente 2026-07-30: 'todo listo' con el bot pausado por circuit breaker.
+    Ahora la pausa runtime es BLOQUEANTE en el veredicto."""
+    rc, salida, _ = _run(
+        [],
+        settings=settings_del_mes,
+        posiciones=[],
+        engaged=(False, None),
+        pausa={"is_paused": True, "pause_reason": "circuit_breaker: 3+", "verificable": True},
+    )
+    assert rc == 0
+    assert "NO puede arrancar" in salida
+    assert "PAUSADO en runtime" in salida
+    assert "todo listo" not in salida.lower()
+
+
+def test_chequeo_pausa_no_verificable_tambien_bloquea(settings_del_mes):
+    """FAIL-SAFE: si /status no responde, no se asume sano — bloqueante explícito."""
+    rc, salida, _ = _run(
+        [],
+        settings=settings_del_mes,
+        posiciones=[],
+        engaged=(False, None),
+        pausa={"is_paused": None, "pause_reason": None, "verificable": False},
+    )
+    assert "NO VERIFICABLE" in salida
+    assert "todo listo" not in salida.lower()

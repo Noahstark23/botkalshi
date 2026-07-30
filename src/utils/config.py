@@ -275,6 +275,32 @@ class Settings(BaseSettings):
         ge=1,
         description="Abortos de rollback en 24h que escalan al kill-switch global igual",
     )
+    # Circuit breaker de M1 (incidente 2026-07-30, día 1 del mes: 3 rollbacks LIMPIOS de
+    # $0.21 totales, con 0 huérfanas, dispararon el breaker hardcodeado 3/60min sin resume
+    # automático → 12 de 13 horas de bot muerto). Tunables en vivo; el peligro real es el
+    # rollback ABORTADO (pata huérfana), que siempre cuenta y además tiene su propia
+    # respuesta (kill-switch / pausa proporcional).
+    MOTOR_1_BREAKER_THRESHOLD: int = Field(
+        default=3, ge=1, description="Rollbacks en ventana que disparan el breaker de M1"
+    )
+    MOTOR_1_BREAKER_WINDOW_MIN: float = Field(
+        default=60.0, gt=0, description="Ventana (min) del breaker de M1"
+    )
+    MOTOR_1_BREAKER_COUNT_CLEAN_ROLLBACKS: bool = Field(
+        default=True,
+        description="Contar rollbacks LIMPIOS (cerrados sin huérfana) para el breaker. false = solo abortados.",
+    )
+    # Self-healing condicionado: despausa SOLO si la ventana bajó del umbral, hay CERO
+    # abortados en ella, y quedan reanudaciones del tope diario (agotado → humano). Jamás
+    # toca el kill-switch. Default off: cambiar la respuesta de un freno es decisión del
+    # operador.
+    MOTOR_1_BREAKER_AUTO_RESUME: bool = Field(
+        default=False,
+        description="Auto-resume del breaker de M1 al vaciarse la ventana (condicionado)",
+    )
+    MOTOR_1_BREAKER_MAX_RESUMES_PER_DAY: int = Field(
+        default=3, ge=1, description="Tope diario de auto-resumes del breaker de M1"
+    )
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     # Capa A por motor para las ENTRADAS (apuestas) de Motor 2 (auditoría 2026-07-07, P1):
     # mismo gap que Motor 1 — el Motor2Executor de entrada se construía con TRADING_ENABLED

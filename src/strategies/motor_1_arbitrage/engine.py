@@ -272,6 +272,30 @@ class Motor1Engine:
                 return
             async with self._exec_lock:
                 ticker = opp.legs[0].market_ticker if opp.legs else "?"
+                # REVALIDACIÓN T-0 (incidente 2026-07-30, día 1 del mes: 3 de 3 rollbacks
+                # por la SEGUNDA pata FOK rebotando 409 a 33-35ms de la primera). El opp
+                # detectado envejece entre el tick y este punto (single-flight, delays del
+                # loop): la premisa "count ≤ available_size por construcción" era verdad AL
+                # DETECTAR, no al ejecutar. Se re-detecta del book VIVO acá mismo y se
+                # ejecuta el arb FRESCO: si el cruce ya no existe (o dejó de ser rentable),
+                # skip LIMPIO — cero órdenes, cero rollback, cero breaker. La carrera
+                # residual (RTTs del pre-check de balance + pata dura) es irreducible con
+                # FOK secuencial; esto elimina la parte acumulada, que es la grande.
+                fresh = self._detect(ticker) if ticker != "?" else None
+                if fresh is None:
+                    logger.info(
+                        f"motor1.exec.revalidation_skip ticker={ticker} — el cruce murió "
+                        "entre la detección y la ejecución (skip limpio, sin órdenes)"
+                    )
+                    self._update_edge_window_outcome(edge_id, False)
+                    return
+                if fresh.net_profit_cents != opp.net_profit_cents or fresh.count != opp.count:
+                    logger.info(
+                        f"motor1.exec.revalidated ticker={ticker} "
+                        f"net {opp.net_profit_cents}c→{fresh.net_profit_cents}c "
+                        f"count {opp.count}→{fresh.count} (se ejecuta el book VIVO)"
+                    )
+                opp = fresh
                 filled = await executor.execute(opp)
                 logger.info(
                     f"motor1.exec.outcome edge_id={edge_id} ticker={ticker} "

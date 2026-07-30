@@ -135,6 +135,10 @@ async def health() -> dict[str, Any]:
         "status": "healthy" if all_ok else "unhealthy",
         "uptime_seconds": int(uptime),
         "checks": checks,
+        # Separar "pausado" de "roto" (2026-07-30): not_paused=false colapsaba ambos y una
+        # pausa de breaker TAPABA fallas reales del feed en el badge. El status sigue
+        # decidiendo igual (Coolify no cambia); esto hace legible el PORQUÉ de un 503.
+        "pause_reason": BotState.pause_reason,
         "timestamp": now.isoformat(),
     }
 
