@@ -92,6 +92,12 @@ class ArbitrageExecutor:
         # LAZY: se construye en el primer execute() (get_settings ahí, no en __init__ — el
         # executor también se instancia en contextos sin env completo, ej. reconcile de boot).
         self.event_tracker: EventExposureTracker | None = None
+        # Pausa LOCAL de Motor 1 (respuesta proporcional a huérfanas chicas, 2026-07-29):
+        # runtime-only y por MOTOR — el resto del bot y Motor 3 (que gestiona la huérfana)
+        # siguen operando. El kill-switch GLOBAL sigue existiendo para huérfanas grandes y
+        # para la escalada por repetición.
+        self._motor_paused: bool = False
+        self._motor_pause_reason: str | None = None
         # Bug 1: caché del balance real de Kalshi (TTL corto) para el pre-check por arb sin
         # martillar la API. (monotonic_ts, balance_usd); se invalida tras cada place exitoso.
         self._balance_cache: tuple[float, float] | None = None
@@ -185,6 +191,14 @@ class ArbitrageExecutor:
             True  — either successfully filled (live) or dry-run (TRADING_ENABLED=false).
             False — risk check failed, or partial/full placement failure.
         """
+        # Pausa LOCAL de Motor 1 (proporcional): corta ANTES de tocar red o riesgo. Es el
+        # equivalente por-motor del kill-switch, para huérfanas chicas.
+        if self._motor_paused:
+            logger.info(
+                f"ArbitrageExecutor: Motor 1 PAUSADO localmente — {self._motor_pause_reason}"
+            )
+            return False
+
         decision = await self.risk_manager.check_pre_trade(opp)
         if not decision.approved:
             logger.info(f"ArbitrageExecutor: risk check rejected — {decision.reason}")
@@ -455,7 +469,7 @@ class ArbitrageExecutor:
                             f"bid={current_bid}¢ original={leg.price_cents}¢. "
                             "Manual review required."
                         )
-                        await self._pause_on_aborted_rollback(leg, slippage_pct)
+                        await self._pause_on_aborted_rollback(leg, slippage_pct, remaining)
                         break
 
                     logger.info(
@@ -666,7 +680,30 @@ class ArbitrageExecutor:
         self._balance_cache = (now, usd)
         return usd
 
-    async def _pause_on_aborted_rollback(self, leg: ArbLeg, slippage_pct: float) -> None:
+    def _recent_aborted_rollbacks(self) -> int:
+        """Abortos de rollback en las últimas 24h (de risk_events, así SOBREVIVE redeploys).
+        Insumo de la escalada anti-acumulación: una huérfana chica REPETIDA no es un
+        accidente, es un mercado roto — y ahí sí corresponde el kill-switch global."""
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
+        try:
+            with get_session() as s:
+                return len(
+                    list(
+                        s.exec(
+                            select(RiskEvent).where(
+                                RiskEvent.event_type == "rollback_aborted_slippage",
+                                RiskEvent.triggered_at >= cutoff,
+                            )
+                        ).all()
+                    )
+                )
+        except Exception:
+            logger.exception("_recent_aborted_rollbacks: query falló → se asume escalada")
+            return 10**6  # fail-CLOSED: si no se puede contar, se escala al global
+
+    async def _pause_on_aborted_rollback(
+        self, leg: ArbLeg, slippage_pct: float, remaining: int = 0
+    ) -> None:
         """
         Bug 3 (incidente 2026-07-07): UN rollback abortado por slippage = PAUSA INMEDIATA
         y PERSISTENTE. Un abort significa que el mercado se movió tanto entre la pata y el
@@ -676,32 +713,104 @@ class ArbitrageExecutor:
         mercado roto. engage_kill_switch persiste en operational_state → el boot re-hidrata
         la pausa (_rehydrate_kill_switch) y SOLO scripts/clear_kill_switch.py la levanta.
         Best-effort: un fallo de persistencia no rompe el rollback (prioridad: alertar).
+
+        RESPUESTA PROPORCIONAL (2026-07-29, flag MOTOR_1_PROPORTIONAL_ORPHAN_PAUSE, default
+        OFF): la evidencia de 21 días dice que los 3 abortos fueron de UN contrato cada uno
+        (~$0.47) y cada uno paró el bot ENTERO 14+ horas. Con el flag on, una huérfana bajo
+        MOTOR_1_ORPHAN_KILL_SWITCH_USD pausa SOLO Motor 1 (runtime; el resto de los motores
+        y M3 —que gestiona la huérfana— siguen), y el kill-switch global se reserva para
+        huérfanas grandes O para la N-ésima chica en 24h (anti-acumulación: repetido = roto).
+        El RiskEvent y la alerta se emiten SIEMPRE, en los dos caminos.
         """
+        exposure_usd = abs(remaining) * leg.price_cents / 100.0
+        # FAIL-CLOSED EN TODA LA DECISIÓN (dos bugs cazados en QA 2026-07-29):
+        #  (a) leer el flag por TRUTHINESS tomaba la rama BLANDA con un settings mockeado o a
+        #      medias — fail-OPEN en un control de seguridad. Solo un True EXPLÍCITO ablanda.
+        #  (b) `get_settings()` acá puede EXPLOTAR (el executor también vive en contextos sin
+        #      env completo, ej. el reconcile de boot) y la excepción la traga el loop de
+        #      rollback → la pausa NO ocurriría. Todo el cómputo va envuelto: cualquier fallo
+        #      cae al kill-switch global histórico, que es el comportamiento seguro.
+        local_only = False
+        previous = 0
+        limite = 1
+        try:
+            settings = get_settings()
+            if settings.MOTOR_1_PROPORTIONAL_ORPHAN_PAUSE is True:
+                umbral = settings.MOTOR_1_ORPHAN_KILL_SWITCH_USD
+                if (
+                    isinstance(umbral, (int, float))
+                    and not isinstance(umbral, bool)
+                    and exposure_usd < float(umbral)
+                ):
+                    crudo = settings.MOTOR_1_ORPHAN_ESCALATE_COUNT
+                    # Sin un límite entero válido, `limite=1` → escala YA (nunca local).
+                    limite = crudo if isinstance(crudo, int) and not isinstance(crudo, bool) else 1
+                    # El evento de ESTE abort se persiste abajo, así que la escalada compara
+                    # contra los PREVIOS: N-1 previos + este = N.
+                    previous = self._recent_aborted_rollbacks()
+                    local_only = previous + 1 < limite
+        except Exception:
+            logger.exception(
+                "pause_on_aborted_rollback: no se pudo evaluar la política proporcional → "
+                "kill-switch GLOBAL (fail-closed)"
+            )
+            local_only = False
+
         reason = (
             f"rollback_aborted_slippage: {leg.market_ticker} ({leg.side}) "
-            f"slippage {slippage_pct:.1f}% — pata huérfana sin cerrar, revisión manual"
+            f"slippage {slippage_pct:.1f}% — pata huérfana sin cerrar "
+            f"({remaining} contratos ≈ ${exposure_usd:.2f})"
+            + (
+                " — pausa SOLO Motor 1 (proporcional; M3 gestiona la huérfana)"
+                if local_only
+                else " — revisión manual"
+            )
         )
-        BotState.is_paused = True
-        BotState.pause_reason = reason
+        if local_only:
+            # Pausa LOCAL: Motor 1 deja de operar (execute() corta arriba), el resto del bot
+            # sigue. Runtime-only a propósito: una huérfana de centavos no debe sobrevivir un
+            # redeploy como bloqueo global — y si se repite, la escalada la convierte en uno.
+            self._motor_paused = True
+            self._motor_pause_reason = reason
+            BotState.motor1_local_pause = reason  # visible en /status (freno que no se ve = bug)
+        else:
+            BotState.is_paused = True
+            BotState.pause_reason = reason
         try:
+            # El RiskEvent se graba SIEMPRE (los dos caminos): es el rastro forense y el
+            # insumo de la escalada anti-acumulación.
             with get_session() as s:
                 s.add(
                     RiskEvent(
                         event_type="rollback_aborted_slippage",
-                        severity="critical",
+                        severity="warning" if local_only else "critical",
                         message=reason[:500],
                     )
                 )
                 s.commit()
-            engage_kill_switch(reason)
+            if not local_only:
+                engage_kill_switch(reason)
         except Exception:
             logger.exception("pause_on_aborted_rollback: persistencia falló (pausa runtime activa)")
-        logger.critical(f"PAUSA PERSISTENTE por rollback abortado: {reason}")
+        if local_only:
+            logger.critical(
+                f"PAUSA LOCAL de Motor 1 por rollback abortado (proporcional): {reason} "
+                f"[abortos previos en 24h: {previous}; escala al global en "
+                f"{limite}]"
+            )
+        else:
+            logger.critical(f"PAUSA PERSISTENTE por rollback abortado: {reason}")
         try:  # best-effort: un fallo de Telegram no debe romper el flujo del rollback
             await alert_risk_event(
                 "rollback_aborted_slippage",
-                f"{reason}. Bot pausado PERSISTENTE (sobrevive redeploy); "
-                "levantar con scripts/clear_kill_switch.py tras revisar la pata huérfana.",
+                (
+                    f"{reason}. Motor 1 PAUSADO (runtime); el resto del bot sigue y Motor 3 "
+                    f"gestiona la huérfana. Abortos en 24h: {previous + 1}/"
+                    f"{limite} antes de escalar al kill-switch."
+                    if local_only
+                    else f"{reason}. Bot pausado PERSISTENTE (sobrevive redeploy); "
+                    "levantar con scripts/clear_kill_switch.py tras revisar la pata huérfana."
+                ),
             )
         except Exception:
             logger.exception("pause_on_aborted_rollback: alerta Telegram falló")

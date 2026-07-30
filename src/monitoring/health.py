@@ -43,6 +43,11 @@ class BotState:
     last_error: str | None = None
     last_error_at: datetime | None = None
     v2_manager: Any = None  # Set by DataCaptureService when USE_ORDERBOOK_MANAGER_V2=True
+    # Pausa LOCAL de Motor 1 (respuesta proporcional a huérfanas chicas, 2026-07-29). Es
+    # runtime-only y por MOTOR: `is_paused` global sigue en False, así que SIN esto la pausa
+    # era INVISIBLE en /status — un freno que no se ve es la misma clase de bug que las
+    # alertas mudas y los contadores sin exponer. None = Motor 1 operando.
+    motor1_local_pause: str | None = None
 
     # TTL del last_error: un error mas viejo que esto se considera rancio y se limpia,
     # para que el dashboard no quede mostrando un error ya superado tras la recuperacion.
@@ -237,6 +242,9 @@ async def status() -> dict[str, Any]:
             "uptime_hours": round((now - BotState.started_at).total_seconds() / 3600, 2),
             "is_paused": BotState.is_paused,
             "pause_reason": BotState.pause_reason,
+            # Pausa por MOTOR (proporcional, 2026-07-29): con is_paused=False el bot opera,
+            # pero Motor 1 puede estar frenado por una huérfana chica. None = M1 operando.
+            "motor1_local_pause": BotState.motor1_local_pause,
             "capture_running": BotState.capture_running,
             "ws_connected": (
                 BotState.last_ws_message is not None
