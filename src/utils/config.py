@@ -251,6 +251,30 @@ class Settings(BaseSettings):
         gt=0.0,
         description="Cap de exposición direccional acumulada por evento (USD) para Motor 1",
     )
+    # Respuesta PROPORCIONAL a la pata huérfana de Motor 1 (evidencia 2026-07-29): en 21 días
+    # hubo 3 rollbacks abortados por slippage (25% de los 12 partial fills), TODOS de 1 solo
+    # contrato — y cada uno disparó el kill-switch GLOBAL persistente, que paró el bot entero
+    # 14+ horas por ~$0.47 de exposición. El guard nació del incidente 2026-07-07 (~$135), así
+    # que a esa escala era correcto; a esta, es un martillo neumático para una chinche.
+    # Con el flag en true: huérfana < UMBRAL → pausa SOLO Motor 1 (runtime) + RiskEvent +
+    # alerta, y Motor 3 la gestiona; huérfana >= UMBRAL → kill-switch global (comportamiento
+    # histórico intacto). ANTI-ACUMULACIÓN: N abortos en 24h escalan al global igual, aunque
+    # sean chicos (una huérfana chica repetida es un mercado roto, no un accidente).
+    # Default FALSE: ablandar una capa de seguridad es decisión explícita del operador.
+    MOTOR_1_PROPORTIONAL_ORPHAN_PAUSE: bool = Field(
+        default=False,
+        description="Huérfana chica pausa SOLO Motor 1 en vez del kill-switch global",
+    )
+    MOTOR_1_ORPHAN_KILL_SWITCH_USD: float = Field(
+        default=5.0,
+        gt=0,
+        description="Exposición huérfana (USD) desde la que se dispara el kill-switch global",
+    )
+    MOTOR_1_ORPHAN_ESCALATE_COUNT: int = Field(
+        default=3,
+        ge=1,
+        description="Abortos de rollback en 24h que escalan al kill-switch global igual",
+    )
     MOTOR_2_SPORTSBOOK_ENABLED: bool = False
     # Capa A por motor para las ENTRADAS (apuestas) de Motor 2 (auditoría 2026-07-07, P1):
     # mismo gap que Motor 1 — el Motor2Executor de entrada se construía con TRADING_ENABLED
