@@ -153,6 +153,35 @@ def _estado_feed() -> dict[str, Any]:
     }
 
 
+def _estado_pausa_runtime() -> dict[str, Any]:
+    """Pausa RUNTIME del bot vivo, vía /status HTTP (punto ciego del incidente 2026-07-30:
+    este script corría por `docker exec` — proceso APARTE — miraba solo el kill-switch
+    persistente en DB y dio 'todo listo' con el bot pausado 12 horas por el circuit
+    breaker, que vive en BotState del proceso del bot). El /status es la única ventana a
+    ese estado desde afuera. Best-effort: sin respuesta se reporta 'no verificable' y se
+    trata como BLOQUEANTE (no se asume sano lo que no se pudo ver)."""
+    import json
+    import urllib.request
+
+    from src.utils.config import get_settings as _gs
+
+    try:
+        port = int(_gs().HEALTH_PORT)
+    except Exception:  # noqa: BLE001
+        port = 8080
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/status", timeout=5) as r:
+            d = json.load(r)
+        bot = d.get("bot", {})
+        return {
+            "is_paused": bool(bot.get("is_paused")),
+            "pause_reason": bot.get("pause_reason"),
+            "verificable": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"is_paused": None, "pause_reason": None, "verificable": False, "error": str(exc)}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -211,6 +240,11 @@ def main(argv: list[str] | None = None) -> int:
     print("\n5) FEED (V2)")
     print(f"   {_estado_feed()}")
 
+    # ── 6. Pausa RUNTIME (el punto ciego del 2026-07-30) ────────────────────
+    pausa = _estado_pausa_runtime()
+    print("\n6) PAUSA RUNTIME (BotState del bot vivo, vía /status)")
+    print(f"   {pausa}")
+
     # ── Veredicto ───────────────────────────────────────────────────────────
     print("\n" + "-" * 68)
     bloqueantes: list[str] = []
@@ -220,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
         bloqueantes.append("kill-switch engaged")
     if cap.get("is_paused"):
         bloqueantes.append("capital bajo el piso")
+    if pausa.get("is_paused"):
+        bloqueantes.append(
+            f"bot PAUSADO en runtime ({pausa.get('pause_reason') or 'sin razón'}) — "
+            "se levanta con POST /admin/resume o restart, NO con --arrancar"
+        )
+    elif not pausa.get("verificable"):
+        bloqueantes.append("pausa runtime NO VERIFICABLE (/status no respondió)")
 
     if not args.arrancar:
         if bloqueantes:

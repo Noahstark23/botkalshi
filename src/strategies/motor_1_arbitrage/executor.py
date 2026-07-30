@@ -101,6 +101,10 @@ class ArbitrageExecutor:
         # Bug 1: caché del balance real de Kalshi (TTL corto) para el pre-check por arb sin
         # martillar la API. (monotonic_ts, balance_usd); se invalida tras cada place exitoso.
         self._balance_cache: tuple[float, float] | None = None
+        # Auto-resume del breaker (2026-07-30): contador de reanudaciones del día (el tope
+        # diario es la escalada — agotado, queda pausado hasta un humano).
+        self._resumes_today = 0
+        self._resumes_day: object = None
         self.BALANCE_CACHE_TTL_SEC = 5.0
 
     # =====================================================
@@ -199,6 +203,10 @@ class ArbitrageExecutor:
             )
             return False
 
+        # Self-healing del breaker ANTES del risk check (que rechaza por is_paused): si la
+        # ventana ya se vació y las condiciones se cumplen, este mismo intento despausa y
+        # sigue. Con el flag off (default) es un no-op.
+        self._maybe_auto_resume()
         decision = await self.risk_manager.check_pre_trade(opp)
         if not decision.approved:
             logger.info(f"ArbitrageExecutor: risk check rejected — {decision.reason}")
@@ -588,6 +596,50 @@ class ArbitrageExecutor:
         except Exception:
             logger.exception(f"rollback settle falló coid={original_coid} (pérdida sin realizar)")
 
+    def _breaker_params(self) -> tuple[int, float, bool]:
+        """(threshold, window_min, count_clean) desde settings — tunables EN VIVO (incidente
+        2026-07-30: 3/60min hardcodeados mataron el día 1 del mes por $0.21). Fallback a los
+        valores del ctor si los settings no cargan (tests viejos, contextos sin env)."""
+        try:
+            s = get_settings()
+            return (
+                int(s.MOTOR_1_BREAKER_THRESHOLD),
+                float(s.MOTOR_1_BREAKER_WINDOW_MIN),
+                bool(s.MOTOR_1_BREAKER_COUNT_CLEAN_ROLLBACKS),
+            )
+        except Exception:
+            return self.circuit_breaker_threshold, float(self.rollback_window_minutes), True
+
+    def _rollbacks_in_window(self, window_min: float, *, count_clean: bool) -> tuple[int, int]:
+        """(contados_para_el_breaker, abortados) en la ventana. Los ABORTADOS (pata huérfana)
+        siempre cuentan; los LIMPIOS (posición cerrada, pérdida en cents) solo si
+        count_clean — el día 1 del mes, 3 rollbacks limpios de $0.21 totales costaron 12
+        horas de bot muerto contándolos igual que a los peligrosos."""
+        cutoff = datetime.now(UTC) - timedelta(minutes=window_min)
+        with get_session() as s:
+            clean = len(
+                list(
+                    s.exec(
+                        select(RiskEvent).where(
+                            RiskEvent.event_type == "atomic_rollback",
+                            RiskEvent.triggered_at >= cutoff,
+                        )
+                    ).all()
+                )
+            )
+            aborted = len(
+                list(
+                    s.exec(
+                        select(RiskEvent).where(
+                            RiskEvent.event_type == "rollback_aborted_slippage",
+                            RiskEvent.triggered_at >= cutoff,
+                        )
+                    ).all()
+                )
+            )
+        counted = aborted + (clean if count_clean else 0)
+        return counted, aborted
+
     async def _check_circuit_breaker(self) -> None:
         """
         Record rollback event, then pause bot if threshold rollbacks occurred in window.
@@ -603,32 +655,86 @@ class ArbitrageExecutor:
             s.add(event)
             s.commit()
 
-        cutoff = datetime.now(UTC) - timedelta(minutes=self.rollback_window_minutes)
-        with get_session() as s:
-            events: list[RiskEvent] = list(
-                s.exec(
-                    select(RiskEvent).where(
-                        RiskEvent.event_type == "atomic_rollback",
-                        RiskEvent.triggered_at >= cutoff,
-                    )
-                ).all()
-            )
+        threshold, window_min, count_clean = self._breaker_params()
+        counted, _aborted = self._rollbacks_in_window(window_min, count_clean=count_clean)
 
-        if len(events) >= self.circuit_breaker_threshold:
+        if counted >= threshold:
             BotState.is_paused = True
             BotState.pause_reason = (
-                f"circuit_breaker: {len(events)}+ rollbacks in "
-                f"{self.rollback_window_minutes}min window"
+                f"circuit_breaker: {counted}+ rollbacks in {window_min:.0f}min window"
             )
             logger.critical(
-                f"Circuit breaker triggered: {len(events)} rollbacks in "
-                f"{self.rollback_window_minutes}min — bot paused"
+                f"Circuit breaker triggered: {counted} rollbacks in "
+                f"{window_min:.0f}min — bot paused"
             )
-            await alert_risk_event(
-                "circuit_breaker",
-                f"{len(events)} atomic rollbacks in {self.rollback_window_minutes}min. "
-                "Bot paused. Manual review required.",
+            try:  # best-effort SIEMPRE: un fallo de Telegram/settings no rompe el freno
+                await alert_risk_event(
+                    "circuit_breaker",
+                    f"{counted} rollbacks in {window_min:.0f}min. Bot paused. "
+                    "Auto-resume al vaciarse la ventana si MOTOR_1_BREAKER_AUTO_RESUME=true "
+                    "(condicionado: 0 abortados, tope diario); si no, POST /admin/resume.",
+                )
+            except Exception:
+                logger.exception("circuit_breaker: alerta falló (la pausa igual quedó aplicada)")
+
+    def _maybe_auto_resume(self) -> None:
+        """Self-healing CONDICIONADO del breaker (incidente 2026-07-30: sin resume
+        automático, 3 rollbacks limpios = 12 horas de mes muerto por $0.21; el único
+        `is_paused = False` del árbol era el POST /admin/resume manual).
+
+        SOLO despausa si TODAS: (1) MOTOR_1_BREAKER_AUTO_RESUME=true (default false —
+        cambiar la respuesta de un freno es decisión del operador); (2) la pausa es DE ESTE
+        breaker (pause_reason con el marcador — jamás toca kill-switch ni otras pausas);
+        (3) la ventana ya está por debajo del umbral; (4) CERO rollbacks ABORTADOS en la
+        ventana (huérfana = revisión humana, sin excepciones); (5) quedan reanudaciones en
+        el tope diario (agotado el tope, queda pausado hasta un humano — la escalada)."""
+        if not BotState.is_paused:
+            return
+        reason = BotState.pause_reason or ""
+        if not reason.startswith("circuit_breaker"):
+            return  # kill-switch u otra pausa: NUNCA se auto-levanta desde acá
+        try:
+            s = get_settings()
+            if not bool(s.MOTOR_1_BREAKER_AUTO_RESUME):
+                return
+            max_per_day = int(s.MOTOR_1_BREAKER_MAX_RESUMES_PER_DAY)
+        except Exception:
+            return  # sin settings legibles no se despausa nada (fail-closed)
+        threshold, window_min, count_clean = self._breaker_params()
+        counted, aborted = self._rollbacks_in_window(window_min, count_clean=count_clean)
+        if aborted > 0 or counted >= threshold:
+            return
+        today = datetime.now(UTC).date()
+        if self._resumes_day != today:
+            self._resumes_day, self._resumes_today = today, 0
+        if self._resumes_today >= max_per_day:
+            logger.warning(
+                f"motor1.breaker.auto_resume_agotado ({self._resumes_today}/{max_per_day} "
+                "hoy) — queda pausado hasta revisión humana (la escalada del self-healing)"
             )
+            return
+        self._resumes_today += 1
+        BotState.is_paused = False
+        BotState.pause_reason = None
+        try:
+            with get_session() as db:
+                db.add(
+                    RiskEvent(
+                        event_type="breaker_auto_resume",
+                        severity="warning",
+                        message=(
+                            f"ventana vacía ({counted}<{threshold} en {window_min:.0f}min, "
+                            f"0 abortados) — resume {self._resumes_today}/{max_per_day} del día"
+                        )[:500],
+                    )
+                )
+                db.commit()
+        except Exception:
+            logger.exception("breaker_auto_resume: persistencia falló (resume igual aplicado)")
+        logger.warning(
+            f"motor1.breaker.AUTO_RESUME: ventana vacía — bot despausado "
+            f"({self._resumes_today}/{max_per_day} del día)"
+        )
 
     async def _balance_sufficient(self, opp: ArbOpportunity, count: int) -> bool:
         """
