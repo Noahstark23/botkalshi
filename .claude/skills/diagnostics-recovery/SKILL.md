@@ -34,6 +34,13 @@ Los falsos "healthy" ya costaron sesiones enteras de arqueología. Reglas con fa
   `motor5.funnel`, `v2.recovery_*` / `v2.desync_quarantine` / `v2.bootstrap_buffer_capped`,
   `motor5.book_shape` / `motor5.book_error`, `odds_api: CUOTA AGOTADA`, `[MOTOR N SHADOW]`.
 - **`risk_events`** (DB): kill_switch, daily_stop, rollbacks — el rastro persistente.
+- **Clasificación ESTRICTA de errores de API**: leer el status code Y el texto literal
+  antes de mapear. Un 401 no es un 429 (auth ≠ rate limit), y el mismo código cambia de
+  significado por el payload: el 401 `OUT_OF_USAGE_CREDITS` de The Odds API es CUOTA (se
+  arma el breaker mensual), no credenciales; el 409 de Kalshi solo es "FOK sin volumen"
+  si trae `fill_or_kill_insufficient_resting_volume`; el code 15 del WS llegó con el
+  payload ANIDADO y el parser plano lo convirtió en ruido (#186). Mapear por código a
+  secas ya cegó el bot días enteros.
 - **El buffer del visor de Coolify scrollea**: el boot log se pierde de la vista — para
   líneas de arranque usar `docker logs <container> | grep -m1 ...`, no el visor web.
   Y una línea one-shot puede haber salido ANTES de tu ventana (lección del book_shape:

@@ -1,7 +1,15 @@
 ---
 name: motor-6-linemove
-description: Motor 6 — line-move follower (comprar la dirección del movimiento del consenso antes de que Kalshi ajuste), con fases F1 shadow / F2 validación / F3 ejecución. Usar al tocar el detector de line-moves, el shadow, sus umbrales, o al evaluar la activación de F2/F3. Nació de los datos del funnel 2026-07-12: los edges reales de M2 son transitorios y viven en los saltos de línea.
+description: Motor 6 — line-move follower. ⚫ ARCHIVADO 2026-07-23 (0 señales en toda su vida útil) — NO evaluar activación; usar solo como registro del diseño o si aparece una fila linemove real que amerite re-abrir. Nació de los datos del funnel 2026-07-12: los edges reales de M2 son transitorios y viven en los saltos de línea.
 ---
+
+> ## ⚫ VEREDICTO FINAL: ARCHIVADO (2026-07-23, ratificado 2026-07-29)
+> **0 filas `linemove` en toda su vida útil**, incluso tras el cableado real de #173 y con
+> el feed sano post-#187. El fair no se mueve ≥3pp con Kalshi rezagado en este universo.
+> La tesis murió con datos, no con opinión. **NO revivir sin una observación nueva MEDIDA**
+> (una fila linemove real, no una intuición). El resto de esta skill queda como registro
+> del diseño. OJO: un brief del 2026-07-31 lo describió como "CLV Momentum (comprar al
+> abrir, vender T-30)" — eso NO es M6 (es territorio de M3); no re-etiquetar.
 
 # Motor 6 — line-move follower
 

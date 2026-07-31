@@ -1,7 +1,17 @@
 ---
 name: motor-9-spillover
-description: Motor 9 — "Derrame" (spillover) entre hermanos del mismo evento, en F1 shadow AUTO-VALIDANTE (mide el follow-through real del hermano a T+60/T+120 de cada salto). Usar al tocar el tracker de saltos, el shadow, sus umbrales, o al evaluar el gate F2 (derrame capturable vs ajuste instantáneo vs archivar). La tesis se decide con la tabla, no con intuición.
+description: Motor 9 — Derrame. ⚫ ARCHIVADO 2026-07-29 (el mid da +2.69¢ pero el EJECUTABLE da −2.42¢ neto: el spread se lo come) — NO escribir F3; usar al tocar el shadow que sigue midiendo mid-vs-exec. La tesis se decide con la tabla, no con intuición.
 ---
+
+> ## ⚫ VEREDICTO FINAL: ARCHIVADO — el spread se lo come (2026-07-29)
+> El derrame EXISTE en el mid (+2.69¢ a T+60, t=8.2, n=518) pero NO sobrevive al precio
+> ejecutable: la serie `spillover_exec` (ask de entrada → bid de salida − fees roundtrip)
+> dio **neto −2.42¢/contrato, t=−2.5, 19% positivos sobre n=43**. Mismo final que REST
+> arb: detectado ≠ capturable. El trigger clave que lo confirmó: la huérfana de COLSD
+> nació de un edge LEGÍTIMO de 7.14pp con slippage — no de un fantasma. **NO escribir su
+> F3**; el shadow puede seguir midiendo (la DIFERENCIA mid-vs-exec es la medida del costo
+> del spread en este universo). Revivir exige que la serie exec cambie de signo con n
+> nuevo — no un re-cálculo de la misma muestra.
 
 # Motor 9 — Derrame (spillover) entre hermanos del mismo evento
 
@@ -57,6 +67,11 @@ Follow **> 0** = el hermano ajustó como la conservación predice, DESPUÉS del 
 - Requiere el manager V2 activo (mids en memoria); books stale/cuarentena → drop, no basura.
 
 ## Gate F2 (escrito de antemano — decidir con la tabla)
+
+> **CERRADO**: el gate del MID dio VERDE el 28-jul (+2.69¢, t=8.2) y por eso se
+> construyó el gate EJECUTABLE (`spillover_exec`, ask+fees) — que dio ROJO el 29-jul
+> (−2.42¢ neto, t=−2.5). El veredicto de arriba manda; esto queda como registro de
+> cómo se decidió.
 
 Con **n ≥ 30 mediciones**: leer con `scripts/diag_edge_shadow.py` (sección spillover).
 - follow60 medio **> +1¢ con t-stat > 2** → derrame rezagado real → diseñar F3 (executor

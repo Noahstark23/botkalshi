@@ -1,7 +1,15 @@
 ---
 name: motor-8-ofi
-description: Motor 8 — Order Flow Imbalance (OFI) sobre el feed de deltas del WS, en F1 shadow AUTO-VALIDANTE (mide el move real a T+30/T+60 de cada señal). Usar al tocar el tracker OFI, sus umbrales, la medición de resultados, o al evaluar el gate F2 (contrarian vs momentum vs archivar). La tesis tiene DOS reservas documentadas: books finos y flujo informado.
+description: Motor 8 — OFI. ⚫ ARCHIVADO 2026-07-28 (n=30.108, +0.02¢, RUIDO) — NO evaluar F2/F3; usar solo como registro del diseño o al tocar el tracker que sigue midiendo en shadow. La tesis tiene DOS reservas documentadas: books finos y flujo informado.
 ---
+
+> ## ⚫ VEREDICTO FINAL: ARCHIVADO (2026-07-28)
+> Con la muestra completa del feed sano: **n=30.108, media +0.02¢ a T+60, 6% positivos,
+> t=2.0 → RUIDO**. El flujo no predice el precio a esta microescala. La "promesa" inicial
+> (p50 +3.18pp con n=141) era ARTEFACTO del feed ciego — con solo mercados raros visibles,
+> la muestra chica lucía fuerte. Costó $0 refutarla (el patrón shadow-first funcionando).
+> **NO revivir sin re-derivar la tesis a otra escala/umbral con una observación medida.**
+> El shadow puede seguir corriendo (telemetría barata); ejecutarlo, no.
 
 # Motor 8 — Order Flow Imbalance (OFI)
 
