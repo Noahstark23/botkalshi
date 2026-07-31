@@ -366,9 +366,16 @@ class OrderbookManagerV2:
             self._apply_snapshot_msg(raw_msg)
             applied = True
         else:
-            # Devuelve False si encoló el delta (ticker sin snapshot inicial):
-            # en ese caso NO se avanza el baseline del sid, para que el snapshot
-            # posterior no se interprete como gap.
+            # Devuelve False si NO aplicó. Dos sub-casos con semántica de baseline OPUESTA:
+            #   - BOOTSTRAP (ticker sin snapshot inicial): delta ENCOLADO, baseline congelado
+            #     para que el snapshot inicial no se lea como gap.
+            #   - Book STALE: delta DESCARTADO pero la seq SÍ se consume (abajo) — el mensaje
+            #     llegó en secuencia; lo roto es el BOOK, no el stream. Congelar el baseline
+            #     acá (bug hasta 2026-07-31) convertía cada delta siguiente en un "gap" falso
+            #     → supresión → mark_stale de TODO el sid → más drops → más "gaps": UNA
+            #     cuarentena de UN ticker cegaba los 217 books hasta la próxima recovery.
+            #     Forense: 258 supresiones/min con ~7 desyncs/min de semilla real; bot ciego
+            #     el 36% del tiempo en régimen estacionario.
             try:
                 applied = self._apply_delta_msg(raw_msg)  # May raise OrderbookDesyncError
             except (OrderbookDesyncError, OrderbookSeqRegressionError):
@@ -403,6 +410,16 @@ class OrderbookManagerV2:
             await self._quarantine_if_incoherent(ticker, sid)
         if applied:
             self._last_seq_by_sid[sid] = max(self._last_seq_by_sid.get(sid, 0), new_seq)
+        elif msg_type == "orderbook_delta":
+            state = self._books.get(ticker)
+            # is_stale distingue los dos sub-casos SIN ambigüedad: mark_stale() baja
+            # _initialized (por eso el book stale entra al branch de bootstrap de
+            # _apply_delta_msg y su delta se ENCOLA), pero un book de bootstrap puro
+            # jamás tiene is_stale=True. Stale → la seq se consume aunque el delta no
+            # se aplique: la continuidad es del STREAM, no del book (lo re-basea la
+            # recovery ya pedida, y el drain del buffer repone los deltas encolados).
+            if state is not None and state.is_stale:
+                self._last_seq_by_sid[sid] = max(self._last_seq_by_sid.get(sid, 0), new_seq)
 
     async def _quarantine_if_incoherent(self, ticker: str, sid: int) -> None:
         """Cuarentena PROACTIVA por invariante del book binario (incidente 2026-07-28).
