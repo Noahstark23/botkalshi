@@ -30,6 +30,10 @@ def setup_logging() -> None:
         ),
         backtrace=True,
         diagnose=False,  # no exponer valores en errores (puede leak datos)
+        # enqueue (2026-07-31): el sink sincrónico BLOQUEABA el event loop en cada
+        # línea; a 167KB/s durante la espiral de recovery, el logging era parte de los
+        # gaps que alimentaban la espiral. Con enqueue, la escritura va a un thread.
+        enqueue=True,
     )
 
     # File handler - retención local en volumen Docker
@@ -50,6 +54,10 @@ def setup_logging() -> None:
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
         backtrace=True,
         diagnose=False,
+        # enqueue (2026-07-31): el sink sincrónico BLOQUEABA el event loop en cada
+        # línea; a 167KB/s durante la espiral de recovery, el logging era parte de los
+        # gaps que alimentaban la espiral. Con enqueue, la escritura va a un thread.
+        enqueue=True,
     )
 
     # File handler crítico separado - para auditoría de eventos importantes
@@ -59,6 +67,7 @@ def setup_logging() -> None:
         rotation="00:00",
         retention="90 days",
         compression="gz",
+        enqueue=True,
     )
 
     logger.info(

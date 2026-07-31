@@ -128,6 +128,14 @@ class OrderbookManagerV2:
     DEFAULT_RECOVERY_BACKOFF_BASE_SEC = 30.0
     DEFAULT_RECOVERY_BACKOFF_FACTOR = 4.0
     DEFAULT_RECOVERY_BACKOFF_CAP_SEC = 1800.0
+    # ANTI-ESPIRAL (incidente 2026-07-31): intervalo MÍNIMO entre arranques de recovery
+    # por sid. La noche de carga pico llegó a 5 bootstraps de 200 tickers POR SEGUNDO
+    # (38.365 recoveries en 9h; gaps 166/min sostenido): cada gap re-bootstrapeaba el sid
+    # entero, la recovery en sí era la carga que generaba los gaps siguientes, y los books
+    # no convergían POR DEFINICIÓN (initialized=0 durante 9.5 horas con /health verde).
+    # Un gap dentro del intervalo NO dispara otra recovery: marca stale (seguridad
+    # idéntica — mejor ciego que fantasma), avanza baseline y se cuenta la supresión.
+    DEFAULT_RECOVERY_MIN_INTERVAL_SEC = 5.0
 
     def __init__(
         self,
@@ -138,6 +146,7 @@ class OrderbookManagerV2:
         recovery_chunk_size: int = DEFAULT_RECOVERY_CHUNK_SIZE,
         bootstrap_buffer_cap: int = DEFAULT_BOOTSTRAP_BUFFER_CAP,
         max_plausible_cross_cents: int = DEFAULT_MAX_PLAUSIBLE_CROSS_CENTS,
+        recovery_min_interval_sec: float = DEFAULT_RECOVERY_MIN_INTERVAL_SEC,
         recovery_backoff_base_sec: float = DEFAULT_RECOVERY_BACKOFF_BASE_SEC,
         recovery_backoff_factor: float = DEFAULT_RECOVERY_BACKOFF_FACTOR,
         recovery_backoff_cap_sec: float = DEFAULT_RECOVERY_BACKOFF_CAP_SEC,
@@ -148,6 +157,10 @@ class OrderbookManagerV2:
         self._recovery_chunk_size = max(1, recovery_chunk_size)
         self._bootstrap_buffer_cap = max(1, bootstrap_buffer_cap)
         self._max_plausible_cross_cents = max(1, max_plausible_cross_cents)
+        self._recovery_min_interval_sec = max(0.0, recovery_min_interval_sec)
+        # Anti-espiral: último arranque de recovery por sid + supresiones acumuladas.
+        self._last_recovery_start_mono: dict[int, float] = {}
+        self._recoveries_suppressed = 0
         self._recovery_backoff_base_sec = max(1.0, recovery_backoff_base_sec)
         self._recovery_backoff_factor = max(1.0, recovery_backoff_factor)
         self._recovery_backoff_cap_sec = max(
@@ -330,7 +343,16 @@ class OrderbookManagerV2:
                         self._last_seq_by_sid[sid] = new_seq
                         return
                     self._rearm_recovery_after_backoff(sid)
-                await self._start_recovery(sid)
+                started = await self._start_recovery(sid)
+                if not started and sid not in self._recovery_disabled_sids:
+                    # SUPRIMIDA por el rate-limit anti-espiral (2026-07-31): books ya stale,
+                    # baseline avanza y NADA más — ni alerta (el contador de gaps a 166/min
+                    # inundó Telegram toda la noche) ni SidGapError (ruido por mensaje). La
+                    # recovery real corre a lo sumo cada interval segundos. El caso
+                    # all_settled NO entra acá (deshabilita el sid dentro de la llamada y
+                    # conserva el path previo: alerta de frecuencia + SidGapError).
+                    self._last_seq_by_sid[sid] = new_seq
+                    return
                 # Solo bufferear si la recovery ARRANCÓ (no si _start_recovery la deshabilitó por
                 # quedarse sin tickers vivos → el sid no entra en _recovering).
                 if sid in self._recovering:
@@ -502,6 +524,10 @@ class OrderbookManagerV2:
             # sigue, el mecanismo era otro).
             "stale_snapshots_ignored_total": self._stale_snapshots_ignored,
             "recoveries_completed_total": self._recoveries_completed,
+            # Anti-espiral (2026-07-31): recoveries suprimidas por el rate-limit. Alto y
+            # creciendo = el feed sigue con gaps crónicos, pero el sistema RESPIRA (antes:
+            # 5 bootstraps/seg y books jamás inicializados).
+            "recoveries_suppressed_total": self._recoveries_suppressed,
             "sids": list(self._last_seq_by_sid.keys()),
             "last_seq_by_sid": dict(self._last_seq_by_sid),
             "gaps_last_60s": gaps_last_60s,
@@ -611,14 +637,46 @@ class OrderbookManagerV2:
         close_time = self._close_time_by_ticker.get(ticker)
         return close_time is not None and close_time <= now
 
-    async def _start_recovery(self, sid: int) -> None:
+    async def _start_recovery(self, sid: int, *, internal: bool = False) -> bool:
         """Marca los tickers del sid stale y pide get_snapshot SOLO de los recuperables.
+        Devuelve True si la recovery ARRANCÓ (sid en _recovering); False si se suprimió
+        (rate-limit anti-espiral), estaba deshabilitada, o el sid entero estaba settled.
+
+        `internal=True` = reintento INTERNO de una recovery ya en curso (retry filtrado tras
+        code 15, abort+restart del watchdog): ya está acotado por MAX_RECOVERY_FAILURES +
+        circuit breaker y NO pasa por el rate-limit anti-espiral — suprimirlo dejaría la
+        recovery MUERTA (sin pending, sin timer) hasta el próximo gap casual.
 
         FIX 1 (purga): excluye tickers settled/dead — pedir snapshot de un mercado cerrado dispara
         code 15. Si NO queda ninguno vivo, el sid entero está cerrado → circuit breaker (no se pide
         nada, no se entra en _recovering, no hay loop)."""
         if sid in self._recovery_disabled_sids:
-            return  # ya deshabilitado (circuit breaker) → no reintentar
+            return False  # ya deshabilitado (circuit breaker) → no reintentar
+
+        # ANTI-ESPIRAL (2026-07-31): un gap dentro del intervalo mínimo NO re-bootstrapea.
+        # A 166 gaps/min, cada uno relanzando un bootstrap de 200 tickers, la recovery ERA
+        # la carga que generaba los gaps siguientes (5 bootstraps/seg, books jamás
+        # inicializados). Suprimir = marcar stale (mejor ciego que fantasma) y dejar que la
+        # PRÓXIMA recovery (a lo sumo en interval segundos) re-basee con el sistema
+        # respirando. La seguridad es idéntica: books stale no sirven precios.
+        now = time.monotonic()
+        if not internal:
+            last = self._last_recovery_start_mono.get(sid)
+            if last is not None and (now - last) < self._recovery_min_interval_sec:
+                self._recoveries_suppressed += 1
+                for ticker in self._tickers_by_sid.get(sid, set()):
+                    state = self._books.get(ticker)
+                    if state is not None:
+                        state.mark_stale()
+                if self._recoveries_suppressed == 1 or self._recoveries_suppressed % 500 == 0:
+                    logger.warning(
+                        f"v2.recovery_suppressed sid={sid} — gap a "
+                        f"{now - last:.2f}s del último arranque (< "
+                        f"{self._recovery_min_interval_sec}s): books stale sin re-bootstrap "
+                        f"(anti-espiral). total={self._recoveries_suppressed}"
+                    )
+                return False
+        self._last_recovery_start_mono[sid] = now
 
         all_tickers = self._tickers_by_sid.get(sid, set())
         live = [t for t in all_tickers if not self._is_unrecoverable(t)]
@@ -658,7 +716,7 @@ class OrderbookManagerV2:
                 progress=f"recovered=0/{total} elapsed=n/a",
                 expected_settlement=True,
             )
-            return
+            return False
 
         self._recovering.add(sid)
         self._pending_deltas[sid] = []
@@ -683,6 +741,7 @@ class OrderbookManagerV2:
                 params={"market_tickers": batch, "sids": [sid]},
             )
             self._pending_snapshot_requests[req_id] = (sid, set(batch))
+        return True
 
     async def _guard_stuck_recovery(self, sid: int) -> None:
         """
@@ -825,6 +884,11 @@ class OrderbookManagerV2:
         self._recovery_disabled_sids.discard(sid)
         self._recovery_disabled_at.pop(sid, None)
         self._recovery_failures_by_sid.pop(sid, None)
+        # El rate-limit anti-espiral NO aplica al reintento que este backoff ya gateó
+        # (cooldown mínimo 30s >> intervalo): sin esto, el gap que re-arma quedaría
+        # suprimido por el timestamp de la recovery vieja y el sid moriría hasta el
+        # próximo gap casual.
+        self._last_recovery_start_mono.pop(sid, None)
 
     async def _handle_recovery_rejected(self, req_id: int, raw_msg: dict) -> None:
         """FIX 2 — code 15 sobre un get_snapshot pendiente: la request fue RECHAZADA. En vez de
@@ -856,7 +920,7 @@ class OrderbookManagerV2:
         BotState.record_error(f"v2 recovery rechazada (code 15) sid={sid}")
         if await self._register_failure_and_maybe_break(sid, "code15", progress=progress):
             return
-        await self._start_recovery(sid)
+        await self._start_recovery(sid, internal=True)
 
     async def _abort_and_restart_recovery(self, sid: int, reason: str) -> None:
         """
@@ -901,7 +965,7 @@ class OrderbookManagerV2:
             sid, reason, progress=progress, expected_settlement=settled_subcase
         ):
             return
-        await self._start_recovery(sid)
+        await self._start_recovery(sid, internal=True)
 
     def _pending_req_id_for_sid(self, sid: int) -> int | None:
         """req_id de la solicitud de snapshot EN CURSO para este sid (para completar la recovery
@@ -1004,7 +1068,11 @@ class OrderbookManagerV2:
         yes_raw = msg.get("yes_dollars_fp") or msg.get("yes") or []
         no_raw = msg.get("no_dollars_fp") or msg.get("no") or []
 
-        logger.info(
+        # DEBUG desde 2026-07-31 (era INFO): a 1000 snapshots/seg durante la espiral, esta
+        # línea era el 98% de un log de 10MB/min — y escribirla BLOQUEABA el event loop,
+        # alimentando los gaps que generaban los snapshots. El resumen agregado vive en
+        # v2.recovery_complete; el detalle por snapshot es forense, no operación.
+        logger.debug(
             f"V2 snapshot: ticker={ticker} seq={seq} "
             f"num_yes={len(yes_raw)} num_no={len(no_raw)} "
             f"sample_yes={yes_raw[:3]} sample_no={no_raw[:3]}"

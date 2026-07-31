@@ -13,6 +13,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -23,6 +24,11 @@ from sqlmodel import select
 
 from src.storage.models import DailyPnL, RiskEvent, Trade, get_session
 from src.utils.config import get_settings
+
+# Gracia antes de que books_alive marque unhealthy (incidente 2026-07-31): cubre el
+# warm-up normal post-subscribe (~2-5 min hasta que nacen los books) con margen; una
+# ceguera SOSTENIDA (la espiral duró 9.5h) la cruza de sobra.
+BLIND_GRACE_SEC = 600.0
 
 
 class BotState:
@@ -48,6 +54,9 @@ class BotState:
     # era INVISIBLE en /status — un freno que no se ve es la misma clase de bug que las
     # alertas mudas y los contadores sin exponer. None = Motor 1 operando.
     motor1_local_pause: str | None = None
+    # Primer instante (time.monotonic) en que se observó tracked>0 con initialized==0
+    # (incidente 2026-07-31: bot CIEGO 9.5h con /health verde). None = no está ciego.
+    books_blind_since: float | None = None
 
     # TTL del last_error: un error mas viejo que esto se considera rancio y se limpia,
     # para que el dashboard no quede mostrando un error ya superado tras la recuperacion.
@@ -128,6 +137,28 @@ async def health() -> dict[str, Any]:
         # Gracia de 30 min para discovery inicial.
         # Kalshi puede mantener rate-limit activo 20-30 min tras un burst de restarts.
         checks["ws_alive"] = uptime < 1800
+
+    # books_alive (incidente 2026-07-31): CIEGO ≠ SANO. El bot pasó 9.5 horas con
+    # tracked=229 e initialized=0 (espiral de recovery) mientras /health decía healthy —
+    # ws_alive era true porque LLEGABAN mensajes... que se tiraban a un loop de recovery.
+    # Tercer falso-healthy de este endpoint. Con captura corriendo y tickers trackeados,
+    # CERO books inicializados sostenido más de BLIND_GRACE_SEC = unhealthy (la gracia
+    # cubre el warm-up normal: los books tardan ~2-5 min en nacer tras el subscribe).
+    v2_mgr = BotState.v2_manager
+    if BotState.capture_running and v2_mgr is not None:
+        try:
+            s = v2_mgr.stats()
+            blind = s.get("tracked_tickers", 0) > 0 and s.get("initialized_tickers", 0) == 0
+        except Exception:
+            blind = False  # fail-open de LECTURA: un error del stats no marca unhealthy
+        mono = time.monotonic()
+        if blind:
+            if BotState.books_blind_since is None:
+                BotState.books_blind_since = mono
+            checks["books_alive"] = (mono - BotState.books_blind_since) < BLIND_GRACE_SEC
+        else:
+            BotState.books_blind_since = None
+            checks["books_alive"] = True
 
     all_ok = all(checks.values())
 
