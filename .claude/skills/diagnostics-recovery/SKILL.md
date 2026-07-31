@@ -7,6 +7,19 @@ description: Cómo diagnosticar el bot SIN creerle al primer verde — falsos "h
 
 Los falsos "healthy" ya costaron sesiones enteras de arqueología. Reglas con factura:
 
+## La regla que engloba a todas (destilada de TRES falsos-healthy)
+
+`ws_alive` verde por ventana de gracia; el preflight "todo listo" con el bot pausado
+(punto ciego del estado runtime); `/health` healthy con 0/229 books inicializados
+durante 9.5 horas (2026-07-31). Tres parches puntuales después, la regla general:
+**toda señal de salud debe ser FALSABLE y distinguir "está bien" de "no lo sé"** — un
+check que devuelve verde cuando no puede evaluar da confianza falsa, peor que no tener
+check. Al escribir o auditar un check: (a) ¿qué estado del mundo lo pone en rojo? — si
+no existe, no es un check; (b) "no evaluable" se reporta como estado propio, jamás como
+éxito; (c) toda gracia (warm-up, boot) es ACOTADA y con su porqué escrito. El fail-open
+sigue siendo para la LECTURA del trading (un hiccup no apaga el bot); la salud
+REPORTADA no hereda ese default.
+
 ## El /status miente en formas conocidas — validar empíricamente
 
 1. **`capture_running: true` NO prueba que fluyan datos.** Es un flag de arranque de la
@@ -24,6 +37,15 @@ Los falsos "healthy" ya costaron sesiones enteras de arqueología. Reglas con fa
 4. **Un heartbeat con `signals=0` recién arrancado no es representativo** — mirar
    ticks/tracked acumulados, no la primera línea post-boot (falso "M1 no encuentra nada"
    del 2026-07-18: sí había encontrado 14, el heartbeat era de un motor re-arrancado).
+5. **Ningún contador solo mide los gaps CRUDOS del feed** (post-#204, anti-espiral):
+   la supresión NO registra el gap (deliberado — a 166/min ese contador era el flood de
+   Telegram), así que `gaps_last_60s` solo cuenta los que ARRANCARON recovery; y
+   `recoveries_suppressed_total` suma TRES paths (gap de secuencia, cuarentena por
+   desync, cuarentena por incoherencia — los reintentos internos NO suman: bypass
+   `internal=True`, pineado por test). Tasa cruda ≈ `gaps_last_60s` + Δsupresiones por
+   minuto, discriminando con `grep -c v2.desync_quarantine` / `v2.book_incoherent` en
+   la misma ventana. Métrica nueva sin la frase "sube si y solo si X" escrita = métrica
+   que no decide nada (desarrollo-bot, regla 12).
 
 ## Dónde viven los errores reales
 
@@ -34,6 +56,13 @@ Los falsos "healthy" ya costaron sesiones enteras de arqueología. Reglas con fa
   `motor5.funnel`, `v2.recovery_*` / `v2.desync_quarantine` / `v2.bootstrap_buffer_capped`,
   `motor5.book_shape` / `motor5.book_error`, `odds_api: CUOTA AGOTADA`, `[MOTOR N SHADOW]`.
 - **`risk_events`** (DB): kill_switch, daily_stop, rollbacks — el rastro persistente.
+- **Clasificación ESTRICTA de errores de API**: leer el status code Y el texto literal
+  antes de mapear. Un 401 no es un 429 (auth ≠ rate limit), y el mismo código cambia de
+  significado por el payload: el 401 `OUT_OF_USAGE_CREDITS` de The Odds API es CUOTA (se
+  arma el breaker mensual), no credenciales; el 409 de Kalshi solo es "FOK sin volumen"
+  si trae `fill_or_kill_insufficient_resting_volume`; el code 15 del WS llegó con el
+  payload ANIDADO y el parser plano lo convirtió en ruido (#186). Mapear por código a
+  secas ya cegó el bot días enteros.
 - **El buffer del visor de Coolify scrollea**: el boot log se pierde de la vista — para
   líneas de arranque usar `docker logs <container> | grep -m1 ...`, no el visor web.
   Y una línea one-shot puede haber salido ANTES de tu ventana (lección del book_shape:

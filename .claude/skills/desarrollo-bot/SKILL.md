@@ -1,6 +1,6 @@
 ---
 name: desarrollo-bot
-description: Las lecciones de desarrollo GRANDES del bot, destiladas de los incidentes que costaron plata real (jun-jul 2026) — verificar antes de implementar, nada sin tope, medir antes de construir, una sola matemática, presupuesto de APIs externas, detectado ≠ capturable. Usar al diseñar CUALQUIER feature, integración o motor nuevo: cada regla acá abajo tiene una factura que la respalda.
+description: Las lecciones de desarrollo GRANDES del bot, destiladas de los incidentes que costaron plata real (jun-jul 2026) — verificar antes de implementar, nada sin tope, medir antes de construir, una sola matemática, detectado ≠ capturable, presupuesto del hot path, "por construcción" exige assert, estado degradado con salida, verificación falsable, torniquete antes que cirugía. Usar al diseñar CUALQUIER feature, integración o motor nuevo: cada regla acá abajo tiene una factura que la respalda.
 ---
 
 # Desarrollo del bot — las lecciones que costaron plata
@@ -73,3 +73,68 @@ Apagar M2, activar el rolling stop, subir el límite del container: cambios de e
 producción con dinero real → **decisión y ejecución del operador**, con los riesgos
 repetidos aunque ya se hayan hablado (la lección 2026-07-07: proceder "como rutina" con
 bugs conocidos costó ~$140). El código deja todo listo detrás de flags default-off.
+
+## 9. El hot path tiene presupuesto (frecuencia × costo ANTES de commitear)
+
+El handler del WS corre a ~200 msg/s. Un `logger.info` por snapshot ahí = **400MB/día**
+de log rotando cada 40min, y el sink SINCRÓNICO bloqueaba el event loop en cada línea —
+el logging alimentaba los gaps que generaban los snapshots. Y `_start_recovery` sin
+debounce re-bootstrapeaba ~200 tickers POR GAP: **5 bootstraps/seg, 38.365 recoveries
+en 9h, books jamás inicializados** (espiral 2026-07-31). La regla: para cualquier línea
+dentro de un loop de alta frecuencia, escribir la multiplicación (frecuencia × costo)
+antes de commitearla; todo lo que dispara I/O desde un hot path nace con rate-limit/
+debounce/nivel DEBUG. Es la hermana de la regla 2: aquella acota el ESPACIO, esta la
+FRECUENCIA.
+
+## 10. "Por construcción" sin assert es una creencia, no una garantía
+
+`executor.py` documentaba que el pre-check de depth "sería un no-op (count =
+min(available_size) ya, por construcción)". El comentario es VERDADERO sobre el book
+local — y ahí está el bug: el book local no es la fuente de verdad, y la carrera de
+33ms del FOK vivía exactamente en esa distancia. La revalidación T-0 heredó el mismo
+error de fondo (re-leer la MISMA copia local: 2 rollbacks con 0 `revalidation_skip`
+lo probaron en producción). Al escribir "por construcción"/"ya garantizado": ¿está el
+assert al lado? ¿cuál es la fuente de verdad de este dato, y mi chequeo LA consulta o
+consulta mi copia? Revalidar contra tu propia memoria no rompe la cadena causal.
+
+## 11. Estado degradado: la entrada y la SALIDA en el mismo PR
+
+El circuit breaker de M1 ponía `is_paused=true` y el único camino de vuelta era un
+endpoint manual: **12 horas muerto por $0.21** de rollbacks limpios. Ninguna transición
+a modo degradado (pausa, disable, cuarentena) se mergea sin su condición de salida
+definida y testeada en el MISMO PR: auto-recuperación acotada, backoff con reintento,
+o "manual" EXPLÍCITO con la alerta que lo diga. Y clasificar el evento antes de
+contarlo: un rollback limpio de 2¢ es costo operativo, una huérfana es riesgo — meter
+ambos en el mismo contador hizo al breaker hipersensible primero e inerte después.
+
+## 12. Verificación falsable (métricas Y comandos)
+
+Toda métrica nueva nace con una frase escrita: **"sube si y solo si pasa X"** — si no
+podés escribirla, no sirve para decidir (`recoveries_suppressed_total` nació como
+"discriminador de gaps" y suma tres paths distintos; hoy NINGÚN contador solo mide los
+gaps crudos — ver diagnostics-recovery). Y todo comando de verificación en un PR o
+reporte lleva sus DOS salidas: qué resultado CONFIRMA y qué resultado REFUTA — un grep
+garantizado a devolver cero (`revalidation_skip` con 0 trades) no verifica nada. El
+formato que ya funcionó: "skips > 0 con rollbacks ≈ 0 = causa raíz muerta".
+
+## 13. Torniquete antes que cirugía
+
+Con producción sangrando, primero la mitigación que NO requiere merge (env var
+existente, flag, nivel de log) y después el fix. El log de 400MB/día tenía torniquete
+inmediato (`LOG_FILE_LEVEL=WARNING`, un env flip que ya existía) y en su lugar esperó
+un PR + deploy completo. Orden en incidente: torniquete → forense → cirugía. La
+aplicación es del operador con lista literal `NOMBRE=valor` (Workflow 4 de botkalshi).
+
+## 14. La deuda #1: banco de pruebas de secuencias (replay)
+
+Hoy el único entorno de test del hot path es producción de madrugada: cada fix del
+manager V2 se valida con fuego real porque no hay dónde reproducir una tormenta. OJO
+con la premisa fácil "el stream ya está en los logs": **falso** — INFO trae resumen por
+snapshot (ticker/seq/3 niveles), los payloads completos son DEBUG (default INFO desde
+#190), los deltas no se loguean y `orderbook_events` está OFF por default. Lo que SÍ se
+reconstruye de un log INFO es el CONTROL-FLOW (secuencia sid/seq/gaps/recoveries con
+timestamps): suficiente para replay de la mecánica de recovery con books sintéticos.
+El harness completo pide dos piezas: captura ACOTADA de envelopes crudos detrás de un
+flag (respetando la regla 2 y DiskGuard) + reconstructor log→secuencia. Hasta que
+exista, todo fix de hot path declara en su PR cómo se validó y qué NO pudo validarse
+sin producción.

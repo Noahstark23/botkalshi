@@ -111,6 +111,13 @@ Al proponer o acompañar CUALQUIER activación (`TRADING_ENABLED`, `MOTOR_X_EXEC
    toda request se dimensiona (chunking); toda API externa nace con caché TTL +
    breaker de cuota + costo por unidad en el Field. Detalle: el estado
    (caché/breaker) de un cliente que se recrea por ciclo va en CLASE, no instancia.
+8. **Inspeccionar el CÓDIGO REAL antes de planificar.** Ningún plan ni diff se escribe
+   desde docstrings, briefs o memoria de la arquitectura — se abre el archivo y se lee.
+   Facturas: el brief que "faltaba una env var de M9" (no existía tal flag), el
+   "hardcodeado" de M2 que era un default de Pydantic, y "M1 esquiva el piso" refutado
+   leyendo `_check_pre_trade_locked`. Los briefs del operador y de otros agentes llegan
+   con errores DOCUMENTADOS — incluida la fórmula de fees con `/1_000_000` (regla 4),
+   que reapareció por TERCERA vez en un brief el 2026-07-31.
 
 ## Comandos de referencia
 

@@ -71,3 +71,7 @@ chat — script/env + humano en el container, por diseño.
    no "algo pasó").
 3. ¿Estado compartido? → atributo de clase con `reset()` para tests.
 4. Nada de esta capa puede escribir estado de trading ni llamar `place_order`. Nunca.
+5. ¿Check de salud o métrica nueva? → FALSABLE: qué estado del mundo lo pone en rojo,
+   "no evaluable" ≠ verde, gracias acotadas con su porqué, y la frase "sube si y solo
+   si X" escrita. Tres falsos-healthy ya costaron noches enteras (la regla completa y
+   sus facturas: skills `diagnostics-recovery` y `desarrollo-bot` regla 12).
