@@ -442,6 +442,18 @@ class Settings(BaseSettings):
         gt=0,
         description="Techo (s) del cooldown de reintento de un sid con breaker",
     )
+    # Anti-espiral (incidente 2026-07-31): a 166 gaps/min, cada gap relanzaba un bootstrap
+    # de ~200 tickers y la recovery ERA la carga que generaba los gaps siguientes (38k
+    # recoveries en 9h, books jamás inicializados). Un gap dentro de este intervalo NO
+    # re-bootstrapea: marca stale (mejor ciego que fantasma) y espera la próxima ventana.
+    # 0 = deshabilitado (comportamiento pre-fix). Los reintentos internos de una recovery
+    # en curso (code 15 filtrado, watchdog) NO pasan por este límite.
+    ORDERBOOK_V2_RECOVERY_MIN_INTERVAL_SEC: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=120.0,
+        description="Intervalo mínimo (s) entre arranques de recovery por sid (anti-espiral)",
+    )
 
     # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
     # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe
