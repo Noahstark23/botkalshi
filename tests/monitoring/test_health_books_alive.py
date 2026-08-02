@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from src.monitoring.health import BLIND_GRACE_SEC, BotState, app
+from src.monitoring.health import BLIND_CLEAR_SEC, BLIND_GRACE_SEC, BotState, app
 
 
 @pytest.fixture(autouse=True)
@@ -30,11 +30,13 @@ def reset_bot_state():
     BotState.last_ws_message = datetime.now(UTC)  # ws_alive verde (no es lo que se testea acá)
     BotState.v2_manager = None
     BotState.books_blind_since = None
+    BotState.books_healthy_since = None
     yield
     BotState.capture_running = False
     BotState.last_ws_message = None
     BotState.v2_manager = None
     BotState.books_blind_since = None
+    BotState.books_healthy_since = None
 
 
 @pytest.fixture
@@ -96,17 +98,45 @@ def test_ciego_sostenido_mas_alla_de_la_gracia_es_unhealthy(client):
     assert detail["status"] == "unhealthy"
 
 
-def test_books_inicializados_resetea_el_reloj(client):
-    """Cuando los books convergen, books_alive vuelve a True y el reloj se limpia — una
-    ceguera FUTURA arranca su propia ventana de gracia (no hereda la vieja)."""
+def test_un_blip_sano_no_limpia_el_reloj(client):
+    """SEXTO FAIL-OPEN (2026-08-02): la siembra ponía 100% durante ~1s cada 30s y UNA
+    observación sana reseteaba los 10 min de ceguera acumulados — el check jamás
+    disparó con el bot ciego el 97% del tiempo. Un blip NO borra el reloj: el 503
+    se sostiene hasta que la salud dure BLIND_CLEAR_SEC."""
+    BotState.v2_manager = _manager(tracked=203, initialized=191)  # el segundo post-siembra
+    BotState.books_blind_since = time.monotonic() - BLIND_GRACE_SEC - 1.0  # ceguera vencida
+
+    r = client.get("/health")  # poll que cae en la ventana de 1s
+
+    assert r.status_code == 503  # el blip no lava la ceguera acumulada
+    assert BotState.books_blind_since is not None  # el reloj sigue corriendo
+    assert BotState.books_healthy_since is not None  # la racha sana arrancó
+
+
+def test_salud_sostenida_si_limpia_el_reloj(client):
+    """CONTROL: recuperación REAL (salud sostenida ≥ BLIND_CLEAR_SEC) limpia el reloj —
+    una ceguera futura arranca su propia ventana de gracia, no hereda la vieja."""
     BotState.v2_manager = _manager(tracked=229, initialized=213)
-    BotState.books_blind_since = time.monotonic() - BLIND_GRACE_SEC - 1.0  # ceguera previa
+    BotState.books_blind_since = time.monotonic() - BLIND_GRACE_SEC - 1.0
+    BotState.books_healthy_since = time.monotonic() - BLIND_CLEAR_SEC - 1.0  # racha sana larga
 
     r = client.get("/health")
 
     assert r.json()["checks"]["books_alive"] is True
     assert r.json()["status"] == "healthy"
     assert BotState.books_blind_since is None
+
+
+def test_ceguera_nueva_corta_la_racha_sana(client):
+    """La observación ciega resetea la racha sana — alternar 29s ciego / 1s sano jamás
+    acumula los BLIND_CLEAR_SEC que limpiarían el reloj."""
+    BotState.v2_manager = _manager(tracked=203, initialized=0)
+    BotState.books_healthy_since = time.monotonic() - 30.0  # racha sana a medio camino
+
+    client.get("/health")
+
+    assert BotState.books_healthy_since is None  # cortada
+    assert BotState.books_blind_since is not None
 
 
 def test_sin_tickers_trackeados_no_es_ceguera(client):

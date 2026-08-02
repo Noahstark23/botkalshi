@@ -348,7 +348,7 @@ class OrderbookManagerV2:
                         self._last_seq_by_sid[sid] = new_seq
                         return
                     self._rearm_recovery_after_backoff(sid)
-                started = await self._start_recovery(sid)
+                started = await self._start_recovery(sid, stale_all=True)
                 if not started and sid not in self._recovery_disabled_sids:
                     # SUPRIMIDA por el rate-limit anti-espiral (2026-07-31): books ya stale,
                     # baseline avanza y NADA más — ni alerta (el contador de gaps a 166/min
@@ -660,15 +660,28 @@ class OrderbookManagerV2:
         close_time = self._close_time_by_ticker.get(ticker)
         return close_time is not None and close_time <= now
 
-    async def _start_recovery(self, sid: int, *, internal: bool = False) -> bool:
-        """Marca los tickers del sid stale y pide get_snapshot SOLO de los recuperables.
-        Devuelve True si la recovery ARRANCÓ (sid en _recovering); False si se suprimió
-        (rate-limit anti-espiral), estaba deshabilitada, o el sid entero estaba settled.
+    async def _start_recovery(
+        self, sid: int, *, internal: bool = False, stale_all: bool = False
+    ) -> bool:
+        """Pide get_snapshot SOLO de los tickers recuperables del sid. Devuelve True si la
+        recovery ARRANCÓ (sid en _recovering); False si se suprimió (rate-limit
+        anti-espiral), estaba deshabilitada, o el sid entero estaba settled.
 
         `internal=True` = reintento INTERNO de una recovery ya en curso (retry filtrado tras
         code 15, abort+restart del watchdog): ya está acotado por MAX_RECOVERY_FAILURES +
         circuit breaker y NO pasa por el rate-limit anti-espiral — suprimirlo dejaría la
         recovery MUERTA (sin pending, sin timer) hasta el próximo gap casual.
+
+        `stale_all=True` = SOLO para el trigger de GAP: mensajes perdidos del sid entero →
+        TODOS los books son sospechosos → mark_stale masivo (incluso si la recovery se
+        suprime — mejor ciego que fantasma). Los demás triggers (desync, incoherencia,
+        siembra) afectan a UN ticker que YA fue puesto en cuarentena por su propio path:
+        stalear los 191 restantes era el ALCANCE equivocado que tenía al bot ciego el 97%
+        del tiempo (forense 2026-08-02, resolución 1s: siembra re-basea 191 → desync de
+        UNO → mass-stale → la recovery la suprime el rate-limiter → ciegos hasta el
+        próximo tick de 30s; con desyncs a 2/min y siembras a 2/min, empatados). Los books
+        no-divergentes siguen SIRVIENDO durante la recovery (sus mensajes se bufferean y
+        drenan al completar; el snapshot fresco re-basea igual a todos los pedidos).
 
         FIX 1 (purga): excluye tickers settled/dead — pedir snapshot de un mercado cerrado dispara
         code 15. Si NO queda ninguno vivo, el sid entero está cerrado → circuit breaker (no se pide
@@ -679,23 +692,24 @@ class OrderbookManagerV2:
         # ANTI-ESPIRAL (2026-07-31): un gap dentro del intervalo mínimo NO re-bootstrapea.
         # A 166 gaps/min, cada uno relanzando un bootstrap de 200 tickers, la recovery ERA
         # la carga que generaba los gaps siguientes (5 bootstraps/seg, books jamás
-        # inicializados). Suprimir = marcar stale (mejor ciego que fantasma) y dejar que la
-        # PRÓXIMA recovery (a lo sumo en interval segundos) re-basee con el sistema
-        # respirando. La seguridad es idéntica: books stale no sirven precios.
+        # inicializados). Suprimir un GAP = marcar stale (mejor ciego que fantasma) y
+        # esperar la próxima ventana. Suprimir un desync/incoherencia/siembra NO stalea
+        # nada extra: su ticker ya está en cuarentena y el resto no divergió.
         now = time.monotonic()
         if not internal:
             last = self._last_recovery_start_mono.get(sid)
             if last is not None and (now - last) < self._recovery_min_interval_sec:
                 self._recoveries_suppressed += 1
-                for ticker in self._tickers_by_sid.get(sid, set()):
-                    state = self._books.get(ticker)
-                    if state is not None:
-                        state.mark_stale()
+                if stale_all:
+                    for ticker in self._tickers_by_sid.get(sid, set()):
+                        state = self._books.get(ticker)
+                        if state is not None:
+                            state.mark_stale()
                 if self._recoveries_suppressed == 1 or self._recoveries_suppressed % 500 == 0:
                     logger.warning(
-                        f"v2.recovery_suppressed sid={sid} — gap a "
+                        f"v2.recovery_suppressed sid={sid} — trigger a "
                         f"{now - last:.2f}s del último arranque (< "
-                        f"{self._recovery_min_interval_sec}s): books stale sin re-bootstrap "
+                        f"{self._recovery_min_interval_sec}s): sin re-bootstrap "
                         f"(anti-espiral). total={self._recoveries_suppressed}"
                     )
                 return False
@@ -717,9 +731,11 @@ class OrderbookManagerV2:
             f"close_times_known={known_ct}/{len(all_tickers)} open_times_known={known_ot} "
             f"statuses_known={known_st} — requesting WS recovery snapshot."
         )
-        for ticker in all_tickers:
-            if ticker in self._books:
-                self._books[ticker].mark_stale()
+        if stale_all:
+            # Solo el trigger de GAP: los mensajes perdidos invalidan el sid entero.
+            for ticker in all_tickers:
+                if ticker in self._books:
+                    self._books[ticker].mark_stale()
 
         if not live:
             logger.warning(
