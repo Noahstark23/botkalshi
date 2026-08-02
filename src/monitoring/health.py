@@ -35,6 +35,13 @@ BLIND_GRACE_SEC = 600.0
 # cosa > 0 es el mismo error conceptual que el latch de la siembra. 0.5 tolera settleos
 # y cuarentenas transitorias sin dar verde a un feed funcionalmente ciego.
 BLIND_MIN_INITIALIZED_FRACTION = 0.5
+# HISTÉRESIS (sexto fail-open, mismo día): el reloj de ceguera se reseteaba con UNA
+# observación sana — y la siembra ponía la fracción en 100% durante ~1s cada 30s, así
+# que cualquier poll que cayera en esa ventana borraba los 10 minutos acumulados y el
+# check no disparaba JAMÁS con el bot ciego el 97% del tiempo (medido a resolución 1s).
+# El mismo error del latch, un nivel más adentro: una condición satisfecha por un pico
+# instantáneo. Ahora limpiar el reloj exige salud SOSTENIDA este tiempo.
+BLIND_CLEAR_SEC = 60.0
 
 
 class BotState:
@@ -63,6 +70,10 @@ class BotState:
     # Primer instante (time.monotonic) en que se observó tracked>0 con initialized==0
     # (incidente 2026-07-31: bot CIEGO 9.5h con /health verde). None = no está ciego.
     books_blind_since: float | None = None
+    # Primer instante de la racha SANA en curso (histéresis 2026-08-02): el reloj de
+    # ceguera solo se limpia con BLIND_CLEAR_SEC de salud SOSTENIDA — un blip de 1s
+    # post-siembra no borra los minutos de ceguera acumulados.
+    books_healthy_since: float | None = None
 
     # TTL del last_error: un error mas viejo que esto se considera rancio y se limpia,
     # para que el dashboard no quede mostrando un error ya superado tras la recuperacion.
@@ -163,12 +174,24 @@ async def health() -> dict[str, Any]:
             blind = False  # fail-open de LECTURA: un error del stats no marca unhealthy
         mono = time.monotonic()
         if blind:
+            BotState.books_healthy_since = None
             if BotState.books_blind_since is None:
                 BotState.books_blind_since = mono
             checks["books_alive"] = (mono - BotState.books_blind_since) < BLIND_GRACE_SEC
         else:
-            BotState.books_blind_since = None
-            checks["books_alive"] = True
+            # HISTÉRESIS: una observación sana NO limpia el reloj de ceguera — la
+            # siembra ponía 100% durante ~1s cada 30s y cualquier poll en esa ventana
+            # reseteaba los 10 min acumulados (el check jamás disparó con el bot ciego
+            # el 97% del tiempo). Limpia solo la salud SOSTENIDA ≥ BLIND_CLEAR_SEC.
+            if BotState.books_healthy_since is None:
+                BotState.books_healthy_since = mono
+            if (mono - BotState.books_healthy_since) >= BLIND_CLEAR_SEC:
+                BotState.books_blind_since = None
+            # El estado ACTUAL es sano solo si no arrastra una ceguera ya vencida.
+            checks["books_alive"] = (
+                BotState.books_blind_since is None
+                or (mono - BotState.books_blind_since) < BLIND_GRACE_SEC
+            )
 
     all_ok = all(checks.values())
 
