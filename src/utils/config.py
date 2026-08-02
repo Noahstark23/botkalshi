@@ -454,6 +454,17 @@ class Settings(BaseSettings):
         le=120.0,
         description="Intervalo mínimo (s) entre arranques de recovery por sid (anti-espiral)",
     )
+    # Siembra explícita de books (P0 2026-08-02): NADA pedía el snapshot inicial al
+    # suscribir — los books dependían de que un gap disparara una recovery, y sin gaps
+    # reales (post-#205) el bot quedó 61h con initialized=0. El watchdog chequea cada N
+    # segundos y siembra los sids CIEGOS vía la recovery normal (rate-limit + breaker:
+    # sin loop caliente si Kalshi no responde). 0 = deshabilitado (pre-fix).
+    ORDERBOOK_V2_SEED_WATCHDOG_INTERVAL_SEC: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=600.0,
+        description="Intervalo (s) del watchdog que siembra books ciegos (0 = off)",
+    )
 
     # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
     # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe

@@ -191,6 +191,11 @@ class OrderbookManagerV2:
         # COMPLETARON (el cierre era silencioso: 0 hits de recovery_complete en 6.265 ciclos).
         self._stale_snapshots_ignored = 0
         self._recoveries_completed = 0
+        # sid → cuántos tickers VIVOS pidió la recovery en curso (diag P0 2026-08-02:
+        # una completion "exitosa" sobre 2 de 261 tickers es degenerada y era invisible).
+        self._recovery_live_by_sid: dict[int, int] = {}
+        # Siembras explícitas arrancadas (observabilidad del watchdog de siembra).
+        self._seeds_started = 0
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
         # Tickers que NO se vuelven a pedir en recovery: settled/expirados (close_time vencido,
@@ -541,6 +546,7 @@ class OrderbookManagerV2:
             # sigue, el mecanismo era otro).
             "stale_snapshots_ignored_total": self._stale_snapshots_ignored,
             "recoveries_completed_total": self._recoveries_completed,
+            "seeds_started_total": self._seeds_started,
             # Anti-espiral (2026-07-31): recoveries suprimidas por el rate-limit. Alto y
             # creciendo = el feed sigue con gaps crónicos, pero el sistema RESPIRA (antes:
             # 5 bootstraps/seg y books jamás inicializados).
@@ -738,6 +744,10 @@ class OrderbookManagerV2:
         self._recovering.add(sid)
         self._pending_deltas[sid] = []
         self._recovery_started_at[sid] = time.monotonic()
+        # DIAG del P0 2026-08-02 (10 recovery_complete con initialized=0 sostenido — sin
+        # este número no se distingue "recovery degenerada sobre 2 tickers vivos" de
+        # "sembró 250 y algo los re-cegó después"): cuántos tickers se PIDEN de verdad.
+        self._recovery_live_by_sid[sid] = len(live)
 
         # CHUNKING (incidente 2026-07-17): un get_snapshot masivo (223 tickers) nunca vuelve; se
         # parte en lotes. Cada lote lleva su propio req_id y pending set — la recovery del sid
@@ -759,6 +769,41 @@ class OrderbookManagerV2:
             )
             self._pending_snapshot_requests[req_id] = (sid, set(batch))
         return True
+
+    async def seed_blind_sids(self) -> int:
+        """SIEMBRA EXPLÍCITA de books (P0 2026-08-02): pide el snapshot inicial de los sids
+        CIEGOS sin esperar un gap.
+
+        Hasta este fix NADA pedía snapshots al suscribir: los books solo se sembraban por
+        (a) snapshots espontáneos post-subscribe, o (b) la recovery que dispara un gap o
+        desync. Al eliminar los gaps falsos (#205), un régimen sin gaps reales dejó el bot
+        con initialized=0 durante 61 HORAS (M1 mudo, M8/M9 sin mid — todo el pipeline
+        aguas abajo muerto) mientras el feed entregaba ~190 msg/s que iban al buffer de
+        bootstrap (99 tickers capados, 122k mensajes).
+
+        La siembra ES una recovery normal — mismo chunking, rate-limit anti-espiral,
+        circuit breaker con backoff y watchdog de timeout: si Kalshi no responde, el sid
+        se deshabilita con backoff y NO hay loop caliente. Un sid se considera ciego si
+        NINGUNO de sus books está inicializado (todos stale o nunca sembrados); la ceguera
+        PARCIAL la sigue manejando la recovery por gap.
+
+        Devuelve cuántos sids arrancaron siembra. La llama el watchdog de data_capture."""
+        started = 0
+        for sid, tickers in list(self._tickers_by_sid.items()):
+            if sid in self._recovering or sid in self._recovery_disabled_sids:
+                continue
+            if any(
+                (book := self._books.get(t)) is not None and book.is_initialized for t in tickers
+            ):
+                continue
+            logger.warning(
+                f"v2.seed sid={sid} tickers={len(tickers)}: books ciegos y sin gap que "
+                "dispare recovery — siembra explícita del snapshot inicial."
+            )
+            if await self._start_recovery(sid):
+                started += 1
+                self._seeds_started += 1
+        return started
 
     async def _guard_stuck_recovery(self, sid: int) -> None:
         """
@@ -799,6 +844,7 @@ class OrderbookManagerV2:
         self._recovering.discard(sid)
         self._pending_deltas.pop(sid, None)
         self._recovery_started_at.pop(sid, None)
+        self._recovery_live_by_sid.pop(sid, None)
 
     async def _register_failure_and_maybe_break(
         self,
@@ -1021,8 +1067,15 @@ class OrderbookManagerV2:
             # El cierre era SILENCIOSO (2026-07-29): en 6.265 ciclos del día de la tormenta
             # no había una sola línea de completion — imposible medir cuánto tarda un ciclo
             # o si se solapa con el siguiente sin inferirlo por snapshots/seg.
+            # live= e initialized_now= (P0 2026-08-02): una completion puede ser DEGENERADA
+            # (pidió 2 tickers vivos de 261 porque el resto se marcó dead) — el conteo de
+            # tickers del sid lo esconde. initialized_now responde en la MISMA línea si la
+            # siembra prendió books o si algo los re-ciega después.
+            live = self._recovery_live_by_sid.pop(sid, None)
+            init_now = sum(1 for b in self._books.values() if b.is_initialized)
             logger.info(
                 f"v2.recovery_complete sid={sid} tickers={len(self._tickers_by_sid.get(sid, set()))} "
+                f"live={live} initialized_now={init_now} "
                 f"elapsed={elapsed} total_completadas={self._recoveries_completed}"
             )
             self._recovering.discard(sid)

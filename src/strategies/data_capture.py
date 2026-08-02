@@ -609,6 +609,36 @@ class DataCaptureService:
                 logger.warning(msg)
                 BotState.record_error(msg)
 
+    async def _run_seed_watchdog(self) -> None:
+        """Watchdog de SIEMBRA de books (P0 2026-08-02): cada tick, si el manager V2 tiene
+        sids ciegos (cero books inicializados), dispara la siembra explícita del snapshot
+        inicial. Cierra el hueco estructural: nada pedía snapshots al suscribir — los books
+        dependían de que un GAP disparara una recovery, y sin gaps reales (post-#205) el
+        bot quedó 61 horas con initialized=0 y todo el pipeline aguas abajo mudo.
+
+        BEST-EFFORT por tick (Lección 7): un fallo se registra y el loop sigue. Acotado:
+        la siembra reusa la recovery normal (rate-limit anti-espiral + circuit breaker con
+        backoff por sid), así que un Kalshi que no responde NO produce loop caliente."""
+        interval = self.settings.ORDERBOOK_V2_SEED_WATCHDOG_INTERVAL_SEC
+        if interval <= 0:
+            # Deshabilitado por config (0 = pre-fix). NO retornar: esta task participa del
+            # FIRST_COMPLETED de run() — completarse acá tumbaría la captura entera.
+            await self._stop_event.wait()
+            return
+        while not self._stop_event.is_set():
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+            if self._stop_event.is_set():
+                return
+            try:
+                v2 = self._v2_manager
+                if v2 is not None:
+                    await v2.seed_blind_sids()
+            except Exception as e:
+                msg = f"Seed watchdog fallo: {type(e).__name__}: {e}"
+                logger.warning(msg)
+                BotState.record_error(msg)
+
     # =====================================================
     # Snapshots periodicos (REST fallback)
     # =====================================================
@@ -968,11 +998,15 @@ class DataCaptureService:
         # Re-discovery (P2): best-effort con manejo interno de errores — solo termina
         # con el stop_event, igual que stop_task, así que no dispara el FIRST_COMPLETED.
         rediscovery_task = asyncio.create_task(self._run_rediscovery(), name="rediscovery")
+        # Siembra de books (P0 2026-08-02): best-effort con manejo interno de errores —
+        # solo termina con el stop_event (o si está deshabilitada por config), así que
+        # no dispara el FIRST_COMPLETED en operación normal.
+        seed_task = asyncio.create_task(self._run_seed_watchdog(), name="seed_watchdog")
         stop_task = asyncio.create_task(self._stop_event.wait(), name="stop_waiter")
 
         try:
             done, pending = await asyncio.wait(
-                [ws_task, snap_task, rediscovery_task, stop_task],
+                [ws_task, snap_task, rediscovery_task, seed_task, stop_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
