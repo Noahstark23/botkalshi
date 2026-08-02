@@ -29,6 +29,12 @@ from src.utils.config import get_settings
 # warm-up normal post-subscribe (~2-5 min hasta que nacen los books) con margen; una
 # ceguera SOSTENIDA (la espiral duró 9.5h) la cruza de sobra.
 BLIND_GRACE_SEC = 600.0
+# Fracción mínima de books inicializados para considerar el feed VIVO (quinto fail-open,
+# 2026-08-02): el check original era `initialized == 0` — con 8 de 203 books vivos y la
+# siembra latcheada 35 min, /health decía healthy. Un bit que se satisface con cualquier
+# cosa > 0 es el mismo error conceptual que el latch de la siembra. 0.5 tolera settleos
+# y cuarentenas transitorias sin dar verde a un feed funcionalmente ciego.
+BLIND_MIN_INITIALIZED_FRACTION = 0.5
 
 
 class BotState:
@@ -141,14 +147,18 @@ async def health() -> dict[str, Any]:
     # books_alive (incidente 2026-07-31): CIEGO ≠ SANO. El bot pasó 9.5 horas con
     # tracked=229 e initialized=0 (espiral de recovery) mientras /health decía healthy —
     # ws_alive era true porque LLEGABAN mensajes... que se tiraban a un loop de recovery.
-    # Tercer falso-healthy de este endpoint. Con captura corriendo y tickers trackeados,
-    # CERO books inicializados sostenido más de BLIND_GRACE_SEC = unhealthy (la gracia
-    # cubre el warm-up normal: los books tardan ~2-5 min en nacer tras el subscribe).
+    # Tercer falso-healthy de este endpoint. FRACCIÓN, no bit (2026-08-02, quinto
+    # fail-open): con 8/203 books el `initialized == 0` original daba verde con el bot
+    # funcionalmente ciego. Bajo la fracción mínima sostenido más de BLIND_GRACE_SEC =
+    # unhealthy (la gracia cubre el warm-up: los books tardan ~2-5 min post-subscribe).
     v2_mgr = BotState.v2_manager
     if BotState.capture_running and v2_mgr is not None:
         try:
             s = v2_mgr.stats()
-            blind = s.get("tracked_tickers", 0) > 0 and s.get("initialized_tickers", 0) == 0
+            tracked = s.get("tracked_tickers", 0)
+            blind = tracked > 0 and (
+                s.get("initialized_tickers", 0) < tracked * BLIND_MIN_INITIALIZED_FRACTION
+            )
         except Exception:
             blind = False  # fail-open de LECTURA: un error del stats no marca unhealthy
         mono = time.monotonic()

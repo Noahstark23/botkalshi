@@ -59,6 +59,30 @@ def test_ciego_dentro_de_la_gracia_sigue_healthy(client):
     assert BotState.books_blind_since is not None  # el reloj de ceguera arrancó
 
 
+def test_fraccion_baja_es_ciego_aunque_no_sea_cero(client):
+    """QUINTO FAIL-OPEN (2026-08-02): con 8/203 books el `initialized == 0` original
+    daba verde con el bot funcionalmente ciego y la siembra latcheada 35 min. Un bit
+    que se satisface con cualquier cosa > 0 no mide lo que su nombre promete."""
+    BotState.v2_manager = _manager(tracked=203, initialized=8)
+    BotState.books_blind_since = time.monotonic() - BLIND_GRACE_SEC - 1.0
+
+    r = client.get("/health")
+
+    assert r.status_code == 503
+    assert r.json()["detail"]["checks"]["books_alive"] is False
+
+
+def test_fraccion_sobre_el_umbral_es_sano(client):
+    """CONTROL: settleos y cuarentenas transitorias (initialized alto pero < tracked)
+    no disparan el check — la fracción tolera la operación normal."""
+    BotState.v2_manager = _manager(tracked=203, initialized=180)
+
+    r = client.get("/health")
+
+    assert r.json()["checks"]["books_alive"] is True
+    assert BotState.books_blind_since is None
+
+
 def test_ciego_sostenido_mas_alla_de_la_gracia_es_unhealthy(client):
     """El caso del incidente: initialized=0 sostenido (9.5h reales; acá gracia+1s)."""
     BotState.v2_manager = _manager(tracked=229, initialized=0)
