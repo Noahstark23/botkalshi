@@ -9,8 +9,15 @@ matar los gaps falsos (#205) el gatillo casual desapareció.
 
 La siembra ES una recovery normal (chunking + rate-limit anti-espiral + breaker con
 backoff + watchdog de timeout): si Kalshi no responde, el sid se deshabilita con
-backoff — no hay loop caliente. `seed_blind_sids()` siembra SOLO sids ciegos (cero
-books inicializados); la ceguera parcial la sigue manejando la recovery por gap.
+backoff — no hay loop caliente.
+
+⚠️ CAMBIO SEMÁNTICO (latch 2026-08-02, mismo día): la v1 sembraba solo con el sid
+ENTERO ciego, delegando la ceguera parcial a "la recovery por gap" — que en régimen
+sin gaps NO EXISTE. El desync stalea de a un ticker; bastaron 8 books sobrevivientes
+de 203 para latchear la siembra para siempre (seeds 20/10min → 0, M8/M9 muertos en
+la misma franja, 195 stale congelados). Ahora siembra con CUALQUIER ticker
+recuperable ciego, excluyendo los irrecuperables (settled/dead: re-sembrarían
+eternamente por books que jamás llegan).
 """
 
 from __future__ import annotations
@@ -87,17 +94,52 @@ async def test_sid_ciego_se_siembra_via_recovery(mock_ws):
     assert 1 not in manager._recovering
 
 
-async def test_sid_con_algun_book_sano_no_se_siembra(mock_ws):
-    """CONTROL: ceguera PARCIAL no dispara siembra (eso lo maneja la recovery por gap) —
-    la siembra es para el sid CIEGO, no un re-bootstrap gratuito."""
+async def test_ceguera_parcial_si_dispara_siembra(mock_ws):
+    """EL LATCH (2026-08-02): la v1 pineaba lo contrario ("parcial no siembra") y con 8
+    books sanos de 203 la siembra no disparó NUNCA MÁS — 195 stale congelados 35 min.
+    Ahora un solo ticker recuperable ciego alcanza."""
     manager = OrderbookManagerV2(mock_ws)
     await manager.handle_message(_snapshot("SANO", seq=1))  # un book inicializado
-    await manager.handle_message(_delta("NUEVO", seq=2))  # otro en bootstrap
+    await manager.handle_message(_delta("NUEVO", seq=2))  # otro en bootstrap, ciego
     mock_ws.send_command.reset_mock()
 
     started = await manager.seed_blind_sids()
 
-    assert started == 0
+    assert started == 1
+    assert 1 in manager._recovering
+    assert mock_ws.send_command.await_count == 1
+
+
+async def test_trinquete_de_stales_parciales_se_resiembra(mock_ws):
+    """LA FORMA EXACTA del trinquete de producción: books sembrados, el desync stalea
+    ALGUNOS (no todos) — los sobrevivientes no pueden bloquear la re-siembra."""
+    manager = OrderbookManagerV2(mock_ws)
+    await manager.handle_message(_snapshot("VIVO", seq=1))
+    await manager.handle_message(_snapshot("HOU", sid=1, seq=2))
+    await manager.handle_message(_snapshot("BOS", sid=1, seq=3))
+    manager._books["HOU"].mark_stale()  # cuarentena por desync (de a uno, como en prod)
+    manager._books["BOS"].mark_stale()
+    manager._last_recovery_start_mono.clear()  # fuera del intervalo mínimo
+    mock_ws.send_command.reset_mock()
+
+    started = await manager.seed_blind_sids()
+
+    assert started == 1  # VIVO inicializado NO bloquea la siembra de HOU/BOS
+
+
+async def test_tickers_irrecuperables_no_disparan_siembra_eterna(mock_ws):
+    """CONTROL del matiz sobre el `any→all` propuesto: un ticker settled/dead sin book
+    NO cuenta como ciego — contarlo re-sembraría el sid para siempre por un snapshot
+    que jamás va a llegar."""
+    manager = OrderbookManagerV2(mock_ws)
+    await manager.handle_message(_snapshot("SANO", seq=1))
+    await manager.handle_message(_delta("MUERTO", seq=2))  # registrado pero sin book
+    manager.set_market_metadata({"MUERTO": {"status": "settled"}})
+    mock_ws.send_command.reset_mock()
+
+    started = await manager.seed_blind_sids()
+
+    assert started == 0  # el único ciego es irrecuperable → no hay nada que sembrar
     assert mock_ws.send_command.await_count == 0
 
 

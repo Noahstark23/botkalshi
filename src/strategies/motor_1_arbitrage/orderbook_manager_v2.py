@@ -783,22 +783,34 @@ class OrderbookManagerV2:
 
         La siembra ES una recovery normal — mismo chunking, rate-limit anti-espiral,
         circuit breaker con backoff y watchdog de timeout: si Kalshi no responde, el sid
-        se deshabilita con backoff y NO hay loop caliente. Un sid se considera ciego si
-        NINGUNO de sus books está inicializado (todos stale o nunca sembrados); la ceguera
-        PARCIAL la sigue manejando la recovery por gap.
+        se deshabilita con backoff y NO hay loop caliente.
+
+        ⚠️ LATCH 2026-08-02 (mismo día del fix original): la primera versión sembraba
+        solo con el sid ENTERO ciego ("la ceguera parcial la maneja la recovery por gap")
+        — pero en régimen sin gaps esa recovery NO EXISTE, y el desync stalea de a un
+        ticker por vez. Bastó que 8 de 203 books sobrevivieran para que la siembra no
+        disparara NUNCA MÁS: el sistema se degradó al peor estado y se quedó (trinquete
+        medido: seeds 20/10min → 0, M8/M9 a cero en la misma franja, 195 stale
+        congelados 35 min). Ahora siembra con CUALQUIER ticker recuperable ciego —
+        excluyendo los irrecuperables (settled/dead): contarlos re-sembraría el sid
+        eternamente por books que jamás van a llegar.
 
         Devuelve cuántos sids arrancaron siembra. La llama el watchdog de data_capture."""
         started = 0
         for sid, tickers in list(self._tickers_by_sid.items()):
             if sid in self._recovering or sid in self._recovery_disabled_sids:
                 continue
-            if any(
-                (book := self._books.get(t)) is not None and book.is_initialized for t in tickers
-            ):
+            blind = [
+                t
+                for t in tickers
+                if not self._is_unrecoverable(t)
+                and ((book := self._books.get(t)) is None or not book.is_initialized)
+            ]
+            if not blind:
                 continue
             logger.warning(
-                f"v2.seed sid={sid} tickers={len(tickers)}: books ciegos y sin gap que "
-                "dispare recovery — siembra explícita del snapshot inicial."
+                f"v2.seed sid={sid} ciegos={len(blind)}/{len(tickers)}: books sin snapshot "
+                "y sin gap que dispare recovery — siembra explícita."
             )
             if await self._start_recovery(sid):
                 started += 1
