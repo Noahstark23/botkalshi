@@ -136,6 +136,10 @@ class OrderbookManagerV2:
     # Un gap dentro del intervalo NO dispara otra recovery: marca stale (seguridad
     # idéntica — mejor ciego que fantasma), avanza baseline y se cuenta la supresión.
     DEFAULT_RECOVERY_MIN_INTERVAL_SEC = 5.0
+    # Cuántas supresiones se loguean con detalle COMPLETO antes de volver al muestreo
+    # 1/500 (diag P0b 2026-08-03): suficiente para contestar en los primeros minutos
+    # post-deploy qué arranque cierra el gate, sin volver el log un acelerante.
+    SUPPRESSION_DIAG_SAMPLES = 50
 
     def __init__(
         self,
@@ -196,6 +200,19 @@ class OrderbookManagerV2:
         self._recovery_live_by_sid: dict[int, int] = {}
         # Siembras explícitas arrancadas (observabilidad del watchdog de siembra).
         self._seeds_started = 0
+        # Recoveries AGENDADAS por el rate-limit (P0 2026-08-03): sid → instante
+        # (monotonic) en que la supresión deja de aplicar. Sin esto la supresión
+        # DESCARTABA la recovery y los books quedaban ciegos hasta el barrido de 30s.
+        self._deferred_recovery_due: dict[int, float] = {}
+        # Sids cuya agendada nació de la supresión de un GAP (no de desync/siembra): al
+        # dispararla hay que contabilizar ese gap, o la escalada de Telegram se apaga.
+        # Acotado por sid, igual que _deferred_recovery_due.
+        self._deferred_from_gap: set[int] = set()
+        self._deferred_scheduled = 0
+        self._deferred_fired = 0
+        # ¿El arranque que fijó _last_recovery_start_mono[sid] fue interno? (diag P0b:
+        # discrimina si el gate de N segundos lo cierran los reintentos internos.)
+        self._last_recovery_internal: dict[int, bool] = {}
         # req_id → (sid, set_of_pending_tickers_awaiting_recovery_snapshot)
         self._pending_snapshot_requests: dict[int, tuple[int, set[str]]] = {}
         # Tickers que NO se vuelven a pedir en recovery: settled/expirados (close_time vencido,
@@ -325,6 +342,50 @@ class OrderbookManagerV2:
             if req_id is not None:
                 await self._handle_recovery_snapshot(raw_msg, req_id)
                 return
+
+        # RECOVERY AGENDADA (P0 2026-08-03): una supresión anterior dejó pendiente el
+        # re-bootstrap; si ya venció el intervalo anti-espiral, arranca ACÁ. Se dispara
+        # desde el flujo de mensajes (~190 msg/s = latencia de milisegundos sobre el
+        # vencimiento) en vez de con un timer: sin tasks que cancelar ni fugas, y el
+        # watchdog de siembra sigue como backstop si el feed callara. Va después del
+        # ruteo de snapshots y ANTES del buffer: si arranca, el mensaje actual se
+        # bufferea en el bloque de abajo, igual que en el path de gap.
+        # ⚠️ Un mensaje que TRAE GAP no dispara la agendada (revisión adversarial del
+        # propio fix): al arrancar acá, el mensaje cae en el buffer de abajo y hace
+        # `return`, así que NO correrían el mark_stale masivo (`stale_all=True`), ni el
+        # conteo del gap, ni el `SidGapError` — books sirviendo precios con mensajes
+        # perdidos, y `gaps_last_60s`→0 apagando la escalada de Telegram justo en el
+        # régimen roto. Se lo deja al path de gap de abajo, que con el intervalo ya
+        # vencido (now ≥ due = last+interval ⟹ elapsed ≥ interval) arranca la MISMA
+        # recovery sin suprimirse, y de paso consume lo agendado (pop en _start_recovery).
+        es_gap = sid in self._last_seq_by_sid and new_seq != self._last_seq_by_sid[sid] + 1
+        if sid not in self._recovering and not es_gap:
+            due = self._deferred_recovery_due.get(sid)
+            if due is not None and time.monotonic() >= due:
+                self._deferred_recovery_due.pop(sid, None)
+                # ¿La supresión que agendó esto era de un GAP? Entonces hay un gap REAL
+                # sin contabilizar: #204 lo silenció para no inundar, pero dejaba viva la
+                # señal amortiguada (el gap que SÍ pasaba el gate cada `interval`). Si la
+                # agendada pasa a ser quien arranca la recovery y nadie cuenta, la métrica
+                # que grita "el feed está roto" se apaga cuando más se la necesita.
+                era_gap = sid in self._deferred_from_gap
+                self._deferred_from_gap.discard(sid)
+                # stale_all=False: si la supresión fue de un gap, YA marcó todo stale;
+                # lo que se sembró limpio en el medio vino de un snapshot y no es
+                # sospechoso. Re-stalearlo solo alargaría la ceguera.
+                if await self._start_recovery(sid):
+                    self._deferred_fired += 1
+                    logger.info(
+                        f"v2.recovery_deferred_fired sid={sid} era_gap={era_gap} "
+                        f"total={self._deferred_fired} — re-bootstrap tras el intervalo "
+                        "anti-espiral (la supresión ya no descarta la recovery)."
+                    )
+                    if era_gap:
+                        # Un registro por VENTANA (no por mensaje): misma cadencia que
+                        # tenía el path de gap pre-fix, sin reabrir la inundación de #204.
+                        alert_args = self._record_gap_and_should_alert()
+                        if alert_args:
+                            asyncio.create_task(self._fire_alert(*alert_args))
 
         # Buffer all messages while sid is recovering
         if sid in self._recovering:
@@ -547,6 +608,8 @@ class OrderbookManagerV2:
             "stale_snapshots_ignored_total": self._stale_snapshots_ignored,
             "recoveries_completed_total": self._recoveries_completed,
             "seeds_started_total": self._seeds_started,
+            "deferred_recoveries_scheduled_total": self._deferred_scheduled,
+            "deferred_recoveries_fired_total": self._deferred_fired,
             # Anti-espiral (2026-07-31): recoveries suprimidas por el rate-limit. Alto y
             # creciendo = el feed sigue con gaps crónicos, pero el sistema RESPIRA (antes:
             # 5 bootstraps/seg y books jamás inicializados).
@@ -705,15 +768,47 @@ class OrderbookManagerV2:
                         state = self._books.get(ticker)
                         if state is not None:
                             state.mark_stale()
-                if self._recoveries_suppressed == 1 or self._recoveries_suppressed % 500 == 0:
+                # AGENDAR, NO DESCARTAR (P0 2026-08-03): la supresión dejaba los books
+                # ciegos hasta que ALGO volviera a pedir recovery — y con el gap
+                # suprimido no quedaba nadie: el único rescate era el barrido de siembra
+                # cada 30s. Medido en ventana larga: duty cycle 20%, ventanas ciegas de
+                # media 34.6s (máx 77.1s) contra ventanas vivas de 8.2s. Ahora la
+                # recovery se agenda para `last + interval`: la ceguera queda acotada al
+                # intervalo anti-espiral, sin tocar su semántica ni el ruteo de deltas.
+                due = last + self._recovery_min_interval_sec
+                prev = self._deferred_recovery_due.get(sid)
+                if prev is None or due < prev:
+                    self._deferred_recovery_due[sid] = due
+                    self._deferred_scheduled += 1
+                if stale_all:
+                    # El origen es un GAP: hay mensajes perdidos sin contabilizar. Se
+                    # recuerda para registrarlos cuando la agendada arranque.
+                    self._deferred_from_gap.add(sid)
+                # DIAG P0b: las primeras N con detalle COMPLETO (cuánto faltaba y si el
+                # arranque que cerró el gate fue interno) — contesta en minutos por qué
+                # un gap a 8s de la semilla se suprimía con el intervalo en 5s. Después
+                # vuelve al muestreo 1/500: nada sin tope en el hot path.
+                if self._recoveries_suppressed <= self.SUPPRESSION_DIAG_SAMPLES:
+                    logger.info(
+                        f"v2.recovery_suppressed_diag sid={sid} "
+                        f"elapsed={now - last:.2f}s interval={self._recovery_min_interval_sec}s "
+                        f"last_was_internal={self._last_recovery_internal.get(sid)} "
+                        f"stale_all={stale_all} due_en={due - now:.2f}s "
+                        f"total={self._recoveries_suppressed}"
+                    )
+                elif self._recoveries_suppressed % 500 == 0:
                     logger.warning(
                         f"v2.recovery_suppressed sid={sid} — trigger a "
                         f"{now - last:.2f}s del último arranque (< "
-                        f"{self._recovery_min_interval_sec}s): sin re-bootstrap "
-                        f"(anti-espiral). total={self._recoveries_suppressed}"
+                        f"{self._recovery_min_interval_sec}s): agendada para "
+                        f"{due - now:.2f}s (anti-espiral). total={self._recoveries_suppressed}"
                     )
                 return False
         self._last_recovery_start_mono[sid] = now
+        self._last_recovery_internal[sid] = internal
+        # Arrancó de verdad: lo agendado (si había) ya está cubierto por ESTE arranque.
+        self._deferred_recovery_due.pop(sid, None)
+        self._deferred_from_gap.discard(sid)
 
         all_tickers = self._tickers_by_sid.get(sid, set())
         live = [t for t in all_tickers if not self._is_unrecoverable(t)]
