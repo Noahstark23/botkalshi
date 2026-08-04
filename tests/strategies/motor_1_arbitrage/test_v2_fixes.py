@@ -41,8 +41,24 @@ def test_parse_fp_levels_filters_size_zero():
 
 
 # =====================================================
-# Tests 2 & 3: _last_seq_by_sid not advanced when apply_delta raises
+# Tests 2 & 3: el desync CONSUME la seq del sid (cambio semántico 2026-08-04)
 # =====================================================
+# Originalmente (mayo 2026) estos tests pineaban lo CONTRARIO — "_last_seq_by_sid not
+# advanced when apply_delta raises" — porque en aquel momento la excepción de desync
+# moría en el dispatcher del WS y NADIE pedía recovery: el único mecanismo de
+# resincronización era que el mensaje siguiente se leyera como gap.
+#
+# Desde el 2026-07-12 el except hace mark_stale + _start_recovery explícita, así que ese
+# "gap" dejó de ser el rescate y pasó a ser un DAÑO: con el baseline congelado, el
+# mensaje siguiente — perfectamente en secuencia — disparaba un gap FALSO cuyo
+# mark_stale masivo cegaba los 211 books del sid. Firma medida en producción: pares de
+# supresión a 1-30ms (stale_all=False del desync, stale_all=True de su gap falso); la
+# MITAD de los gaps eran autoinfligidos y el duty cycle techaba en 79%.
+#
+# Lo que se conserva: el book NO se corrompe (el delta no se aplica), queda en
+# cuarentena, y la recuperación la hace la recovery explícita. Excepción pineada aparte:
+# si el sid es NUEVO (reset de época) el baseline NO se crea acá —
+# test_epoch_reset_heals_via_recovery_snapshot.
 
 
 def _snapshot_msg(ticker: str, sid: int, seq: int, yes_levels=None, no_levels=None) -> dict:
@@ -73,8 +89,9 @@ def _delta_msg(ticker: str, sid: int, seq: int, side: str, price: str, delta: st
 
 
 @pytest.mark.asyncio
-async def test_delta_negative_on_absent_price_preserves_seq():
-    """Después del filter, delta=-X sobre price ausente lanza error y NO avanza last_seq."""
+async def test_delta_negative_on_absent_price_consume_seq():
+    """Después del filter, delta=-X sobre price ausente lanza error, deja el book en
+    cuarentena y CONSUME la seq (el mensaje llegó en secuencia: lo roto es el book)."""
     mgr = make_v2()
     sid = 1
     ticker = "KXTEST"
@@ -92,10 +109,11 @@ async def test_delta_negative_on_absent_price_preserves_seq():
     with pytest.raises(OrderbookDesyncError):
         await mgr.handle_message(delta)
 
-    # CRÍTICO: last_seq NO avanzó
-    assert mgr._last_seq_by_sid[sid] == 100, (
-        f"_last_seq_by_sid advanced to {mgr._last_seq_by_sid[sid]} despite apply raising"
-    )
+    # La seq SE CONSUME: el siguiente mensaje en secuencia no puede ser un gap falso.
+    assert mgr._last_seq_by_sid[sid] == 101
+    # Lo que importa del fail-safe sigue: el book quedó en cuarentena (no sirve precios).
+    assert mgr._books[ticker].is_stale
+    assert mgr.get_top_of_book(ticker, "yes") is None
 
 
 @pytest.mark.asyncio
@@ -118,7 +136,7 @@ async def test_regression_production_magnitudes():
         await mgr.handle_message(delta)
 
     assert "qty" in str(exc_info.value).lower() or "desync" in str(exc_info.value).lower()
-    assert mgr._last_seq_by_sid[sid] == 1000  # seq intacto
+    assert mgr._last_seq_by_sid[sid] == 1001  # seq consumida (ver nota del bloque)
 
     # State del book intacto (no corrupto)
     state = mgr._books[ticker]

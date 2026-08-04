@@ -461,6 +461,24 @@ class OrderbookManagerV2:
                         f"v2.desync_quarantine ticker={ticker} sid={sid}: book stale + "
                         "recovery (dejó de servir precios fantasma)"
                     )
+                # LA SEQ SE CONSUME IGUAL (2026-08-04): este mensaje llegó EN SECUENCIA
+                # — lo roto es el BOOK, no el stream. Es el mismo razonamiento de #205,
+                # pero aquel fix vive en el avance de baseline de más abajo y el `raise`
+                # de acá lo saltea: el baseline quedaba congelado y el mensaje SIGUIENTE
+                # (perfectamente en secuencia) se leía como GAP FALSO → mass-stale de los
+                # 211 books. Firma en producción: pares de supresión a 1-30ms, primero
+                # stale_all=False (el desync) y después stale_all=True (su gap falso) —
+                # la MITAD de los gaps eran autoinfligidos, y cada uno cegaba el sid
+                # entero. Va ANTES del await: suspender con el baseline viejo abriría la
+                # misma ventana para el mensaje que llegue en el medio. `max()` mantiene
+                # el fail-safe de la regresión de seq (nunca retrocede).
+                # SOLO si el sid YA tenía baseline: en un reset de época (Kalshi cambia el
+                # sid y la seq vuelve a valores bajos) el sid es NUEVO, y crear su baseline
+                # acá haría que el primer mensaje posterior a la recovery se leyera como
+                # gap — el snapshot de recovery no avanza el baseline del sid. Lo cazó
+                # test_epoch_reset_heals_via_recovery_snapshot, que lo pinea.
+                if sid in self._last_seq_by_sid:
+                    self._last_seq_by_sid[sid] = max(self._last_seq_by_sid[sid], new_seq)
                 if sid not in self._recovering:
                     await self._start_recovery(sid)
                 raise
