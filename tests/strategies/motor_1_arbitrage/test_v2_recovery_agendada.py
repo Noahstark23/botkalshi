@@ -226,9 +226,9 @@ async def test_agendada_de_desync_no_inventa_un_gap(mock_ws):
     manager._deferred_recovery_due[1] = time.monotonic() - 0.01
     manager._last_recovery_start_mono[1] = time.monotonic() - 99.0
 
-    # EN secuencia: el delta que desyncó no avanzó el baseline (quedó en 1), así que el
-    # siguiente esperado sigue siendo seq=2.
-    await manager.handle_message(_delta("A", seq=2))
+    # EN secuencia: desde 2026-08-04 el desync CONSUME su seq (quedó en 2), así que el
+    # siguiente esperado es 3.
+    await manager.handle_message(_delta("A", seq=3))
 
     assert manager.stats()["deferred_recoveries_fired_total"] == 1
     assert manager.stats()["gaps_last_60s"] == 0  # no hubo gap: no se inventa
