@@ -195,6 +195,16 @@ class OrderbookManagerV2:
         # COMPLETARON (el cierre era silencioso: 0 hits de recovery_complete en 6.265 ciclos).
         self._stale_snapshots_ignored = 0
         self._recoveries_completed = 0
+        # Desyncs atrapados DENTRO de un drain (2026-08-05): antes abortaban el drain
+        # entero y perdían el resto del buffer en silencio. Sube si y solo si un mensaje
+        # encolado desincronizó durante un drain (y el drain siguió).
+        self._drain_desyncs = 0
+        # Tasa BASE de deltas fraccionales (pedida por el forense 2026-08-05): el 14.76%
+        # de los deltas que DESYNCAN traen decimales ≠ .00, pero sin la tasa base sobre
+        # el total no se puede testear enriquecimiento. deltas_total cuenta los que
+        # llegan al parseo (aplicación); fractional los que traen parte decimal ≠ 0.
+        self._deltas_total = 0
+        self._deltas_fractional = 0
         # sid → cuántos tickers VIVOS pidió la recovery en curso (diag P0 2026-08-02:
         # una completion "exitosa" sobre 2 de 261 tickers es degenerada y era invisible).
         self._recovery_live_by_sid: dict[int, int] = {}
@@ -628,6 +638,9 @@ class OrderbookManagerV2:
             "seeds_started_total": self._seeds_started,
             "deferred_recoveries_scheduled_total": self._deferred_scheduled,
             "deferred_recoveries_fired_total": self._deferred_fired,
+            "drain_desyncs_total": self._drain_desyncs,
+            "deltas_total": self._deltas_total,
+            "deltas_fractional_total": self._deltas_fractional,
             # Anti-espiral (2026-07-31): recoveries suprimidas por el rate-limit. Alto y
             # creciendo = el feed sigue con gaps crónicos, pero el sistema RESPIRA (antes:
             # 5 bootstraps/seg y books jamás inicializados).
@@ -1258,10 +1271,29 @@ class OrderbookManagerV2:
             if msg_seq <= state.sequence:
                 continue
 
-            if msg["type"] == "orderbook_snapshot":
-                self._apply_snapshot_msg(msg)
-            elif msg["type"] == "orderbook_delta":
-                self._apply_delta_msg(msg)
+            # RESILIENCIA DEL DRAIN (2026-08-05, generador de desyncs): un desync en UN
+            # mensaje encolado abortaba el drain ENTERO — el buffer ya está popeado, así
+            # que los deltas restantes de TODOS los tickers se perdían en silencio, con
+            # los books cortos/inflados y SIN marcar stale. Con ~500 desyncs/h y miles
+            # de ventanas de recovery por día, era un motor de pérdida autoalimentado:
+            # perder sumas → book corto → el próximo delta negativo explota → recovery →
+            # drain → otro desync a mitad → perder más. Firma medida: 10.712/10.712
+            # desyncs con delta NEGATIVO, nivel presente y cantidad insuficiente.
+            # Lección 7: cuarentenar ESE ticker y SEGUIR drenando el resto. La
+            # re-siembra la hace el watchdog/deferred (contexto sync: no hay await acá).
+            try:
+                if msg["type"] == "orderbook_snapshot":
+                    self._apply_snapshot_msg(msg)
+                elif msg["type"] == "orderbook_delta":
+                    self._apply_delta_msg(msg)
+            except (OrderbookDesyncError, OrderbookSeqRegressionError):
+                self._drain_desyncs += 1
+                state.mark_stale()
+                logger.warning(
+                    f"v2.drain_desync ticker={msg_ticker} sid={sid} seq={msg_seq}: "
+                    f"cuarentena y el drain SIGUE (antes abortaba y perdía el resto "
+                    f"del buffer). total={self._drain_desyncs}"
+                )
 
             if msg_seq > self._last_seq_by_sid.get(sid, 0):
                 self._last_seq_by_sid[sid] = msg_seq
@@ -1322,7 +1354,20 @@ class OrderbookManagerV2:
         for m in sorted(buffered, key=lambda m: m["seq"]):  # deque → sorted (no tiene .sort())
             if m["seq"] <= snapshot_seq:
                 continue  # ya incluido en el snapshot
-            self._apply_delta_msg(m)
+            # Mismo blindaje que _drain_buffer (2026-08-05): un desync acá abortaba
+            # además el _apply_snapshot_msg del CALLER (la recovery no completaba →
+            # timeout del watchdog → abort+restart: churn extra). Cuarentena + sigue.
+            try:
+                self._apply_delta_msg(m)
+            except (OrderbookDesyncError, OrderbookSeqRegressionError):
+                self._drain_desyncs += 1
+                book = self._books.get(ticker)
+                if book is not None:
+                    book.mark_stale()
+                logger.warning(
+                    f"v2.drain_desync ticker={ticker} sid={sid} seq={m['seq']}: "
+                    f"cuarentena en drain de bootstrap y SIGUE. total={self._drain_desyncs}"
+                )
             if m["seq"] > self._last_seq_by_sid.get(sid, 0):
                 self._last_seq_by_sid[sid] = m["seq"]
 
@@ -1379,6 +1424,19 @@ class OrderbookManagerV2:
             raise ValueError(
                 f"Delta parse error for {ticker}: price_raw={price_raw!r}, delta_raw={delta_raw!r}"
             )
+
+        # Tasa BASE de fraccionales (forense 2026-08-05): el 14.76% de los deltas que
+        # DESYNCAN traen decimales; sin esta base sobre el TOTAL no se puede saber si
+        # eso es enriquecimiento (7× → el redondeo importa) o el fondo natural del feed.
+        # Costo: un float() por delta (~190/s, trivial). Sube si y solo si el delta
+        # trae parte decimal ≠ 0 tras el parseo.
+        self._deltas_total += 1
+        try:
+            _f = float(delta_raw)
+            if abs(_f - round(_f)) > 1e-9:
+                self._deltas_fractional += 1
+        except (TypeError, ValueError):
+            pass  # ya validado arriba; jamás romper el hot path por el contador
 
         # May raise OrderbookDesyncError (new_qty < 0). Capturamos SOLO para emitir
         # logging diagnostico defensivo y re-lanzamos la excepcion intacta: no se
