@@ -846,6 +846,7 @@ class DataCaptureService:
             recovery_backoff_factor=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_FACTOR,
             recovery_backoff_cap_sec=self.settings.ORDERBOOK_V2_RECOVERY_BACKOFF_CAP_SEC,
             recovery_min_interval_sec=self.settings.ORDERBOOK_V2_RECOVERY_MIN_INTERVAL_SEC,
+            seam_grace_sec=self.settings.ORDERBOOK_V2_SEAM_GRACE_SEC,
         )
         BotState.v2_manager = self._v2_manager
         logger.info("OrderbookManagerV2 creado + publicado en BotState (pre-discovery)")

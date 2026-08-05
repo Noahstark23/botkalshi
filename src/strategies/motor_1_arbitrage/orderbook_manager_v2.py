@@ -140,6 +140,12 @@ class OrderbookManagerV2:
     # 1/500 (diag P0b 2026-08-03): suficiente para contestar en los primeros minutos
     # post-deploy qué arranque cierra el gate, sin volver el log un acelerante.
     SUPPRESSION_DIAG_SAMPLES = 50
+    # Ventana de gracia del EMPALME DE SIEMBRA (2026-08-05): dentro de estos segundos
+    # tras el snapshot de un ticker, un removal que underflowea se clampea a 0 (book
+    # SUBESTIMADO = dirección segura) en vez de desincronizar. Forense n=4.752: 63.8%
+    # de los desyncs a ≤5s de la siembra, 1 solo en books de >5min — el contenido del
+    # snapshot llega más viejo que su sello y los incrementos del medio se pierden.
+    DEFAULT_SEAM_GRACE_SEC = 10.0
 
     def __init__(
         self,
@@ -151,6 +157,7 @@ class OrderbookManagerV2:
         bootstrap_buffer_cap: int = DEFAULT_BOOTSTRAP_BUFFER_CAP,
         max_plausible_cross_cents: int = DEFAULT_MAX_PLAUSIBLE_CROSS_CENTS,
         recovery_min_interval_sec: float = DEFAULT_RECOVERY_MIN_INTERVAL_SEC,
+        seam_grace_sec: float = DEFAULT_SEAM_GRACE_SEC,
         recovery_backoff_base_sec: float = DEFAULT_RECOVERY_BACKOFF_BASE_SEC,
         recovery_backoff_factor: float = DEFAULT_RECOVERY_BACKOFF_FACTOR,
         recovery_backoff_cap_sec: float = DEFAULT_RECOVERY_BACKOFF_CAP_SEC,
@@ -162,6 +169,10 @@ class OrderbookManagerV2:
         self._bootstrap_buffer_cap = max(1, bootstrap_buffer_cap)
         self._max_plausible_cross_cents = max(1, max_plausible_cross_cents)
         self._recovery_min_interval_sec = max(0.0, recovery_min_interval_sec)
+        # Empalme de siembra (2026-08-05): gracia post-snapshot por ticker + clamps.
+        self._seam_grace_sec = max(0.0, seam_grace_sec)
+        self._seeded_at_mono: dict[str, float] = {}
+        self._seam_clamps = 0
         # Anti-espiral: último arranque de recovery por sid + supresiones acumuladas.
         self._last_recovery_start_mono: dict[int, float] = {}
         self._recoveries_suppressed = 0
@@ -639,6 +650,7 @@ class OrderbookManagerV2:
             "deferred_recoveries_scheduled_total": self._deferred_scheduled,
             "deferred_recoveries_fired_total": self._deferred_fired,
             "drain_desyncs_total": self._drain_desyncs,
+            "seam_clamps_total": self._seam_clamps,
             "deltas_total": self._deltas_total,
             "deltas_fractional_total": self._deltas_fractional,
             # Anti-espiral (2026-07-31): recoveries suprimidas por el rate-limit. Alto y
@@ -1331,6 +1343,10 @@ class OrderbookManagerV2:
             self._books[ticker] = OrderbookState(ticker)
 
         self._books[ticker].apply_snapshot({"seq": seq, "yes": yes_levels, "no": no_levels})
+        # Arranca la ventana de gracia del empalme (2026-08-05): los primeros segundos
+        # post-siembra concentran el 63.8% de los desyncs (contenido del snapshot más
+        # viejo que su sello) — en esa ventana el underflow se clampea, no desincroniza.
+        self._seeded_at_mono[ticker] = time.monotonic()
 
         # Drenar deltas pre-snapshot encolados para este ticker (bootstrap reordenado).
         self._drain_bootstrap_buffer(raw_msg["sid"], ticker, seq)
@@ -1438,11 +1454,33 @@ class OrderbookManagerV2:
         except (TypeError, ValueError):
             pass  # ya validado arriba; jamás romper el hot path por el contador
 
+        # EMPALME DE SIEMBRA (2026-08-05): dentro de la gracia post-snapshot el underflow
+        # se clampea a 0 (book subestimado = dirección segura) en vez de desincronizar —
+        # el 63.8% de los desyncs vivía en esos primeros segundos. Fuera de la gracia,
+        # el path de desync sigue INTACTO (cuarentena + recovery): la línea ERROR de
+        # abajo pasa a medir solo los desyncs POST-gracia, que es la señal limpia.
+        en_gracia = (
+            self._seam_grace_sec > 0
+            and (time.monotonic() - self._seeded_at_mono.get(ticker, float("-inf")))
+            <= self._seam_grace_sec
+        )
+
         # May raise OrderbookDesyncError (new_qty < 0). Capturamos SOLO para emitir
         # logging diagnostico defensivo y re-lanzamos la excepcion intacta: no se
         # altera la logica ni el control flow (la misma excepcion propaga igual).
         try:
-            state.apply_delta({"side": side, "price": price_cents, "delta": delta_size, "seq": seq})
+            clamped = state.apply_delta(
+                {"side": side, "price": price_cents, "delta": delta_size, "seq": seq},
+                clamp_underflow=en_gracia,
+            )
+            if clamped:
+                self._seam_clamps += 1
+                if self._seam_clamps == 1 or self._seam_clamps % 500 == 0:
+                    logger.warning(
+                        f"v2.seam_clamp ticker={ticker} price={price_cents} "
+                        f"delta={delta_size}: underflow clampeado a 0 dentro de la gracia "
+                        f"de siembra ({self._seam_grace_sec}s). total={self._seam_clamps}"
+                    )
         except OrderbookDesyncError:
             # El bloque de logging va envuelto en su propio try/except para que
             # ningun fallo del diagnostico introduzca un path de excepcion nuevo.

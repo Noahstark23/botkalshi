@@ -68,7 +68,11 @@ def mock_ws() -> AsyncMock:
 async def test_desync_en_drain_de_recovery_cuarentena_y_sigue(mock_ws):
     """El caso con deltas POSTERIORES al snapshot: el desync de B no aborta el drain —
     A recibe su delta, B queda en cuarentena, contador sube."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("A", seq=1))
     await manager.handle_message(_snapshot("B", seq=2))
     with pytest.raises(SidGapError):
@@ -92,7 +96,11 @@ async def test_desync_en_drain_de_bootstrap_no_rompe_la_recovery(mock_ws):
     """El drain de bootstrap corre DENTRO de _apply_snapshot_msg: un desync ahí abortaba
     además la contabilidad de la recovery (timeout del watchdog). Ahora: cuarentena y
     la recovery completa normal."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_delta("NUEVO", seq=5, delta="-500.00"))  # → bootstrap buffer
     await manager.handle_message(_delta("NUEVO", seq=6, delta="3.00"))  # → bootstrap buffer
 
@@ -107,7 +115,11 @@ async def test_contador_de_deltas_fraccionales(mock_ws):
     """Tasa base pedida por el forense: fractional sube si y solo si el delta trae
     parte decimal ≠ 0. Sin esta base, el 14.76% de fraccionales en los desyncs no se
     puede testear por enriquecimiento."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("A", seq=1))
 
     await manager.handle_message(_delta("A", seq=2, delta="10.00"))  # entero

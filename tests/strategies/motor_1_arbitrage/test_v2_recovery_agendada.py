@@ -63,7 +63,11 @@ def mock_ws() -> AsyncMock:
 
 async def _manager_con_gap_suprimido(mock_ws) -> OrderbookManagerV2:
     """Manager con un GAP recién suprimido: books stale y recovery agendada."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("A", seq=1))
     await manager.handle_message(_snapshot("B", seq=2))
     manager._last_recovery_start_mono[1] = time.monotonic()  # dentro del intervalo
@@ -171,7 +175,11 @@ async def test_mensaje_con_gap_no_dispara_la_agendada(mock_ws):
     sin mark_stale masivo (books sirviendo precios con mensajes PERDIDOS), sin conteo y
     sin SidGapError. El gap debe manejarlo su propio path, que con el intervalo vencido
     arranca la misma recovery."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("A", seq=1))
     await manager.handle_message(_snapshot("B", seq=2))
     # Agendada nacida de un trigger NO-gap (desync): los books sanos siguen vivos (#208).
@@ -216,7 +224,11 @@ async def test_agendada_de_gap_contabiliza_el_gap_al_disparar(mock_ws):
 async def test_agendada_de_desync_no_inventa_un_gap(mock_ws):
     """CONTROL del anterior: una agendada nacida de un desync/siembra NO contabiliza
     gaps — inflar el contador dispararía alertas de feed roto sin feed roto."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("A", seq=1))
     manager._last_recovery_start_mono[1] = time.monotonic()
     with pytest.raises(Exception):  # noqa: B017 — desync, trigger NO-gap
@@ -237,7 +249,11 @@ async def test_agendada_de_desync_no_inventa_un_gap(mock_ws):
 async def test_diag_de_supresion_registra_el_arranque_que_cerro_el_gate(mock_ws):
     """P0b: el diag debe decir si el arranque que cerró el gate fue INTERNO — es la
     pregunta abierta del forense (por qué un gap a 8s se suprimía con intervalo 5s)."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("A", seq=1))
     with pytest.raises(Exception):  # noqa: B017 — SidGapError: arranque real por gap
         await manager.handle_message(_delta("A", seq=99))

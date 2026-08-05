@@ -22,7 +22,11 @@ from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import (
 def make_v2() -> OrderbookManagerV2:
     ws = MagicMock()
     ws.send_command = AsyncMock(return_value=1)
-    return OrderbookManagerV2(ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    return OrderbookManagerV2(ws, seam_grace_sec=0.0)
 
 
 # =====================================================

@@ -54,6 +54,8 @@ def test_ensure_v2_manager_publishes_botstate_early_and_idempotent():
         s.ORDERBOOK_V2_RECOVERY_BACKOFF_FACTOR = 4.0
         s.ORDERBOOK_V2_RECOVERY_BACKOFF_CAP_SEC = 1800.0
         s.ORDERBOOK_V2_RECOVERY_MIN_INTERVAL_SEC = 5.0
+        s.ORDERBOOK_V2_SEED_WATCHDOG_INTERVAL_SEC = 30.0
+        s.ORDERBOOK_V2_SEAM_GRACE_SEC = 10.0
         svc = DataCaptureService()
         assert svc._v2_manager is None
 

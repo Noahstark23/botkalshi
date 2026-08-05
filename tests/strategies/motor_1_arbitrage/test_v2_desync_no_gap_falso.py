@@ -62,7 +62,11 @@ def mock_ws() -> AsyncMock:
 
 async def _manager_con_desync(mock_ws) -> OrderbookManagerV2:
     """Manager con dos books sanos y un desync recién ocurrido en 'ROTO' (seq=3)."""
-    manager = OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    manager = OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
     await manager.handle_message(_snapshot("SANO", seq=1))
     await manager.handle_message(_snapshot("ROTO", seq=2))
     with pytest.raises(OrderbookDesyncError):

@@ -465,6 +465,16 @@ class Settings(BaseSettings):
         le=600.0,
         description="Intervalo (s) del watchdog que siembra books ciegos (0 = off)",
     )
+    # Empalme de siembra (2026-08-05): el 63.8% de los desyncs ocurre ≤5s tras sembrar
+    # (contenido del snapshot más viejo que su sello → los incrementos del medio se
+    # pierden). Dentro de esta gracia el underflow se clampea a 0 (book SUBESTIMADO =
+    # dirección segura, jamás fantasma) en vez de desincronizar. 0 = off (pre-fix).
+    ORDERBOOK_V2_SEAM_GRACE_SEC: float = Field(
+        default=10.0,
+        ge=0.0,
+        le=120.0,
+        description="Gracia (s) post-snapshot en que el underflow clampea en vez de desincronizar",
+    )
 
     # === Motor 5 (market maker) — F1 SHADOW (docs/motor_5_market_maker_plan_fases.md) ===
     # F1 = cotización HIPOTÉTICA contra el book real, cero órdenes: el executor no existe
