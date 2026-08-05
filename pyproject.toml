@@ -29,6 +29,10 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
     "freezegun>=1.5.0",
+    # Mutation testing de los money paths (2026-08-05): mide si los tests MUERDEN.
+    # Solo dev/manual (scripts/mutacion_money_paths.sh) — jamás en el hot path de CI:
+    # corre la suite una vez POR MUTANTE.
+    "mutmut>=2.5,<3",
 ]
 
 [build-system]
