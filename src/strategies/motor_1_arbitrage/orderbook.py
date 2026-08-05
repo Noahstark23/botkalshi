@@ -281,7 +281,7 @@ class OrderbookState:
         self._is_stale = False
         self._initialized = True
 
-    def apply_delta(self, delta: dict) -> None:
+    def apply_delta(self, delta: dict, *, clamp_underflow: bool = False) -> bool:
         """
         Aplica un delta del WebSocket validando monotonicidad de sequence.
 
@@ -354,17 +354,31 @@ class OrderbookState:
         new_size = book.get(price, 0) + delta_size
 
         if new_size < 0:
-            raise OrderbookDesyncError(
-                ticker=self.ticker,
-                price_cents=price,
-                new_qty=new_size,
-            )
+            if not clamp_underflow:
+                raise OrderbookDesyncError(
+                    ticker=self.ticker,
+                    price_cents=price,
+                    new_qty=new_size,
+                )
+            # EMPALME DE SIEMBRA (2026-08-05): dentro de la ventana de gracia post-snapshot,
+            # un removal que underflowea se CLAMPEA a 0 en vez de desincronizar. Forense
+            # n=4.752: el 63.8% de los desyncs ocurre ≤5s después de sembrar y solo 1 en
+            # books de >5min — el contenido del snapshot llega más viejo que su sello de
+            # seq, el drain descarta los incrementos de esa ventanita, y el primer removal
+            # grande explota. Dirección FAIL-SAFE: clampear solo puede SUBESTIMAR el book
+            # (qty real ≥ 0 = la clampeada) — jamás crea liquidez fantasma; el fantasma
+            # nace de PERDER removals, que no pasan por acá. El book queda vivo y
+            # conservador hasta el próximo re-base natural.
+            book.pop(price, None)
+            self._sequence = new_seq
+            return True
         elif new_size == 0:
             book.pop(price, None)
         else:
             book[price] = new_size
 
         self._sequence = new_seq
+        return False
 
     # =====================================================
     # Reads

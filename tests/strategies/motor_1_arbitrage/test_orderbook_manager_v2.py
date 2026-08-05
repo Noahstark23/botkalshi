@@ -104,7 +104,11 @@ def mock_ws() -> AsyncMock:
 
 @pytest.fixture
 def manager(mock_ws: AsyncMock) -> OrderbookManagerV2:
-    return OrderbookManagerV2(mock_ws)
+    # seam_grace_sec=0: estos tests ejercitan el path de DESYNC REAL (cuarentena +
+    # recovery) — la gracia del empalme (2026-08-05) clampearía el underflow y taparía
+    # la maquinaria que se está probando. El clamp tiene su propia suite:
+    # test_v2_empalme_siembra.py.
+    return OrderbookManagerV2(mock_ws, seam_grace_sec=0.0)
 
 
 # =====================================================
