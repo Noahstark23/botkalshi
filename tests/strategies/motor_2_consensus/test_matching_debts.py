@@ -61,8 +61,21 @@ def test_series_sport_compatibility():
     assert not series_sport_compatible("KXMLBGAME-26JUN27NYMPHI", "basketball_nba")
     assert series_sport_compatible("KXWCGAME-26JUN27JORARG", "soccer_fifa_world_cup")
     assert not series_sport_compatible("KXNBAGAME-26JUN27BOSLAL", "baseball_mlb")
-    # Serie desconocida → no filtra (compat + log one-shot para onboardear)
-    assert series_sport_compatible("KXNUEVASERIE-26JUN27AAABBB", "cricket_odi")
+    # Serie desconocida → FAIL-CLOSED (cambio 2026-08-06: antes devolvía True "compat" y
+    # un onboarding incompleto — serie en MOTOR2_SERIES sin entrada en la tabla — producía
+    # matches CRUZADOS entre deportes en silencio: la fábrica de edges fantasma. Ahora no
+    # matchea y avisa en WARNING one-shot; el costo de olvidar la tabla es cero señales
+    # ruidosas, no plata).
+    assert not series_sport_compatible("KXNUEVASERIE-26JUN27AAABBB", "cricket_odi")
+    # Y todas las series del default de MOTOR2_SERIES DEBEN estar mapeadas — si esto
+    # falla, el default mismo caería en fail-closed (el "typo latente" que el forense
+    # buscó y no existía: este test lo vuelve imposible de introducir).
+    from src.strategies.motor_2_consensus.matcher import _SERIES_SPORT_PREFIXES
+    from src.utils.config import Settings
+
+    default_series = Settings.model_fields["MOTOR2_SERIES"].default.split(",")
+    for serie in default_series:
+        assert serie in _SERIES_SPORT_PREFIXES, f"{serie} sin deporte en el matcher"
 
 
 def test_nba_kalshi_event_does_not_match_mlb_odds():

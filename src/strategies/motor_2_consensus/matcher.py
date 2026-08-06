@@ -77,8 +77,14 @@ def parse_event_key_start(event_key: str) -> tuple[date, tuple[int, int] | None]
 # Deporte por prefijo de serie Kalshi → prefijos de sport_key de The Odds API. El matcher
 # de nombres es global y los aliases ciudad→equipo son de MLB: sin este gate, onboardear
 # otro deporte "sin tocar código" (como invita la config) armaba el cross-match catastrófico
-# (NBA "Boston" canoniza a "boston red sox" y matchea el set MLB). Serie DESCONOCIDA → no
-# filtra (compat), pero se loguea one-shot para agregarla acá al onboardear.
+# (NBA "Boston" canoniza a "boston red sox" y matchea el set MLB). Serie DESCONOCIDA →
+# FAIL-CLOSED (2026-08-06, sexto fail-open de la familia y el único cuyo disparador es una
+# acción humana de config): todo event_key que llega acá viene del universo MOTOR2_SERIES,
+# así que "desconocida" = serie CONFIGURADA sin mapear = error de operador. Antes devolvía
+# True sin filtro — el cross-match fantasma es exactamente el bucket de edges 12-13% que
+# ya sangró −$621 (≤54% win) contra el de ~5% que fue rentable (+$189, 59% win). Ahora NO
+# matchea y grita en WARNING one-shot: el onboarding incompleto produce silencio ruidoso,
+# no matches cruzados.
 _SERIES_SPORT_PREFIXES: dict[str, tuple[str, ...]] = {
     "KXMLBGAME": ("baseball",),
     "KXWCGAME": ("soccer",),
@@ -97,18 +103,22 @@ _unknown_series_logged: set[str] = set()
 
 def series_sport_compatible(event_key: str, sport_key: str) -> bool:
     """False si la serie del event_key tiene deporte CONOCIDO y el sport_key del odds
-    event no le corresponde. Serie desconocida → True (no filtra; log one-shot)."""
+    event no le corresponde. Serie desconocida → False (FAIL-CLOSED; WARNING one-shot):
+    llegó del universo configurado sin mapa de deporte = onboarding incompleto — sin el
+    gate, los aliases de ciudad cruzan deportes y fabrican edges fantasma."""
     prefix = event_key.split("-", 1)[0]
     sports = _SERIES_SPORT_PREFIXES.get(prefix)
     if sports is None:
         if prefix not in _unknown_series_logged:
             _unknown_series_logged.add(prefix)
-            logger.info(
-                f"motor2.matcher.serie_sin_deporte prefix={prefix} — agregar a "
-                "_SERIES_SPORT_PREFIXES al onboardear (sin el gate, los aliases de ciudad "
-                "pueden cruzar deportes)"
+            logger.warning(
+                f"motor2.matcher.serie_sin_deporte prefix={prefix} — serie del universo "
+                "MOTOR2_SERIES SIN entrada en _SERIES_SPORT_PREFIXES: NO se matchea "
+                "(fail-closed). Onboarding incompleto: agregar el prefijo a la tabla del "
+                "matcher — sin el gate, los aliases de ciudad cruzan deportes (el bucket "
+                "de edges fantasma 12-13% que ya sangró)."
             )
-        return True
+        return False
     return any(sport_key.startswith(sp) for sp in sports)
 
 
