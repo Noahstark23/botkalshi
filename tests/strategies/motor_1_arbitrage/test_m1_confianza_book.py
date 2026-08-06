@@ -55,49 +55,93 @@ def _delta(ticker: str, seq: int, sid: int = 1, delta: str = "10.00") -> dict:
 
 
 # =====================================================
-# El manager registra incidentes por ticker
+# El manager registra PERTURBACIONES por ticker (incidente O re-baseo)
 # =====================================================
+# QA adversarial 2026-08-06: la v1 anclaba solo al incidente y dejaba tres agujeros
+# (re-seed sid-wide por hermano sin incidente propio; recovery ≥trust con 0s de
+# protección post-re-baseo; dict vacío post-deploy). Ahora la SIEMBRA también arranca
+# el embargo: la digestión empieza cuando el book vuelve a servir.
 
 
-async def test_desync_registra_incidente_del_ticker():
+def _manager(seam_grace: float = 0.0) -> OrderbookManagerV2:
     ws = AsyncMock()
     ws.send_command.side_effect = list(range(42, 400))
-    manager = OrderbookManagerV2(ws, seam_grace_sec=0.0)
+    return OrderbookManagerV2(ws, seam_grace_sec=seam_grace)
+
+
+async def test_la_siembra_arranca_el_embargo():
+    """QA hallazgo (c): post-deploy el dict de incidentes está vacío pero la siembra de
+    boot re-basea todo — el embargo debe arrancar en la SIEMBRA, no solo en incidentes."""
+    manager = _manager()
+    assert manager.book_incident_age("TICK") is None  # jamás sembrado: sin book
+
     await manager.handle_message(_snapshot("TICK", seq=1))
-    assert manager.book_incident_age("TICK") is None  # book limpio: sin incidentes
+
+    edad = manager.book_incident_age("TICK")
+    assert edad is not None and edad < 1.0  # recién sembrado = en digestión
+
+
+async def test_desync_refresca_el_embargo_de_un_book_maduro():
+    manager = _manager()
+    await manager.handle_message(_snapshot("TICK", seq=1))
+    manager._seeded_at_mono["TICK"] -= 100.0  # book maduro (sembrado hace 100s)
+    assert manager.book_incident_age("TICK") > 50.0
 
     with pytest.raises(OrderbookDesyncError):
         await manager.handle_message(_delta("TICK", seq=2, delta="-500.00"))
 
-    edad = manager.book_incident_age("TICK")
-    assert edad is not None and edad < 1.0  # incidente recién registrado
+    assert manager.book_incident_age("TICK") < 1.0  # el incidente re-arma el embargo
 
 
-async def test_clamp_del_empalme_registra_incidente():
-    ws = AsyncMock()
-    ws.send_command.side_effect = list(range(42, 400))
-    manager = OrderbookManagerV2(ws)  # gracia default: el underflow clampea
+async def test_clamp_del_empalme_refresca_el_embargo():
+    manager = _manager(seam_grace=10.0)
     await manager.handle_message(_snapshot("TICK", seq=1))
-
     await manager.handle_message(_delta("TICK", seq=2, delta="-500.00"))  # clamp, no raise
-
     assert manager.stats()["seam_clamps_total"] == 1
-    edad = manager.book_incident_age("TICK")
-    assert edad is not None and edad < 1.0  # el clamp también es incidente
+    manager._seeded_at_mono["TICK"] -= 100.0  # aunque la siembra fuera vieja...
+
+    assert manager.book_incident_age("TICK") < 1.0  # ...el clamp manda (max de marcas)
 
 
-async def test_ticker_ajeno_no_hereda_incidentes():
-    ws = AsyncMock()
-    ws.send_command.side_effect = list(range(42, 400))
-    manager = OrderbookManagerV2(ws, seam_grace_sec=0.0)
-    await manager.handle_message(_snapshot("SANO", seq=1))
-    await manager.handle_message(_snapshot("ROTO", seq=2))
-
+async def test_recovery_larga_protege_desde_el_rebaseo_no_desde_el_incidente():
+    """QA hallazgo (b): con ancla solo-incidente, una recovery ≥trust consumía la
+    ventana entera con el book stale y el PRIMER tick servible ya pasaba el guard.
+    Ahora el re-baseo re-arma el embargo: la protección corre donde hay riesgo."""
+    manager = _manager()
+    await manager.handle_message(_snapshot("TICK", seq=1))
     with pytest.raises(OrderbookDesyncError):
-        await manager.handle_message(_delta("ROTO", seq=3, delta="-500.00"))
+        await manager.handle_message(_delta("TICK", seq=2, delta="-500.00"))
+    manager._book_incident_mono["TICK"] -= 100.0  # el incidente fue hace 100s (recovery larga)
+    assert 1 in manager._recovering
 
-    assert manager.book_incident_age("ROTO") is not None
-    assert manager.book_incident_age("SANO") is None  # el incidente es POR ticker
+    rid = manager._pending_req_id_for_sid(1)
+    msg = _snapshot("TICK", seq=50)
+    msg["id"] = rid
+    await manager.handle_message(msg)  # el re-baseo llega recién ahora
+
+    assert manager.book_incident_age("TICK") < 1.0  # embargo fresco POST-re-baseo
+
+
+async def test_reseed_por_hermano_tambien_embarga():
+    """QA hallazgo (a) — LA FÁBRICA DOMINANTE: el desync de un season market dispara
+    recovery sid-wide que re-basea al GAME sin incidente propio; el empalme puede
+    inflarlo en silencio. El re-baseo del hermano ahora también arranca SU embargo."""
+    manager = _manager()
+    await manager.handle_message(_snapshot("GAME", seq=1))
+    await manager.handle_message(_snapshot("SEASON", seq=2))
+    manager._seeded_at_mono["GAME"] -= 100.0  # GAME maduro
+    assert manager.book_incident_age("GAME") > 50.0
+
+    with pytest.raises(OrderbookDesyncError):  # desync del HERMANO → recovery sid-wide
+        await manager.handle_message(_delta("SEASON", seq=3, delta="-500.00"))
+    rid = manager._pending_req_id_for_sid(1)
+    for i, t in enumerate(("GAME", "SEASON")):
+        msg = _snapshot(t, seq=10 + i)
+        msg["id"] = rid
+        await manager.handle_message(msg)  # la recovery re-basea a AMBOS
+
+    assert manager.book_incident_age("GAME") < 1.0  # re-sembrado = en digestión
+    assert manager._book_incident_mono.get("GAME") is None  # sin incidente propio (correcto)
 
 
 # =====================================================

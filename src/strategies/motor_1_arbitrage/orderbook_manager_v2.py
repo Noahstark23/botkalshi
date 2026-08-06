@@ -179,6 +179,10 @@ class OrderbookManagerV2:
         # "en digestión": sus precios pueden ser fantasmas del re-baseo (forense: el edge
         # 3.19% y el cruce incoherente de 11¢ eran el mismo book, 0.4s aparte). Acotado
         # por ticker trackeado, como _seeded_at_mono.
+        # ⚠️ PODA (QA 2026-08-06): hoy NINGÚN dict por-ticker se poda (tampoco _books,
+        # _seeded_at_mono, _close_time_by_ticker...) — acotado por el universo trackeado,
+        # no es fuga. Si algún día se poda _books de tickers settled, la MISMA pasada
+        # debe podar todos estos dicts o quedan huérfanos.
         self._book_incident_mono: dict[str, float] = {}
         # Anti-espiral: último arranque de recovery por sid + supresiones acumuladas.
         self._last_recovery_start_mono: dict[int, float] = {}
@@ -934,16 +938,36 @@ class OrderbookManagerV2:
         return True
 
     def book_incident_age(self, ticker: str) -> float | None:
-        """Segundos desde el último INCIDENTE propio del book de este ticker (desync,
-        incoherencia, desync en drain, o clamp del empalme). None = sin incidentes
-        registrados en la vida del proceso. Consumidor: el guard de confianza de M1
-        (MOTOR_1_BOOK_TRUST_SEC) — un book con incidente reciente está en digestión y
-        sus cruces son sospechosos de fantasma (forense 2026-08-06: el edge 3.19% y el
-        `book_incoherent cruce=11¢` eran el mismo book, 0.4s aparte)."""
-        marca = self._book_incident_mono.get(ticker)
-        if marca is None:
+        """Segundos desde la última PERTURBACIÓN del book: incidente propio (desync,
+        incoherencia, desync en drain, clamp del empalme) O re-baseo por snapshot
+        (siembra/recovery). Consumidor: el guard de confianza de M1
+        (MOTOR_1_BOOK_TRUST_SEC).
+
+        QA adversarial 2026-08-06 (4 hallazgos convergentes sobre la v1, que anclaba
+        solo al incidente): (a) el re-seed sid-wide por el desync de un HERMANO infla
+        este book SIN incidente propio — la fábrica dominante: 98.3% de los desyncs
+        son de season markets que comparten sid con los GAME que M1 opera; (b) una
+        recovery ≥trust consumía la ventana entera con el book stale (riesgo cero:
+        get_top_of_book da None) y dejaba 0s de protección post-re-baseo, exactamente
+        donde vive el 63.8% de la corrupción del empalme; (c) tras un deploy el dict
+        de incidentes arranca vacío y la siembra masiva de boot quedaba sin embargo.
+        La digestión arranca cuando el book VUELVE A SERVIR, no cuando rompió.
+
+        None = ticker jamás sembrado (sin book el engine no detecta nada igual).
+        Consecuencia deliberada y FAIL-SAFE: en horas de churn (recoveries sid-wide
+        frecuentes) M1 queda mayormente en skip — visible en skips_book_no_confiable
+        del heartbeat. Con 44/44 intentos perdedores medidos, el costo de esperar
+        books estables es cero contra el costo conocido de no esperar; y si los
+        "edges" de M1 jamás sobreviven 60s de book estable, eso ES el veredicto
+        (eran artefactos), medido por el shadow que sigue intacto."""
+        marcas = [
+            m
+            for m in (self._book_incident_mono.get(ticker), self._seeded_at_mono.get(ticker))
+            if m is not None
+        ]
+        if not marcas:
             return None
-        return time.monotonic() - marca
+        return time.monotonic() - max(marcas)
 
     async def seed_blind_sids(self) -> int:
         """SIEMBRA EXPLÍCITA de books (P0 2026-08-02): pide el snapshot inicial de los sids

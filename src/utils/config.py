@@ -254,7 +254,7 @@ class Settings(BaseSettings):
         default=60.0,
         ge=0.0,
         le=600.0,
-        description="Segundos sin incidentes (desync/incoherencia/clamp) que exige el book de un ticker para EJECUTAR (Motor 1)",
+        description="Segundos sin perturbaciones (incidente O re-baseo/siembra) que exige el book de un ticker para EJECUTAR (Motor 1)",
     )
     # Bug 2 (incidente 2026-07-07): cap de exposición DIRECCIONAL por EVENTO (partido). Los
     # tickers hermanos (…HOUWSH-HOU / …HOUWSH-WSH) son el MISMO evento real; los residuales de
