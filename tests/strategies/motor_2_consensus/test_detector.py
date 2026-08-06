@@ -43,7 +43,12 @@ def _odds_event(
 
 
 def _kalshi_event(*quotes: KalshiQuote) -> KalshiEventQuotes:
-    return KalshiEventQuotes(event_key="NBA-LAL-BOS", outcomes=quotes)
+    # Prefijo REAL mapeado a basketball (el sport_key del _odds_event de arriba): desde
+    # el fail-closed del gate serie↔deporte (2026-08-06), una serie sintética sin entrada
+    # en _SERIES_SPORT_PREFIXES ya no matchea — que es el punto del gate.
+    # Sin fecha en la clave (como la original "NBA-LAL-BOS"): el gate de fecha no aplica
+    # y estos tests siguen midiendo lo suyo (edge/nombres/cardinalidad), no el calendario.
+    return KalshiEventQuotes(event_key="KXNBAGAME-LAL-BOS", outcomes=quotes)
 
 
 def test_case_a_gross_edge_eaten_by_commission_no_signal():
