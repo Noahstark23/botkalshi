@@ -90,6 +90,9 @@ class Motor1Engine:
         #     engine re-martillaba el mismo cruce stale cada ~1s hasta el circuit breaker.
         self._streak: dict[str, int] = {}  # ticker → ticks consecutivos con el cruce vivo
         self._cooldown_until: dict[str, float] = {}  # ticker → monotonic hasta el que no ejecutar
+        # Guard de confianza del book (2026-08-06): ejecuciones salteadas por incidente
+        # reciente del ticker (visible en el heartbeat — un freno que no se ve = bug).
+        self._skips_untrusted = 0
 
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "LIVE" if self._executor is not None else "SHADOW"
@@ -152,7 +155,8 @@ class Motor1Engine:
         if self._ticks % self.HEARTBEAT_EVERY == 0:
             logger.info(
                 f"motor1.engine.heartbeat ticks={self._ticks} "
-                f"tracked={len(self._manager.tracked_tickers)} signals={self._signals_seen}"
+                f"tracked={len(self._manager.tracked_tickers)} signals={self._signals_seen} "
+                f"skips_book_no_confiable={self._skips_untrusted}"
             )
 
         for ticker in self._manager.tracked_tickers:
@@ -171,6 +175,27 @@ class Motor1Engine:
             # barrera. Cualquiera corta antes de tocar la red.
             if self._executor is None or not self.settings.TRADING_ENABLED:
                 continue
+
+            # CONFIANZA DEL BOOK (forense 2026-08-06): un ticker con incidente PROPIO
+            # reciente (desync/incoherencia/clamp del empalme) tiene el book en digestión
+            # — su "edge" es sospechoso de fantasma del re-baseo. La prueba pericial: en
+            # 44 intentos consecutivos M1 completó CERO arbs; en el evento 21:02 el edge
+            # de 3.19% y un `book_incoherent cruce=11¢` 0.4s antes eran EL MISMO BOOK
+            # (la pata "fácil" no existía: FOK sin volumen en 141ms, 9¢ de vacío al
+            # deshacer). La detección y el EdgeWindow ya se grabaron (shadow intacto);
+            # acá se corta SOLO la ejecución. El techo anti-fantasma no cubre esto: un
+            # cruce fantasma de 2-5¢ cae DENTRO de la banda plausible.
+            trust = self.settings.MOTOR_1_BOOK_TRUST_SEC
+            if trust > 0:
+                edad = self._manager.book_incident_age(ticker)
+                if edad is not None and edad < trust:
+                    self._skips_untrusted += 1
+                    logger.info(
+                        f"motor1.exec.book_no_confiable ticker={ticker} "
+                        f"incidente_hace={edad:.1f}s < {trust:.0f}s → NO ejecuta "
+                        f"(total_skips={self._skips_untrusted})"
+                    )
+                    continue
 
             # Umbral FINO de ejecución (distinto del MIN_EDGE_PCT de detección).
             if opp.edge_pct < self.settings.MOTOR_1_EXECUTION_EDGE_PCT:

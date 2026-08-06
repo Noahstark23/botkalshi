@@ -242,6 +242,20 @@ class Settings(BaseSettings):
         ge=0.0,
         description="Cooldown por ticker tras una ejecución fallida de Motor 1 (KILL/rollback) — no re-martillar el mismo cruce stale",
     )
+    # CONFIANZA del book por ticker (forense 2026-08-06): en 44 intentos consecutivos M1
+    # completó CERO arbitrajes — el 47% que tocó el exchange llenó la pata dura y la fácil
+    # NO EXISTÍA (FOK sin volumen en 141ms, 9¢ de vacío al deshacer). La prueba pericial:
+    # el edge de 3.19% del evento 21:02 y un `book_incoherent cruce=11¢` 0.4s antes eran
+    # EL MISMO BOOK. Un ticker con incidente propio reciente (desync/incoherencia/clamp
+    # del empalme) tiene book en digestión: sus "edges" son fantasmas del re-baseo. Se
+    # DETECTA y graba igual (shadow intacto); NO se ejecuta hasta que el book lleve este
+    # tiempo sin incidentes. 0 = off (pre-fix).
+    MOTOR_1_BOOK_TRUST_SEC: float = Field(
+        default=60.0,
+        ge=0.0,
+        le=600.0,
+        description="Segundos sin incidentes (desync/incoherencia/clamp) que exige el book de un ticker para EJECUTAR (Motor 1)",
+    )
     # Bug 2 (incidente 2026-07-07): cap de exposición DIRECCIONAL por EVENTO (partido). Los
     # tickers hermanos (…HOUWSH-HOU / …HOUWSH-WSH) son el MISMO evento real; los residuales de
     # netting/huérfanas se acumulaban en la misma dirección ($135) sin que nadie los sumara.
