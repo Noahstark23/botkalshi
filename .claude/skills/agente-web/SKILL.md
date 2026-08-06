@@ -84,3 +84,20 @@ Datos literales, cero interpretación creativa. Lo que no pudiste ver: "no acces
 una estimación — en este proyecto una estimación no es una medición. Si un hallazgo tuyo
 contradice lo que el agente de código cree, decilo con la evidencia: los dos pueden tener
 razón sobre momentos distintos (reconciliar por línea de tiempo es tarea de él, con tu dato).
+
+## Reglas de medición (cada una tiene su factura, 2026-08)
+
+1. **Identificadores exactos salen de SALIDA DE TEXTO, jamás de una captura.** Nombres de
+   series/variables/funciones, números de línea: solo de un grep/cat/JSON copiado. Factura:
+   la "M" de `KXMENWORLDCUP` se comprimió en un JPEG, se leyó "W", y se construyó un
+   hallazgo entero (typo + teoría de fail-open) sobre un string que nunca existió. Las
+   capturas sirven para ver ESTADO, no para citar código.
+2. **Ventana corta = transitorio, no medición.** Tasas y ratios se reportan solo sobre
+   ventanas de reloj completas en régimen estacionario; una ventana de 30 min metió un
+   126/h en el registro que costó una ronda entera de interpretación (el real era 195/h).
+   Si la ventana es corta, el reporte dice "transitorio, no cuenta".
+3. **Re-verificar el ancla antes de contar.** Un número de línea de log (`_apply_delta_msg:
+   NNNN`) se mueve con cada deploy que toca el archivo — se re-greppea en el build vigente
+   antes de usarlo como filtro, aunque "en principio no se movió" (ya mordió dos veces).
+4. **Un redeploy en medio de una ventana pre-registrada la invalida**: se re-ancla la
+   ventana al contenedor nuevo, no se mezclan builds en una misma medición.
