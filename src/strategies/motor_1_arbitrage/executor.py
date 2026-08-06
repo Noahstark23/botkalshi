@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -15,7 +16,14 @@ from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
 from src.risk.manager import RiskManager
-from src.storage.models import RiskEvent, Trade, _naive_utc_now, engage_kill_switch, get_session
+from src.storage.models import (
+    PortfolioPosition,
+    RiskEvent,
+    Trade,
+    _naive_utc_now,
+    engage_kill_switch,
+    get_session,
+)
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker
 from src.utils.config import get_settings
@@ -98,6 +106,14 @@ class ArbitrageExecutor:
         # para la escalada por repetición.
         self._motor_paused: bool = False
         self._motor_pause_reason: str | None = None
+        # SALIDA de la pausa local (2026-08-06 — regla 11 de desarrollo-bot, violada por
+        # la propia pausa proporcional: nació sin condición de salida y el 05-ago M1 quedó
+        # 5.5 HORAS pausado citando una huérfana que M3 cerró en 2m22s — 27 intentos
+        # rechazados, 479 señales tiradas, y el experimento del mes sesgado). El ticker de
+        # la huérfana que causó la pausa + cuándo se pausó (monotonic) + throttle del check.
+        self._motor_pause_orphan_ticker: str | None = None
+        self._motor_paused_at_mono: float | None = None
+        self._last_release_check_mono: float = 0.0
         # Bug 1: caché del balance real de Kalshi (TTL corto) para el pre-check por arb sin
         # martillar la API. (monotonic_ts, balance_usd); se invalida tras cada place exitoso.
         self._balance_cache: tuple[float, float] | None = None
@@ -196,12 +212,17 @@ class ArbitrageExecutor:
             False — risk check failed, or partial/full placement failure.
         """
         # Pausa LOCAL de Motor 1 (proporcional): corta ANTES de tocar red o riesgo. Es el
-        # equivalente por-motor del kill-switch, para huérfanas chicas.
+        # equivalente por-motor del kill-switch, para huérfanas chicas. Con SALIDA
+        # (2026-08-06): si la huérfana que la causó ya se cerró (M3 la vende en minutos),
+        # este mismo intento libera la pausa y sigue — la pausa dura lo que dura su motivo.
         if self._motor_paused:
-            logger.info(
-                f"ArbitrageExecutor: Motor 1 PAUSADO localmente — {self._motor_pause_reason}"
-            )
-            return False
+            if await self._maybe_release_local_pause():
+                logger.info("ArbitrageExecutor: pausa local LIBERADA — la huérfana se cerró")
+            else:
+                logger.info(
+                    f"ArbitrageExecutor: Motor 1 PAUSADO localmente — {self._motor_pause_reason}"
+                )
+                return False
 
         # Self-healing del breaker ANTES del risk check (que rechaza por is_paused): si la
         # ventana ya se vació y las condiciones se cumplen, este mismo intento despausa y
@@ -807,6 +828,79 @@ class ArbitrageExecutor:
             logger.exception("_recent_aborted_rollbacks: query falló → se asume escalada")
             return 10**6  # fail-CLOSED: si no se puede contar, se escala al global
 
+    # Salida de la pausa local: gracia mínima antes de poder liberar (le da al
+    # PortfolioPoller ≥2 ciclos de 60s para haber VISTO la posición huérfana — sin esto,
+    # una tabla aún no sincronizada se leería como "flat" y liberaría en falso), y
+    # throttle del check de DB (la pausa se evalúa por intento de ejecución).
+    LOCAL_PAUSE_MIN_SEC = 150.0
+    RELEASE_CHECK_EVERY_SEC = 10.0
+
+    async def _maybe_release_local_pause(self) -> bool:
+        """SALIDA de la pausa local por huérfana (2026-08-06 — regla 11: ninguna entrada
+        a modo degradado sin su salida). La pausa proporcional nació sin salida: el 05-ago
+        M3 cerró la huérfana en 2m22s (¡en GANANCIA: +4¢!) y M1 quedó 5.5 horas tirando
+        señales — 27 intentos rechazados citando una huérfana que no existía.
+
+        Libera si y solo si: (a) pasó la gracia mínima (el poller tuvo que haber VISTO la
+        posición — una tabla no sincronizada parecería flat), y (b) NO queda fila en
+        portfolio_positions para el ticker de la huérfana (el poller borra la fila al
+        quedar flat). Fail-CLOSED: cualquier error de lectura mantiene la pausa — soltar
+        un freno exige certeza, no ausencia de datos. Solo toca la pausa LOCAL: el
+        kill-switch global sigue siendo territorio exclusivo de clear_kill_switch.py.
+
+        Devuelve True si liberó (el intento actual continúa)."""
+        ticker = self._motor_pause_orphan_ticker
+        pausado_en = self._motor_paused_at_mono
+        if ticker is None or pausado_en is None:
+            return False  # pausa sin metadata (legacy/manual): la libera un humano
+        now = time.monotonic()
+        if (now - pausado_en) < self.LOCAL_PAUSE_MIN_SEC:
+            return False
+        if (now - self._last_release_check_mono) < self.RELEASE_CHECK_EVERY_SEC:
+            return False
+        self._last_release_check_mono = now
+        try:
+            with get_session() as s:
+                abierta = s.exec(
+                    select(PortfolioPosition).where(PortfolioPosition.ticker == ticker)
+                ).first()
+        except Exception:
+            logger.exception(
+                "release de pausa local: lectura de posiciones falló → la pausa SIGUE "
+                "(fail-closed: soltar un freno exige certeza)"
+            )
+            return False
+        if abierta is not None:
+            return False  # la huérfana sigue abierta: la pausa tiene motivo vigente
+        mensaje = (
+            f"Pausa local de Motor 1 LIBERADA: la huérfana de {ticker} ya no está en "
+            "portfolio_positions (M3/settlement la cerró). El motivo de la pausa dejó "
+            "de existir."
+        )
+        self._motor_paused = False
+        self._motor_pause_reason = None
+        self._motor_pause_orphan_ticker = None
+        self._motor_paused_at_mono = None
+        BotState.motor1_local_pause = None
+        logger.warning(f"motor1.local_pause_released — {mensaje}")
+        try:
+            with get_session() as s:
+                s.add(
+                    RiskEvent(
+                        event_type="orphan_pause_auto_released",
+                        severity="info",
+                        message=mensaje[:500],
+                    )
+                )
+                s.commit()
+        except Exception:
+            logger.exception("release de pausa local: no se pudo persistir el RiskEvent")
+        try:  # best-effort SIEMPRE: Telegram caído no frena la liberación
+            await alert_risk_event("orphan_pause_auto_released", mensaje)
+        except Exception:
+            logger.exception("release de pausa local: alerta Telegram falló")
+        return True
+
     async def _pause_on_aborted_rollback(
         self, leg: ArbLeg, slippage_pct: float, remaining: int = 0
     ) -> None:
@@ -878,6 +972,8 @@ class ArbitrageExecutor:
             # redeploy como bloqueo global — y si se repite, la escalada la convierte en uno.
             self._motor_paused = True
             self._motor_pause_reason = reason
+            self._motor_pause_orphan_ticker = leg.market_ticker  # para la SALIDA automática
+            self._motor_paused_at_mono = time.monotonic()
             BotState.motor1_local_pause = reason  # visible en /status (freno que no se ve = bug)
         else:
             BotState.is_paused = True
