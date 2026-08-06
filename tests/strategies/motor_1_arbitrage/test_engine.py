@@ -38,6 +38,9 @@ def _settings(
     # (la confirmación de persistencia se testea explícita en test_confirm_*).
     s.MOTOR_1_CONFIRM_TICKS = confirm_ticks
     s.MOTOR_1_TICKER_COOLDOWN_SEC = cooldown_sec
+    # Guard de confianza del book APAGADO en los tests preexistentes (su mecánica se
+    # testea explícita en test_m1_confianza_book.py).
+    s.MOTOR_1_BOOK_TRUST_SEC = 0.0
     s.TRADING_ENABLED = trading
     return s
 

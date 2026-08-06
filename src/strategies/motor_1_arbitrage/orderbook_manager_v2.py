@@ -173,6 +173,17 @@ class OrderbookManagerV2:
         self._seam_grace_sec = max(0.0, seam_grace_sec)
         self._seeded_at_mono: dict[str, float] = {}
         self._seam_clamps = 0
+        # INCIDENTES por ticker (2026-08-06, guard de confianza de M1): último instante
+        # (monotonic) en que el book de un ticker mostró evidencia de divergencia PROPIA
+        # — desync, incoherencia o clamp del empalme. Un book con incidente reciente está
+        # "en digestión": sus precios pueden ser fantasmas del re-baseo (forense: el edge
+        # 3.19% y el cruce incoherente de 11¢ eran el mismo book, 0.4s aparte). Acotado
+        # por ticker trackeado, como _seeded_at_mono.
+        # ⚠️ PODA (QA 2026-08-06): hoy NINGÚN dict por-ticker se poda (tampoco _books,
+        # _seeded_at_mono, _close_time_by_ticker...) — acotado por el universo trackeado,
+        # no es fuga. Si algún día se poda _books de tickers settled, la MISMA pasada
+        # debe podar todos estos dicts o quedan huérfanos.
+        self._book_incident_mono: dict[str, float] = {}
         # Anti-espiral: último arranque de recovery por sid + supresiones acumuladas.
         self._last_recovery_start_mono: dict[int, float] = {}
         self._recoveries_suppressed = 0
@@ -478,6 +489,7 @@ class OrderbookManagerV2:
                 state = self._books.get(ticker) if ticker else None
                 if state is not None:
                     state.mark_stale()
+                    self._book_incident_mono[ticker] = time.monotonic()
                     logger.warning(
                         f"v2.desync_quarantine ticker={ticker} sid={sid}: book stale + "
                         "recovery (dejó de servir precios fantasma)"
@@ -564,6 +576,7 @@ class OrderbookManagerV2:
         self._incoherent_tickers.add(ticker)
         self._incoherent_quarantines += 1
         state.mark_stale()
+        self._book_incident_mono[ticker] = time.monotonic()
         logger.warning(
             f"v2.book_incoherent ticker={ticker} sid={sid} yes_bid={yes.best_bid.price_cents} "
             f"no_bid={no.best_bid.price_cents} cruce={cross}¢ > "
@@ -923,6 +936,38 @@ class OrderbookManagerV2:
             )
             self._pending_snapshot_requests[req_id] = (sid, set(batch))
         return True
+
+    def book_incident_age(self, ticker: str) -> float | None:
+        """Segundos desde la última PERTURBACIÓN del book: incidente propio (desync,
+        incoherencia, desync en drain, clamp del empalme) O re-baseo por snapshot
+        (siembra/recovery). Consumidor: el guard de confianza de M1
+        (MOTOR_1_BOOK_TRUST_SEC).
+
+        QA adversarial 2026-08-06 (4 hallazgos convergentes sobre la v1, que anclaba
+        solo al incidente): (a) el re-seed sid-wide por el desync de un HERMANO infla
+        este book SIN incidente propio — la fábrica dominante: 98.3% de los desyncs
+        son de season markets que comparten sid con los GAME que M1 opera; (b) una
+        recovery ≥trust consumía la ventana entera con el book stale (riesgo cero:
+        get_top_of_book da None) y dejaba 0s de protección post-re-baseo, exactamente
+        donde vive el 63.8% de la corrupción del empalme; (c) tras un deploy el dict
+        de incidentes arranca vacío y la siembra masiva de boot quedaba sin embargo.
+        La digestión arranca cuando el book VUELVE A SERVIR, no cuando rompió.
+
+        None = ticker jamás sembrado (sin book el engine no detecta nada igual).
+        Consecuencia deliberada y FAIL-SAFE: en horas de churn (recoveries sid-wide
+        frecuentes) M1 queda mayormente en skip — visible en skips_book_no_confiable
+        del heartbeat. Con 44/44 intentos perdedores medidos, el costo de esperar
+        books estables es cero contra el costo conocido de no esperar; y si los
+        "edges" de M1 jamás sobreviven 60s de book estable, eso ES el veredicto
+        (eran artefactos), medido por el shadow que sigue intacto."""
+        marcas = [
+            m
+            for m in (self._book_incident_mono.get(ticker), self._seeded_at_mono.get(ticker))
+            if m is not None
+        ]
+        if not marcas:
+            return None
+        return time.monotonic() - max(marcas)
 
     async def seed_blind_sids(self) -> int:
         """SIEMBRA EXPLÍCITA de books (P0 2026-08-02): pide el snapshot inicial de los sids
@@ -1301,6 +1346,7 @@ class OrderbookManagerV2:
             except (OrderbookDesyncError, OrderbookSeqRegressionError):
                 self._drain_desyncs += 1
                 state.mark_stale()
+                self._book_incident_mono[msg_ticker] = time.monotonic()
                 logger.warning(
                     f"v2.drain_desync ticker={msg_ticker} sid={sid} seq={msg_seq}: "
                     f"cuarentena y el drain SIGUE (antes abortaba y perdía el resto "
@@ -1380,6 +1426,7 @@ class OrderbookManagerV2:
                 book = self._books.get(ticker)
                 if book is not None:
                     book.mark_stale()
+                self._book_incident_mono[ticker] = time.monotonic()
                 logger.warning(
                     f"v2.drain_desync ticker={ticker} sid={sid} seq={m['seq']}: "
                     f"cuarentena en drain de bootstrap y SIGUE. total={self._drain_desyncs}"
@@ -1475,6 +1522,7 @@ class OrderbookManagerV2:
             )
             if clamped:
                 self._seam_clamps += 1
+                self._book_incident_mono[ticker] = time.monotonic()
                 if self._seam_clamps == 1 or self._seam_clamps % 500 == 0:
                     logger.warning(
                         f"v2.seam_clamp ticker={ticker} price={price_cents} "
