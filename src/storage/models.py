@@ -323,6 +323,14 @@ class MMShadowFill(SQLModel, table=True):
     fee_cents: int = 0  # comisión real del fill (kalshi_fee_cents con count)
     rule: str = Field(max_length=50)  # p.ej. "ask 38 < bid 40"
     inventory_after: int = 0
+    # Fair-at-fill (2026-08-07): la pregunta central del A/B de M5 es si el fill capturó
+    # spread o fue selección adversa (el fair se movió y el mercado nos cruzó). Sin el
+    # fair DEL MOMENTO del fill era incontestable: 66 fills históricos sin el dato.
+    # Nullable: las filas viejas quedan NULL y el análisis las excluye.
+    quote_fair_prob: float | None = None  # fair sobre el que se construyó la quote (tick t−1)
+    fill_fair_prob: float | None = None  # fair vigente al detectar el cruce (tick t)
+    yes_bid: int | None = None  # top-of-book YES en el tick del fill
+    yes_ask: int | None = None
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 
@@ -444,6 +452,12 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
     ("portfolio_positions", "peak_bid_cents", "INTEGER"),  # Motor 3 FASE 2: trailing stop
     ("trades", "filled_count", "INTEGER"),  # Motor 5 F2: fills parciales de resting orders
+    # Motor 5 fair-at-fill: sin el fair del momento del fill, el A/B no puede separar
+    # spread capturado de selección adversa (el dato que faltaba para graduar/archivar).
+    ("mm_shadow_fills", "quote_fair_prob", "FLOAT"),
+    ("mm_shadow_fills", "fill_fair_prob", "FLOAT"),
+    ("mm_shadow_fills", "yes_bid", "INTEGER"),
+    ("mm_shadow_fills", "yes_ask", "INTEGER"),
 ]
 
 
