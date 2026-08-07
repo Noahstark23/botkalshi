@@ -220,7 +220,9 @@ class Motor5Engine:
             prev = self._live_quotes.get(ticker)
             if prev is not None and self._executor is None:
                 try:
-                    counters["fills"] += self._settle_fills(prev, yes_bid, yes_ask)
+                    counters["fills"] += self._settle_fills(
+                        prev, yes_bid, yes_ask, fill_fair_prob=fv.fair_prob
+                    )
                 except Exception:
                     # Estado del ticker en duda → quote fuera y re-sync el próximo tick.
                     self._live_quotes.pop(ticker, None)
@@ -312,17 +314,45 @@ class Motor5Engine:
             )
         return applied
 
-    def _settle_fills(self, quote: QuoteSet, yes_bid: int | None, yes_ask: int | None) -> int:
-        """Aplica los fills hipotéticos de la quote resting contra el book actual."""
+    def _settle_fills(
+        self,
+        quote: QuoteSet,
+        yes_bid: int | None,
+        yes_ask: int | None,
+        *,
+        fill_fair_prob: float,
+    ) -> int:
+        """Aplica los fills hipotéticos de la quote resting contra el book actual.
+
+        Fair-at-fill (2026-08-07): junto con el fill se registra el fair VIGENTE (el del
+        ciclo que detectó el cruce) además del fair de la quote (tick t−1). La resta de
+        ambos separa la pregunta del A/B: edge≥0 contra el fair vigente = spread capturado;
+        edge<0 = el fair se movió y el mercado nos cruzó (selección adversa). El dato se
+        persiste crudo (probs + book) y el juicio lo hace el análisis, no el hot path."""
         fills = fills_for_quote(quote, best_yes_bid=yes_bid, best_yes_ask=yes_ask)
         for fill in fills:
             inv = self._inventory.apply_fill(fill)
+            fill_fair_cents = fill_fair_prob * 100.0
+            edge_c = (
+                fill_fair_cents - fill.price_cents
+                if fill.side == "buy"
+                else fill.price_cents - fill_fair_cents
+            )
+            drift_c = (fill_fair_prob - quote.fair_prob) * 100.0
             logger.info(
                 f"[MOTOR 5 SHADOW] fill {fill.side} {fill.count}x{fill.ticker} "
                 f"@{fill.price_cents}c ({fill.rule}) net={inv.net_contracts} "
-                f"cash={inv.cash_cents}c fees={inv.fees_cents}c"
+                f"cash={inv.cash_cents}c fees={inv.fees_cents}c "
+                f"edge={edge_c:+.1f}c drift={drift_c:+.1f}c"
             )
-            self._persist_fill(fill, inv.net_contracts)
+            self._persist_fill(
+                fill,
+                inv.net_contracts,
+                quote_fair_prob=quote.fair_prob,
+                fill_fair_prob=fill_fair_prob,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+            )
         return len(fills)
 
     def _record_mark(
@@ -400,7 +430,16 @@ class Motor5Engine:
         except Exception:
             logger.exception("motor5.persist_quote_error")
 
-    def _persist_fill(self, fill, inventory_after: int) -> None:
+    def _persist_fill(
+        self,
+        fill,
+        inventory_after: int,
+        *,
+        quote_fair_prob: float | None = None,
+        fill_fair_prob: float | None = None,
+        yes_bid: int | None = None,
+        yes_ask: int | None = None,
+    ) -> None:
         from src.math.fees import kalshi_fee_cents
 
         try:
@@ -414,6 +453,14 @@ class Motor5Engine:
                         fee_cents=kalshi_fee_cents(fill.count, fill.price_cents),
                         rule=fill.rule[:50],
                         inventory_after=inventory_after,
+                        quote_fair_prob=round(quote_fair_prob, 4)
+                        if quote_fair_prob is not None
+                        else None,
+                        fill_fair_prob=round(fill_fair_prob, 4)
+                        if fill_fair_prob is not None
+                        else None,
+                        yes_bid=yes_bid,
+                        yes_ask=yes_ask,
                     )
                 )
                 s.commit()
