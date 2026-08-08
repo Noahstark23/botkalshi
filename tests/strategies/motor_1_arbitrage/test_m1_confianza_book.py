@@ -145,6 +145,54 @@ async def test_reseed_por_hermano_tambien_embarga():
 
 
 # =====================================================
+# Atribución de FUENTE del embargo (2026-08-08, calibración del guard)
+# =====================================================
+# 495/495 skips en 20h no distinguen "el guard frena fantasmas" de "las recoveries
+# sid-wide re-arman el embargo más rápido de lo que expira". book_trust_info separa
+# las hipótesis: la distribución incidente/siembra decide QUÉ palanca calibrar.
+
+
+async def test_fuente_siembra_para_book_sembrado_sin_incidente():
+    manager = _manager()
+    await manager.handle_message(_snapshot("TICK", seq=1))
+
+    edad, fuente = manager.book_trust_info("TICK")
+    assert fuente == "siembra" and edad < 1.0
+
+
+async def test_fuente_incidente_cuando_el_desync_es_posterior_a_la_siembra():
+    manager = _manager()
+    await manager.handle_message(_snapshot("TICK", seq=1))
+    manager._seeded_at_mono["TICK"] -= 100.0
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(_delta("TICK", seq=2, delta="-500.00"))
+
+    edad, fuente = manager.book_trust_info("TICK")
+    assert fuente == "incidente" and edad < 1.0
+
+
+async def test_fuente_siembra_cuando_el_rebaseo_es_posterior_al_incidente():
+    """El caso dominante en producción: incidente viejo, pero la recovery sid-wide
+    acaba de re-basear — el embargo vigente lo causó la SIEMBRA, no el incidente."""
+    manager = _manager()
+    await manager.handle_message(_snapshot("TICK", seq=1))
+    with pytest.raises(OrderbookDesyncError):
+        await manager.handle_message(_delta("TICK", seq=2, delta="-500.00"))
+    manager._book_incident_mono["TICK"] -= 100.0  # el incidente fue hace 100s
+    rid = manager._pending_req_id_for_sid(1)
+    msg = _snapshot("TICK", seq=50)
+    msg["id"] = rid
+    await manager.handle_message(msg)  # la recovery re-basea AHORA
+
+    edad, fuente = manager.book_trust_info("TICK")
+    assert fuente == "siembra" and edad < 1.0
+
+
+async def test_book_trust_info_none_sin_marcas():
+    assert _manager().book_trust_info("JAMAS-VISTO") is None
+
+
+# =====================================================
 # El engine corta SOLO la ejecución (el shadow sigue)
 # =====================================================
 
@@ -160,7 +208,9 @@ def _engine_con_arb(trust_sec: float, incidente_hace: float | None):
     top_no.best_bid.price_cents = 45  # yes_ask_synth = 55 → 55+40=95 < 100: arb
     top_no.best_bid.size = 50
     manager.get_top_of_book.side_effect = lambda t, side: top_yes if side == "yes" else top_no
-    manager.book_incident_age.return_value = None if incidente_hace is None else incidente_hace
+    manager.book_trust_info.return_value = (
+        None if incidente_hace is None else (incidente_hace, "incidente")
+    )
 
     settings = MagicMock()
     settings.TRADING_ENABLED = True
@@ -188,7 +238,21 @@ async def test_incidente_reciente_corta_la_ejecucion_pero_no_el_shadow():
     assert engine._signals_seen == 1  # la señal se vio
     engine._record_edge_window.assert_called_once()  # y el shadow la grabó
     assert engine._skips_untrusted == 1  # pero la ejecución se cortó
+    assert engine._skips_por_fuente == {"incidente": 1}  # con la fuente atribuida
     assert engine._exec_task is None  # sin orden lanzada
+
+
+async def test_skip_por_siembra_alimenta_su_propio_contador():
+    """El desglose del heartbeat: un embargo causado por re-siembra rutinaria cuenta
+    en 'siembra', no en 'incidente' — la distribución decide la calibración."""
+    engine = _engine_con_arb(trust_sec=60.0, incidente_hace=0.4)
+    engine._manager.book_trust_info.return_value = (0.4, "siembra")
+
+    await engine._tick()
+
+    assert engine._skips_untrusted == 1
+    assert engine._skips_por_fuente == {"siembra": 1}
+    assert engine._exec_task is None
 
 
 async def test_book_con_historia_limpia_ejecuta():

@@ -93,6 +93,10 @@ class Motor1Engine:
         # Guard de confianza del book (2026-08-06): ejecuciones salteadas por incidente
         # reciente del ticker (visible en el heartbeat — un freno que no se ve = bug).
         self._skips_untrusted = 0
+        # Desglose por fuente del embargo (2026-08-08): con 495/495 skips el agregado
+        # no distingue "frena fantasmas" de "las re-siembras rutinarias re-arman el
+        # embargo más rápido de lo que expira". La calibración se decide con esto.
+        self._skips_por_fuente: dict[str, int] = {}
 
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "LIVE" if self._executor is not None else "SHADOW"
@@ -156,7 +160,9 @@ class Motor1Engine:
             logger.info(
                 f"motor1.engine.heartbeat ticks={self._ticks} "
                 f"tracked={len(self._manager.tracked_tickers)} signals={self._signals_seen} "
-                f"skips_book_no_confiable={self._skips_untrusted}"
+                f"skips_book_no_confiable={self._skips_untrusted} "
+                f"(incidente={self._skips_por_fuente.get('incidente', 0)} "
+                f"siembra={self._skips_por_fuente.get('siembra', 0)})"
             )
 
         for ticker in self._manager.tracked_tickers:
@@ -187,13 +193,15 @@ class Motor1Engine:
             # cruce fantasma de 2-5¢ cae DENTRO de la banda plausible.
             trust = self.settings.MOTOR_1_BOOK_TRUST_SEC
             if trust > 0:
-                edad = self._manager.book_incident_age(ticker)
-                if edad is not None and edad < trust:
+                info = self._manager.book_trust_info(ticker)
+                if info is not None and info[0] < trust:
+                    edad, fuente = info
                     self._skips_untrusted += 1
+                    self._skips_por_fuente[fuente] = self._skips_por_fuente.get(fuente, 0) + 1
                     logger.info(
                         f"motor1.exec.book_no_confiable ticker={ticker} "
-                        f"incidente_hace={edad:.1f}s < {trust:.0f}s → NO ejecuta "
-                        f"(total_skips={self._skips_untrusted})"
+                        f"incidente_hace={edad:.1f}s < {trust:.0f}s fuente={fuente} "
+                        f"→ NO ejecuta (total_skips={self._skips_untrusted})"
                     )
                     continue
 
