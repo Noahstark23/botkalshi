@@ -256,6 +256,19 @@ class Settings(BaseSettings):
         le=600.0,
         description="Segundos sin perturbaciones (incidente O re-baseo/siembra) que exige el book de un ticker para EJECUTAR (Motor 1)",
     )
+    # SPLIT del guard por fuente (2026-08-08): la primera lectura etiquetada (#219) dio
+    # 31/31 skips fuente=siembra, 0 incidente — el guard al 100% lo causan las re-siembras
+    # sid-wide rutinarias (una cada ~15s con juegos), no incidentes reales. Una siembra
+    # limpia digiere en ~ORDERBOOK_V2_SEAM_GRACE_SEC; no necesita los 60s del incidente.
+    # 0 = SIN split (el umbral de arriba aplica a todo, comportamiento actual). El valor
+    # se fija con la distribución medida del slate (mediana siembra 23.4s en la primera
+    # muestra) — no a ciegas.
+    MOTOR_1_SEED_TRUST_SEC: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=600.0,
+        description="Umbral SEPARADO (seg) para embargos por SIEMBRA limpia (re-baseo sin incidente propio). 0 = sin split: aplica MOTOR_1_BOOK_TRUST_SEC a todo",
+    )
     # Bug 2 (incidente 2026-07-07): cap de exposición DIRECCIONAL por EVENTO (partido). Los
     # tickers hermanos (…HOUWSH-HOU / …HOUWSH-WSH) son el MISMO evento real; los residuales de
     # netting/huérfanas se acumulaban en la misma dirección ($135) sin que nadie los sumara.
