@@ -645,6 +645,14 @@ class Settings(BaseSettings):
     # MULTI_SERIES (Motor REST, winner-take-all ≥3 legs): Motor 2 también opera 2-way
     # (MLB/NBA moneyline) que el arb NO toca. Coma-separado, tuneable por env — sumar
     # KXNBAGAME/KXNHLGAME aquí onboarda esos deportes a Motor 2 sin tocar código.
+    # DISCOVERY: series EXACTAS extra que el feed WS descubre y suscribe, ADEMÁS de la
+    # lista base (data_capture.TARGET_SERIES_PREFIXES). Es la palanca de expansión de
+    # universo (2026-08-08): MOTOR2_SERIES/MULTI_SERIES solo FILTRAN sobre lo trackeado
+    # — sin la serie acá (o en la base), ningún motor la ve. Ej.: KXNFLGAME,KXEPLGAME.
+    DISCOVERY_EXTRA_SERIES: str = Field(
+        default="",
+        description="Series exactas extra del discovery WS (coma-separadas). Vacío = solo la base.",
+    )
     MOTOR2_SERIES: str = "KXMLBGAME,KXWCGAME,KXWCGROUPWIN,KXMENWORLDCUP,KXMWORLDCUP"
     # Umbral de edge NETO post-comisión de Motor 2, en PUNTOS PORCENTUALES (3.0 = 3pp).
     # Tuneable sin tocar código: subilo (ej. 4-5) para filtrar señales marginales pegadas

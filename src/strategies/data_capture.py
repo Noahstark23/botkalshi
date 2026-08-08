@@ -70,6 +70,29 @@ TARGET_SERIES_PREFIXES = [
 ]
 
 
+def discovery_series(settings) -> list[str]:
+    """Series efectivas del discovery: la lista base + DISCOVERY_EXTRA_SERIES (env).
+
+    Punto ciego 2026-08-08: MOTOR2_SERIES filtra SOBRE lo que el discovery trackea —
+    no descubre nada por sí solo. El experimento NFL de M2 llevaba KXNFLGAME en
+    MOTOR2_SERIES pero esta lista solo tenía KXNFL (el futuro de campeón, no los
+    partidos): el lado Kalshi corría estructuralmente ciego y "0 señales NFL" habría
+    sido un artefacto de config, no un veredicto. Regla 6 (config, no hardcode): las
+    series GAME nuevas entran por env — misma palanca para expandir el universo de
+    M1 (más partidos = más n) sin tocar código. Dedup preservando el orden base.
+
+    Recibe el settings del caller (no llama get_settings): LECTURA falla abierta —
+    un valor no-string (settings mockeado, env corrupto) degrada a "sin extras", la
+    lista base jamás se pierde."""
+    extras_raw = getattr(settings, "DISCOVERY_EXTRA_SERIES", "")
+    if not isinstance(extras_raw, str):
+        extras_raw = ""
+    extras = [s.strip() for s in extras_raw.split(",") if s.strip()]
+    series = list(TARGET_SERIES_PREFIXES)
+    series.extend(s for s in extras if s not in series)
+    return series
+
+
 def parse_price_to_cents(value: object) -> int | None:
     """
     Convierte precio a centavos enteros.
@@ -498,7 +521,7 @@ class DataCaptureService:
         per_series: dict[str, int] = {}
         errors_by_prefix: dict[str, str] = {}
         async with KalshiRestClient() as client:
-            for prefix in TARGET_SERIES_PREFIXES:
+            for prefix in discovery_series(self.settings):
                 try:
                     # limit=200 (máx de Kalshi): el Mundial tiene 104 partidos — una serie
                     # como KXFIFAGAME clipea con limit=100 y perderíamos eventos.

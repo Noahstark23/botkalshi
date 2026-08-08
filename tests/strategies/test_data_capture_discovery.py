@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.strategies.data_capture import DataCaptureService
+from src.strategies.data_capture import DataCaptureService, discovery_series
 
 
 @pytest.fixture
@@ -211,3 +211,50 @@ async def test_rediscovery_survives_failures_best_effort(service):
 
     assert calls["n"] == 2  # sobrevivió el fallo y reintentó
     mock_state.record_error.assert_called()
+
+
+# =====================================================
+# discovery_series(): la lista base + DISCOVERY_EXTRA_SERIES (env)
+# =====================================================
+# Punto ciego 2026-08-08: MOTOR2_SERIES filtra SOBRE lo trackeado — no descubre nada.
+# El experimento NFL llevaba KXNFLGAME en MOTOR2_SERIES pero el discovery solo conocía
+# KXNFL (futuro de campeón): el lado Kalshi corría ciego. Las series GAME nuevas
+# entran por env, sin tocar código.
+
+
+def _settings_con_extras(extras: str) -> MagicMock:
+    s = MagicMock()
+    s.DISCOVERY_EXTRA_SERIES = extras
+    return s
+
+
+def test_discovery_series_default_vacio_es_solo_la_base():
+    with patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXMLBGAME"]):
+        assert discovery_series(_settings_con_extras("")) == ["KXMLB", "KXMLBGAME"]
+
+
+def test_discovery_series_extras_se_agregan_al_final():
+    with patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB"]):
+        assert discovery_series(_settings_con_extras(" KXNFLGAME , KXEPLGAME ")) == [
+            "KXMLB",
+            "KXNFLGAME",
+            "KXEPLGAME",
+        ]
+
+
+def test_discovery_series_dedup_contra_la_base():
+    """CONTROL: repetir una serie de la base en el env no la duplica (dos pasadas de
+    list_events sobre la misma serie serían el doble de requests y de pausas)."""
+    with patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB", "KXMLBGAME"]):
+        assert discovery_series(_settings_con_extras("KXMLBGAME,KXNFLGAME")) == [
+            "KXMLB",
+            "KXMLBGAME",
+            "KXNFLGAME",
+        ]
+
+
+def test_discovery_series_settings_mockeado_degrada_a_base():
+    """FAIL-SAFE de lectura: un settings sin el campo como string (mock del harness,
+    env corrupto) NO rompe el discovery — degrada a la lista base."""
+    with patch("src.strategies.data_capture.TARGET_SERIES_PREFIXES", ["KXMLB"]):
+        assert discovery_series(MagicMock()) == ["KXMLB"]
