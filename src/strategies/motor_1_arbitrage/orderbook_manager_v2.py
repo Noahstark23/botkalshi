@@ -960,14 +960,31 @@ class OrderbookManagerV2:
         books estables es cero contra el costo conocido de no esperar; y si los
         "edges" de M1 jamás sobreviven 60s de book estable, eso ES el veredicto
         (eran artefactos), medido por el shadow que sigue intacto."""
-        marcas = [
-            m
-            for m in (self._book_incident_mono.get(ticker), self._seeded_at_mono.get(ticker))
-            if m is not None
-        ]
-        if not marcas:
+        info = self.book_trust_info(ticker)
+        return None if info is None else info[0]
+
+    def book_trust_info(self, ticker: str) -> tuple[float, str] | None:
+        """(edad_seg, fuente) de la última perturbación del book, con la ATRIBUCIÓN
+        que el contador agregado no puede dar: fuente="incidente" (desync, incoherencia,
+        clamp — evidencia de divergencia PROPIA) o fuente="siembra" (re-baseo por
+        snapshot sin incidente propio: boot, recovery sid-wide por un hermano).
+
+        El discriminador de la calibración del guard (2026-08-08): 495/495 skips en
+        20h no distinguen entre "el guard frena fantasmas reales" y "las recoveries
+        sid-wide (una cada ~15s con juegos vivos) re-arman el embargo más rápido de
+        lo que expira, y la precondición book-confiable es inalcanzable POR
+        CONSTRUCCIÓN justo cuando M1 señala". Si la distribución carga en "siembra",
+        la palanca es acortar el embargo de re-siembras limpias — no bajar el trust
+        de los incidentes. Empate de marcas → "incidente" (la atribución severa)."""
+        inc = self._book_incident_mono.get(ticker)
+        seed = self._seeded_at_mono.get(ticker)
+        if inc is None and seed is None:
             return None
-        return time.monotonic() - max(marcas)
+        if seed is None or (inc is not None and inc >= seed):
+            marca, fuente = inc, "incidente"
+        else:
+            marca, fuente = seed, "siembra"
+        return time.monotonic() - marca, fuente
 
     async def seed_blind_sids(self) -> int:
         """SIEMBRA EXPLÍCITA de books (P0 2026-08-02): pide el snapshot inicial de los sids
