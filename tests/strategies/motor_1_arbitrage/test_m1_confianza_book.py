@@ -197,7 +197,7 @@ async def test_book_trust_info_none_sin_marcas():
 # =====================================================
 
 
-def _engine_con_arb(trust_sec: float, incidente_hace: float | None):
+def _engine_con_arb(trust_sec: float, incidente_hace: float | None, seed_trust: float = 0.0):
     """Engine LIVE con un arb detectable en 'TICK' y el incidente configurado."""
     manager = MagicMock()
     manager.tracked_tickers = ["TICK"]
@@ -220,6 +220,7 @@ def _engine_con_arb(trust_sec: float, incidente_hace: float | None):
     settings.MOTOR_1_CONFIRM_TICKS = 1
     settings.MOTOR_1_TICKER_COOLDOWN_SEC = 60.0
     settings.MOTOR_1_BOOK_TRUST_SEC = trust_sec
+    settings.MOTOR_1_SEED_TRUST_SEC = seed_trust
 
     with patch("src.strategies.motor_1_arbitrage.engine.get_settings", return_value=settings):
         engine = Motor1Engine(manager, executor=AsyncMock())
@@ -286,3 +287,65 @@ async def test_trust_cero_desactiva_el_guard():
     assert engine._skips_untrusted == 0
     assert engine._exec_task is not None
     engine._exec_task.cancel()
+
+
+# =====================================================
+# SPLIT de umbral por fuente (2026-08-08): siembra limpia ≠ incidente
+# =====================================================
+# Primera lectura etiquetada del guard (#219 en producción): 31/31 skips
+# fuente=siembra, 0 incidente, mediana 23.4s — el 100% de bloqueo lo causan las
+# re-siembras sid-wide rutinarias re-armando el embargo de 60s, no incidentes.
+# MOTOR_1_SEED_TRUST_SEC pone un umbral SEPARADO para siembras limpias; 0 = sin
+# split. El VALOR lo fija el operador con la distribución del slate, no el código.
+
+
+async def test_sin_split_la_siembra_usa_el_umbral_general():
+    """CONTROL (default 0): sin split, una siembra de 20s sigue bloqueada por los 60s
+    — exactamente el comportamiento desplegado hoy. Pinnea que el default no destraba."""
+    engine = _engine_con_arb(trust_sec=60.0, incidente_hace=None, seed_trust=0.0)
+    engine._manager.book_trust_info.return_value = (20.0, "siembra")
+
+    await engine._tick()
+
+    assert engine._skips_untrusted == 1
+    assert engine._skips_por_fuente == {"siembra": 1}
+    assert engine._exec_task is None
+
+
+async def test_con_split_la_siembra_digerida_ejecuta():
+    """MECANISMO: con seed_trust=15, una siembra de 23.4s (la mediana medida) ya
+    digirió — la ejecución se lanza. El embargo de siembra deja de ser perpetuo."""
+    engine = _engine_con_arb(trust_sec=60.0, incidente_hace=None, seed_trust=15.0)
+    engine._manager.book_trust_info.return_value = (23.4, "siembra")
+
+    await engine._tick()
+
+    assert engine._skips_untrusted == 0
+    assert engine._exec_task is not None
+    engine._exec_task.cancel()
+
+
+async def test_con_split_la_siembra_fresca_sigue_bloqueada():
+    """CONTROL: seed_trust=15 NO abre la ventana del empalme — una siembra de 9s
+    (el mínimo global medido fue 9.2s) sigue en digestión y bloqueada."""
+    engine = _engine_con_arb(trust_sec=60.0, incidente_hace=None, seed_trust=15.0)
+    engine._manager.book_trust_info.return_value = (9.0, "siembra")
+
+    await engine._tick()
+
+    assert engine._skips_untrusted == 1
+    assert engine._skips_por_fuente == {"siembra": 1}
+    assert engine._exec_task is None
+
+
+async def test_con_split_el_incidente_conserva_sus_60s():
+    """LA MITAD QUE NO SE NEGOCIA: el split jamás acorta el embargo de un incidente
+    propio — 23.4s post-desync sigue bloqueado aunque seed_trust=15 (el forense del
+    21:02 fue un incidente, no una siembra)."""
+    engine = _engine_con_arb(trust_sec=60.0, incidente_hace=23.4, seed_trust=15.0)
+
+    await engine._tick()
+
+    assert engine._skips_untrusted == 1
+    assert engine._skips_por_fuente == {"incidente": 1}
+    assert engine._exec_task is None

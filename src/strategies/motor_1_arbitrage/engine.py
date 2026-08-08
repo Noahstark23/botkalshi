@@ -194,16 +194,25 @@ class Motor1Engine:
             trust = self.settings.MOTOR_1_BOOK_TRUST_SEC
             if trust > 0:
                 info = self._manager.book_trust_info(ticker)
-                if info is not None and info[0] < trust:
+                if info is not None:
                     edad, fuente = info
-                    self._skips_untrusted += 1
-                    self._skips_por_fuente[fuente] = self._skips_por_fuente.get(fuente, 0) + 1
-                    logger.info(
-                        f"motor1.exec.book_no_confiable ticker={ticker} "
-                        f"incidente_hace={edad:.1f}s < {trust:.0f}s fuente={fuente} "
-                        f"→ NO ejecuta (total_skips={self._skips_untrusted})"
-                    )
-                    continue
+                    # SPLIT por fuente (2026-08-08): la primera lectura etiquetada dio
+                    # 31/31 fuente=siembra, 0 incidente — el embargo lo re-arman las
+                    # re-siembras rutinarias, no los incidentes. Una re-siembra limpia
+                    # digiere en ~seam_grace, no necesita los 60s del incidente. El
+                    # umbral de siembra es SEPARADO y default 0 = sin split (60s para
+                    # todo): el valor lo fija el operador con la distribución del slate.
+                    seed_trust = self.settings.MOTOR_1_SEED_TRUST_SEC
+                    umbral = seed_trust if (fuente == "siembra" and seed_trust > 0) else trust
+                    if edad < umbral:
+                        self._skips_untrusted += 1
+                        self._skips_por_fuente[fuente] = self._skips_por_fuente.get(fuente, 0) + 1
+                        logger.info(
+                            f"motor1.exec.book_no_confiable ticker={ticker} "
+                            f"edad_book={edad:.1f}s < {umbral:.0f}s fuente={fuente} "
+                            f"→ NO ejecuta (total_skips={self._skips_untrusted})"
+                        )
+                        continue
 
             # Umbral FINO de ejecución (distinto del MIN_EDGE_PCT de detección).
             if opp.edge_pct < self.settings.MOTOR_1_EXECUTION_EDGE_PCT:
