@@ -173,6 +173,10 @@ class OrderbookManagerV2:
         self._seam_grace_sec = max(0.0, seam_grace_sec)
         self._seeded_at_mono: dict[str, float] = {}
         self._seam_clamps = 0
+        # Siembras idénticas (2026-08-09): re-baseos que confirmaron el book sano sin
+        # cambiarlo → no re-arman embargo. El contador mide qué fracción del churn de
+        # recoveries sid-wide era ruido puro (la hipótesis del 68% siembra de M1).
+        self._identical_seeds = 0
         # INCIDENTES por ticker (2026-08-06, guard de confianza de M1): último instante
         # (monotonic) en que el book de un ticker mostró evidencia de divergencia PROPIA
         # — desync, incoherencia o clamp del empalme. Un book con incidente reciente está
@@ -664,6 +668,7 @@ class OrderbookManagerV2:
             "deferred_recoveries_fired_total": self._deferred_fired,
             "drain_desyncs_total": self._drain_desyncs,
             "seam_clamps_total": self._seam_clamps,
+            "identical_seeds_total": self._identical_seeds,
             "deltas_total": self._deltas_total,
             "deltas_fractional_total": self._deltas_fractional,
             # Anti-espiral (2026-07-31): recoveries suprimidas por el rate-limit. Alto y
@@ -1402,14 +1407,36 @@ class OrderbookManagerV2:
         yes_levels = _parse_fp_levels(yes_raw, ticker, "yes")
         no_levels = _parse_fp_levels(no_raw, ticker, "no")
 
+        # SIEMBRA IDÉNTICA (2026-08-09): un snapshot que re-basea un book SANO con el
+        # MISMO contenido no es una perturbación — el exchange confirmó nuestro estado,
+        # no hay empalme que digerir. La cadena que mataba a M1: desync de un hermano →
+        # recovery sid-wide → re-baseo idéntico de los books sanos del sid → embargo de
+        # 60s re-armado por nada (medido 2026-08-09: 68% de 733 skips fuente=siembra,
+        # edad media 24s, 85/85 edges ejecutables bloqueados). Un book stale o sin
+        # inicializar JAMÁS confirma identidad (snapshot_equals lo garantiza): la
+        # cuarentena siempre re-arma. La gracia del empalme tampoco se reabre: si el
+        # contenido es idéntico no hay removals perdidos, y un underflow posterior es
+        # señal real de desync, no artefacto de costura.
+        estado_previo = self._books.get(ticker)
+        siembra_identica = estado_previo is not None and estado_previo.snapshot_equals(
+            {"yes": yes_levels, "no": no_levels}
+        )
+
         if ticker not in self._books:
             self._books[ticker] = OrderbookState(ticker)
 
         self._books[ticker].apply_snapshot({"seq": seq, "yes": yes_levels, "no": no_levels})
-        # Arranca la ventana de gracia del empalme (2026-08-05): los primeros segundos
-        # post-siembra concentran el 63.8% de los desyncs (contenido del snapshot más
-        # viejo que su sello) — en esa ventana el underflow se clampea, no desincroniza.
-        self._seeded_at_mono[ticker] = time.monotonic()
+        if siembra_identica:
+            self._identical_seeds += 1
+            logger.debug(
+                f"v2.siembra_identica ticker={ticker} seq={seq}: contenido confirmado — "
+                f"embargo NO re-armado. total={self._identical_seeds}"
+            )
+        else:
+            # Arranca la ventana de gracia del empalme (2026-08-05): los primeros segundos
+            # post-siembra concentran el 63.8% de los desyncs (contenido del snapshot más
+            # viejo que su sello) — en esa ventana el underflow se clampea, no desincroniza.
+            self._seeded_at_mono[ticker] = time.monotonic()
 
         # Drenar deltas pre-snapshot encolados para este ticker (bootstrap reordenado).
         self._drain_bootstrap_buffer(raw_msg["sid"], ticker, seq)
