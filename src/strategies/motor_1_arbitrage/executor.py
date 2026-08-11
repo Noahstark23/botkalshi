@@ -531,6 +531,15 @@ class ArbitrageExecutor:
                     # el precio efectivo — se anota como estimación en notes).
                     self._settle_rollback_fill(original_coid, leg, sold, current_bid)
                     remaining -= sold
+                    # Log AFIRMATIVO del éxito (sonda 2026-08-11): este era el ÚNICO
+                    # desenlace silencioso del rollback — el operador tenía que inferir
+                    # "vendió" de la ausencia de rollback_aborted y de pausa. El éxito
+                    # se afirma, no se deduce.
+                    logger.info(
+                        f"rollback: VENDIDO {sold}x {leg.market_ticker} ({leg.side}) "
+                        f"@~{current_bid}¢ — pérdida realizada en DB "
+                        f"(quedan {remaining}, attempt {attempt + 1})"
+                    )
                     if remaining > 0:
                         logger.warning(
                             f"rollback: fill parcial {sold}, quedan {remaining} "
