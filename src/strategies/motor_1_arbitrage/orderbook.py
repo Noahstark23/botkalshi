@@ -247,29 +247,38 @@ class OrderbookState:
         yes_ask_levels = snapshot.get("yes_asks") or []
         no_ask_levels = snapshot.get("no_asks") or []
 
+        # SUMA en colisión de bucket (forense 2026-08-11): los precios sub-céntimo del
+        # fixed-point de Kalshi colapsan niveles DISTINTOS en el mismo centavo entero
+        # (0.9950/0.9960/0.9990 → bucket 100). La sobreescritura (dict[price] = size)
+        # perdía el nivel anterior y el removal posterior underfloweaba: el desync
+        # crónico cada ~23s de los season markets (qty=-1964 = 36 − 2000), cuya
+        # recovery sid-wide re-embargaba los GAME y cegaba a M1 (1032/1054 skips).
+        # Con suma acá y suma en apply_delta (qty = current + delta), un bucket jamás
+        # va negativo por mensajes en secuencia: el removal de cualquier nivel cae en
+        # el bucket donde cayeron sus adds.
         new_yes_bids: dict[int, int] = {}
         for lvl in yes_levels:
             price, size = _parse_level(lvl, "yes bids")
             if size > 0:
-                new_yes_bids[price] = size
+                new_yes_bids[price] = new_yes_bids.get(price, 0) + size
 
         new_no_bids: dict[int, int] = {}
         for lvl in no_levels:
             price, size = _parse_level(lvl, "no bids")
             if size > 0:
-                new_no_bids[price] = size
+                new_no_bids[price] = new_no_bids.get(price, 0) + size
 
         new_yes_asks: dict[int, int] = {}
         for lvl in yes_ask_levels:
             price, size = _parse_level(lvl, "yes asks")
             if size > 0:
-                new_yes_asks[price] = size
+                new_yes_asks[price] = new_yes_asks.get(price, 0) + size
 
         new_no_asks: dict[int, int] = {}
         for lvl in no_ask_levels:
             price, size = _parse_level(lvl, "no asks")
             if size > 0:
-                new_no_asks[price] = size
+                new_no_asks[price] = new_no_asks.get(price, 0) + size
 
         # Atomic replace
         self._yes_bids = new_yes_bids
