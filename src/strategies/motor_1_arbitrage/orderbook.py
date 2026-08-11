@@ -281,6 +281,37 @@ class OrderbookState:
         self._is_stale = False
         self._initialized = True
 
+    def snapshot_equals(self, snapshot: dict) -> bool:
+        """True si el contenido del snapshot (bids YES/NO con size>0) es IDÉNTICO al
+        book vivo. Solo un book sano puede confirmar identidad: sin inicializar o
+        stale devuelve False (su contenido es sospechoso por definición — la
+        cuarentena exige re-baseo real).
+
+        Consumidor: el manager V2 (2026-08-09) — una re-siembra sid-wide cuyo
+        snapshot coincide con el book que ya servíamos no es una perturbación (no
+        hay empalme que digerir: el exchange CONFIRMÓ nuestro estado) y no debe
+        re-armar el embargo de confianza de M1."""
+        if not self._initialized or self._is_stale:
+            return False
+        new_yes: dict[int, int] = {}
+        for lvl in snapshot.get("yes") or []:
+            price, size = _parse_level(lvl, "yes bids")
+            if size > 0:
+                new_yes[price] = size
+        new_no: dict[int, int] = {}
+        for lvl in snapshot.get("no") or []:
+            price, size = _parse_level(lvl, "no bids")
+            if size > 0:
+                new_no[price] = size
+        # Los asks entran a la comparación: el snapshot WS no trae asks (quedarían {}),
+        # así que un book vivo CON asks difiere y re-arma — conservador.
+        return (
+            new_yes == self._yes_bids
+            and new_no == self._no_bids
+            and not self._yes_asks
+            and not self._no_asks
+        )
+
     def apply_delta(self, delta: dict, *, clamp_underflow: bool = False) -> bool:
         """
         Aplica un delta del WebSocket validando monotonicidad de sequence.

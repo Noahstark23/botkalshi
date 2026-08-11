@@ -122,10 +122,17 @@ async def test_recovery_larga_protege_desde_el_rebaseo_no_desde_el_incidente():
     assert manager.book_incident_age("TICK") < 1.0  # embargo fresco POST-re-baseo
 
 
-async def test_reseed_por_hermano_tambien_embarga():
+async def test_reseed_por_hermano_con_cambio_tambien_embarga():
     """QA hallazgo (a) — LA FÁBRICA DOMINANTE: el desync de un season market dispara
     recovery sid-wide que re-basea al GAME sin incidente propio; el empalme puede
-    inflarlo en silencio. El re-baseo del hermano ahora también arranca SU embargo."""
+    inflarlo en silencio. El re-baseo del hermano arranca SU embargo.
+
+    ⚠️ CAMBIO SEMÁNTICO DELIBERADO (2026-08-09): el embargo del hermano ahora exige
+    que el snapshot traiga contenido DISTINTO al book vivo. La versión previa de este
+    test usaba un re-seed idéntico y pineaba el re-embargo incondicional — esa
+    política produjo el 68% de 733 skips por siembra y 85/85 edges bloqueados en un
+    día. La siembra idéntica (exchange confirmando nuestro estado) ya no perturba;
+    ver test_v2_siembra_identica.py."""
     manager = _manager()
     await manager.handle_message(_snapshot("GAME", seq=1))
     await manager.handle_message(_snapshot("SEASON", seq=2))
@@ -137,10 +144,12 @@ async def test_reseed_por_hermano_tambien_embarga():
     rid = manager._pending_req_id_for_sid(1)
     for i, t in enumerate(("GAME", "SEASON")):
         msg = _snapshot(t, seq=10 + i)
+        if t == "GAME":  # el re-baseo del GAME trae contenido NUEVO (el book cambió)
+            msg["msg"]["yes_dollars_fp"] = [["0.55", "80.00"]]
         msg["id"] = rid
         await manager.handle_message(msg)  # la recovery re-basea a AMBOS
 
-    assert manager.book_incident_age("GAME") < 1.0  # re-sembrado = en digestión
+    assert manager.book_incident_age("GAME") < 1.0  # re-sembrado con cambio = en digestión
     assert manager._book_incident_mono.get("GAME") is None  # sin incidente propio (correcto)
 
 
