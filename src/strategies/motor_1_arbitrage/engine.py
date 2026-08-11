@@ -81,6 +81,10 @@ class Motor1Engine:
         # graba SOLO cuando la oportunidad cambió (magnitude, count) desde la última grabada
         # para ese ticker. ticker → (magnitude_cents, count) de la última fila grabada.
         self._last_recorded: dict[str, tuple[int, int]] = {}
+        # ticker → id de la última fila grabada (sonda 2026-08-11): el de-dupe devolvía
+        # None para señales sin cambios, y una ejecución sobre señal deduplicada perdía
+        # la atribución del outcome (edge_id=None → _update_edge_window_outcome no-op).
+        self._last_recorded_id: dict[str, int] = {}
         # Auditoría rentabilidad 2026-07-07: el "arb" binario intra-ticker equivale a un
         # book AUTO-CRUZADO (yes_bid + no_bid > 100) — un estado que el matching engine
         # elimina en ms; casi toda señal de 1 tick es book local stale. Dos defensas:
@@ -274,7 +278,11 @@ class Motor1Engine:
         """
         key = (opp.net_profit_cents, opp.count)
         if self._last_recorded.get(ticker) == key:
-            return None  # arb sin cambios desde la última grabación → no re-grabar (anti-flood)
+            # Arb sin cambios → no re-grabar (anti-flood), pero devolver el id de la fila
+            # ORIGINAL: es la misma oportunidad, y su outcome pertenece a esa fila (la
+            # sonda 2026-08-11 encontró edge_id=None en una ejecución real deduplicada
+            # → la EdgeWindow de DET jamás recibió su outcome).
+            return self._last_recorded_id.get(ticker)
         try:
             with get_session() as s:
                 window = EdgeWindow(
@@ -290,6 +298,8 @@ class Motor1Engine:
                 s.commit()
                 s.refresh(window)
                 self._last_recorded[ticker] = key
+                if window.id is not None:
+                    self._last_recorded_id[ticker] = window.id
                 logger.info(
                     f"motor1.edge.detected ticker={ticker} net={opp.net_profit_cents}c "
                     f"gross={opp.gross_profit_cents}c count={opp.count} edge={opp.edge_pct:.2f}%"
