@@ -33,8 +33,9 @@ from typing import TYPE_CHECKING, Literal
 from loguru import logger
 
 from src.monitoring.health import BotState
-from src.strategies.data_capture import parse_price_to_cents, parse_size
+from src.strategies.data_capture import parse_price_to_cents
 from src.strategies.motor_1_arbitrage.orderbook import (
+    BookLevel,
     BookTop,
     OrderbookDesyncError,
     OrderbookError,
@@ -629,15 +630,27 @@ class OrderbookManagerV2:
         return frozenset(self._books.keys())
 
     def get_top_of_book(self, ticker: str, side: Literal["yes", "no"]) -> BookTop | None:
-        """Top of book. Returns None if ticker is unknown, stale, or uninitialized.
+        """Top of book EN CONTRATOS ENTEROS. Returns None if unknown, stale, or uninitialized.
 
         El chequeo de is_stale faltaba (el docstring ya lo prometía): un book stale = esperando el
         snapshot de recovery, sus datos están DESACTUALIZADOS. Servirlos daría un book incoherente
-        a quien lea (crítico para market making). None hasta que el snapshot lo re-basee."""
+        a quien lea (crítico para market making). None hasta que el snapshot lo re-basee.
+
+        Unidades (2026-08-12): el estado interno guarda CENTI-contratos (aritmética
+        exacta, cero drift de redondeo). Esta es LA frontera de conversión: se pide el
+        mejor nivel con ≥1 contrato entero (min_size=100 — un nivel de polvo de 0.4
+        contratos no tapa al operable) y el size sale en contratos, floor (conservador:
+        jamás reportar más profundidad de la ejecutable)."""
         state = self._books.get(ticker)
         if state is None or not state.is_initialized or state.is_stale:
             return None
-        return state.top_of_book(side)
+        top = state.top_of_book(side, min_size=100)
+        bid = top.best_bid
+        ask = top.best_ask
+        return BookTop(
+            best_bid=BookLevel(bid.price_cents, bid.size // 100) if bid else None,
+            best_ask=BookLevel(ask.price_cents, ask.size // 100) if ask else None,
+        )
 
     def stats(self) -> dict:
         """Internal state for debugging via /status."""
@@ -1525,7 +1538,9 @@ class OrderbookManagerV2:
         side = msg.get("side")
 
         price_cents = parse_price_to_cents(price_raw)
-        delta_size = parse_size(delta_raw)
+        # CENTI-contratos (2026-08-12): mismo parser exacto que los snapshots — el book
+        # entero opera en una sola escala y el drift de redondeo por mensaje desaparece.
+        delta_size = parse_size_centi(delta_raw)
 
         if price_cents is None or delta_size is None:
             raise ValueError(
@@ -1581,12 +1596,15 @@ class OrderbookManagerV2:
             try:
                 view = state.snapshot_view()
                 bids = view.get("yes_bids" if side == "yes" else "no_bids", {})
+                # ⚠️ Unidades (2026-08-12): delta y bucket van en CENTI-contratos desde el
+                # fix de sizes exactos — los campos llevan sufijo _centi para que ningún
+                # parser externo (el análisis de brechas del agente) mezcle escalas.
                 logger.error(
                     "V2 desync diagnostic: "
                     f"ticker={ticker} sid={raw_msg.get('sid')} msg_seq={seq} "
                     f"state_seq={view.get('sequence')} side={side} "
-                    f"price_cents={price_cents} delta_size={delta_size} "
-                    f"bucket_qty_pre_delta={bids.get(price_cents)} "
+                    f"price_cents={price_cents} delta_size_centi={delta_size} "
+                    f"bucket_qty_pre_delta_centi={bids.get(price_cents)} "
                     f"raw_msg={raw_msg!r}"
                 )
             except Exception:
@@ -1640,19 +1658,42 @@ def _parse_iso_naive_utc(value: str) -> datetime | None:
     return dt
 
 
+def parse_size_centi(value: object) -> int | None:
+    """Size en CENTI-contratos (2026-08-12): el fixed-point de Kalshi trae exactamente
+    2 decimales ("100.00", "6092.50"), así que ×100 es EXACTO — cero redondeo por
+    mensaje. La medición que lo exige (proceso #223, noche completa del agente web):
+    634/714 desyncs residuales eran brecha=1 — drift acumulado de int(round(float))
+    por mensaje (dos adds de 0.50 redondeaban 0+0 y el removal del 1.00 exacto
+    underfloweaba). Con aritmética exacta, la única fuente de qty<0 que queda es
+    corrupción real del feed."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value * 100  # contratos enteros (shape viejo) → centi
+    if isinstance(value, (str, float)):
+        try:
+            return int(round(float(value) * 100))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _parse_fp_levels(
     raw_levels: list,
     ticker: str,
     side: str,
 ) -> list[list[int]]:
-    """Convert [price_str, size_str] WS list to [price_cents, size_int] list."""
+    """Convert [price_str, size_str] WS list to [price_cents, size_CENTI] list.
+
+    ⚠️ Sizes en centi-contratos desde 2026-08-12 (aritmética exacta del book) — la
+    conversión a contratos enteros vive SOLO en get_top_of_book del manager."""
     result: list[list[int]] = []
     for lvl in raw_levels:
         if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
             logger.warning(f"OrderbookManagerV2: invalid level shape for {ticker}/{side}: {lvl!r}")
             continue
         price_cents = parse_price_to_cents(lvl[0])
-        size = parse_size(lvl[1])
+        size = parse_size_centi(lvl[1])
         if price_cents is None or size is None:
             logger.warning(f"OrderbookManagerV2: unparseable level for {ticker}/{side}: {lvl!r}")
             continue

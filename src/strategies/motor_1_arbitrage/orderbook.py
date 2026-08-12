@@ -424,9 +424,15 @@ class OrderbookState:
     # Reads
     # =====================================================
 
-    def top_of_book(self, side: Side) -> BookTop:
+    def top_of_book(self, side: Side, *, min_size: int = 1) -> BookTop:
         """
         Mejor bid y mejor ask del side especificado.
+
+        `min_size` (2026-08-12, sizes en centi-unidades): el mejor nivel es el de
+        mayor precio con qty >= min_size. La clase es AGNÓSTICA de unidades — quien
+        parsea decide la escala; el manager V2 guarda centi-contratos y pide
+        min_size=100 para que un nivel de POLVO (<1 contrato entero) no tape al
+        mejor nivel operable. Default 1 = comportamiento histórico.
 
         Returns:
             BookTop con best_bid (mayor precio) y best_ask (menor precio).
@@ -450,13 +456,15 @@ class OrderbookState:
             raise ValueError(f"Invalid side: {side!r}")
 
         best_bid = None
-        if bids:
-            p = max(bids.keys())
+        operables = [p for p, q in bids.items() if q >= min_size]
+        if operables:
+            p = max(operables)
             best_bid = BookLevel(price_cents=p, size=bids[p])
 
         best_ask = None
-        if asks:
-            p = min(asks.keys())
+        asks_operables = [p for p, q in asks.items() if q >= min_size]
+        if asks_operables:
+            p = min(asks_operables)
             best_ask = BookLevel(price_cents=p, size=asks[p])
 
         return BookTop(best_bid=best_bid, best_ask=best_ask)
