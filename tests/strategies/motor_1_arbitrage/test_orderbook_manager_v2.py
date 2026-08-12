@@ -294,7 +294,8 @@ async def test_ac3_negative_qty_raises_orderbook_desync(manager: OrderbookManage
 
     assert exc_info.value.ticker == ticker
     assert exc_info.value.price_cents == 40
-    assert exc_info.value.new_qty == -5
+    # Unidades CENTI-contratos (2026-08-12, aritmética exacta): -5.00 contratos = -500.
+    assert exc_info.value.new_qty == -500
 
 
 @pytest.mark.asyncio
@@ -320,14 +321,16 @@ async def test_desync_emits_error_diagnostic_and_reraises(manager: OrderbookMana
         logger.remove(sink_id)
 
     # La excepcion original propaga intacta (mismo control flow que antes).
-    assert exc_info.value.new_qty == -5
+    # Unidades CENTI-contratos (2026-08-12): -5.00 contratos = -500.
+    assert exc_info.value.new_qty == -500
     assert exc_info.value.price_cents == 40
 
     # Se emitio el diagnostico a nivel ERROR (persiste con LOG_LEVEL=INFO) con los campos clave.
     captured = "\n".join(str(r) for r in records)
     assert "V2 desync diagnostic" in captured
-    assert "bucket_qty_pre_delta=10" in captured  # estado PRE-delta (book aun no mutado)
-    assert "delta_size=-15" in captured
+    # Campos con sufijo _centi (2026-08-12): 10.00 contratos = 1000, -15.00 = -1500.
+    assert "bucket_qty_pre_delta_centi=1000" in captured  # estado PRE-delta (book aun no mutado)
+    assert "delta_size_centi=-1500" in captured
     assert "msg_seq=2" in captured
     assert "raw_msg=" in captured
 

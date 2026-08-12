@@ -91,7 +91,8 @@ async def test_el_clamp_jamas_infla_el_book(mock_ws):
 
     view = manager._books["TICK"].snapshot_view()
     assert 50 not in view["yes_bids"]  # nivel removido, no negativo ni fantasma
-    assert view["yes_bids"].get(40) == 30  # los demás niveles intactos
+    # snapshot_view expone el estado INTERNO: centi-contratos (30.00 = 3000).
+    assert view["yes_bids"].get(40) == 3000  # los demás niveles intactos
 
 
 async def test_fuera_de_la_gracia_el_desync_sigue_intacto(mock_ws):
