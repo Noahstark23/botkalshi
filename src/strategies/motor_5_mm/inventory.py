@@ -38,14 +38,20 @@ class TickerInventory:
 
 
 class InventoryBook:
-    """Inventario simulado de TODOS los tickers cotizados. Instancia del engine (no global)."""
+    """Inventario simulado de TODOS los tickers cotizados. Instancia del engine (no global).
 
-    def __init__(self) -> None:
+    fees_as_maker (APUESTA 1, 2026-08-12): True = los fills shadow no pagan comisión
+    (maker fee $0 verificable en el schedule de Kalshi) — el default False conserva el
+    modelo taker histórico. El mtm del A/B con el modelo viejo incluía un impuesto
+    fantasma del 60-90% del spread capturado."""
+
+    def __init__(self, *, fees_as_maker: bool = False) -> None:
         self.positions: dict[str, TickerInventory] = {}
+        self._fees_as_maker = fees_as_maker
 
     def apply_fill(self, fill: ShadowFill) -> TickerInventory:
         inv = self.positions.setdefault(fill.ticker, TickerInventory())
-        fee = kalshi_fee_cents(fill.count, fill.price_cents)
+        fee = 0 if self._fees_as_maker else kalshi_fee_cents(fill.count, fill.price_cents)
         if fill.side == "buy":
             inv.net_contracts += fill.count
             inv.cash_cents -= fill.price_cents * fill.count

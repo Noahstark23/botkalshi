@@ -83,6 +83,7 @@ class Motor5Engine:
         risk_manager: RiskManager | None = None,
         fill_feed: MMFillFeed | None = None,
         mm_exposure_cap_usd: float | None = None,
+        fees_as_maker: bool = False,
     ) -> None:
         self._max_tickers = max_tickers
         self._half_spread = half_spread_cents
@@ -92,7 +93,14 @@ class Motor5Engine:
         self._fair_ttl = fair_ttl_sec
         self._client_factory = client_factory
         self._client: KalshiRestClient | None = None
-        self._inventory = InventoryBook()
+        # APUESTA 1 (2026-08-12): modelo de fee del shadow — maker ($0) o taker (legacy).
+        self._fees_as_maker = fees_as_maker
+        self._inventory = InventoryBook(fees_as_maker=fees_as_maker)
+        # MARKOUT (la métrica que decide si el maker chico sobrevive): fills shadow
+        # pendientes de medir el mid a T+30s y T+5min contra el precio del fill —
+        # markout negativo sistemático = selección adversa (nos cruzan cuando el fair
+        # ya se movió). Acotado (nada sin tope) y best-effort.
+        self._markouts_pendientes: list[dict] = []
         self._live_quotes: dict[str, QuoteSet] = {}
         self._last_marks: dict[str, float] = {}  # último mark conocido por ticker (MTM)
         # ── F2 (demo): ejecución real. CAPA A: el executor SOLO se construye (en run())
@@ -237,6 +245,7 @@ class Motor5Engine:
                 max_inventory_contracts=self._max_inventory,
                 best_yes_bid=yes_bid,
                 best_yes_ask=yes_ask,
+                fees_as_maker=self._fees_as_maker,
             )
             if quote is None:
                 key = {"fair_out_of_range": "skip_fair_range"}.get(skip or "", f"skip_{skip}")
@@ -260,6 +269,10 @@ class Motor5Engine:
                     counters["exec_corrupted"] += 1
                 elif outcome == "risk_blocked":
                     counters["exec_risk_blocked"] += 1
+        # MARKOUT: con los marks del tick recién refrescados, medir los fills pendientes
+        # (T+30s / T+5min). Va acá y no en _settle_fills porque el mark "posterior" de un
+        # fill es el de un tick FUTURO, no el del tick que lo detectó.
+        self._medir_markouts()
         mtm = self._inventory.total_mtm_cents(self._last_marks)
         self._persist_snapshot(len(fairs), counters, mtm)
         logger.info(
@@ -345,7 +358,7 @@ class Motor5Engine:
                 f"cash={inv.cash_cents}c fees={inv.fees_cents}c "
                 f"edge={edge_c:+.1f}c drift={drift_c:+.1f}c"
             )
-            self._persist_fill(
+            fill_id = self._persist_fill(
                 fill,
                 inv.net_contracts,
                 quote_fair_prob=quote.fair_prob,
@@ -353,7 +366,76 @@ class Motor5Engine:
                 yes_bid=yes_bid,
                 yes_ask=yes_ask,
             )
+            if fill_id is not None:
+                # Encolar la medición de markout (T+30s/T+5min contra el mark futuro).
+                self._markouts_pendientes.append(
+                    {
+                        "id": fill_id,
+                        "ticker": fill.ticker,
+                        "side": fill.side,
+                        "price": fill.price_cents,
+                        "t_mono": time.monotonic(),
+                        "m1_hecho": False,
+                    }
+                )
+                if len(self._markouts_pendientes) > 500:  # nada sin tope
+                    self._markouts_pendientes.pop(0)
         return len(fills)
+
+    def _medir_markouts(self) -> None:
+        """Markout de los fills shadow: (mark_posterior − precio) para buys, invertido
+        para sells — positivo = el mercado nos dio la razón; negativo sistemático =
+        SELECCIÓN ADVERSA (nos cruzan cuando el fair ya se movió), la causa de muerte
+        documentada del maker chico. Resolución = cadencia del tick (~60s): el T+30s
+        real es "el primer tick ≥30s" y se persiste la edad exacta. Best-effort."""
+        if not self._markouts_pendientes:
+            return
+        ahora = time.monotonic()
+        restantes: list[dict] = []
+        for p in self._markouts_pendientes:
+            edad = ahora - p["t_mono"]
+            mark = self._last_marks.get(p["ticker"])
+            try:
+                if not p["m1_hecho"] and edad >= 30.0 and mark is not None:
+                    self._persist_markout(p["id"], 1, self._markout_cents(p, mark), edad)
+                    p["m1_hecho"] = True
+                if edad >= 300.0:
+                    if mark is not None:
+                        self._persist_markout(p["id"], 2, self._markout_cents(p, mark), edad)
+                        continue  # completo → sale de la cola
+                    if edad >= 600.0:
+                        continue  # sin mark en 10min (ticker fuera del universo) → soltar
+            except Exception:
+                logger.exception("motor5.markout_error")
+                continue  # un fill problemático no bloquea la cola
+            restantes.append(p)
+        self._markouts_pendientes = restantes
+
+    @staticmethod
+    def _markout_cents(p: dict, mark_cents: float) -> float:
+        signo = 1.0 if p["side"] == "buy" else -1.0
+        return signo * (mark_cents - p["price"])
+
+    def _persist_markout(self, fill_id: int, which: int, valor: float, edad_sec: float) -> None:
+        try:
+            with get_session() as s:
+                row = s.get(MMShadowFill, fill_id)
+                if row is None:
+                    return
+                if which == 1:
+                    row.markout1_cents = round(valor, 2)
+                    row.markout1_age_sec = round(edad_sec, 1)
+                else:
+                    row.markout2_cents = round(valor, 2)
+                    row.markout2_age_sec = round(edad_sec, 1)
+                s.add(row)
+                s.commit()
+            logger.info(
+                f"[MOTOR 5 SHADOW] markout fill_id={fill_id} t+{edad_sec:.0f}s "
+                f"mo{which}={valor:+.1f}c"
+            )
+        except Exception:
+            logger.exception("motor5.persist_markout_error")
 
     def _record_mark(
         self, ticker: str, yes_bid: int | None, yes_ask: int | None, fair_prob: float
@@ -439,33 +521,37 @@ class Motor5Engine:
         fill_fair_prob: float | None = None,
         yes_bid: int | None = None,
         yes_ask: int | None = None,
-    ) -> None:
+    ) -> int | None:
+        """Devuelve el id de la fila (para el markout) o None si la persistencia falló.
+        fee_cents SIEMPRE registra la fee de TAKER (kalshi_fee_cents) aunque el modelo
+        del shadow sea maker: es el dato que permite derivar las DOS contabilidades de
+        la misma tabla — el análisis resta o no según el modelo bajo estudio."""
         from src.math.fees import kalshi_fee_cents
 
         try:
             with get_session() as s:
-                s.add(
-                    MMShadowFill(
-                        ticker=fill.ticker[:100],
-                        side=fill.side,
-                        price_cents=fill.price_cents,
-                        count=fill.count,
-                        fee_cents=kalshi_fee_cents(fill.count, fill.price_cents),
-                        rule=fill.rule[:50],
-                        inventory_after=inventory_after,
-                        quote_fair_prob=round(quote_fair_prob, 4)
-                        if quote_fair_prob is not None
-                        else None,
-                        fill_fair_prob=round(fill_fair_prob, 4)
-                        if fill_fair_prob is not None
-                        else None,
-                        yes_bid=yes_bid,
-                        yes_ask=yes_ask,
-                    )
+                row = MMShadowFill(
+                    ticker=fill.ticker[:100],
+                    side=fill.side,
+                    price_cents=fill.price_cents,
+                    count=fill.count,
+                    fee_cents=kalshi_fee_cents(fill.count, fill.price_cents),
+                    rule=fill.rule[:50],
+                    inventory_after=inventory_after,
+                    quote_fair_prob=round(quote_fair_prob, 4)
+                    if quote_fair_prob is not None
+                    else None,
+                    fill_fair_prob=round(fill_fair_prob, 4) if fill_fair_prob is not None else None,
+                    yes_bid=yes_bid,
+                    yes_ask=yes_ask,
                 )
+                s.add(row)
                 s.commit()
+                s.refresh(row)
+                return row.id
         except Exception:
             logger.exception("motor5.persist_fill_error")
+        return None
 
     def _persist_snapshot(self, fair_fresh: int, counters: dict[str, int], mtm: int) -> None:
         try:

@@ -331,6 +331,14 @@ class MMShadowFill(SQLModel, table=True):
     fill_fair_prob: float | None = None  # fair vigente al detectar el cruce (tick t)
     yes_bid: int | None = None  # top-of-book YES en el tick del fill
     yes_ask: int | None = None
+    # MARKOUT (Apuesta 1, 2026-08-12): mid posterior vs precio del fill, signado (buy:
+    # mark−precio; sell: precio−mark). Negativo sistemático = selección adversa — LA
+    # métrica que decide si el maker chico sobrevive. Edad exacta persistida porque la
+    # resolución es la cadencia del tick (~60s), no los 30s/300s nominales.
+    markout1_cents: float | None = None  # primer tick ≥30s post-fill
+    markout1_age_sec: float | None = None
+    markout2_cents: float | None = None  # primer tick ≥300s post-fill
+    markout2_age_sec: float | None = None
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 
@@ -458,6 +466,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("mm_shadow_fills", "fill_fair_prob", "FLOAT"),
     ("mm_shadow_fills", "yes_bid", "INTEGER"),
     ("mm_shadow_fills", "yes_ask", "INTEGER"),
+    # Apuesta 1: markout del maker shadow (selección adversa medida por fill).
+    ("mm_shadow_fills", "markout1_cents", "FLOAT"),
+    ("mm_shadow_fills", "markout1_age_sec", "FLOAT"),
+    ("mm_shadow_fills", "markout2_cents", "FLOAT"),
+    ("mm_shadow_fills", "markout2_age_sec", "FLOAT"),
 ]
 
 
