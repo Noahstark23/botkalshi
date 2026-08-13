@@ -559,17 +559,17 @@ class Settings(BaseSettings):
         gt=0.0,
         description="Techo duro (USD) del costo abierto del Motor 5 (canary F3)",
     )
-    # APUESTA 1 (plan 2026-08-12) — el "fee fantasma": el quoter cobraba fee de TAKER a
-    # las DOS patas de un round-trip que por construcción es MAKER (post_only GTC), y el
-    # shadow le descontaba esa fee a cada fill simulado. El fee schedule de Kalshi tiene
-    # maker fee = $0 en deportes estándar → M5 se auto-excluía de los books de 1-5¢ (su
-    # único hábitat viable) y el mtm del A/B midió un impuesto que un maker real no paga.
-    # False (default) = modelo taker (comportamiento actual). Encender SOLO tras verificar
-    # el fee real con evidencia (is_taker + fee en el fills API de fills propios, o el fee
-    # schedule de la serie) — protocolo de lista literal del operador.
+    # APUESTA 1 (plan 2026-08-12; VERIFICADA 2026-08-13 contra el PDF oficial del fee
+    # schedule "July 7, 2026") — el "fee fantasma": el quoter cobraba fee de TAKER (0.07)
+    # a las DOS patas de un round-trip que por construcción es MAKER (post_only GTC). El
+    # maker real de deportes NO es $0 (eso era falso — murió contra el PDF antes de tocar
+    # nada): es ¼ del taker (0.0175, multiplicador 1, fila "KXMLBGAME | 1 | 1"), cobrado
+    # al ejecutar la resting (cancelar es gratis). Round-trip maker en zona media ≈
+    # 1¢/contrato a size=10 → spreads ≥2¢ rentables; el modelo taker exigía ≥4¢ y
+    # auto-excluía a M5 de su hábitat. False (default) = modelo taker legacy.
     MOTOR_MM_FEES_AS_MAKER: bool = Field(
         default=False,
-        description="True = quoter e inventario shadow modelan fee de MAKER ($0); False = modelo taker (actual). Encender solo con el fee real verificado",
+        description="True = quoter e inventario shadow usan la fee REAL de maker (¼ del taker, kalshi_maker_fee_cents); False = modelo taker legacy",
     )
 
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===

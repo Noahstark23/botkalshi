@@ -171,3 +171,32 @@ def test_integer_implementation_matches_official_formula():
             assert actual == exact, (
                 f"Mismatch at count={count}, price={price}: int={actual}, exact={exact}"
             )
+
+
+# =====================================================
+# Fee de MAKER (verificada 2026-08-13 contra el PDF oficial July 7, 2026)
+# =====================================================
+# maker = round up(M × 0.0175 × C × P × (1−P)) — ¼ del taker, multiplicador 1 en
+# deportes ("KXMLBGAME | 1 | 1"). El $0 existe solo en series no deportivas.
+
+
+def test_maker_fee_ejemplo_oficial_cuarto_del_taker():
+    from src.math.fees import kalshi_maker_fee_cents
+
+    # Taker oficial: fee(100, 50) = 175¢. Maker exacto: 0.0175×100×0.25 = 43.75¢ → 44.
+    assert kalshi_maker_fee_cents(100, 50) == 44
+
+
+def test_maker_fee_ceil_por_orden():
+    from src.math.fees import kalshi_maker_fee_cents
+
+    assert kalshi_maker_fee_cents(10, 50) == 5  # 4.375¢ → 5 (ceil)
+    assert kalshi_maker_fee_cents(1, 50) == 1  # 0.4375¢ → 1 (medir a count=1 sobreestima)
+
+
+def test_maker_fee_bordes():
+    from src.math.fees import kalshi_maker_fee_cents
+
+    assert kalshi_maker_fee_cents(0, 50) == 0
+    assert kalshi_maker_fee_cents(100, 0) == 0
+    assert kalshi_maker_fee_cents(100, 100) == 0

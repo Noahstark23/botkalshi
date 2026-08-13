@@ -1,12 +1,13 @@
 """
 Apuesta 1 (plan de reestructuración 2026-08-12) — contabilidad MAKER + markout.
 
-El "fee fantasma": quoter.py cobraba fee de TAKER a las DOS patas de un round-trip
-que por construcción es maker (post_only GTC), e inventory.py se la descontaba a cada
-fill simulado. Con maker fee $0 en el schedule de deportes de Kalshi, M5 se
-auto-excluía de los books de 1-5¢ (su único hábitat viable) y el mtm del A/B midió
-un impuesto que un maker real no paga. MOTOR_MM_FEES_AS_MAKER (default False =
-comportamiento histórico) corrige el modelo SOLO tras verificación del fee real.
+El "fee fantasma": quoter.py cobraba fee de TAKER (0.07) a las DOS patas de un
+round-trip que por construcción es maker (post_only GTC). VERIFICADO 2026-08-13
+contra el PDF oficial (July 7, 2026): el maker de deportes NO paga $0 (la creencia
+del dossier murió contra la evidencia primaria antes de encender nada) — paga ¼ del
+taker (0.0175, multiplicador 1). MOTOR_MM_FEES_AS_MAKER=true usa la fee REAL de
+maker; el default False conserva el modelo taker legacy. Con la fee real: round-trip
+maker ≈ 1¢/contrato a size=10 → spreads ≥2¢ rentables (el taker exigía ≥4¢).
 
 El markout (mid posterior vs precio del fill, signado) es la otra mitad del gate:
 mtm positivo con markout negativo sistemático = los fills son tóxicos (selección
@@ -18,7 +19,7 @@ from __future__ import annotations
 import pytest
 from sqlmodel import select
 
-from src.math.fees import kalshi_fee_cents
+from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
 from src.storage.models import MMShadowFill, get_session
 from src.strategies.fair_value_book import FairValueBook
 from src.strategies.motor_5_mm.engine import Motor5Engine
@@ -32,8 +33,9 @@ from src.strategies.motor_5_mm.shadow_fill import ShadowFill
 
 
 def test_maker_cotiza_el_spread_de_2c_que_el_modelo_taker_rechazaba():
-    """EL HÁBITAT RECUPERADO: spread capturado 2¢ en zona media — fee taker de ambas
-    patas ≈ 3.5¢ lo rechazaba como unprofitable; el maker (fee 0) lo cotiza."""
+    """EL HÁBITAT RECUPERADO: spread capturado 2¢ en zona media — el taker (4¢ de fee
+    round-trip a count=1) lo rechazaba; con la fee REAL de maker al size (10¢ de fee
+    por orden vs 20¢ capturados) se cotiza. La matemática del PDF, no la del deseo."""
     kwargs = {
         "half_spread_cents": 1,
         "size_contracts": 10,
@@ -51,7 +53,7 @@ def test_maker_cotiza_el_spread_de_2c_que_el_modelo_taker_rechazaba():
 
 
 def test_maker_sigue_rechazando_spread_cero():
-    """CONTROL: maker fee 0 no habilita spread ≤0 — captured debe ser positivo."""
+    """CONTROL: el modelo maker no habilita spread ≤0 — captured debe superar la fee."""
     quote, motivo = compute_quote(
         "T",
         0.50,
@@ -76,24 +78,28 @@ def _fill(side: str = "buy", count: int = 10, price: int = 47) -> ShadowFill:
     return ShadowFill(ticker="T", side=side, price_cents=price, count=count, rule="test")
 
 
-def test_inventario_maker_no_paga_fee_fantasma():
+def test_inventario_maker_paga_la_fee_real_de_maker():
     maker = InventoryBook(fees_as_maker=True)
     inv = maker.apply_fill(_fill())
-    assert inv.fees_cents == 0  # el maker no paga el impuesto
+    assert inv.fees_cents == kalshi_maker_fee_cents(10, 47)  # ¼ del taker, NO cero
+    assert 0 < inv.fees_cents < kalshi_fee_cents(10, 47)
 
     taker = InventoryBook()  # default = modelo histórico
     inv_t = taker.apply_fill(_fill())
     assert inv_t.fees_cents == kalshi_fee_cents(10, 47)  # CONTROL: sin cambio
 
 
-def test_mtm_maker_vs_taker_difiere_exactamente_en_la_fee():
+def test_mtm_maker_vs_taker_difiere_exactamente_en_el_delta_de_fee():
     maker, taker = InventoryBook(fees_as_maker=True), InventoryBook()
     for book in (maker, taker):
         book.apply_fill(_fill("buy", 10, 47))
         book.apply_fill(_fill("sell", 10, 53))
-    fee_total = kalshi_fee_cents(10, 47) + kalshi_fee_cents(10, 53)
-    assert maker.total_mtm_cents({}) - taker.total_mtm_cents({}) == fee_total
-    assert maker.total_mtm_cents({}) == 60  # round-trip 6¢ × 10 contratos, limpio
+    delta_fee = (kalshi_fee_cents(10, 47) - kalshi_maker_fee_cents(10, 47)) + (
+        kalshi_fee_cents(10, 53) - kalshi_maker_fee_cents(10, 53)
+    )
+    assert maker.total_mtm_cents({}) - taker.total_mtm_cents({}) == delta_fee
+    # Round-trip 6¢ × 10 = 60¢ bruto; fee maker 5+5=10¢ → 50¢ neto (taker dejaba 24¢).
+    assert maker.total_mtm_cents({}) == 50
 
 
 # =====================================================

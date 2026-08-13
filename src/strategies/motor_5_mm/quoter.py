@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from src.math.fees import kalshi_fee_cents
+from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,13 +86,24 @@ def compute_quote(
         ask = None
     if bid is not None and ask is not None:
         captured = ask - bid
-        # APUESTA 1 (2026-08-12): con fees_as_maker el round-trip post_only no paga
-        # comisión (maker fee $0 en el schedule de deportes de Kalshi) — la regla 5
-        # exige solo spread positivo. El modelo taker (default) era el "fee fantasma"
-        # que auto-excluía a M5 de todo book con spread ≤4¢ en zona media.
-        fees = 0 if fees_as_maker else kalshi_fee_cents(1, bid) + kalshi_fee_cents(1, ask)
-        if captured <= fees:
-            return None, "unprofitable"
+        if fees_as_maker:
+            # APUESTA 1, corregida 2026-08-13 contra el PDF oficial (July 7, 2026): el
+            # maker de deportes NO paga $0 — paga ¼ del taker (0.0175, multiplicador 1).
+            # La regla se evalúa AL SIZE de la quote: el ceil es POR ORDEN y medirlo a
+            # count=1 sobreestima por contrato (a size=10 y 50¢: 0.5¢/contrato/pata
+            # real vs 1¢ medido a count=1). Round-trip maker en zona media ≈ 1¢/contrato
+            # → spreads capturados ≥2¢ son rentables; el modelo taker exigía ≥4¢.
+            fees_orden = kalshi_maker_fee_cents(size_contracts, bid) + kalshi_maker_fee_cents(
+                size_contracts, ask
+            )
+            if captured * size_contracts <= fees_orden:
+                return None, "unprofitable"
+        else:
+            # Modelo taker legacy (el "fee fantasma" para un flujo post_only): intacto
+            # como default hasta que el operador encienda el flag.
+            fees = kalshi_fee_cents(1, bid) + kalshi_fee_cents(1, ask)
+            if captured <= fees:
+                return None, "unprofitable"
     return QuoteSet(
         ticker=ticker, fair_prob=fair_prob, bid_cents=bid, ask_cents=ask, size=size_contracts
     ), None
