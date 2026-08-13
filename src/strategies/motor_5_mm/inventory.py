@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.math.fees import kalshi_fee_cents
+from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
 from src.strategies.motor_5_mm.shadow_fill import ShadowFill
 
 
@@ -40,10 +40,10 @@ class TickerInventory:
 class InventoryBook:
     """Inventario simulado de TODOS los tickers cotizados. Instancia del engine (no global).
 
-    fees_as_maker (APUESTA 1, 2026-08-12): True = los fills shadow no pagan comisión
-    (maker fee $0 verificable en el schedule de Kalshi) — el default False conserva el
-    modelo taker histórico. El mtm del A/B con el modelo viejo incluía un impuesto
-    fantasma del 60-90% del spread capturado."""
+    fees_as_maker (APUESTA 1, corregida 2026-08-13 contra el PDF oficial): True = los
+    fills shadow pagan la fee REAL de maker — ¼ del taker (0.0175, multiplicador 1 en
+    deportes), NO $0 como creía el dossier. El default False conserva el modelo taker
+    histórico, que para un flujo post_only cobraba 4× de más (el "fee fantasma")."""
 
     def __init__(self, *, fees_as_maker: bool = False) -> None:
         self.positions: dict[str, TickerInventory] = {}
@@ -51,7 +51,11 @@ class InventoryBook:
 
     def apply_fill(self, fill: ShadowFill) -> TickerInventory:
         inv = self.positions.setdefault(fill.ticker, TickerInventory())
-        fee = 0 if self._fees_as_maker else kalshi_fee_cents(fill.count, fill.price_cents)
+        fee = (
+            kalshi_maker_fee_cents(fill.count, fill.price_cents)
+            if self._fees_as_maker
+            else kalshi_fee_cents(fill.count, fill.price_cents)
+        )
         if fill.side == "buy":
             inv.net_contracts += fill.count
             inv.cash_cents -= fill.price_cents * fill.count
