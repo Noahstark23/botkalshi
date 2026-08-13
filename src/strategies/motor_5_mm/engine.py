@@ -84,6 +84,7 @@ class Motor5Engine:
         fill_feed: MMFillFeed | None = None,
         mm_exposure_cap_usd: float | None = None,
         fees_as_maker: bool = False,
+        jump_retreat_cents: float = 5.0,
     ) -> None:
         self._max_tickers = max_tickers
         self._half_spread = half_spread_cents
@@ -95,6 +96,8 @@ class Motor5Engine:
         self._client: KalshiRestClient | None = None
         # APUESTA 1 (2026-08-12): modelo de fee del shadow — maker ($0) o taker (legacy).
         self._fees_as_maker = fees_as_maker
+        # Retiro por salto (blindaje del maker): 0 = off.
+        self._jump_retreat = jump_retreat_cents
         self._inventory = InventoryBook(fees_as_maker=fees_as_maker)
         # MARKOUT (la métrica que decide si el maker chico sobrevive): fills shadow
         # pendientes de medir el mid a T+30s y T+5min contra el precio del fill —
@@ -222,19 +225,41 @@ class Motor5Engine:
                     await self._executor.retire_ticker(ticker)
                 continue
             yes_bid, yes_ask = top
+            # SALTO del mark desde el tick anterior (Apuesta 1, blindaje): el insumo del
+            # retiro por salto Y la etiqueta de los fills (mark_jump_cents). Se captura
+            # ANTES de refrescar el mark.
+            mark_previo = self._last_marks.get(ticker)
             self._record_mark(ticker, yes_bid, yes_ask, fv.fair_prob)
+            salto = abs(self._last_marks[ticker] - mark_previo) if mark_previo is not None else None
             # Fills SHADOW solo sin executor (F1): con ejecución real, los fills vienen
             # de la verdad del reconciler (_apply_settled_fills) — nunca de la inferencia.
             prev = self._live_quotes.get(ticker)
             if prev is not None and self._executor is None:
                 try:
+                    # El fill que un salto ya causó SE CUENTA (un maker real tampoco
+                    # cancela en 0ms) — pero queda etiquetado para que el gate segmente
+                    # markout de salto vs calmo. Medir, no asumir.
                     counters["fills"] += self._settle_fills(
-                        prev, yes_bid, yes_ask, fill_fair_prob=fv.fair_prob
+                        prev, yes_bid, yes_ask, fill_fair_prob=fv.fair_prob, mark_jump=salto
                     )
                 except Exception:
                     # Estado del ticker en duda → quote fuera y re-sync el próximo tick.
                     self._live_quotes.pop(ticker, None)
                     raise
+            # RETIRO POR SALTO (primer dato del gate 13-ago: 4 fills in-play con markout
+            # −18/−20¢, ambos lados perdiendo a la vez — el evento del juego atravesó
+            # las quotes): mark saltó ≥ umbral → la quote se retira y este tick no se
+            # re-cotiza. Vuelve sola al primer tick calmo.
+            if salto is not None and self._jump_retreat > 0 and salto >= self._jump_retreat:
+                counters["skip_jump"] = counters.get("skip_jump", 0) + 1
+                self._live_quotes.pop(ticker, None)
+                if self._executor is not None:
+                    await self._executor.retire_ticker(ticker)
+                logger.info(
+                    f"motor5.jump_retreat ticker={ticker} salto={salto:.1f}c "
+                    f"≥ {self._jump_retreat:.0f}c → quote retirada este tick"
+                )
+                continue
             quote, skip = compute_quote(
                 ticker,
                 fv.fair_prob,
@@ -279,6 +304,7 @@ class Motor5Engine:
             f"motor5.funnel fair_fresh={len(fairs)} quoted={counters['quoted']} "
             f"skip_book={counters['skip_no_book']} skip_unprof={counters['skip_unprofitable']} "
             f"skip_degen={counters['skip_degenerate']} skip_fair={counters['skip_fair_range']} "
+            f"skip_jump={counters.get('skip_jump', 0)} "
             f"fills={counters['fills']} inv_abs={self._inventory.total_abs_contracts()} "
             f"mtm={mtm}c"
             + (
@@ -334,6 +360,7 @@ class Motor5Engine:
         yes_ask: int | None,
         *,
         fill_fair_prob: float,
+        mark_jump: float | None = None,
     ) -> int:
         """Aplica los fills hipotéticos de la quote resting contra el book actual.
 
@@ -365,6 +392,7 @@ class Motor5Engine:
                 fill_fair_prob=fill_fair_prob,
                 yes_bid=yes_bid,
                 yes_ask=yes_ask,
+                mark_jump=mark_jump,
             )
             if fill_id is not None:
                 # Encolar la medición de markout (T+30s/T+5min contra el mark futuro).
@@ -521,6 +549,7 @@ class Motor5Engine:
         fill_fair_prob: float | None = None,
         yes_bid: int | None = None,
         yes_ask: int | None = None,
+        mark_jump: float | None = None,
     ) -> int | None:
         """Devuelve el id de la fila (para el markout) o None si la persistencia falló.
         fee_cents SIEMPRE registra la fee de TAKER (kalshi_fee_cents) aunque el modelo
@@ -544,6 +573,7 @@ class Motor5Engine:
                     fill_fair_prob=round(fill_fair_prob, 4) if fill_fair_prob is not None else None,
                     yes_bid=yes_bid,
                     yes_ask=yes_ask,
+                    mark_jump_cents=round(mark_jump, 2) if mark_jump is not None else None,
                 )
                 s.add(row)
                 s.commit()
