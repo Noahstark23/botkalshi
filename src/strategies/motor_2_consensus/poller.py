@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from src.storage.models import EdgeWindow, Motor2FunnelSnapshot, get_session
+from src.storage.models import EdgeWindow, FairKickoffSnapshot, Motor2FunnelSnapshot, get_session
 from src.strategies.fair_value_book import FairValueBook
 from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
 from src.strategies.motor_2_consensus.executor import Motor2Executor
@@ -104,6 +104,9 @@ class Motor2ShadowPoller:
         self._burst_window_min = burst_window_min
         self._next_kickoff: datetime | None = None  # próximo commence_time futuro visto
         self._in_burst = False  # para loguear solo las transiciones (anti-spam)
+        # CLV-al-kickoff: tickers ya snapshoteados este proceso (dedup barato en memoria;
+        # el dedup duro es la fila en DB — un reboot re-snapshotea a lo sumo una vez más).
+        self._kickoff_snapshotted: set[str] = set()
         # Motor 6 (F1 shadow, opcional): pasajero del ciclo — observa (quotes, fair) y
         # detecta line-moves. None = apagado. JAMÁS ejecuta (no existe executor en F1).
         self._linemove = linemove
@@ -148,6 +151,14 @@ class Motor2ShadowPoller:
         if self._odds.is_live and fair_out:
             FairValueBook.publish(fair_out)
             logger.info(f"motor2.fair_book publicados={len(fair_out)}")
+            # CLV-al-kickoff (Propuesta 2026-08-13): en el ÚLTIMO ciclo antes del
+            # kickoff, el fair de cada ticker se persiste como su "cierre" — el
+            # benchmark del CLV de los fills shadow de M5. Pasajero best-effort:
+            # jamás rompe el ciclo del host.
+            try:
+                self._snapshot_fair_kickoff(kalshi_events, fair_out)
+            except Exception:
+                logger.exception("motor2.fair_kickoff_snapshot falló (el ciclo sigue)")
         # Motor 6 (pasajero best-effort): line-moves sobre el MISMO (quotes, fair) del ciclo
         # — cero requests extra. Su observe es internamente best-effort; el guard de acá es
         # el cinturón redundante: M6 nunca puede romper el ciclo del host.
@@ -288,6 +299,45 @@ class Motor2ShadowPoller:
                 s.commit()
         except Exception:
             logger.exception("motor2.shadow persist_error")
+
+    def _snapshot_fair_kickoff(self, kalshi_events, fair_out: dict[str, float]) -> None:
+        """Persiste el fair del ÚLTIMO ciclo pre-kickoff por ticker (el "cierre" del CLV).
+
+        El kickoff sale de parse_event_key_start(event_key) — cero requests extra. Se
+        dispara cuando el kickoff cae dentro del próximo intervalo del poller (este es
+        el último fair que vamos a computar antes del arranque). Una vez por ticker."""
+        from src.strategies.motor_2_consensus.matcher import ET, parse_event_key_start
+
+        now = datetime.now(UTC)
+        for ke in kalshi_events:
+            parsed = parse_event_key_start(ke.event_key)
+            if parsed is None or parsed[1] is None:
+                continue  # sin hora en el key no hay kickoff preciso → sin cierre
+            d, (hh, mm) = parsed
+            kickoff = datetime(d.year, d.month, d.day, hh, mm, tzinfo=ET).astimezone(UTC)
+            restante = (kickoff - now).total_seconds()
+            if not (0 <= restante <= self._interval * 1.5):
+                continue  # todavía no es el último ciclo (o ya arrancó)
+            filas = []
+            for q in ke.outcomes:
+                t = q.market_ticker
+                if t in self._kickoff_snapshotted or t not in fair_out:
+                    continue
+                filas.append(
+                    FairKickoffSnapshot(
+                        ticker=t[:100], fair_prob=round(fair_out[t], 4), kickoff_at=kickoff
+                    )
+                )
+                self._kickoff_snapshotted.add(t)
+            if filas:
+                with get_session() as s:
+                    for fila in filas:
+                        s.add(fila)
+                    s.commit()
+                logger.info(
+                    f"motor2.fair_kickoff event={ke.event_key} snapshoteados={len(filas)} "
+                    f"(cierre del CLV, kickoff en {restante:.0f}s)"
+                )
 
     def _note_next_kickoff(self, odds_events: list) -> None:
         """Registra el próximo commence_time FUTURO del feed (para el burst pre-kickoff).

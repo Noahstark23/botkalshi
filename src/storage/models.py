@@ -346,6 +346,30 @@ class MMShadowFill(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 
+class FairKickoffSnapshot(SQLModel, table=True):
+    """
+    Fair de consenso del ÚLTIMO ciclo pre-kickoff, por ticker (Propuesta CLV 2026-08-13).
+
+    Es el "cierre" contra el que se mide el CLV de los fills shadow de M5: el estándar
+    de la industria (Buchdahl) y el diseño del gemelo público de M2 — ¿los fills compran
+    sistemáticamente mejor que el precio de cierre del consenso? Converge en cientos de
+    observaciones (vs miles para settlements) y diagnostica el confound del fair
+    degradado: markout OK + CLV negativo = el problema es el fair, no el maker.
+
+    Lo escribe el ciclo de M2 como pasajero best-effort (jamás rompe al host), solo con
+    odds REALES, una vez por ticker (dedup en memoria + tabla). El kickoff sale de
+    parse_event_key_start(event_key) — cero requests extra.
+    """
+
+    __tablename__ = "fair_kickoff_snapshots"
+
+    id: int | None = Field(default=None, primary_key=True)
+    ticker: str = Field(index=True, max_length=100)
+    fair_prob: float
+    kickoff_at: datetime = Field(index=True)  # AWARE UTC (convención commence_time)
+    captured_at: datetime = Field(default_factory=_utc_now)
+
+
 class MMFunnelSnapshot(SQLModel, table=True):
     """
     Foto del embudo del Motor 5 por tick (patrón Motor2FunnelSnapshot): cuántos tickers
