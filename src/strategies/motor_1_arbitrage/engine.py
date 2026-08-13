@@ -81,6 +81,14 @@ class Motor1Engine:
         # graba SOLO cuando la oportunidad cambió (magnitude, count) desde la última grabada
         # para ese ticker. ticker → (magnitude_cents, count) de la última fila grabada.
         self._last_recorded: dict[str, tuple[int, int]] = {}
+        # SUPERVIVENCIA de ventanas (veredicto estructural 2026-08-13): por cada ventana
+        # binaria grabada, un task best-effort re-chequea el book EN MEMORIA a T+200ms y
+        # T+1s y persiste si el cruce seguía vivo. La predicción del mecanismo (Kalshi
+        # tiene UN book: el matching engine consume el cruce al arribo) es ~0% — el gate
+        # n≥200 / <5% cierra el ⚫ de M1 con número propio. Refs vivas (lección del GC)
+        # y tope duro (nada sin cota).
+        self._survival_tasks: set[asyncio.Task] = set()
+        self._survival_skipped = 0
         # ticker → id de la última fila grabada (sonda 2026-08-11): el de-dupe devolvía
         # None para señales sin cambios, y una ejecución sobre señal deduplicada perdía
         # la atribución del outcome (edge_id=None → _update_edge_window_outcome no-op).
@@ -300,6 +308,7 @@ class Motor1Engine:
                 self._last_recorded[ticker] = key
                 if window.id is not None:
                     self._last_recorded_id[ticker] = window.id
+                    self._lanzar_supervivencia(window.id, ticker)
                 logger.info(
                     f"motor1.edge.detected ticker={ticker} net={opp.net_profit_cents}c "
                     f"gross={opp.gross_profit_cents}c count={opp.count} edge={opp.edge_pct:.2f}%"
@@ -308,6 +317,51 @@ class Motor1Engine:
         except Exception:
             logger.exception("motor1.edge.persist_error")
             return None
+
+    # Chequeos de supervivencia: (delay_seg, columna). Constante de clase para que los
+    # tests la achiquen sin dormir de verdad.
+    SURVIVAL_CHECKS: tuple[tuple[float, str], ...] = (
+        (0.2, "survived_200ms"),
+        (1.0, "survived_1s"),
+    )
+    SURVIVAL_MAX_TASKS = 100  # tope duro de tasks vivos (nada sin cota)
+
+    def _lanzar_supervivencia(self, window_id: int, ticker: str) -> None:
+        """Task best-effort que mide si el cruce sigue vivo a T+200ms/T+1s (book en
+        memoria, cero red). Con la cola llena se saltea y cuenta — jamás bloquea."""
+        if len(self._survival_tasks) >= self.SURVIVAL_MAX_TASKS:
+            self._survival_skipped += 1
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Sin event loop corriendo (caller síncrono/tests): la medición se saltea
+            # contada — best-effort, jamás rompe la grabación de la ventana. El chequeo
+            # va ANTES de crear la corrutina (una corrutina huérfana emite warning).
+            self._survival_skipped += 1
+            return
+        task = asyncio.create_task(self._medir_supervivencia(window_id, ticker))
+        self._survival_tasks.add(task)
+        task.add_done_callback(self._survival_tasks.discard)
+
+    async def _medir_supervivencia(self, window_id: int, ticker: str) -> None:
+        try:
+            transcurrido = 0.0
+            resultados: dict[str, bool] = {}
+            for delay, columna in self.SURVIVAL_CHECKS:
+                await asyncio.sleep(max(0.0, delay - transcurrido))
+                transcurrido = delay
+                resultados[columna] = self._detect(ticker) is not None
+            with get_session() as s:
+                row = s.get(EdgeWindow, window_id)
+                if row is None:
+                    return
+                for columna, vivo in resultados.items():
+                    setattr(row, columna, vivo)
+                s.add(row)
+                s.commit()
+        except Exception:
+            logger.exception("motor1.supervivencia_error")
 
     async def _execute_and_record(self, opp: ArbOpportunity, edge_id: int | None) -> None:
         """
