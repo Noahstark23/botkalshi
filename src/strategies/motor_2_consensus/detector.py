@@ -441,7 +441,15 @@ def find_signals(
             reason = select_reject or best_reason
             diag["reject_" + reason] = diag.get("reject_" + reason, 0.0) + 1.0
             if select_reject in ("date", "ambiguous"):
-                logger.warning(
+                # 'date' a DEBUG (auditoría 2026-08-12): 1.058 WARNINGs/día = 98% del
+                # ruido del log — 7 eventos de series MLB repitiendo cada ciclo porque
+                # el partido de +1/+2 días aún no tiene odds y el candidato por nombres
+                # es el juego de HOY de la misma serie (rechazo CORRECTO y esperado).
+                # El conteo agregado vive en el funnel (rej_date=N por ciclo) y el
+                # detalle queda en DEBUG para forensia. 'ambiguous' sigue en WARNING:
+                # es raro (0 en el día medido) y accionable (doubleheader sin resolver).
+                log_fn = logger.debug if select_reject == "date" else logger.warning
+                log_fn(
                     f"motor2.match.rejected_{select_reject} event={ke.event_key} "
                     f"candidatos={len(candidates)} (matching conservador: el partido "
                     "equivocado es la falla catastrófica → descarta)"

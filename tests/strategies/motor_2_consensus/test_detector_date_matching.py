@@ -234,3 +234,73 @@ def test_unparseable_key_two_candidates_rejects_ambiguous():
     diag: dict[str, float] = {}
     assert _find([_kalshi("KXMLBGAME-PHINYM")], odds, diag) == []
     assert diag["reject_ambiguous"] == 1.0
+
+
+# =====================================================
+# Nivel de log del rechazo por fecha (auditoría 2026-08-12)
+# =====================================================
+# 1.058 WARNINGs/día (98% del ruido del log) eran 7 eventos de series MLB repitiendo
+# cada ciclo: el partido de +1/+2 días sin odds aún, con el juego de HOY de la misma
+# serie como candidato — rechazo CORRECTO. El detalle baja a DEBUG; el agregado vive
+# en el funnel (rej_date). 'ambiguous' (raro y accionable) se queda en WARNING.
+
+
+def test_rejected_date_loguea_debug_no_warning():
+    from loguru import logger
+
+    # Mismo escenario que test_reject_date_when_feed_covers_day...: el feed cubre el
+    # día del key con OTRO partido, y este matchup solo existe mañana → reject_date.
+    otro_hoy = OddsEvent(
+        id="other",
+        sport_key="baseball_mlb",
+        commence_time=NOW + timedelta(hours=6),
+        home_team="Atlanta Braves",
+        away_team="Miami Marlins",
+        bookmakers=(
+            Bookmaker(
+                key="pinnacle",
+                title="P",
+                markets=(
+                    Market(
+                        key="h2h",
+                        outcomes=(
+                            Outcome(name="Atlanta Braves", price=1.6),
+                            Outcome(name="Miami Marlins", price=2.6),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    phinym_manana = _odds(NOW + timedelta(hours=30), oid="tmrw")
+    ke_hoy = _kalshi(f"KXMLBGAME-{_stamp(NOW + timedelta(hours=6))}PHINYM")
+
+    registros: list = []
+    sink = logger.add(lambda m: registros.append(m.record), level="DEBUG")
+    try:
+        diag: dict[str, float] = {}
+        _find([ke_hoy], [otro_hoy, phinym_manana], diag)
+        assert diag.get("reject_date") == 1.0  # el funnel SIGUE contando
+    finally:
+        logger.remove(sink)
+
+    date_logs = [r for r in registros if "rejected_date" in r["message"]]
+    assert len(date_logs) == 1
+    assert date_logs[0]["level"].name == "DEBUG"  # detalle en DEBUG, no WARNING
+
+
+def test_rejected_ambiguous_sigue_en_warning():
+    from loguru import logger
+
+    odds = [_odds(NOW + timedelta(hours=2), oid="a"), _odds(NOW + timedelta(hours=26), oid="b")]
+
+    registros: list = []
+    sink = logger.add(lambda m: registros.append(m.record), level="DEBUG")
+    try:
+        _find([_kalshi("KXMLBGAME-PHINYM")], odds, {})
+    finally:
+        logger.remove(sink)
+
+    ambig = [r for r in registros if "rejected_ambiguous" in r["message"]]
+    assert len(ambig) == 1
+    assert ambig[0]["level"].name == "WARNING"  # el caso raro y accionable no se degrada
