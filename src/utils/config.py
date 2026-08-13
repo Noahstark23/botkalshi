@@ -559,6 +559,18 @@ class Settings(BaseSettings):
         gt=0.0,
         description="Techo duro (USD) del costo abierto del Motor 5 (canary F3)",
     )
+    # APUESTA 1 (plan 2026-08-12) — el "fee fantasma": el quoter cobraba fee de TAKER a
+    # las DOS patas de un round-trip que por construcción es MAKER (post_only GTC), y el
+    # shadow le descontaba esa fee a cada fill simulado. El fee schedule de Kalshi tiene
+    # maker fee = $0 en deportes estándar → M5 se auto-excluía de los books de 1-5¢ (su
+    # único hábitat viable) y el mtm del A/B midió un impuesto que un maker real no paga.
+    # False (default) = modelo taker (comportamiento actual). Encender SOLO tras verificar
+    # el fee real con evidencia (is_taker + fee en el fills API de fills propios, o el fee
+    # schedule de la serie) — protocolo de lista literal del operador.
+    MOTOR_MM_FEES_AS_MAKER: bool = Field(
+        default=False,
+        description="True = quoter e inventario shadow modelan fee de MAKER ($0); False = modelo taker (actual). Encender solo con el fee real verificado",
+    )
 
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,

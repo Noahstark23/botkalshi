@@ -52,6 +52,7 @@ def compute_quote(
     best_yes_bid: int | None,
     best_yes_ask: int | None,
     edge_skew_cents: int = 0,
+    fees_as_maker: bool = False,
 ) -> tuple[QuoteSet | None, str | None]:
     """(QuoteSet, None) si hay quote emitible; (None, motivo_de_skip) si no."""
     if not (0.0 < fair_prob < 1.0):
@@ -85,7 +86,11 @@ def compute_quote(
         ask = None
     if bid is not None and ask is not None:
         captured = ask - bid
-        fees = kalshi_fee_cents(1, bid) + kalshi_fee_cents(1, ask)
+        # APUESTA 1 (2026-08-12): con fees_as_maker el round-trip post_only no paga
+        # comisión (maker fee $0 en el schedule de deportes de Kalshi) — la regla 5
+        # exige solo spread positivo. El modelo taker (default) era el "fee fantasma"
+        # que auto-excluía a M5 de todo book con spread ≤4¢ en zona media.
+        fees = 0 if fees_as_maker else kalshi_fee_cents(1, bid) + kalshi_fee_cents(1, ask)
         if captured <= fees:
             return None, "unprofitable"
     return QuoteSet(
