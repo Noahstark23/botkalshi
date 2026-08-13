@@ -229,6 +229,11 @@ class EdgeWindow(SQLModel, table=True):
     # Tipo de detección: "binary" (mismo market, libro cruzado) | "multi_outcome"
     # (1X2/winner: N markets del mismo evento sumando <100). NULL = pre-P3 (binary).
     kind: str | None = Field(default=None, max_length=20)
+    # Supervivencia (M1 binario, 2026-08-13): ¿el cruce seguía vivo a T+200ms / T+1s en
+    # nuestro book en memoria? None = no medido (kinds no binarios / cola llena). La
+    # predicción estructural es ~0%: el matching engine consume el cruce al arribo.
+    survived_200ms: bool | None = None
+    survived_1s: bool | None = None
     leg_states: str | None = Field(
         default=None, max_length=50
     )  # "FILL/KILL", "FILL/ERROR_RED", etc.
@@ -485,6 +490,12 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("edge_windows", "fees_cents", "INTEGER"),
     ("edge_windows", "edge_pct", "FLOAT"),
     ("edge_windows", "kind", "VARCHAR(20)"),  # P3: binary | multi_outcome
+    # Supervivencia de ventanas binarias (veredicto estructural M1, 2026-08-13): ¿el
+    # cruce sigue vivo a T+200ms/T+1s en NUESTRO feed? Predicción del mecanismo: ~0%
+    # (el matching engine de Kalshi consume el cruce al arribo — la ventana que vemos
+    # es el delta de un cruce YA muerto). Gate: n≥200, <5% sobrevive → ⚫ cerrado.
+    ("edge_windows", "survived_200ms", "BOOLEAN"),
+    ("edge_windows", "survived_1s", "BOOLEAN"),
     ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
     ("portfolio_positions", "peak_bid_cents", "INTEGER"),  # Motor 3 FASE 2: trailing stop
     ("trades", "filled_count", "INTEGER"),  # Motor 5 F2: fills parciales de resting orders
