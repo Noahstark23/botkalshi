@@ -339,6 +339,10 @@ class MMShadowFill(SQLModel, table=True):
     markout1_age_sec: float | None = None
     markout2_cents: float | None = None  # primer tick ≥300s post-fill
     markout2_age_sec: float | None = None
+    # Salto del mark en el tick del fill (blindaje 2026-08-13): |mark_t − mark_t−1|.
+    # Permite segmentar markout de fills de SALTO (evento de juego atravesando la
+    # quote) vs fills calmos — el gate juzga la economía de los calmos por separado.
+    mark_jump_cents: float | None = None
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 
@@ -471,6 +475,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("mm_shadow_fills", "markout1_age_sec", "FLOAT"),
     ("mm_shadow_fills", "markout2_cents", "FLOAT"),
     ("mm_shadow_fills", "markout2_age_sec", "FLOAT"),
+    ("mm_shadow_fills", "mark_jump_cents", "FLOAT"),  # blindaje: fills de salto etiquetados
 ]
 
 

@@ -571,6 +571,19 @@ class Settings(BaseSettings):
         default=False,
         description="True = quoter e inventario shadow usan la fee REAL de maker (¼ del taker, kalshi_maker_fee_cents); False = modelo taker legacy",
     )
+    # RETIRO POR SALTO (Apuesta 1, blindaje del maker — primer dato del gate 2026-08-13:
+    # 4 fills en un juego EN VIVO con markout −18/−20¢ a T+5min, ambos lados perdiendo a
+    # la vez = un evento del juego atravesó las quotes; el perfil de víctima documentado
+    # del maker lento). Si el mark de un ticker saltó ≥ este umbral desde el tick
+    # anterior: la quote viva se retira y no se re-cotiza ese tick (modela el
+    # cancel-on-move de un maker real). El fill que el salto ya causó SE CUENTA IGUAL y
+    # queda etiquetado (mark_jump_cents en mm_shadow_fills): el gate puede segmentar
+    # markout en fills de salto vs fills calmos — medir, no asumir. 0 = off.
+    MOTOR_MM_JUMP_RETREAT_CENTS: float = Field(
+        default=5.0,
+        ge=0.0,
+        description="Salto del mark (¢) desde el tick anterior que retira la quote del ticker por ese tick (0 = off). Los fills del salto se etiquetan, no se ocultan",
+    )
 
     # === Motor REST (arbitraje WS-detección + REST-ejecución) ===
     # MOTOR_REST_ENABLED controla si el motor CORRE (se conecta, parsea, detecta,

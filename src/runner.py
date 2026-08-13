@@ -254,6 +254,7 @@ class ProductionRunner:
                 fill_feed=fill_feed,
                 mm_exposure_cap_usd=self.settings.MOTOR_MM_MAX_EXPOSURE_USD,
                 fees_as_maker=self.settings.MOTOR_MM_FEES_AS_MAKER,
+                jump_retreat_cents=self.settings.MOTOR_MM_JUMP_RETREAT_CENTS,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor5_mm runner: {type(e).__name__}: {e}"
