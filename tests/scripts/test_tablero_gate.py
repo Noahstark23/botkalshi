@@ -23,7 +23,7 @@ def _db(tmp_path, filas):
     con.execute(
         "CREATE TABLE mm_shadow_fills (id INTEGER PRIMARY KEY, created_at TEXT, "
         "markout1_cents REAL, markout2_cents REAL, quote_jump_cents REAL, "
-        "fee_cents INT, fee_effective_cents INT)"
+        "fee_cents INT, fee_effective_cents INT, price_cents INT DEFAULT 50)"
     )
     con.executemany(
         "INSERT INTO mm_shadow_fills (created_at, markout1_cents, markout2_cents, "
@@ -97,3 +97,58 @@ def test_umbral_del_gate_con_n_suficiente(tmp_path, avg2, esperado):
 def test_el_corte_es_el_fix_del_mark_congelado():
     """CONTROL de documentación: el corte no es una fecha mágica — es #235."""
     assert CORTE_MARK_CONGELADO.startswith("2026-08-14")
+
+
+# =====================================================
+# Margen teórico — el chequeo PRE-gate (2026-08-14)
+# =====================================================
+# Bartlett/O'Hara (41,6M trades): el revenue del MM en broad-based (ganador del juego,
+# = lo que M5 cotiza) es 0.82¢/contrato, y su fuente NO es el spread sino el sesgo
+# conductual del retail. El fee de Kalshi es proporcional a p(1−p) → máximo en 50¢.
+# Consecuencia: en la zona media el margen del maker es NEGATIVO antes de la primera
+# pérdida por selección adversa. El gate no debe gastar semanas midiendo eso.
+
+
+def test_margen_negativo_en_la_zona_media():
+    from scripts.tablero_gate import margen_teorico
+
+    assert margen_teorico(50) < 0  # la peor: fee round-trip 0.875¢ vs 0.82¢
+    assert margen_teorico(45) < 0
+    assert margen_teorico(40) < 0
+
+
+def test_margen_positivo_en_las_colas():
+    from scripts.tablero_gate import margen_teorico
+
+    assert margen_teorico(20) > 0.25
+    assert margen_teorico(10) > 0.5
+    assert margen_teorico(80) == pytest.approx(margen_teorico(20))  # simétrico en p(1−p)
+
+
+def test_la_zona_muerta_es_el_centro():
+    """El conjunto viable es DISJUNTO (dos colas); lo que se reporta es el pozo del
+    medio, que es justo donde M5 cotiza ganadores de partido."""
+    from scripts.tablero_gate import zona_muerta
+
+    zm = zona_muerta()
+    assert zm is not None
+    lo, hi = zm
+    assert lo <= 50 <= hi  # 50¢ está DENTRO de la zona muerta
+    assert lo > 30 and hi < 70  # y el pozo no llega a las colas
+
+
+def test_el_tablero_avisa_si_la_mayoria_cae_en_zona_muerta(tmp_path):
+    """El caso real de M5: ganadores de partido cotizados en 40-60¢."""
+    db = _db(
+        tmp_path,
+        [
+            ("2026-08-14 22:45", 1.0, 1.0, 0.0, 18, 5),
+            ("2026-08-14 22:46", 1.0, 1.0, 0.0, 18, 5),
+        ],
+    )
+    salida = tablero(db, half_spread=5)
+
+    assert "MARGEN TEÓRICO" in salida
+    assert "2/2 (100%) en zona de margen ≤0" in salida
+    assert "MAYORÍA EN ZONA MUERTA" in salida
+    assert "ZONA MUERTA" in salida
