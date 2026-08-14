@@ -68,6 +68,13 @@ class Motor5Engine:
     # one-shot de por vida se consume una vez (p.ej. en el boot, fuera de la ventana de
     # log que alguien esté mirando) y el skip perpetuo vuelve a ser arqueología.
     BOOK_DIAG_REARM_SEC = 1800.0
+    # FRESCURA del mark para medir markout (bug encontrado por la sonda 2026-08-14):
+    # _last_marks NUNCA se invalida — con max_tickers=10 y fair_fresh=20-48 los tickers
+    # ROTAN fuera del universo, el mark se congela y AMBOS horizontes medían contra el
+    # mismo valor viejo (markout2 == markout1 exacto en 5/5 fills). El T+5min —
+    # justamente el que detecta selección adversa SOSTENIDA — estaba ciego. Un markout
+    # contra un mark congelado no es una medición: se descarta y se espera uno fresco.
+    MARK_FRESH_MAX_SEC = 90.0  # 1.5 ticks
 
     def __init__(
         self,
@@ -106,6 +113,7 @@ class Motor5Engine:
         self._markouts_pendientes: list[dict] = []
         self._live_quotes: dict[str, QuoteSet] = {}
         self._last_marks: dict[str, float] = {}  # último mark conocido por ticker (MTM)
+        self._last_marks_at: dict[str, float] = {}  # monotonic del último refresh del mark
         # ── F2 (demo): ejecución real. CAPA A: el executor SOLO se construye (en run())
         # con trading_enabled=True — que el runner deriva de TRADING_ENABLED AND
         # MOTOR_MM_EXECUTION_ENABLED (y el validador de config bloquea EXECUTION=true en
@@ -422,22 +430,33 @@ class Motor5Engine:
         restantes: list[dict] = []
         for p in self._markouts_pendientes:
             edad = ahora - p["t_mono"]
-            mark = self._last_marks.get(p["ticker"])
+            mark = self._mark_fresco(p["ticker"], ahora)
             try:
                 if not p["m1_hecho"] and edad >= 30.0 and mark is not None:
                     self._persist_markout(p["id"], 1, self._markout_cents(p, mark), edad)
                     p["m1_hecho"] = True
-                if edad >= 300.0:
+                    # markout2 JAMÁS en la misma pasada: dos horizontes exigen DOS
+                    # observaciones distintas del mercado, no la misma leída dos veces.
+                elif edad >= 300.0:
                     if mark is not None:
                         self._persist_markout(p["id"], 2, self._markout_cents(p, mark), edad)
                         continue  # completo → sale de la cola
-                    if edad >= 600.0:
-                        continue  # sin mark en 10min (ticker fuera del universo) → soltar
+                if edad >= 600.0:
+                    continue  # sin mark FRESCO en 10min (ticker fuera del universo) → soltar
             except Exception:
                 logger.exception("motor5.markout_error")
                 continue  # un fill problemático no bloquea la cola
             restantes.append(p)
         self._markouts_pendientes = restantes
+
+    def _mark_fresco(self, ticker: str, ahora: float) -> float | None:
+        """El mark SOLO si fue refrescado en este tick o el anterior. Un ticker que rotó
+        fuera del universo conserva su último mark en _last_marks para siempre; medir
+        contra él es inventar una observación que nadie hizo."""
+        marcado_en = self._last_marks_at.get(ticker)
+        if marcado_en is None or (ahora - marcado_en) > self.MARK_FRESH_MAX_SEC:
+            return None
+        return self._last_marks.get(ticker)
 
     @staticmethod
     def _markout_cents(p: dict, mark_cents: float) -> float:
@@ -468,11 +487,13 @@ class Motor5Engine:
     def _record_mark(
         self, ticker: str, yes_bid: int | None, yes_ask: int | None, fair_prob: float
     ) -> None:
-        """Mark para el MTM: mid del book si hay dos lados; si no, el fair (mejor prior)."""
+        """Mark para el MTM: mid del book si hay dos lados; si no, el fair (mejor prior).
+        Estampa el instante: el markout exige un mark FRESCO (ver MARK_FRESH_MAX_SEC)."""
         if yes_bid is not None and yes_ask is not None:
             self._last_marks[ticker] = (yes_bid + yes_ask) / 2.0
         else:
             self._last_marks[ticker] = fair_prob * 100.0
+        self._last_marks_at[ticker] = time.monotonic()
 
     async def _book_top(self, ticker: str) -> tuple[int | None, int | None] | None:
         """Top-of-book YES vía REST. (yes_bid, yes_ask); None = sin book usable.

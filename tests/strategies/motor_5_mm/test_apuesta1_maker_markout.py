@@ -161,6 +161,12 @@ async def test_markout_negativo_cuando_el_mercado_sigue_en_contra():
 
 @pytest.mark.asyncio
 async def test_markout2_completa_y_saca_de_la_cola():
+    """⚠️ CAMBIO SEMÁNTICO DELIBERADO (2026-08-14): la versión previa de este test
+    pineaba el BUG — esperaba markout1 y markout2 escritos en la MISMA pasada con el
+    MISMO mark (ambos 3.0). Producción lo delató: 5/5 fills con markout2 == markout1
+    exacto, o sea el horizonte largo era una copia del corto. Ahora cada horizonte
+    exige su propia observación; acá el mercado no se mueve entre pasadas, así que
+    ambos valen 3.0 — pero se escriben en ticks DISTINTOS."""
     client = _ReadOnlyClient()
     client.books["T-A"] = _book(40, 60)
     FairValueBook.publish({"T-A": 0.50})
@@ -171,12 +177,19 @@ async def test_markout2_completa_y_saca_de_la_cola():
 
     eng._markouts_pendientes[0]["t_mono"] -= 301.0
     client.books["T-A"] = _book(48, 52)  # mid 50: vendimos a 53 y bajó → sell markout +3
-    await eng._tick()
+    await eng._tick()  # pasada 1: markout1
 
     with get_session() as s:
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.markout1_cents == 3.0  # sell: precio − mark = 53 − 50
-    assert row.markout2_cents == 3.0
+    assert row.markout2_cents is None  # el largo NO se copia del corto
+    assert eng._markouts_pendientes  # sigue en cola esperando su observación
+
+    await eng._tick()  # pasada 2: markout2 con su propio mark
+
+    with get_session() as s:
+        row = list(s.exec(select(MMShadowFill)))[0]
+    assert row.markout2_cents == 3.0  # mismo valor porque el mercado no se movió
     assert eng._markouts_pendientes == []  # completo → fuera de la cola
 
 
@@ -250,3 +263,66 @@ async def test_fila_declara_modelo_taker_por_default():
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.fee_model == "taker"
     assert row.fee_effective_cents == row.fee_cents == kalshi_fee_cents(10, 47)
+
+
+# =====================================================
+# El markout exige un mark FRESCO (bug de la sonda 2026-08-14)
+# =====================================================
+# _last_marks nunca se invalidaba: con max_tickers=10 y fair_fresh=20-48 los tickers
+# ROTAN fuera del universo, el mark queda congelado, y markout1/markout2 medían contra
+# el MISMO valor viejo (5/5 fills con markout2 == markout1 exacto en producción). El
+# T+5min — el horizonte que detecta selección adversa SOSTENIDA — estaba ciego.
+
+
+@pytest.mark.asyncio
+async def test_mark_congelado_no_produce_markout():
+    """El ticker rotó fuera del universo: su mark ya no se refresca. Medir contra él
+    sería inventar una observación — se espera, y a los 10min se suelta con NULL."""
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = _engine(client)
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)
+    await eng._tick()  # fill
+    assert len(eng._markouts_pendientes) == 1
+
+    # El fill fue hace 60s y el mark quedó congelado hace 200s (ticker fuera del universo).
+    eng._markouts_pendientes[0]["t_mono"] -= 60.0
+    eng._last_marks_at["T-A"] -= 200.0
+    eng._medir_markouts()
+
+    with get_session() as s:
+        row = list(s.exec(select(MMShadowFill)))[0]
+    assert row.markout1_cents is None  # no se mide contra un mark congelado
+    assert eng._markouts_pendientes  # sigue esperando uno fresco
+
+
+@pytest.mark.asyncio
+async def test_los_dos_horizontes_son_observaciones_distintas():
+    """EL BUG EXACTO: con el fill ya viejo (>300s), markout1 y markout2 no pueden
+    escribirse en la misma pasada leyendo el mismo mark — dos horizontes exigen dos
+    observaciones. markout2 espera a la pasada siguiente (con su mark propio)."""
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = _engine(client)
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)
+    await eng._tick()  # fill buy @47
+
+    eng._markouts_pendientes[0]["t_mono"] -= 400.0  # el fill ya pasó los 300s
+    client.books["T-A"] = _book(38, 42)  # mid 40
+    await eng._tick()  # pasada 1: solo markout1
+
+    with get_session() as s:
+        row = list(s.exec(select(MMShadowFill)))[0]
+    assert row.markout1_cents == -7.0 and row.markout2_cents is None
+
+    client.books["T-A"] = _book(48, 52)  # mid 50: el mercado SE MOVIÓ entre horizontes
+    await eng._tick()  # pasada 2: markout2 con su propia observación
+
+    with get_session() as s:
+        row = list(s.exec(select(MMShadowFill)))[0]
+    assert row.markout2_cents == 3.0  # 50 − 47: distinto de markout1, como debe ser
+    assert eng._markouts_pendientes == []
