@@ -16,6 +16,8 @@ adversa) y el spread capture no existe a esta escala.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from sqlmodel import select
 
@@ -148,7 +150,7 @@ async def test_markout_negativo_cuando_el_mercado_sigue_en_contra():
     await eng._tick()
     assert len(eng._markouts_pendientes) == 1
 
-    eng._markouts_pendientes[0]["t_mono"] -= 60.0  # el fill fue "hace 60s"
+    eng._markouts_pendientes[0]["creado"] -= timedelta(seconds=60.0)  # el fill fue "hace 60s"
     client.books["T-A"] = _book(38, 42)  # mid ahora 40: siguió en contra
     await eng._tick()
 
@@ -175,7 +177,7 @@ async def test_markout2_completa_y_saca_de_la_cola():
     client.books["T-A"] = _book(54, 60)  # bid cruza el ask → fill sell @53
     await eng._tick()
 
-    eng._markouts_pendientes[0]["t_mono"] -= 301.0
+    eng._markouts_pendientes[0]["creado"] -= timedelta(seconds=301.0)
     client.books["T-A"] = _book(48, 52)  # mid 50: vendimos a 53 y bajó → sell markout +3
     await eng._tick()  # pasada 1: markout1
 
@@ -205,7 +207,7 @@ async def test_markout_sin_mark_espera_y_luego_suelta():
     client.books["T-A"] = _book(40, 46)
     await eng._tick()  # fill
 
-    eng._markouts_pendientes[0]["t_mono"] -= 700.0  # >10min sin medir
+    eng._markouts_pendientes[0]["creado"] -= timedelta(seconds=700.0)  # >10min sin medir
     eng._last_marks.clear()  # el ticker ya no tiene mark
     eng._medir_markouts()
 
@@ -288,7 +290,7 @@ async def test_mark_congelado_no_produce_markout():
     assert len(eng._markouts_pendientes) == 1
 
     # El fill fue hace 60s y el mark quedó congelado hace 200s (ticker fuera del universo).
-    eng._markouts_pendientes[0]["t_mono"] -= 60.0
+    eng._markouts_pendientes[0]["creado"] -= timedelta(seconds=60.0)
     eng._last_marks_at["T-A"] -= 200.0
     eng._medir_markouts()
 
@@ -311,7 +313,7 @@ async def test_los_dos_horizontes_son_observaciones_distintas():
     client.books["T-A"] = _book(40, 46)
     await eng._tick()  # fill buy @47
 
-    eng._markouts_pendientes[0]["t_mono"] -= 400.0  # el fill ya pasó los 300s
+    eng._markouts_pendientes[0]["creado"] -= timedelta(seconds=400.0)  # el fill ya pasó los 300s
     client.books["T-A"] = _book(38, 42)  # mid 40
     await eng._tick()  # pasada 1: solo markout1
 
@@ -328,3 +330,88 @@ async def test_los_dos_horizontes_son_observaciones_distintas():
     # El fill 1 completó y salió de la cola (puede haber otros pendientes: en shadow la
     # quote ya no se retira por salto, así que el mercado sigue generando fills).
     assert all(p["id"] != row.id for p in eng._markouts_pendientes)
+
+
+# =====================================================
+# Los markouts sobreviven al redeploy (fuga 2026-08-14)
+# =====================================================
+# La cola vivía solo en RAM: los fills 254/255 perdieron su T+5min porque el proceso
+# se reinició 6 min después del fill. Con 5 deploys en un día eso es una fuga MATERIAL
+# de la métrica que decide el gate. La cola se RECONSTRUYE de la tabla (que ya sabe
+# qué falta medir), no se persiste aparte.
+
+
+@pytest.mark.asyncio
+async def test_rehidrata_los_markouts_pendientes_tras_restart():
+    from datetime import UTC, datetime
+
+    from src.storage.models import MMShadowFill
+
+    # Un fill de hace 2 min con markout1 medido y markout2 pendiente (el caso 254/255).
+    with get_session() as s:
+        fila = MMShadowFill(
+            ticker="T-A",
+            side="buy",
+            price_cents=47,
+            count=10,
+            fee_cents=18,
+            rule="test",
+            inventory_after=10,
+            markout1_cents=-2.0,
+            created_at=datetime.now(UTC) - timedelta(seconds=120),
+        )
+        s.add(fila)
+        s.commit()
+        s.refresh(fila)
+        fill_id = fila.id
+
+    eng = _engine(_ReadOnlyClient())  # proceso NUEVO: cola vacía
+    assert eng._markouts_pendientes == []
+
+    eng._rehidratar_markouts()
+
+    assert len(eng._markouts_pendientes) == 1
+    p = eng._markouts_pendientes[0]
+    assert p["id"] == fill_id and p["price"] == 47 and p["side"] == "buy"
+    assert p["m1_hecho"] is True  # markout1 ya estaba: solo falta el largo
+
+
+@pytest.mark.asyncio
+async def test_no_rehidrata_fills_vencidos_ni_completos():
+    from datetime import UTC, datetime
+
+    from src.storage.models import MMShadowFill
+
+    with get_session() as s:
+        s.add(  # vencido: su ventana de 600s ya pasó
+            MMShadowFill(
+                ticker="VIEJO",
+                side="buy",
+                price_cents=47,
+                count=10,
+                fee_cents=18,
+                rule="t",
+                inventory_after=10,
+                created_at=datetime.now(UTC) - timedelta(seconds=900),
+            )
+        )
+        s.add(  # completo: ya tiene los dos horizontes
+            MMShadowFill(
+                ticker="COMPLETO",
+                side="buy",
+                price_cents=47,
+                count=10,
+                fee_cents=18,
+                rule="t",
+                inventory_after=10,
+                markout1_cents=-1.0,
+                markout2_cents=-3.0,
+                created_at=datetime.now(UTC) - timedelta(seconds=60),
+            )
+        )
+        s.commit()
+
+    eng = _engine(_ReadOnlyClient())
+    eng._rehidratar_markouts()
+
+    assert eng._markouts_pendientes == []  # ninguno de los dos entra

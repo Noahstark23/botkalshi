@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 from sqlmodel import select
@@ -136,6 +136,51 @@ class Motor5Engine:
         # siempre tras la primera vez. Valor = time.monotonic() del último log.
         self._book_diag_last: dict[str, float] = {}
 
+    def _rehidratar_markouts(self) -> None:
+        """Reconstruye la cola de markouts pendientes desde la TABLA tras un restart.
+
+        Fuga encontrada por la sonda 2026-08-14: la cola vivía solo en RAM, así que
+        cada redeploy borraba los markouts en vuelo (los fills 254/255 perdieron su
+        T+5min porque el proceso se reinició 6 minutos después). Con la cadencia de
+        deploys de estos días eso es una fuga MATERIAL de la métrica que decide el gate.
+
+        No hace falta una cola persistida con due_at: la tabla YA sabe qué falta medir
+        (markout NULL + fill reciente). Se rehidrata una vez al arrancar el loop; los
+        fills demasiado viejos (>600s, el mismo tope del fail-safe) se ignoran porque su
+        ventana ya venció. Best-effort: un fallo de DB no impide arrancar el motor."""
+        limite = datetime.now(UTC) - timedelta(seconds=600)
+        try:
+            with get_session() as s:
+                filas = list(
+                    s.exec(
+                        select(MMShadowFill).where(
+                            MMShadowFill.created_at >= limite,
+                            MMShadowFill.markout2_cents.is_(None),  # type: ignore[union-attr]
+                        )
+                    )
+                )
+        except Exception:
+            logger.exception("motor5.rehidratar_markouts_error")
+            return
+        for f in filas:
+            if f.id is None:
+                continue
+            creado = f.created_at
+            if creado.tzinfo is None:  # SQLite no preserva tz
+                creado = creado.replace(tzinfo=UTC)
+            self._markouts_pendientes.append(
+                {
+                    "id": f.id,
+                    "ticker": f.ticker,
+                    "side": f.side,
+                    "price": f.price_cents,
+                    "creado": creado,
+                    "m1_hecho": f.markout1_cents is not None,
+                }
+            )
+        if filas:
+            logger.info(f"motor5.markouts_rehidratados={len(filas)} (sobrevivieron al redeploy)")
+
     async def run(self, stop_event: asyncio.Event) -> None:
         mode = "F2 LIVE (demo)" if self._trading_enabled else "F1 SHADOW — CERO órdenes"
         logger.info(
@@ -143,6 +188,7 @@ class Motor5Engine:
             f"max_tickers={self._max_tickers} half_spread={self._half_spread}c "
             f"size={self._size} max_inv={self._max_inventory} fair_ttl={self._fair_ttl}s"
         )
+        self._rehidratar_markouts()
         async with self._client_factory() as client:
             self._client = client
             if self._trading_enabled:
@@ -436,7 +482,10 @@ class Motor5Engine:
                         "ticker": fill.ticker,
                         "side": fill.side,
                         "price": fill.price_cents,
-                        "t_mono": time.monotonic(),
+                        # Reloj de PARED, no monotonic: es lo único que sobrevive a un
+                        # redeploy (ver _rehidratar_markouts). Los horizontes son de
+                        # 30s/300s — el drift de NTP es irrelevante a esa escala.
+                        "creado": datetime.now(UTC),
                         "m1_hecho": False,
                     }
                 )
@@ -452,11 +501,12 @@ class Motor5Engine:
         real es "el primer tick ≥30s" y se persiste la edad exacta. Best-effort."""
         if not self._markouts_pendientes:
             return
-        ahora = time.monotonic()
+        ahora = datetime.now(UTC)
+        mono = time.monotonic()
         restantes: list[dict] = []
         for p in self._markouts_pendientes:
-            edad = ahora - p["t_mono"]
-            mark = self._mark_fresco(p["ticker"], ahora)
+            edad = (ahora - p["creado"]).total_seconds()
+            mark = self._mark_fresco(p["ticker"], mono)
             try:
                 if not p["m1_hecho"] and edad >= 30.0 and mark is not None:
                     self._persist_markout(p["id"], 1, self._markout_cents(p, mark), edad)
