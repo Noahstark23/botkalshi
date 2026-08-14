@@ -352,6 +352,12 @@ class MMShadowFill(SQLModel, table=True):
     # juzga el gate es deuda que cuesta veredictos.
     fee_model: str | None = Field(default=None, max_length=8)  # "taker" | "maker"
     fee_effective_cents: int | None = None
+    # Salto del mark en el tick en que se CREÓ la quote que llenó (2026-08-14): con
+    # esto el análisis reconstruye la política de CUALQUIER umbral de blindaje desde los
+    # mismos datos (blindaje@X = subconjunto con quote_jump_cents < X). En shadow la
+    # quote NO se retira — medir todo y filtrar después es estrictamente más informativo
+    # que no medir (y protege $0); en live el retiro es real.
+    quote_jump_cents: float | None = None
     # Salto del mark en el tick del fill (blindaje 2026-08-13): |mark_t − mark_t−1|.
     # Permite segmentar markout de fills de SALTO (evento de juego atravesando la
     # quote) vs fills calmos — el gate juzga la economía de los calmos por separado.
@@ -521,6 +527,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("mm_shadow_fills", "mark_jump_cents", "FLOAT"),  # blindaje: fills de salto etiquetados
     ("mm_shadow_fills", "fee_model", "VARCHAR(8)"),  # taker|maker — la tabla se auto-describe
     ("mm_shadow_fills", "fee_effective_cents", "INTEGER"),
+    ("mm_shadow_fills", "quote_jump_cents", "FLOAT"),  # contrafactual de umbral de blindaje
 ]
 
 
