@@ -36,16 +36,21 @@ verificación del 13-ago). El gate corre desde ese boot.
   spread capture no existe a esta escala → **apagar M5 Y el ciclo M2 + The Odds API**.
 - Ambos resultados son veredictos válidos. NO extender el plazo sin causa escrita.
 
-**El tablero (leer en cada parte — queries `mode=ro`, jamás read-write):**
+**El tablero — UNA línea, no queries ad-hoc (2026-08-14):**
 ```bash
-# Marcador del gate: fills con su modelo de fee declarado, markout y salto del tick.
-python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select id,ticker,side,price_cents,count,fee_model,fee_effective_cents,markout1_cents,markout2_cents,mark_jump_cents,created_at from mm_shadow_fills order by id desc limit 20")]'
-# Agregado del gate, SEGMENTADO calmo vs salto (la lectura que decide):
-python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select case when coalesce(mark_jump_cents,0)>=5 then \"salto\" else \"calmo\" end g, count(*), round(avg(markout1_cents),2), round(avg(markout2_cents),2) from mm_shadow_fills where markout1_cents is not null group by g")]'
-# CLV: fill vs el cierre del consenso (FairKickoffSnapshot del último ciclo pre-kickoff).
-python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select f.id,f.ticker,f.side,f.price_cents,f.fee_effective_cents,round(k.fair_prob*100,1) cierre_c from mm_shadow_fills f join fair_kickoff_snapshots k on k.ticker=f.ticker order by f.id desc limit 20")]'
+python3 scripts/tablero_gate.py            # en el container; --db y --half-spread si hace falta
 ```
+⚠️ **Las queries sueltas ya produjeron una lectura falsa**: un tablero ad-hoc reportó
+markout2 −11.09¢ sobre "n=11" cuando NUEVE filas eran residuo del bug del mark congelado
+(#235) — muestra limpia real n=2. El filtro vive en el script, con tests. Si necesitás
+una query nueva, agregala AL SCRIPT; no la improvises en el container.
+
 - **Columnas auto-descriptivas (2026-08-14):** `fee_model` (taker|maker) + `fee_effective_cents` dicen qué contabilidad rigió CADA fill; `fee_cents` es la referencia taker (permite derivar ambas de la misma fila). NULL = tramo pre-columna. **No sumar `fee_cents` crudo con el modelo maker activo.**
+- **markout2 (T+5min) es el juez PRINCIPAL; markout1 (T+30s) secundario** (fijado
+  2026-08-14 ANTES de tener muestra): la selección adversa que mata a un maker chico es
+  la SOSTENIDA. Los primeros datos limpios muestran por qué — fills calmos con markout1
+  **+2.5/+0.5** que a T+5min terminan en **−9.0/−9.5**. El script se NIEGA a declarar
+  veredicto con n<100: un promedio de n chico es una anécdota, no un resultado.
 - **CLV = juez SECUNDARIO** (Propuesta 1 del plan M2, #231): (cierre − precio − fee) signado. Gate propio n≥100: CLV medio > 0 con signo estable semanal. **El markout MANDA, el CLV EXPLICA** — prohibido invertirlo (markout tóxico + CLV lindo = fills tóxicos, punto). Diagnostica el confound del fair degradado: markout OK + CLV negativo → el problema es el fair (palanca: burst solo para el fair).
 - **Blindaje (#230):** `MOTOR_MM_JUMP_RETREAT_CENTS=5` retira la quote si el mark saltó ≥5¢; los fills que el salto igual causó quedan etiquetados (`mark_jump_cents`) — el gate juzga la economía de los CALMOS por separado. `skip_jump` en el funnel.
 - Retención de `mm_shadow_fills`: **30d** (era 7 — la poda borraba la muestra del gate a mitad de período; corregido 13-ago).
@@ -71,6 +76,17 @@ matching de Kalshi). Predicción: ~0%.
 ```bash
 python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select count(*) n, sum(survived_200ms) vivas_200ms, sum(survived_1s) vivas_1s from edge_windows where kind=\"binary\" and survived_200ms is not null")]'
 ```
+**VEREDICTO POR AUSENCIA (pre-registrado 2026-08-14 — el n≥200 NO va a llegar):** la
+última ventana binaria es del **12-ago 03:50**; #225 (aritmética exacta del feed) se
+mergeó **03:54:36** — cuatro minutos después, y van 67h+ con CERO ventanas. Los "arbs"
+de M1 eran, en buena parte, **artefactos de nuestros propios bugs de feed** (la colisión
+sub-céntimo inflaba niveles y fabricaba cruces fantasma). El backfill es IMPOSIBLE (la
+supervivencia exige re-chequear el book vivo a T+200ms; no se reconstruye de una fila).
+Criterio: **si al día 30 hay <10 ventanas binarias nuevas con feed exacto, el ⚫ de M1 se
+cierra por AUSENCIA DEL FENÓMENO**, documentando esta correlación. Confirmación
+independiente: los near-miss del REST se paran SIEMPRE en el bin de 1¢ — el mercado no
+deja plata sobre la mesa ni por un tick.
+
 **Decisiones ya tomadas (día 15, no re-litigar):** NO bajar la banda a 1.0-1.5pp (más
 señales-artefacto contra la misma carrera imposible); NO apagar M1 intra-mes (el día 30
 cierra con el t medido + este fundamento). M1 queda como **detector de flujo cruzante /
