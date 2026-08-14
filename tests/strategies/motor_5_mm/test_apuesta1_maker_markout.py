@@ -325,4 +325,6 @@ async def test_los_dos_horizontes_son_observaciones_distintas():
     with get_session() as s:
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.markout2_cents == 3.0  # 50 − 47: distinto de markout1, como debe ser
-    assert eng._markouts_pendientes == []
+    # El fill 1 completó y salió de la cola (puede haber otros pendientes: en shadow la
+    # quote ya no se retira por salto, así que el mercado sigue generando fills).
+    assert all(p["id"] != row.id for p in eng._markouts_pendientes)

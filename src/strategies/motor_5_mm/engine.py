@@ -114,6 +114,10 @@ class Motor5Engine:
         self._live_quotes: dict[str, QuoteSet] = {}
         self._last_marks: dict[str, float] = {}  # último mark conocido por ticker (MTM)
         self._last_marks_at: dict[str, float] = {}  # monotonic del último refresh del mark
+        # Salto del mark en el tick en que se CREÓ cada quote viva. El fill lo hereda
+        # (quote_jump_cents) → permite evaluar CUALQUIER umbral de blindaje después,
+        # no solo el configurado. ticker → salto en ¢ (0.0 si el tick fue calmo).
+        self._quote_jump: dict[str, float] = {}
         # ── F2 (demo): ejecución real. CAPA A: el executor SOLO se construye (en run())
         # con trading_enabled=True — que el runner deriva de TRADING_ENABLED AND
         # MOTOR_MM_EXECUTION_ENABLED (y el validador de config bloquea EXECUTION=true en
@@ -248,7 +252,12 @@ class Motor5Engine:
                     # cancela en 0ms) — pero queda etiquetado para que el gate segmente
                     # markout de salto vs calmo. Medir, no asumir.
                     counters["fills"] += self._settle_fills(
-                        prev, yes_bid, yes_ask, fill_fair_prob=fv.fair_prob, mark_jump=salto
+                        prev,
+                        yes_bid,
+                        yes_ask,
+                        fill_fair_prob=fv.fair_prob,
+                        mark_jump=salto,
+                        quote_jump=self._quote_jump.get(ticker),
                     )
                 except Exception:
                     # Estado del ticker en duda → quote fuera y re-sync el próximo tick.
@@ -260,14 +269,28 @@ class Motor5Engine:
             # re-cotiza. Vuelve sola al primer tick calmo.
             if salto is not None and self._jump_retreat > 0 and salto >= self._jump_retreat:
                 counters["skip_jump"] = counters.get("skip_jump", 0) + 1
-                self._live_quotes.pop(ticker, None)
                 if self._executor is not None:
+                    # LIVE: retirar de VERDAD — acá el blindaje protege plata real.
+                    self._live_quotes.pop(ticker, None)
+                    self._quote_jump.pop(ticker, None)
                     await self._executor.retire_ticker(ticker)
+                    logger.info(
+                        f"motor5.jump_retreat ticker={ticker} salto={salto:.1f}c "
+                        f"≥ {self._jump_retreat:.0f}c → quote RETIRADA (live)"
+                    )
+                    continue
+                # SHADOW (2026-08-14): NO se retira. Retirar acá protege $0 y CUESTA
+                # DATOS — el gate se quedaría sin los fills que necesita medir (n=9 en
+                # dos días; a ese ritmo no hay veredicto). La quote sigue viva, el fill
+                # se mide, y hereda el salto de su tick de creación (quote_jump_cents):
+                # con eso el análisis reconstruye la política de CUALQUIER umbral
+                # (blindaje@5 = subconjunto con quote_jump<5) desde los mismos datos.
+                # El shadow MIDE, el live PROTEGE.
                 logger.info(
-                    f"motor5.jump_retreat ticker={ticker} salto={salto:.1f}c "
-                    f"≥ {self._jump_retreat:.0f}c → quote retirada este tick"
+                    f"motor5.jump_flag ticker={ticker} salto={salto:.1f}c "
+                    f"≥ {self._jump_retreat:.0f}c → el blindaje HABRÍA retirado "
+                    "(shadow: se mide igual y se etiqueta)"
                 )
-                continue
             quote, skip = compute_quote(
                 ticker,
                 fv.fair_prob,
@@ -289,6 +312,7 @@ class Motor5Engine:
                 continue
             counters["quoted"] += 1
             self._live_quotes[ticker] = quote
+            self._quote_jump[ticker] = salto if salto is not None else 0.0
             self._persist_quote(
                 quote,
                 fv_age_sec=(now - fv.computed_at).total_seconds(),
@@ -369,6 +393,7 @@ class Motor5Engine:
         *,
         fill_fair_prob: float,
         mark_jump: float | None = None,
+        quote_jump: float | None = None,
     ) -> int:
         """Aplica los fills hipotéticos de la quote resting contra el book actual.
 
@@ -401,6 +426,7 @@ class Motor5Engine:
                 yes_bid=yes_bid,
                 yes_ask=yes_ask,
                 mark_jump=mark_jump,
+                quote_jump=quote_jump,
             )
             if fill_id is not None:
                 # Encolar la medición de markout (T+30s/T+5min contra el mark futuro).
@@ -571,6 +597,7 @@ class Motor5Engine:
         yes_bid: int | None = None,
         yes_ask: int | None = None,
         mark_jump: float | None = None,
+        quote_jump: float | None = None,
     ) -> int | None:
         """Devuelve el id de la fila (para el markout) o None si la persistencia falló.
         fee_cents SIEMPRE registra la fee de TAKER (kalshi_fee_cents) aunque el modelo
@@ -601,6 +628,7 @@ class Motor5Engine:
                     yes_bid=yes_bid,
                     yes_ask=yes_ask,
                     mark_jump_cents=round(mark_jump, 2) if mark_jump is not None else None,
+                    quote_jump_cents=round(quote_jump, 2) if quote_jump is not None else None,
                 )
                 s.add(row)
                 s.commit()
