@@ -555,7 +555,7 @@ class Motor5Engine:
         fee_cents SIEMPRE registra la fee de TAKER (kalshi_fee_cents) aunque el modelo
         del shadow sea maker: es el dato que permite derivar las DOS contabilidades de
         la misma tabla — el análisis resta o no según el modelo bajo estudio."""
-        from src.math.fees import kalshi_fee_cents
+        from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
 
         try:
             with get_session() as s:
@@ -565,6 +565,12 @@ class Motor5Engine:
                     price_cents=fill.price_cents,
                     count=fill.count,
                     fee_cents=kalshi_fee_cents(fill.count, fill.price_cents),
+                    fee_model="maker" if self._fees_as_maker else "taker",
+                    fee_effective_cents=(
+                        kalshi_maker_fee_cents(fill.count, fill.price_cents)
+                        if self._fees_as_maker
+                        else kalshi_fee_cents(fill.count, fill.price_cents)
+                    ),
                     rule=fill.rule[:50],
                     inventory_after=inventory_after,
                     quote_fair_prob=round(quote_fair_prob, 4)

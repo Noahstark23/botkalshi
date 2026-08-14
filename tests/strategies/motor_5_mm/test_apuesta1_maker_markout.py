@@ -200,3 +200,53 @@ async def test_markout_sin_mark_espera_y_luego_suelta():
     with get_session() as s:
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.markout1_cents is None and row.markout2_cents is None
+
+
+# =====================================================
+# La tabla se auto-describe (2026-08-14)
+# =====================================================
+# El agente web leyó fee_cents (referencia taker) como "el flag no está aplicado" TRES
+# veces. Una columna ambigua en la tabla que juzga el gate es deuda que cuesta
+# veredictos: ahora cada fila dice qué modelo rigió y cuánto se cobró de verdad.
+
+
+@pytest.mark.asyncio
+async def test_fila_declara_modelo_maker_y_fee_efectiva():
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = Motor5Engine(
+        max_tickers=2,
+        half_spread_cents=3,
+        quote_size_contracts=10,
+        max_inventory_contracts=50,
+        fair_ttl_sec=600.0,
+        fees_as_maker=True,
+        jump_retreat_cents=0.0,
+    )
+    eng._client = client
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)  # cruza → fill buy @47
+    await eng._tick()
+
+    with get_session() as s:
+        row = list(s.exec(select(MMShadowFill)))[0]
+    assert row.fee_model == "maker"
+    assert row.fee_effective_cents == kalshi_maker_fee_cents(10, 47)
+    assert row.fee_cents == kalshi_fee_cents(10, 47)  # la referencia taker SIGUE ahí
+
+
+@pytest.mark.asyncio
+async def test_fila_declara_modelo_taker_por_default():
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = _engine(client)  # default: modelo taker
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)
+    await eng._tick()
+
+    with get_session() as s:
+        row = list(s.exec(select(MMShadowFill)))[0]
+    assert row.fee_model == "taker"
+    assert row.fee_effective_cents == row.fee_cents == kalshi_fee_cents(10, 47)
