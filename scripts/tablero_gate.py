@@ -37,6 +37,13 @@ from dataclasses import dataclass
 CORTE_MARK_CONGELADO = "2026-08-14 19:14"
 N_MINIMO_VEREDICTO = 100
 
+# Revenue del market maker por contrato, medido sobre 41,6M de trades de Kalshi
+# (Bartlett/O'Hara, SSRN 6615739 rev. 2026-08-12). Es el TECHO teórico de lo que un MM
+# captura ANTES de fees — y su fuente no es el spread sino el sesgo conductual del
+# retail (compra YES en mercados que resuelven NO; el MM gana 63,4% de las veces).
+REVENUE_BROAD_BASED = 0.82  # ganador del juego (KXMLBGAME = lo que M5 cotiza hoy)
+REVENUE_SINGLE_NAME = 1.91  # props de jugador — 2,3x el edge, pero más flujo informado
+
 
 @dataclass(frozen=True, slots=True)
 class Resumen:
@@ -61,6 +68,28 @@ def _resumir(filas: list[tuple]) -> Resumen:
         avg2=(sum(m2) / len(m2)) if m2 else None,
         n2=len(m2),
     )
+
+
+def margen_teorico(precio_cents: int, revenue: float = REVENUE_BROAD_BASED) -> float:
+    """Margen teórico por contrato: revenue documentado − fee de maker round-trip.
+
+    El fee de Kalshi es proporcional a p(1−p): MÁXIMO en 50¢ y mínimo en las colas. En
+    la categoría broad-based (0.82¢ de revenue) eso significa que el margen del maker es
+    NEGATIVO en la zona media — justo donde vive el precio de un ganador de partido — y
+    solo se vuelve positivo hacia las colas. Esta función existe para que el gate no
+    gaste tres semanas midiendo una estrategia cuyo techo aritmético ya es ≤0."""
+    fee_rt = 2 * 1.75 * (precio_cents / 100) * (1 - precio_cents / 100)
+    return revenue - fee_rt
+
+
+def zona_muerta(revenue: float = REVENUE_BROAD_BASED) -> tuple[int, int] | None:
+    """(low, high) del rango CONTIGUO donde el margen teórico es ≤0, o None si no hay.
+
+    Se reporta la zona muerta y no "la banda viable" porque el conjunto viable es
+    DISJUNTO (las dos colas): dar su min/max sería decir "1¢-99¢" y ocultar el pozo
+    del medio, que es justo donde M5 cotiza hoy."""
+    muertos = [p for p in range(1, 100) if margen_teorico(p, revenue) <= 0]
+    return (min(muertos), max(muertos)) if muertos else None
 
 
 def tablero(db_path: str, half_spread: int) -> str:
@@ -110,6 +139,37 @@ def tablero(db_path: str, half_spread: int) -> str:
         ).fetchall()
         s = _resumir(filas)
         out.append(f"  {etiqueta:<32} n={s.n:<4} mk1={_fmt(s.avg1):<9} mk2={_fmt(s.avg2)}")
+
+    out.append("")
+    out.append("MARGEN TEÓRICO (techo aritmético ANTES de selección adversa):")
+    out.append(
+        f"  revenue MM broad-based {REVENUE_BROAD_BASED}¢/contrato (Bartlett/O'Hara, 41.6M trades)"
+    )
+    zm = zona_muerta()
+    if zm is None:
+        out.append("  sin zona muerta: el fee no supera al revenue en ningún precio")
+    else:
+        out.append(
+            f"  ZONA MUERTA {zm[0]}¢-{zm[1]}¢ (fee round-trip ≥ revenue) — viable solo en las colas"
+        )
+    precios = con.execute(
+        "select price_cents from mm_shadow_fills where created_at >= ?",
+        (CORTE_MARK_CONGELADO,),
+    ).fetchall()
+    if precios:
+        margenes = [margen_teorico(p[0]) for p in precios]
+        en_rojo = sum(1 for m in margenes if m <= 0)
+        out.append(
+            f"  tus fills: n={len(precios)} | margen medio {sum(margenes) / len(margenes):+.3f}¢ | "
+            f"{en_rojo}/{len(precios)} ({100 * en_rojo / len(precios):.0f}%) en zona de margen ≤0"
+        )
+        if en_rojo / len(precios) > 0.5:
+            out.append(
+                "  ⚠️ MAYORÍA EN ZONA MUERTA: el gate puede fallar por aritmética de fee, no por"
+            )
+            out.append(
+                "     mala cotización. Palanca ANTES de archivar: cotizar solo la banda viable."
+            )
 
     out.append("")
     if r.n2 < N_MINIMO_VEREDICTO:
