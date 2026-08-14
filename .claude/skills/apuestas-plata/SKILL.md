@@ -58,6 +58,25 @@ una query nueva, agregala AL SCRIPT; no la improvises en el container.
 - Riesgo distintivo: pick-off in-play (fair con latencia de segundos-minutos). Primeros datos: 9 fills MLB in-vivo con markout −7.3¢/−11.5¢ — la firma que el blindaje vino a frenar.
 - **LIP**: KXMLBGAME NO califica (0 pools single-game sobre 3.823 programas, verificado 13-ago). Poll barato: `GET https://api.elections.kalshi.com/trade-api/v2/incentive_programs?status=active`.
 
+### Si el gate FALLA: dos palancas ANTES de archivar (pre-registradas 2026-08-14)
+
+Bartlett/O'Hara (SSRN 6615739, 41,6M trades) mostró que el revenue del MM **no viene del
+spread** sino del sesgo conductual del retail, y que depende de la CATEGORÍA:
+single-name (props de jugador) **1,91¢/contrato** vs broad-based (ganador del juego)
+**0,82¢**. M5 cotiza solo KXMLBGAME = broad-based. Y el fee de maker ∝ p(1−p) es MÁXIMO
+en el centro → **zona muerta 38¢-62¢** donde el margen teórico es ≤0 antes de cualquier
+selección adversa (`scripts/tablero_gate.py` lo reporta; los 4 primeros fills limpios
+cayeron 4/4 ahí).
+
+Por eso, si el markout falla, la primera pregunta NO es "¿el maker sirve?" sino "¿sirve
+en esta categoría y en esta banda?". Orden de las palancas:
+1. **Cotizar solo las colas** (fair <35¢ o >65¢): el fee cae a la mitad y el margen
+   teórico se vuelve positivo. Barato: es un filtro en el universo del quoter.
+2. **Cambiar de categoría a single-name** (props): 2,3× el edge por contrato — con la
+   advertencia del propio paper: más flujo INFORMADO. Se mide antes de creerle.
+Recién si las dos fallan, M5 se archiva con su ciclo. **Archivar sin probar (1) es
+tirar el experimento por un parámetro.**
+
 ## APUESTA 1-bis — M1 converge acá (veredicto estructural 2026-08-13)
 
 **El arb intra-ticker de M1 es INCAPTURABLE POR DISEÑO, no por mala ejecución.** Kalshi
@@ -129,6 +148,12 @@ consumiría el insumo cuyo gate ya corre). **No construir motor nuevo sobre este
 - **3b Lag in-play:** MLB StatsAPI (gratis) timestampeado vs el book V2 — ¿cuánto tarda
   Kalshi en digerir un evento de scoring? Lag mediano >segundos → hay ventana, diseñar
   F1 (medir depth junto con lag). Sub-segundo → archivar sin gastar.
+- **PRIORIDAD 1 de las offline (2026-08-14):** el NO-bias es el ÚNICO edge con
+  evidencia académica robusta Y aritmética de fee favorable — Becker (72,1M trades):
+  NO le gana a YES en **69 de 99** niveles de precio; a 1¢ el EV de YES es −41% vs
+  +23% del NO. Y vive en los extremos, donde el fee p(1−p) es MÍNIMO (justo lo
+  contrario del maker en el centro). Riesgo repetido: vender NO caro = vender seguros
+  (ruina con \$400 salvo caps durísimos) — el veredicto sale de settlements propios.
 - **3a-bis (banda de FAVORITOS, del workflow M2):** el único retorno positivo
   documentado académicamente en Kalshi es comprar favoritos >50¢ (Whelan/Bürgi/Deng) —
   espejo del NO-bias. Misma query, bandas >50/>70/>90¢ sobre settlements propios. Si da
