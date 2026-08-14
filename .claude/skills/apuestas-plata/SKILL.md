@@ -38,23 +38,43 @@ verificación del 13-ago). El gate corre desde ese boot.
 
 **El tablero (leer en cada parte — queries `mode=ro`, jamás read-write):**
 ```bash
-# Fills con markout (el marcador del gate):
-python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select id,ticker,side,price_cents,count,fee_cents,markout1_cents,markout2_cents,created_at from mm_shadow_fills where markout1_cents is not null order by id desc limit 20")]'
-# Agregado del gate (n, markout medio, mtm por las DOS contabilidades):
-python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select count(*), avg(markout1_cents), avg(markout2_cents), sum(fee_cents) from mm_shadow_fills where created_at >= \"2026-08-13\"")]'
-# Funnel (¿el maker entró a su hábitat?): grep motor5.funnel — skip_unprof debe caer
-# y quoted subir vs el histórico quoted=10 fijo.
+# Marcador del gate: fills con su modelo de fee declarado, markout y salto del tick.
+python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select id,ticker,side,price_cents,count,fee_model,fee_effective_cents,markout1_cents,markout2_cents,mark_jump_cents,created_at from mm_shadow_fills order by id desc limit 20")]'
+# Agregado del gate, SEGMENTADO calmo vs salto (la lectura que decide):
+python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select case when coalesce(mark_jump_cents,0)>=5 then \"salto\" else \"calmo\" end g, count(*), round(avg(markout1_cents),2), round(avg(markout2_cents),2) from mm_shadow_fills where markout1_cents is not null group by g")]'
+# CLV: fill vs el cierre del consenso (FairKickoffSnapshot del último ciclo pre-kickoff).
+python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select f.id,f.ticker,f.side,f.price_cents,f.fee_effective_cents,round(k.fair_prob*100,1) cierre_c from mm_shadow_fills f join fair_kickoff_snapshots k on k.ticker=f.ticker order by f.id desc limit 20")]'
 ```
-- `fee_cents` en la tabla es SIEMPRE la fee de taker (referencia); la contabilidad
-  maker se deriva con `kalshi_maker_fee_cents` (≈¼, ceil por fill — no dividir por 4).
+- **Columnas auto-descriptivas (2026-08-14):** `fee_model` (taker|maker) + `fee_effective_cents` dicen qué contabilidad rigió CADA fill; `fee_cents` es la referencia taker (permite derivar ambas de la misma fila). NULL = tramo pre-columna. **No sumar `fee_cents` crudo con el modelo maker activo.**
+- **CLV = juez SECUNDARIO** (Propuesta 1 del plan M2, #231): (cierre − precio − fee) signado. Gate propio n≥100: CLV medio > 0 con signo estable semanal. **El markout MANDA, el CLV EXPLICA** — prohibido invertirlo (markout tóxico + CLV lindo = fills tóxicos, punto). Diagnostica el confound del fair degradado: markout OK + CLV negativo → el problema es el fair (palanca: burst solo para el fair).
+- **Blindaje (#230):** `MOTOR_MM_JUMP_RETREAT_CENTS=5` retira la quote si el mark saltó ≥5¢; los fills que el salto igual causó quedan etiquetados (`mark_jump_cents`) — el gate juzga la economía de los CALMOS por separado. `skip_jump` en el funnel.
+- Retención de `mm_shadow_fills`: **30d** (era 7 — la poda borraba la muestra del gate a mitad de período; corregido 13-ago).
 - El mtm en RAM se resetea por deploy — el juez es la TABLA, no el funnel.
-- Riesgo distintivo del maker: pick-off in-play (fair de Odds API con latencia de
-  segundos-minutos = perfil de víctima). Por eso los dos PRs de protección pendientes:
-  retiro de quotes en saltos ≥5¢ (reusar detector M9) y book_top por V2 (no REST).
-- **LIP** (Kalshi paga por quotes resting): KXMLBGAME NO califica hoy (0 pools
-  single-game en 3.823 programas, verificado 13-ago). Poll periódico barato:
-  `GET https://api.elections.kalshi.com/trade-api/v2/incentive_programs?status=active`
-  — si aparece pool en el universo, el A/B pasa a medir reward además de mtm.
+- Riesgo distintivo: pick-off in-play (fair con latencia de segundos-minutos). Primeros datos: 9 fills MLB in-vivo con markout −7.3¢/−11.5¢ — la firma que el blindaje vino a frenar.
+- **LIP**: KXMLBGAME NO califica (0 pools single-game sobre 3.823 programas, verificado 13-ago). Poll barato: `GET https://api.elections.kalshi.com/trade-api/v2/incentive_programs?status=active`.
+
+## APUESTA 1-bis — M1 converge acá (veredicto estructural 2026-08-13)
+
+**El arb intra-ticker de M1 es INCAPTURABLE POR DISEÑO, no por mala ejecución.** Kalshi
+tiene UN book: `yes_ask+no_ask<100 ⇔ book auto-cruzado`, y el MATCHING ENGINE consume el
+cruce al arribo (mintea el par él mismo — el rol que en Polymarket ocupan los bots de
+mint/merge con atomicidad on-chain que Kalshi no tiene). Las ventanas de 30-140ms son
+deltas WS de un cruce YA muerto: 0/46 capturas y 6.7% de fill bilateral **no son una
+carrera perdida por latencia — es una carrera de 0ms contra el engine**. Ni batch (no
+atómico), ni order groups (throttle), ni FIX, ni VPS lo cambian. La única captura
+Kalshi-compatible del fenómeno **es maker — ya existe y es la Apuesta 1**.
+
+**Gate del entierro con número propio (#232):** cada ventana binaria se re-chequea a
+T+200ms/T+1s en el book en memoria → `edge_windows.survived_200ms/_1s`. **n≥200 y <5%
+sobrevive → ⚫ de M1 cerrado el día 30 sin re-litigio** (salvo cambio documentado del
+matching de Kalshi). Predicción: ~0%.
+```bash
+python3 -c 'import sqlite3;c=sqlite3.connect("file:/app/data/trades.db?mode=ro",uri=True);[print(r) for r in c.execute("select count(*) n, sum(survived_200ms) vivas_200ms, sum(survived_1s) vivas_1s from edge_windows where kind=\"binary\" and survived_200ms is not null")]'
+```
+**Decisiones ya tomadas (día 15, no re-litigar):** NO bajar la banda a 1.0-1.5pp (más
+señales-artefacto contra la misma carrera imposible); NO apagar M1 intra-mes (el día 30
+cierra con el t medido + este fundamento). M1 queda como **detector de flujo cruzante /
+selector de universo para M5**, no como brazo de captura.
 
 ## APUESTA 2 — Arb cross-venue Kalshi↔Polymarket US (F1 por construir)
 
@@ -71,6 +91,18 @@ lluvia/suspensión = pérdidas de 5 cifras documentadas; clima → excluir).
 ≥50 contratos y duración ≥5s → discutir cuenta + ~$200 en Polymarket. Menos → archivar
 con tabla. Techo honesto si gradúa: $3-10/día — prueba, no ingreso.
 
+## Veredicto de monetización de M2 (workflow 2026-08-13) — cerrado
+
+**M2 se monetiza A TRAVÉS de la Apuesta 1: su fair es ancla de cotización, no señal de
+ataque.** La única monetización taker documentada del insumo es contra SOFT BOOKS
+(cuentas humanas, bans en semanas — fuera del alcance de un bot de exchange). Contra
+Kalshi, consenso-vs-consenso en venue líquido no deja edge (nuestro 0.15pp/35k es la
+propiedad esperada, no un bug). La variante "M2v2 maker sub-pp" quedó DESCARTADA con 5
+razones (tick 1¢ = sub-pp inexpresable; el único wallet público del juego perdió $3.2k
+en el residual direccional con edges 20× los nuestros; microestructura predice fills
+anti-correlacionados con retorno; ruido de composición de la mediana nunca medido;
+consumiría el insumo cuyo gate ya corre). **No construir motor nuevo sobre este fair.**
+
 ## APUESTA 3 — Dos tesis gratis offline (queries, no motores)
 
 - **3a NO-bias/longshot:** el retail sobre-compra YES barato (Bartlett/O'Hara, 41.6M
@@ -81,6 +113,11 @@ con tabla. Techo honesto si gradúa: $3-10/día — prueba, no ingreso.
 - **3b Lag in-play:** MLB StatsAPI (gratis) timestampeado vs el book V2 — ¿cuánto tarda
   Kalshi en digerir un evento de scoring? Lag mediano >segundos → hay ventana, diseñar
   F1 (medir depth junto con lag). Sub-segundo → archivar sin gastar.
+- **3a-bis (banda de FAVORITOS, del workflow M2):** el único retorno positivo
+  documentado académicamente en Kalshi es comprar favoritos >50¢ (Whelan/Bürgi/Deng) —
+  espejo del NO-bias. Misma query, bandas >50/>70/>90¢ sobre settlements propios. Si da
+  positivo, la traducción NO es motor nuevo: es sesgar el quoting de M5 con el
+  `edge_skew_cents` que ya existe.
 - **GATE:** 2 semanas para ambas; solo la que muestre número positivo pasa a F1 formal.
 
 ## MATAR / CONGELAR (estado)
