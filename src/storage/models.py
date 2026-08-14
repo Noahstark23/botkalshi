@@ -344,6 +344,14 @@ class MMShadowFill(SQLModel, table=True):
     markout1_age_sec: float | None = None
     markout2_cents: float | None = None  # primer tick ≥300s post-fill
     markout2_age_sec: float | None = None
+    # MODELO DE FEE del shadow (2026-08-14): la tabla se auto-describe. `fee_cents` es
+    # SIEMPRE la referencia TAKER (para poder derivar las dos contabilidades de la misma
+    # fila); `fee_model` dice cuál rigió en el inventario/mtm de ese fill y
+    # `fee_effective_cents` es la que realmente se cobró. El agente web leyó fee_cents
+    # como "el flag no está aplicado" TRES veces — una columna ambigua en la tabla que
+    # juzga el gate es deuda que cuesta veredictos.
+    fee_model: str | None = Field(default=None, max_length=8)  # "taker" | "maker"
+    fee_effective_cents: int | None = None
     # Salto del mark en el tick del fill (blindaje 2026-08-13): |mark_t − mark_t−1|.
     # Permite segmentar markout de fills de SALTO (evento de juego atravesando la
     # quote) vs fills calmos — el gate juzga la economía de los calmos por separado.
@@ -511,6 +519,8 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("mm_shadow_fills", "markout2_cents", "FLOAT"),
     ("mm_shadow_fills", "markout2_age_sec", "FLOAT"),
     ("mm_shadow_fills", "mark_jump_cents", "FLOAT"),  # blindaje: fills de salto etiquetados
+    ("mm_shadow_fills", "fee_model", "VARCHAR(8)"),  # taker|maker — la tabla se auto-describe
+    ("mm_shadow_fills", "fee_effective_cents", "INTEGER"),
 ]
 
 
