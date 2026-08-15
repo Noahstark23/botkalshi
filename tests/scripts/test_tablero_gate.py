@@ -152,3 +152,35 @@ def test_el_tablero_avisa_si_la_mayoria_cae_en_zona_muerta(tmp_path):
     assert "2/2 (100%) en zona de margen ≤0" in salida
     assert "MAYORÍA EN ZONA MUERTA" in salida
     assert "ZONA MUERTA" in salida
+
+
+def test_lista_los_fills_del_brazo_de_rescate(tmp_path):
+    """Los fills FUERA de 38-62¢ son los únicos con margen teórico positivo — el primer
+    dato de la palanca #1 (cotizar las colas). El script los lista solo; no hay que
+    acordarse de una query aparte."""
+    db = _db(
+        tmp_path,
+        [
+            ("2026-08-14 22:45", -1.0, -2.0, 0.0, 18, 5),
+            ("2026-08-14 22:46", 3.0, 4.0, 0.0, 18, 5),
+        ],
+    )
+    con = sqlite3.connect(db)
+    con.execute("UPDATE mm_shadow_fills SET price_cents = 50 WHERE id = 1")
+    con.execute("UPDATE mm_shadow_fills SET price_cents = 22 WHERE id = 2")  # cola
+    con.commit()
+    con.close()
+
+    salida = tablero(db, half_spread=5)
+
+    assert "BRAZO DE RESCATE: 1 fill(s) FUERA de la zona muerta" in salida
+    assert "22¢ (margen teórico +0.219¢)" in salida  # 0.82 − 3.5×0.22×0.78 = 0.2194
+    assert "mk1=+3.00¢" in salida
+
+
+def test_avisa_cuando_el_brazo_de_rescate_no_tiene_datos(tmp_path):
+    db = _db(tmp_path, [("2026-08-14 22:45", -1.0, -2.0, 0.0, 18, 5)])
+
+    salida = tablero(db, half_spread=5)
+
+    assert "brazo de rescate: 0 fills fuera de la zona muerta" in salida
