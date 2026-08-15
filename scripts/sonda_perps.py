@@ -38,15 +38,37 @@ import urllib.request
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
+# HOSTS candidatos (ampliado 2026-08-15 tras la primera corrida del agente): los perps
+# NO están bajo api.elections.kalshi.com/trade-api/v2 — `/perpetuals`, `/perpetual_markets`
+# y `/perps` dieron 404 mientras `/markets` y `/exchange/status` daban 200 en la MISMA
+# corrida. O sea: no es red ni auth, el recurso no vive en esa base. Si los perps tienen
+# API pública, está en otro host o bajo otro prefijo — la sonda barre la matriz completa
+# en vez de asumir. Un 404 en TODA la matriz también es un resultado (sin API no hay
+# motor posible, con o sin edge).
+HOSTS = (
+    "https://api.elections.kalshi.com/trade-api/v2",
+    "https://api.kalshi.com/trade-api/v2",
+    "https://trading-api.kalshi.com/trade-api/v2",
+    "https://api.elections.kalshi.com/trade-api/v1",
+)
+
 # Candidatos de endpoint: la doc de perps estuvo inaccesible desde el entorno de
 # desarrollo, así que la sonda DESCUBRE en vez de asumir. El primero que responda 200
 # con JSON usable gana, y el script reporta cuál fue (nadie hereda un path inventado).
 CANDIDATOS_MERCADOS = (
     "/margin/markets",
     "/perpetuals/markets",
+    "/perpetuals",  # 404 confirmado en el host actual (caso de prueba negativo)
+    "/perpetual_markets",  # 404 confirmado
+    "/perps",  # 404 confirmado
     "/markets?series_ticker=BTCPERP",
     "/markets?tickers=BTCPERP",
 )
+
+# Control POSITIVO: si este responde 200 y los de perps 404, el diagnóstico es
+# "el recurso no existe acá", no "el host está caído / falta auth". Sin este control
+# un barrido de 404 no distingue las dos causas — y son veredictos distintos.
+CONTROL_POSITIVO = "/exchange/status"
 CANDIDATOS_ORDERBOOK = (
     "/margin/markets/{t}/orderbook",
     "/perpetuals/markets/{t}/orderbook",
@@ -59,8 +81,8 @@ CANDIDATOS_FUNDING = ("/margin/funding_rates", "/perpetuals/funding_rates")
 ROUND_TRIP_TAKER_BPS = 24.0
 
 
-def _get(path: str, timeout: float = 10.0) -> tuple[int, dict | None]:
-    url = path if path.startswith("http") else f"{BASE}{path}"
+def _get(path: str, timeout: float = 10.0, base: str = BASE) -> tuple[int, dict | None]:
+    url = path if path.startswith("http") else f"{base}{path}"
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
@@ -70,27 +92,48 @@ def _get(path: str, timeout: float = 10.0) -> tuple[int, dict | None]:
 
 
 def descubrir() -> None:
-    """Mapea qué endpoints de perps responden. Primera corrida obligatoria."""
+    """Barre la matriz HOST × PATH. Primera corrida obligatoria.
+
+    Cada host se prueba primero con un CONTROL POSITIVO (`/exchange/status`): si el
+    control responde 200 y los paths de perps 404, el diagnóstico es "el recurso no
+    existe en esta base". Si el control TAMBIÉN falla, el host está caído o no es el
+    correcto — son dos veredictos distintos y un barrido sin control los confunde."""
     print("DESCUBRIMIENTO de endpoints de perps (public market data, sin firma)\n")
-    for grupo, candidatos in (
-        ("mercados", CANDIDATOS_MERCADOS),
-        ("funding", CANDIDATOS_FUNDING),
-    ):
-        print(f"[{grupo}]")
-        for c in candidatos:
-            status, body = _get(c)
-            muestra = ""
-            if status == 200 and isinstance(body, dict):
-                claves = sorted(body.keys())[:6]
-                muestra = f" claves={claves}"
-            elif body and "error" in body:
-                muestra = f" {body['error'][:60]}"
-            print(f"  {status or 'ERR':>3}  {c}{muestra}")
+    hallados: list[str] = []
+    for base in HOSTS:
+        estado_control, _ = _get(CONTROL_POSITIVO, base=base)
+        etiqueta = "control OK" if estado_control == 200 else f"control {estado_control or 'ERR'}"
+        print(f"[{base}]  ({etiqueta})")
+        if estado_control != 200:
+            print("  host no responde el control → los 404 de abajo NO son concluyentes\n")
+            continue
+        for grupo, candidatos in (
+            ("mercados", CANDIDATOS_MERCADOS),
+            ("funding", CANDIDATOS_FUNDING),
+        ):
+            for c in candidatos:
+                status, body = _get(c, base=base)
+                muestra = ""
+                if status == 200 and isinstance(body, dict):
+                    muestra = f" claves={sorted(body.keys())[:6]}"
+                    hallados.append(f"{base}{c}")
+                elif body and "error" in body:
+                    muestra = f" {body['error'][:50]}"
+                print(f"  {status or 'ERR':>3}  [{grupo}] {c}{muestra}")
         print()
-    print(
-        "Si NINGUNO responde 200: los perps no están en el API público y no hay sonda\n"
-        "posible — eso YA es un veredicto (sin API no hay motor, con o sin edge)."
-    )
+
+    if hallados:
+        print("ENDPOINTS VIVOS:")
+        for h in hallados:
+            print(f"  {h}")
+    else:
+        print(
+            "NINGÚN endpoint de perps respondió 200 en hosts cuyo CONTROL sí responde.\n"
+            "Eso YA es un veredicto: los perps no están en el API pública que este bot\n"
+            "puede consumir — sin API no hay motor posible, con o sin edge. Antes de\n"
+            "declararlo definitivo, reportar si algún host falló el control (esos 404\n"
+            "no cuentan) y revisar docs.kalshi.com por un prefijo que no esté en HOSTS."
+        )
 
 
 def _basis_bps(mid: float, referencia: float) -> float:
