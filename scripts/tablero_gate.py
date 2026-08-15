@@ -163,6 +163,29 @@ def tablero(db_path: str, half_spread: int) -> str:
             f"  tus fills: n={len(precios)} | margen medio {sum(margenes) / len(margenes):+.3f}¢ | "
             f"{en_rojo}/{len(precios)} ({100 * en_rojo / len(precios):.0f}%) en zona de margen ≤0"
         )
+        # BRAZO DE RESCATE (pregunta del agente, 2026-08-15): los fills FUERA de la
+        # zona muerta son los únicos con margen teórico positivo — el primer dato de la
+        # palanca #1 (cotizar solo las colas). Se listan con su markout: si el maker
+        # funciona en algún lado, funciona acá y hay que verlo apenas aparezca.
+        zm_lo, zm_hi = zm if zm else (0, 0)
+        fuera = con.execute(
+            "select price_cents, markout1_cents, markout2_cents from mm_shadow_fills "
+            "where created_at >= ? and (price_cents < ? or price_cents > ?) "
+            "order by id desc limit 10",
+            (CORTE_MARK_CONGELADO, zm_lo, zm_hi),
+        ).fetchall()
+        if fuera:
+            out.append(f"  ✅ BRAZO DE RESCATE: {len(fuera)} fill(s) FUERA de la zona muerta:")
+            for px, m1, m2 in fuera:
+                out.append(
+                    f"     {px}¢ (margen teórico {margen_teorico(px):+.3f}¢) "
+                    f"mk1={_fmt(m1)} mk2={_fmt(m2)}"
+                )
+        else:
+            out.append(
+                "  brazo de rescate: 0 fills fuera de la zona muerta todavía "
+                "(la palanca #1 sigue sin su primer dato)"
+            )
         if en_rojo / len(precios) > 0.5:
             out.append(
                 "  ⚠️ MAYORÍA EN ZONA MUERTA: el gate puede fallar por aritmética de fee, no por"
