@@ -16,6 +16,7 @@ adversa) y el spread capture no existe a esta escala.
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 
 import pytest
@@ -415,3 +416,77 @@ async def test_no_rehidrata_fills_vencidos_ni_completos():
     eng._rehidratar_markouts()
 
     assert eng._markouts_pendientes == []  # ninguno de los dos entra
+
+
+# =====================================================
+# El markout NO depende de estar cotizando ese ticker (bug 2026-08-15)
+# =====================================================
+# El universo es sorted(fairs)[:max_tickers] — los 10 primeros ALFABÉTICAMENTE de
+# 20-48 fairs frescos, así que los tickers ROTAN. Cuando uno rota fuera, su mark se
+# congela, el guard de frescura (#235) lo descarta con razón, y su markout2 no se
+# medía JAMÁS: a los 600s se soltaba en NULL. El juez PRINCIPAL del gate no acumulaba
+# para la mayoría de los fills (6 con markout2 nulo a 2h del fill, en producción).
+
+
+@pytest.mark.asyncio
+async def test_refresca_el_mark_de_un_ticker_que_roto_fuera_del_universo():
+    """El ticker con markout pendiente ya no se cotiza, pero su mark se refresca igual
+    — medir no puede depender de si estamos cotizando."""
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = _engine(client)
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)
+    await eng._tick()  # fill → markout pendiente
+    assert len(eng._markouts_pendientes) == 1
+
+    # T-A rota FUERA del universo (otros tickers alfabéticamente antes lo desplazan)
+    eng._last_marks_at["T-A"] -= 500.0  # su mark quedó congelado hace rato
+    client.books["T-A"] = _book(30, 34)  # el book real siguió moviéndose
+
+    await eng._refrescar_marks_pendientes(universo=["OTRO-1", "OTRO-2"])
+
+    assert eng._last_marks["T-A"] == 32.0  # mid fresco del book real
+    assert time.monotonic() - eng._last_marks_at["T-A"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_no_refresca_los_que_ya_estan_en_el_universo():
+    """CONTROL de costo: los del universo ya se refrescan en el loop — no se paga un
+    request de más por ellos."""
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = _engine(client)
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)
+    await eng._tick()
+
+    pedidos_antes = len(client.books)  # el fake no cuenta llamadas: se usa el estado
+    marca_antes = eng._last_marks_at["T-A"]
+    await eng._refrescar_marks_pendientes(universo=["T-A"])  # ya está adentro
+
+    assert eng._last_marks_at["T-A"] == marca_antes  # no se tocó
+    assert len(client.books) == pedidos_antes
+
+
+@pytest.mark.asyncio
+async def test_sin_las_dos_puntas_no_inventa_mark():
+    """FAIL-SAFE: un book de un solo lado no da mid — se deja el mark viejo y el guard
+    de frescura sigue protegiendo. Jamás se fabrica una observación."""
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = _engine(client)
+    await eng._tick()
+    client.books["T-A"] = _book(40, 46)
+    await eng._tick()
+
+    eng._last_marks_at["T-A"] -= 500.0
+    marca_antes = eng._last_marks_at["T-A"]
+    client.books["T-A"] = {"yes": [[40, 100]], "no": []}  # solo un lado
+
+    await eng._refrescar_marks_pendientes(universo=[])
+
+    assert eng._last_marks_at["T-A"] == marca_antes  # no se refrescó: no había mid
