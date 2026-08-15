@@ -504,9 +504,20 @@ class KalshiRestClient:
         # action="sell", que es una SALIDA PROTECTORA (rollback cerrando una pata
         # expuesta). Si el flag se apagara a mitad de una ejecución, bloquear el
         # sell dejaría exposición abierta sin poder cerrarla — peor que no tener
-        # guard. Invariante de Kalshi (verificado en todo el codebase, no hay
-        # short): buy = abrir posición, sell = cerrar. Reconcile usa get_orders/
-        # get_positions, no place_order, así que no se ve afectado.
+        # guard. Invariante: en los productos BINARIOS que este bot opera, buy =
+        # abrir posición y sell = cerrar. Reconcile usa get_orders/get_positions,
+        # no place_order, así que no se ve afectado.
+        #
+        # ⚠️ ALCANCE DEL INVARIANTE (acotado 2026-08-15): "no hay short" describe
+        # nuestro UNIVERSO (binarios de eventos), NO a Kalshi entero — desde el
+        # 3-jun-2026 el exchange lista PERPETUOS apalancados, donde un `sell`
+        # ABRE un corto. Hoy el bot no tiene una sola línea de perps, así que la
+        # excepción sigue siendo segura. PRE-CONDICIÓN para el futuro: si alguna
+        # vez entra CUALQUIER producto con posición corta (perps, márgenes), este
+        # guard se cierra ANTES de que exista su executor — no después. De lo
+        # contrario la Capa C, que es la defensa de último recurso, se convierte
+        # en el agujero por donde sale un corto apalancado con el trading
+        # supuestamente apagado.
         if action != "sell" and not self.settings.TRADING_ENABLED:
             raise TradingDisabledError(
                 f"place_order bloqueado: TRADING_ENABLED=false "
