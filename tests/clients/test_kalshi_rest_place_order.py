@@ -172,3 +172,41 @@ async def test_place_order_allows_protective_sell_when_trading_disabled(mock_set
 
     assert captured["json"]["side"] == "ask"  # vender YES
     assert captured["json"]["price"] == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_el_sell_pasa_con_trading_off_solo_por_el_invariante_binario(
+    mock_settings, mock_signer
+):
+    """PIN del ALCANCE del invariante (2026-08-15). La Capa C deja pasar `sell` con
+    TRADING_ENABLED=false porque en BINARIOS un sell solo puede CERRAR una posición
+    (salida protectora del rollback). Desde que Kalshi lista perpetuos apalancados
+    (3-jun-2026) eso dejó de ser cierto para el EXCHANGE: ahí un sell ABRE un corto.
+    El bot no tiene una línea de perps, así que la excepción sigue siendo segura —
+    este test existe para dejar EXPLÍCITO qué la sostiene: si alguna vez entra un
+    producto con posición corta, este comportamiento se cambia ANTES que nada."""
+    mock_settings.TRADING_ENABLED = False
+    client = KalshiRestClient()
+    client._request = AsyncMock(return_value={"order": {"order_id": "x"}})
+
+    with pytest.raises(TradingDisabledError):  # buy = ENTRADA → bloqueada
+        await client.place_order(
+            ticker="KXTEST",
+            side="yes",
+            action="buy",
+            count=1,
+            yes_price=50,
+            client_order_id="c1",
+        )
+    client._request.assert_not_awaited()
+
+    # sell = SALIDA protectora → pasa. Válido SOLO mientras el universo sea binario.
+    await client.place_order(
+        ticker="KXTEST",
+        side="yes",
+        action="sell",
+        count=1,
+        yes_price=50,
+        client_order_id="c2",
+    )
+    client._request.assert_awaited_once()

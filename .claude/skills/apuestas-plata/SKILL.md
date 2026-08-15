@@ -169,6 +169,28 @@ consumiría el insumo cuyo gate ya corre). **No construir motor nuevo sobre este
   criterios pre-registrados en `docs/mes_de_operacion.env` — no re-litigar antes ni
   después. M2 direccional: terminal por aritmética; queda solo como fábrica de fair
   para M5, y muere con M5 si la Apuesta 1 falla.
+- **PERPS de Kalshi — ⚫ DESCARTADO 2026-08-15 SIN CONSTRUIR** (ni siquiera F1). No se
+  lanzó "hoy": salió el 3-jun-2026, >$5.500M de nocional — no hay ventaja de
+  first-mover. Rompe el axioma de PÉRDIDA ACOTADA sobre el que está construido todo el
+  aparato de seguridad, y nuestros frenos fallarían **silenciosos diciendo OK**: los
+  caps del RiskManager son por COSTO (`manager.py:393-396` — el mismo cheque que aprueba
+  \$200 aprueba L×\$200 de nocional), el stop-loss lee solo `status='settled'`
+  (`manager.py:558-560`) y un perp NUNCA settlea → las cuatro ventanas reportarían "0%
+  consumido" mientras la cuenta se vacía; no existe primitiva de FLATTEN en el repo; y
+  el lazo de riesgo corre a 60-300s contra liquidaciones que ocurren entre dos lecturas.
+  Con \$400: BTC 6.2x liquida a −16,1% (y el 10-oct-2025 hubo −14% intradía; SOL −40%).
+  Kalshi documenta que la auto-liquidación NO es un stop garantizado y puede dejar SALDO
+  NEGATIVO — no es perder el proyecto, es perderlo con deuda. La variante neutral es
+  INCONSTRUIBLE dentro de Kalshi (no lista spot); a \$400 daría \$16-36/AÑO contra
+  \$1,76-2,56 de round-trip. **Reapertura solo con las TRES juntas:** (1) Kalshi
+  documenta negative-balance protection, (2) ≥\$5.000 de dinero NUEVO y segregado, (3)
+  basis persistente medido por nosotros.
+- ⚠️ **Deuda de seguridad que dejó el lanzamiento:** `kalshi_rest.py` deja pasar `sell`
+  con `TRADING_ENABLED=false` (salida protectora). Es seguro SOLO porque nuestro
+  universo es binario. Si algún día entra un producto con posición CORTA, ese guard se
+  cierra ANTES de que exista su executor — si no, la Capa C se vuelve el agujero por
+  donde sale un corto apalancado con el trading apagado. Ya está acotado en el
+  comentario y pinneado por test.
 - Congelados (no tocar, no revivir): M6/M8/M9 (registro barato + plantilla Motor N),
   Kalshi↔sportsbook, steam chasing, microservicios (el monolito es superior a esta
   escala — polybot Java/Kafka: 917★, cero alpha).
