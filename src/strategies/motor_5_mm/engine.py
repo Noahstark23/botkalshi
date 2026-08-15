@@ -372,6 +372,9 @@ class Motor5Engine:
                     counters["exec_corrupted"] += 1
                 elif outcome == "risk_blocked":
                     counters["exec_risk_blocked"] += 1
+        # Los tickers con markout pendiente que rotaron FUERA del universo necesitan su
+        # mark refrescado aparte: si no, su horizonte largo no se mide nunca (bug 15-ago).
+        await self._refrescar_marks_pendientes(tickers)
         # MARKOUT: con los marks del tick recién refrescados, medir los fills pendientes
         # (T+30s / T+5min). Va acá y no en _settle_fills porque el mark "posterior" de un
         # fill es el de un tick FUTURO, no el del tick que lo detectó.
@@ -492,6 +495,42 @@ class Motor5Engine:
                 if len(self._markouts_pendientes) > 500:  # nada sin tope
                     self._markouts_pendientes.pop(0)
         return len(fills)
+
+    async def _refrescar_marks_pendientes(self, universo: list[str]) -> None:
+        """Refresca el mark de los tickers con markout PENDIENTE que quedaron FUERA del
+        universo cotizado.
+
+        Bug encontrado por la sonda 2026-08-15 (6 fills con markout1 medido y markout2
+        NULL a 2h del fill): el universo es `sorted(fairs)[:max_tickers]` — los 10
+        primeros ALFABÉTICAMENTE de 20-48 fairs frescos — así que los tickers ROTAN
+        constantemente. Cuando uno rota fuera, _record_mark deja de correr para él, su
+        mark se congela, el guard de frescura (#235, correcto) lo descarta, y su
+        markout2 no se mide JAMÁS: a los 600s se suelta en NULL. El juez PRINCIPAL del
+        gate no acumulaba para ningún ticker rotado — o sea, para la mayoría.
+
+        La medición no puede depender de si en este momento estamos cotizando ese
+        ticker. Costo acotado: un get_orderbook por ticker DISTINTO con markout
+        pendiente fuera del universo (unidades, no cientos). Best-effort: un fallo deja
+        el mark viejo y el guard de frescura sigue protegiendo — nunca se inventa."""
+        if not self._markouts_pendientes:
+            return
+        en_universo = set(universo)
+        faltantes = {
+            p["ticker"] for p in self._markouts_pendientes if p["ticker"] not in en_universo
+        }
+        for ticker in sorted(faltantes):
+            try:
+                top = await self._book_top(ticker)
+            except Exception:
+                logger.exception("motor5.refresco_mark_pendiente_error")
+                continue
+            if top is None:
+                continue
+            yes_bid, yes_ask = top
+            if yes_bid is None or yes_ask is None:
+                continue  # sin las dos puntas no hay mid: no se inventa un mark
+            self._last_marks[ticker] = (yes_bid + yes_ask) / 2.0
+            self._last_marks_at[ticker] = time.monotonic()
 
     def _medir_markouts(self) -> None:
         """Markout de los fills shadow: (mark_posterior − precio) para buys, invertido
