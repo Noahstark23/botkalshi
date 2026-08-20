@@ -943,8 +943,8 @@ class Settings(BaseSettings):
         if not v.exists():
             raise ValueError(
                 f"Private key no encontrada en {v}. "
-                f"Verifica que esté montada como volume en Coolify "
-                f"o ejecuta scripts/generate_keys.sh localmente."
+                f"Verificá que esté montada por Coolify (Storages → file mount) "
+                f"o generala localmente con scripts/gen_keys.py."
             )
         if v.stat().st_mode & 0o077:
             # Aviso suave - en Coolify puede estar como root

@@ -21,7 +21,9 @@ services:
     environment:
       KALSHI_ENV: ${KALSHI_ENV:-demo}
       KALSHI_API_KEY_ID: ${KALSHI_API_KEY_ID}
-      KALSHI_PRIVATE_KEY_PATH: /app/config/kalshi_private_key.pem
+      # La clave se monta por Coolify (Storages → file mount) en /app/secrets — NUNCA
+      # viaja en la imagen (incidente 2026-08-19: el PEM estuvo versionado en repo público).
+      KALSHI_PRIVATE_KEY_PATH: ${KALSHI_PRIVATE_KEY_PATH:-/app/secrets/kalshi_private_key.pem}
       DATABASE_URL: sqlite:////app/data/trades.db
 
       # Risk management
