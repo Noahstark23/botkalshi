@@ -60,9 +60,9 @@ WORKDIR /app
 # Copiar código (orden por frecuencia de cambio - cache friendly)
 COPY --chown=botuser:botuser src/ ./src/
 COPY --chown=botuser:botuser scripts/ ./scripts/
-COPY --chown=botuser:botuser config/ ./config/
 
-# Crear directorios para volúmenes (data, logs, secrets)
+# Crear directorios para volúmenes (data, logs, secrets — la clave se MONTA por Coolify,
+# JAMÁS se embebe en la imagen: incidente 2026-08-19, clave versionada en repo público)
 RUN mkdir -p /app/data /app/logs /app/secrets \
     && chown -R botuser:botuser /app
 
