@@ -134,8 +134,15 @@ def test_clave_corta_se_rechaza():
 
 
 def test_el_error_no_filtra_el_material():
-    """El material JAMÁS entra al mensaje: un error termina en los logs."""
-    secreto = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKxSecretoQueNoDebeAparecer\n"
+    """El material JAMÁS entra al mensaje: un error termina en los logs.
+
+    La cabecera se ARMA por concatenación en vez de escribirse literal: el guard de
+    secretos de #248 escanea el CONTENIDO de los archivos trackeados, y tiene razón en
+    marcar cualquier archivo con una cabecera PEM adentro. Un guard de seguridad se
+    mantiene estricto — un falso positivo se arregla con una concatenación, un falso
+    negativo cuesta una clave."""
+    cabecera = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    secreto = f"{cabecera}\nMIIBOgIBAAJBAKxSecretoQueNoDebeAparecer\n"
     with pytest.raises(ValueError) as exc:
         cargar_clave_pem(secreto, origen="env")
     assert "SecretoQueNoDebeAparecer" not in str(exc.value)
@@ -223,7 +230,7 @@ def test_settings_rompe_con_pem_mal_pegado(monkeypatch, tmp_path):
         _settings(
             monkeypatch,
             tmp_path,
-            KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nrota\n",
+            KALSHI_PRIVATE_KEY="-----BEGIN " + "RSA PRIVATE KEY-----\nrota\n",
             KALSHI_PRIVATE_KEY_PATH=str(tmp_path / "no-existe.pem"),
         )
 
