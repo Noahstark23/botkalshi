@@ -24,6 +24,12 @@ services:
       # La clave se monta por Coolify (Storages → file mount) en /app/secrets — NUNCA
       # viaja en la imagen (incidente 2026-08-19: el PEM estuvo versionado en repo público).
       KALSHI_PRIVATE_KEY_PATH: ${KALSHI_PRIVATE_KEY_PATH:-/app/secrets/kalshi_private_key.pem}
+      # VÍA PRINCIPAL de entrega de la clave (incidente 2026-08-20): en una app COMPOSE
+      # de Coolify los file mounts del panel se IGNORAN y el volumen que la UI ofrece no
+      # existe en el host → no hay forma de poner un archivo en /app/secrets. Pegar acá
+      # el contenido del .pem (saltos reales, `\n` literal o base64: los tres andan).
+      # Si está seteada, GANA sobre KALSHI_PRIVATE_KEY_PATH.
+      KALSHI_PRIVATE_KEY: ${KALSHI_PRIVATE_KEY:-}
       DATABASE_URL: sqlite:////app/data/trades.db
 
       # Risk management
@@ -93,6 +99,9 @@ services:
       # Persistencia entre re-deploys
       - kalshi_data:/app/data
       - kalshi_logs:/app/logs
+      # Respaldo manual de la clave: nace VACÍO, así que no reemplaza a KALSHI_PRIVATE_KEY
+      # — solo habilita meterla por `docker cp` si alguna vez hace falta un archivo.
+      - kalshi_secrets:/app/secrets
 
     ports:
       # Health endpoint
@@ -130,4 +139,6 @@ volumes:
   kalshi_data:
     driver: local
   kalshi_logs:
+    driver: local
+  kalshi_secrets:
     driver: local

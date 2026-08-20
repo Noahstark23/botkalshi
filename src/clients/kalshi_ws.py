@@ -52,6 +52,7 @@ class KalshiWebSocket:
         self.signer = KalshiSigner(
             private_key_path=self.settings.KALSHI_PRIVATE_KEY_PATH,
             api_key_id=self.settings.KALSHI_API_KEY_ID,
+            private_key_pem=self.settings.clave_privada_env(),
         )
         self.url = self.settings.ws_url
 
