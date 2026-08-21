@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     KALSHI_ENV: Literal["demo", "production"] = "demo"
     KALSHI_API_KEY_ID: str = Field(..., min_length=10)
     KALSHI_PRIVATE_KEY_PATH: Path = Path("/app/secrets/kalshi_private_key.pem")
+    # ENTREGA DE LA CLAVE POR ENV (incidente 2026-08-20): al sacar el PEM de la imagen
+    # (#248) el bot quedó en crash-loop — en una app COMPOSE de Coolify los file mounts
+    # del panel se ignoran y el volumen que la UI ofrece no existe en el host, así que
+    # NO hay forma de poner un archivo en /app/secrets. La env var es la única vía.
+    # Acepta las tres formas en que un panel web guarda un PEM multilínea (saltos reales,
+    # `\n` literal, o base64 del PEM entero) — ver normalizar_pem en auth/signer.py.
+    # PRECEDENCIA: si está seteada GANA sobre KALSHI_PRIVATE_KEY_PATH. Vacía = usar archivo.
+    # SecretStr para que jamás aparezca en un repr/log de Settings.
+    KALSHI_PRIVATE_KEY: SecretStr = Field(
+        default=SecretStr(""),
+        description="Contenido PEM de la clave privada. Gana sobre KALSHI_PRIVATE_KEY_PATH.",
+    )
 
     # URLs (no overrides en .env normalmente, derivadas de KALSHI_ENV)
     KALSHI_DEMO_REST_URL: str = "https://demo-api.kalshi.co/trade-api/v2"
@@ -937,19 +949,39 @@ class Settings(BaseSettings):
 
     # ---- Validators ----
 
-    @field_validator("KALSHI_PRIVATE_KEY_PATH")
-    @classmethod
-    def _key_must_exist(cls, v: Path) -> Path:
-        if not v.exists():
+    @model_validator(mode="after")
+    def _clave_privada_disponible(self) -> Settings:
+        """La clave tiene que estar por ALGUNA de las dos vías, y ser PEM válido.
+
+        Era un field_validator sobre el PATH, y por eso el bot entró en crash-loop el
+        2026-08-20: exigía un archivo que en Coolify compose es imposible de montar. Ahora
+        el contrato es "env O archivo", y el chequeo cruza dos campos → model_validator.
+
+        Se PARSEA acá a propósito (fail-fast del boot): un PEM mal pegado tiene que romper
+        el arranque con un mensaje claro, no producir un 401 críptico en el primer request.
+        El material nunca entra al mensaje de error."""
+        from src.auth.signer import cargar_clave_pem
+
+        crudo = self.KALSHI_PRIVATE_KEY.get_secret_value().strip()
+        if crudo:
+            try:
+                cargar_clave_pem(crudo, origen="env KALSHI_PRIVATE_KEY")
+            except Exception as e:
+                raise ValueError(
+                    f"KALSHI_PRIVATE_KEY está seteada pero no es una clave usable: {e}"
+                ) from e
+            return self
+
+        if not self.KALSHI_PRIVATE_KEY_PATH.exists():
             raise ValueError(
-                f"Private key no encontrada en {v}. "
-                f"Verificá que esté montada por Coolify (Storages → file mount) "
-                f"o generala localmente con scripts/gen_keys.py."
+                f"No hay clave privada. Dos opciones:\n"
+                f"  (a) RECOMENDADO en Coolify compose — pegá el contenido del .pem en la "
+                f"env var KALSHI_PRIVATE_KEY (acepta saltos reales, '\\n' literal o base64).\n"
+                f"  (b) montá el archivo en {self.KALSHI_PRIVATE_KEY_PATH} "
+                f"(los file mounts del panel NO funcionan en apps compose) o generalo "
+                f"localmente con scripts/gen_keys.py."
             )
-        if v.stat().st_mode & 0o077:
-            # Aviso suave - en Coolify puede estar como root
-            pass
-        return v
+        return self
 
     @model_validator(mode="after")
     def _production_safety(self) -> Settings:
@@ -1017,6 +1049,15 @@ class Settings(BaseSettings):
         return self
 
     # ---- Properties ----
+
+    def clave_privada_env(self) -> str | None:
+        """El PEM de la env var, o None si hay que caer al archivo.
+
+        Los clientes se lo pasan al KalshiSigner tal cual: la PRECEDENCIA vive en el
+        signer (pem gana sobre path), un solo lugar. Es método y no property para que
+        quede claro en el call-site que devuelve material sensible."""
+        crudo = self.KALSHI_PRIVATE_KEY.get_secret_value().strip()
+        return crudo or None
 
     @property
     def rest_url(self) -> str:

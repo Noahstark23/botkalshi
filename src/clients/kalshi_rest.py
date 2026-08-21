@@ -240,6 +240,7 @@ class KalshiRestClient:
         self.signer = KalshiSigner(
             private_key_path=self.settings.KALSHI_PRIVATE_KEY_PATH,
             api_key_id=self.settings.KALSHI_API_KEY_ID,
+            private_key_pem=self.settings.clave_privada_env(),
         )
         self.base_url = self.settings.rest_url
         self._client: httpx.AsyncClient | None = None

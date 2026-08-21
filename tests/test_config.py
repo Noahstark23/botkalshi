@@ -45,10 +45,17 @@ def test_settings_rejects_short_api_key(fake_key: Path, monkeypatch):
 
 
 def test_settings_rejects_missing_key_file(monkeypatch):
+    """Sin clave por NINGUNA de las dos vías, el boot rompe.
+
+    ⚠️ CAMBIO SEMÁNTICO DELIBERADO (incidente 2026-08-20): antes bastaba con que
+    faltara el ARCHIVO; ahora falta la clave solo si tampoco está KALSHI_PRIVATE_KEY.
+    El env vacío se fuerza explícitamente porque el contrato cambió — sin eso, este
+    test pasaría o fallaría según lo que hubiera en el entorno del que corre."""
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", "/nonexistent/path.pem")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", "")
 
-    with pytest.raises(ValidationError, match="no encontrada"):
+    with pytest.raises(ValidationError, match="No hay clave privada"):
         Settings()
 
 
