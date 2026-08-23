@@ -27,7 +27,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
+from src.math.fees import (
+    kalshi_fee_cents,
+    kalshi_maker_fee_cents,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +56,7 @@ def compute_quote(
     best_yes_ask: int | None,
     edge_skew_cents: int = 0,
     fees_as_maker: bool = False,
+    fee_multiplier: int | float | str = 1,
 ) -> tuple[QuoteSet | None, str | None]:
     """(QuoteSet, None) si hay quote emitible; (None, motivo_de_skip) si no."""
     if not (0.0 < fair_prob < 1.0):
@@ -88,20 +92,22 @@ def compute_quote(
         captured = ask - bid
         if fees_as_maker:
             # APUESTA 1, corregida 2026-08-13 contra el PDF oficial (July 7, 2026): el
-            # maker de deportes NO paga $0 — paga ¼ del taker (0.0175, multiplicador 1).
+            # maker NO paga $0 — usa ¼ del taker (0.0175) × multiplicador de la serie.
             # La regla se evalúa AL SIZE de la quote: el ceil es POR ORDEN y medirlo a
             # count=1 sobreestima por contrato (a size=10 y 50¢: 0.5¢/contrato/pata
             # real vs 1¢ medido a count=1). Round-trip maker en zona media ≈ 1¢/contrato
             # → spreads capturados ≥2¢ son rentables; el modelo taker exigía ≥4¢.
-            fees_orden = kalshi_maker_fee_cents(size_contracts, bid) + kalshi_maker_fee_cents(
-                size_contracts, ask
-            )
+            fees_orden = kalshi_maker_fee_cents(
+                size_contracts, bid, fee_multiplier=fee_multiplier
+            ) + kalshi_maker_fee_cents(size_contracts, ask, fee_multiplier=fee_multiplier)
             if captured * size_contracts <= fees_orden:
                 return None, "unprofitable"
         else:
             # Modelo taker legacy (el "fee fantasma" para un flujo post_only): intacto
             # como default hasta que el operador encienda el flag.
-            fees = kalshi_fee_cents(1, bid) + kalshi_fee_cents(1, ask)
+            fees = kalshi_fee_cents(1, bid, fee_multiplier=fee_multiplier) + kalshi_fee_cents(
+                1, ask, fee_multiplier=fee_multiplier
+            )
             if captured <= fees:
                 return None, "unprofitable"
     return QuoteSet(

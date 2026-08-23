@@ -17,18 +17,25 @@ adversa) y el spread capture no existe a esta escala.
 from __future__ import annotations
 
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from fractions import Fraction
 
 import pytest
 from sqlmodel import select
 
 from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
 from src.storage.models import MMShadowFill, get_session
-from src.strategies.fair_value_book import FairValueBook
+from src.strategies.fair_value_book import FairProvenance, FairValueBook
 from src.strategies.motor_5_mm.engine import Motor5Engine
+from src.strategies.motor_5_mm.fee_policy import SeriesFeeObservation
 from src.strategies.motor_5_mm.inventory import InventoryBook
 from src.strategies.motor_5_mm.quoter import compute_quote
 from src.strategies.motor_5_mm.shadow_fill import ShadowFill
+
+
+async def _async_value(value):
+    return value
+
 
 # =====================================================
 # Fee model — quoter
@@ -229,27 +236,72 @@ async def test_markout_sin_mark_espera_y_luego_suelta():
 @pytest.mark.asyncio
 async def test_fila_declara_modelo_maker_y_fee_efectiva():
     client = _ReadOnlyClient()
-    client.books["T-A"] = _book(40, 60)
-    FairValueBook.publish({"T-A": 0.50})
+    ticker = "KXMLBGAME-E1-YES"
+    client.books[ticker] = _book(40, 60)
+    FairValueBook.publish(
+        {ticker: 0.50},
+        event_tickers={ticker: "KXMLBGAME-E1"},
+        provenances={
+            ticker: FairProvenance(
+                event_ticker="KXMLBGAME-E1",
+                odds_event_id="odds-e1",
+                sport_key="baseball_mlb",
+                bookmaker_keys=("pinnacle",),
+                oldest_book_update=None,
+                newest_book_update=None,
+                min_books=1,
+                max_book_age_min=None,
+            )
+        },
+    )
     eng = Motor5Engine(
         max_tickers=2,
         half_spread_cents=3,
-        quote_size_contracts=10,
+        quote_size_contracts=1,
         max_inventory_contracts=50,
         fair_ttl_sec=600.0,
         fees_as_maker=True,
         jump_retreat_cents=0.0,
+        exchange_environment="production",
+        fair_odds_regions="us",
+        fair_sport_keys_config="baseball_mlb",
+        fair_cache_ttl_sec=60,
     )
     eng._client = client
+    observation = SeriesFeeObservation(
+        series_ticker="KXMLBGAME",
+        fee_type="quadratic_with_maker_fees",
+        multiplier=Fraction(1, 2),
+        observed_at=datetime.now(UTC),
+        event_ticker="KXMLBGAME-E1",
+        base_multiplier=Fraction(1, 2),
+    )
+    eng._fee_policy = type(
+        "FakeFeePolicy",
+        (),
+        {"observe": staticmethod(lambda _ticker, event_ticker: _async_value(observation))},
+    )()
     await eng._tick()
-    client.books["T-A"] = _book(40, 46)  # cruza → fill buy @47
+    client.books[ticker] = _book(40, 46)  # cruza → fill buy @47
     await eng._tick()
 
     with get_session() as s:
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.fee_model == "maker"
-    assert row.fee_effective_cents == kalshi_maker_fee_cents(10, 47)
-    assert row.fee_cents == kalshi_fee_cents(10, 47)  # la referencia taker SIGUE ahí
+    assert row.count == 1
+    assert row.fee_effective_cents == kalshi_maker_fee_cents(1, 47, fee_multiplier=0.5)
+    assert row.fee_cents == kalshi_fee_cents(1, 47, fee_multiplier=0.5)
+    assert row.metric_version == "f1-v2-bbo-depth"
+    assert row.fee_multiplier == 0.5
+    assert row.event_ticker == "KXMLBGAME-E1"
+    assert row.fee_source == "series"
+    assert row.fee_base_multiplier == 0.5
+    assert row.exchange_environment == "production"
+    assert row.fair_method_version == "m2-median-complete-h2h-v1"
+    assert row.fair_odds_event_id == "odds-e1"
+    assert row.fair_sport_key == "baseball_mlb"
+    assert row.fair_book_count == 1
+    assert row.fair_odds_regions == "us"
 
 
 @pytest.mark.asyncio
@@ -265,7 +317,7 @@ async def test_fila_declara_modelo_taker_por_default():
     with get_session() as s:
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.fee_model == "taker"
-    assert row.fee_effective_cents == row.fee_cents == kalshi_fee_cents(10, 47)
+    assert row.fee_effective_cents == row.fee_cents == kalshi_fee_cents(1, 47)
 
 
 # =====================================================
@@ -328,8 +380,7 @@ async def test_los_dos_horizontes_son_observaciones_distintas():
     with get_session() as s:
         row = list(s.exec(select(MMShadowFill)))[0]
     assert row.markout2_cents == 3.0  # 50 − 47: distinto de markout1, como debe ser
-    # El fill 1 completó y salió de la cola (puede haber otros pendientes: en shadow la
-    # quote ya no se retira por salto, así que el mercado sigue generando fills).
+    # El fill 1 completó y salió de la cola (puede haber otros fills calmos pendientes).
     assert all(p["id"] != row.id for p in eng._markouts_pendientes)
 
 
@@ -473,8 +524,8 @@ async def test_no_refresca_los_que_ya_estan_en_el_universo():
 
 @pytest.mark.asyncio
 async def test_sin_las_dos_puntas_no_inventa_mark():
-    """FAIL-SAFE: un book de un solo lado no da mid — se deja el mark viejo y el guard
-    de frescura sigue protegiendo. Jamás se fabrica una observación."""
+    """FAIL-SAFE: un book de un solo lado invalida el mid anterior. Jamás se reutiliza
+    una observación de otro tick como si fuera el BBO actual."""
     client = _ReadOnlyClient()
     client.books["T-A"] = _book(40, 60)
     FairValueBook.publish({"T-A": 0.50})
@@ -484,9 +535,21 @@ async def test_sin_las_dos_puntas_no_inventa_mark():
     await eng._tick()
 
     eng._last_marks_at["T-A"] -= 500.0
-    marca_antes = eng._last_marks_at["T-A"]
     client.books["T-A"] = {"yes": [[40, 100]], "no": []}  # solo un lado
 
     await eng._refrescar_marks_pendientes(universo=[])
 
-    assert eng._last_marks_at["T-A"] == marca_antes  # no se refrescó: no había mid
+    assert "T-A" not in eng._last_marks_at
+    assert "T-A" not in eng._last_marks
+    assert eng._mark_fresco("T-A", time.monotonic()) is None
+
+
+def test_fair_unilateral_sirve_para_mtm_pero_nunca_para_markout():
+    eng = Motor5Engine()
+
+    observed = eng._record_mark("KXMLBGAME-X", yes_bid=40, yes_ask=None, fair_prob=0.61)
+
+    assert observed is None
+    assert "KXMLBGAME-X" not in eng._last_marks
+    assert "KXMLBGAME-X" not in eng._last_marks_at
+    assert eng._mtm_marks["KXMLBGAME-X"] == 61.0

@@ -25,6 +25,12 @@ def test_publish_and_fresh_within_ttl():
     assert fresh["T-A"].fair_prob == 0.62
 
 
+def test_publish_conserva_commence_time_para_gate_pregame():
+    kickoff = NOW + timedelta(hours=3)
+    FairValueBook.publish({"T-A": 0.62}, now=NOW, commence_times={"T-A": kickoff})
+    assert FairValueBook.fresh(600, now=NOW)["T-A"].commence_time == kickoff
+
+
 def test_stale_entries_expire_and_are_purged():
     FairValueBook.publish({"T-A": 0.62}, now=NOW)
     assert FairValueBook.fresh(600, now=NOW + timedelta(seconds=601)) == {}

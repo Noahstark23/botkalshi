@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+from pathlib import Path
 
 # Tablas de ESTADO DE TRADING: se copian ENTERAS (nunca se pierden).
 _SACRED = [
@@ -40,6 +41,8 @@ _SACRED = [
     "operational_state",  # kill-switch
     "bot_runs",
     "analyst_verdicts",
+    "mm_shadow_fills",  # ledger F1: pérdidas y trayectoria nunca se podan al reconstruir
+    "mm_experiment_runs",  # cadena de custodia: una invalidación nunca puede expirar
 ]
 # Tablas de DIAGNÓSTICO: se copian solo las filas dentro de la ventana (misma retención que
 # src/storage/maintenance._RETENTION_DAYS). orderbook_events NO está → se crea vacía (drop 54G).
@@ -48,7 +51,6 @@ _DIAG_RETENTION = {
     "motor2_funnel_snapshots": ("created_at", 14),
     "market_snapshots": ("captured_at", 7),
     "mm_quotes": ("created_at", 7),
-    "mm_shadow_fills": ("created_at", 7),
     "mm_funnel_snapshots": ("created_at", 7),
 }
 _MIN_FREE_BYTES = 500 * 1024 * 1024  # 500 MB de headroom para la DB nueva (chica)
@@ -82,8 +84,10 @@ def main() -> int:
         return 1
 
     print(f"\nCreando DB nueva con auto_vacuum=INCREMENTAL → {dst}")
-    new = sqlite3.connect(dst)
-    old = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    src_uri = Path(src).resolve().as_uri()
+    dst_uri = Path(dst).resolve().as_uri()
+    new = sqlite3.connect(dst_uri, uri=True)
+    old = sqlite3.connect(f"{src_uri}?mode=ro", uri=True)
     try:
         # auto_vacuum DEBE setearse antes de crear cualquier tabla, y persiste en el archivo.
         new.execute("PRAGMA auto_vacuum=INCREMENTAL")
@@ -106,7 +110,7 @@ def main() -> int:
         new.commit()
 
         # 2. Copiar filas: sagradas enteras, diagnóstico por ventana, orderbook_events NADA.
-        new.execute(f"ATTACH DATABASE 'file:{src}?mode=ro' AS old")
+        new.execute("ATTACH DATABASE ? AS old", (f"{src_uri}?mode=ro",))
         table_names = {n for n, _ in tables}
         copied: dict[str, int] = {}
         for t in _SACRED:
@@ -137,8 +141,8 @@ def main() -> int:
     # 3. Verificación crítica: los conteos de las tablas SAGRADAS en la nueva DB DEBEN
     #    coincidir EXACTO con la vieja. Si alguna perdió filas, la copia está mal → se ABORTA
     #    y NO se imprimen los comandos de swap (fail-safe: jamás reemplazar con estado incompleto).
-    old_ro = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-    new_ro = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+    old_ro = sqlite3.connect(f"{src_uri}?mode=ro", uri=True)
+    new_ro = sqlite3.connect(f"{dst_uri}?mode=ro", uri=True)
     mismatches: list[str] = []
     print("\n=== VERIFICACIÓN de tablas sagradas (nueva vs vieja) ===")
     try:

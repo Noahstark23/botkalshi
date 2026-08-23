@@ -7,13 +7,10 @@ atravesó las quotes. Es el perfil de víctima documentado del maker lento.
 
 El blindaje: mark saltó ≥ MOTOR_MM_JUMP_RETREAT_CENTS desde el tick anterior.
 
-⚠️ SEMÁNTICA POR MODO (2026-08-14, tras la primera evidencia de runtime): en LIVE la
-quote se retira de verdad (protege plata real, cancel-on-move de maker). En SHADOW NO
-se retira: retirar ahí protege $0 y CUESTA DATOS — el gate tenía n=9 en dos días y el
-blindaje frenaba justo los fills que hay que medir. En shadow se mide todo y cada fill
-hereda el salto del tick en que se creó su quote (quote_jump_cents), así el análisis
-reconstruye la política de CUALQUIER umbral desde los mismos datos. El shadow MIDE, el
-live PROTEGE.
+SEMÁNTICA F1-v2: shadow y live aplican la misma política. La quote previa puede llenar
+durante el salto (un maker real tampoco cancela en 0ms), pero después ambos retiran y no
+crean una quote post-salto. Sin esta paridad, el gate mediría órdenes que live no pondría
+y el inventario/skew futuro seguiría una trayectoria imposible.
 """
 
 from __future__ import annotations
@@ -55,10 +52,8 @@ def _engine(client, jump_retreat: float = 5.0) -> Motor5Engine:
 
 
 @pytest.mark.asyncio
-async def test_shadow_no_retira_mide_y_etiqueta():
-    """EL CASO CINCWS en SHADOW: el book salta 17¢ y cruza la quote — el fill se mide
-    CON su etiqueta, y la quote SIGUE viva (retirar en shadow protege $0 y ciega al
-    gate). El contador skip_jump registra que el blindaje habría actuado."""
+async def test_shadow_mide_fill_previo_y_retira_igual_que_live():
+    """El salto puede llenar la quote previa, pero no nace otra quote post-salto."""
     client = _ReadOnlyClient()
     client.books["T-A"] = _book(40, 60)  # mid 50
     FairValueBook.publish({"T-A": 0.50})
@@ -74,7 +69,7 @@ async def test_shadow_no_retira_mide_y_etiqueta():
     assert len(fills) == 1
     assert fills[0].mark_jump_cents == 17.0  # el salto del tick del fill
     assert fills[0].quote_jump_cents == 0.0  # su quote nació en un tick CALMO
-    assert "T-A" in eng._live_quotes  # shadow: la quote sigue midiendo
+    assert "T-A" not in eng._live_quotes
 
 
 @pytest.mark.asyncio
@@ -98,10 +93,8 @@ async def test_live_si_retira_la_quote():
 
 
 @pytest.mark.asyncio
-async def test_el_fill_hereda_el_salto_de_su_quote():
-    """LA CLAVE DEL CONTRAFACTUAL: un fill cuya quote nació en un tick de salto queda
-    con quote_jump_cents alto → 'blindaje@X' = subconjunto con quote_jump<X, evaluable
-    para cualquier X sin volver a correr nada."""
+async def test_shadow_no_crea_quote_post_salto_y_rearma_en_tick_calmo():
+    """Regresión: una quote off-policy post-salto no puede entrar a la cohorte F1."""
     client = _ReadOnlyClient()
     client.books["T-A"] = _book(40, 60)
     FairValueBook.publish({"T-A": 0.50})
@@ -109,15 +102,14 @@ async def test_el_fill_hereda_el_salto_de_su_quote():
     await eng._tick()  # quote nace en tick calmo
 
     client.books["T-A"] = _book(30, 50)  # salto 10¢ (mid 50→40), sin cruce
-    await eng._tick()  # la quote NUEVA nace en un tick de salto
-    assert eng._quote_jump["T-A"] == 10.0
-
-    client.books["T-A"] = _book(30, 36)  # ahora sí cruza
     await eng._tick()
+    assert "T-A" not in eng._live_quotes
+    assert "T-A" not in eng._quote_jump
 
-    with get_session() as s:
-        fills = list(s.exec(select(MMShadowFill)))
-    assert fills[-1].quote_jump_cents == 10.0  # heredado de su tick de creación
+    client.books["T-A"] = _book(39, 43)  # mid 41: tick calmo desde mid 40
+    await eng._tick()
+    assert "T-A" in eng._live_quotes
+    assert eng._quote_jump["T-A"] == 1.0
 
 
 @pytest.mark.asyncio

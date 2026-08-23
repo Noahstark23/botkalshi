@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
-from src.storage.models import EdgeWindow, OperationalState, OrderbookEvent, Trade
+from src.storage.models import EdgeWindow, MMShadowFill, OperationalState, OrderbookEvent, Trade
 
 NOW = datetime.utcnow()
 
@@ -59,6 +59,26 @@ def seeded_db(tmp_path, monkeypatch):
             )
         )  # reciente → sí
         s.add(OperationalState(key="kill_switch", value="engaged", reason="test-kill"))
+        s.add(
+            MMShadowFill(
+                ticker="KXMLBGAME-OLD-YES",
+                side="buy",
+                price_cents=40,
+                count=1,
+                rule="ask 39 < bid 40",
+                created_at=NOW - timedelta(days=90),
+            )
+        )
+        s.add(
+            MMShadowFill(
+                ticker="KXMLBGAME-NEW-YES",
+                side="buy",
+                price_cents=40,
+                count=1,
+                rule="ask 39 < bid 40",
+                created_at=NOW - timedelta(hours=1),
+            )
+        )
         s.commit()
     eng.dispose()
     return db
@@ -67,6 +87,9 @@ def seeded_db(tmp_path, monkeypatch):
 def test_rebuild_drops_orderbook_keeps_trading_state(seeded_db):
     import scripts.rebuild_db as rb
 
+    assert "mm_shadow_fills" not in rb._DIAG_RETENTION
+    assert "mm_shadow_fills" in rb._SACRED
+    assert "mm_experiment_runs" in rb._SACRED
     assert rb.main() == 0
     new = sqlite3.connect(f"{seeded_db}.rebuilt")
     try:
@@ -79,6 +102,7 @@ def test_rebuild_drops_orderbook_keeps_trading_state(seeded_db):
         assert (
             new.execute("SELECT count(*) FROM edge_windows").fetchone()[0] == 1
         )  # solo el reciente
+        assert new.execute("SELECT count(*) FROM mm_shadow_fills").fetchone()[0] == 2
         ks = list(new.execute("SELECT key, value FROM operational_state"))
         assert ks == [("kill_switch", "engaged")]  # kill-switch preservado
         # auto_vacuum=INCREMENTAL (2) → el incremental_vacuum del loop recupera online

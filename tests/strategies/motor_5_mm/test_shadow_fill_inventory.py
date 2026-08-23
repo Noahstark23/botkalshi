@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from src.math.fees import kalshi_fee_cents
 from src.strategies.motor_5_mm.inventory import InventoryBook
 from src.strategies.motor_5_mm.quoter import QuoteSet
@@ -30,6 +32,30 @@ def test_strict_cross_fills_bid():
     assert len(fills) == 1
     f = fills[0]
     assert f.side == "buy" and f.price_cents == 47 and f.count == 10
+
+
+def test_f1_v2_no_inventa_un_contrato_desde_depth_fraccional():
+    fills = fills_for_quote(
+        QUOTE,
+        best_yes_bid=40,
+        best_yes_ask=46,
+        best_yes_ask_depth=Decimal("0.33"),
+        observable_count_cap=1,
+    )
+    assert fills == []
+
+
+def test_f1_v2_afirma_un_contrato_si_depth_cruzada_lo_cubre():
+    fills = fills_for_quote(
+        QUOTE,
+        best_yes_bid=40,
+        best_yes_ask=46,
+        best_yes_ask_depth=Decimal("1.00"),
+        observable_count_cap=1,
+    )
+    assert len(fills) == 1
+    assert fills[0].count == 1
+    assert fills[0].observed_depth == Decimal("1.00")
 
 
 def test_strict_cross_fills_ask():

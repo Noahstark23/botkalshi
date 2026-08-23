@@ -17,6 +17,7 @@ from src.storage.maintenance import _RETENTION_DAYS, prune_diagnostics
 from src.storage.models import (
     EdgeWindow,
     MMQuote,
+    MMShadowFill,
     OrderbookEvent,
     RiskEvent,
     Trade,
@@ -53,6 +54,17 @@ def _seed():
         )
         s.add(EdgeWindow(kind="consensus", market_ticker="T", magnitude_cents=1, created_at=old))
         s.add(EdgeWindow(kind="consensus", market_ticker="T", magnitude_cents=1, created_at=recent))
+        # Ledger científico F1: aun una fila vieja debe sobrevivir indefinidamente.
+        s.add(
+            MMShadowFill(
+                ticker="KXMLBGAME-E-YES",
+                side="buy",
+                price_cents=40,
+                count=1,
+                rule="ask 39 < bid 40",
+                created_at=old,
+            )
+        )
         # ESTADO DE TRADING (sagrado): viejísimo, NUNCA debe borrarse.
         s.add(
             Trade(
@@ -91,6 +103,8 @@ def test_prune_deletes_old_keeps_recent():
     assert _count(OrderbookEvent) == 1  # solo la reciente
     assert _count(MMQuote) == 1
     assert _count(EdgeWindow) == 1
+    assert _count(MMShadowFill) == 1
+    assert "mm_shadow_fills" not in _RETENTION_DAYS
 
 
 def test_prune_never_touches_trading_state():
@@ -103,6 +117,7 @@ def test_prune_never_touches_trading_state():
     assert "trades" not in _RETENTION_DAYS
     assert "risk_events" not in _RETENTION_DAYS
     assert "operational_state" not in _RETENTION_DAYS  # kill-switch — intocable
+    assert "mm_shadow_fills" not in _RETENTION_DAYS  # ledger F1 — intocable
 
 
 def test_edge_windows_retained_longer_than_mm():

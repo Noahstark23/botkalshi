@@ -2,8 +2,46 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from fractions import Fraction
 
-def kalshi_fee_cents(count: int, price_cents: int) -> int:
+
+def _multiplier(value: int | float | str | Fraction) -> Fraction:
+    """Normaliza M sin introducir error binario antes del ceil por orden."""
+    try:
+        result = value if isinstance(value, Fraction) else Fraction(str(value))
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError(f"fee_multiplier inválido: {value!r}") from exc
+    if result < 0:
+        raise ValueError(f"fee_multiplier debe ser >= 0, got {value!r}")
+    return result
+
+
+def maker_fee_multiplier_for_ticker(ticker: str, *, as_of: datetime | None = None) -> Fraction:
+    """Multiplicador maker conocido para la serie, con fallback conservador M=1.
+
+    Kalshi cambió KXMLBGAME a M=0.5 el 2026-08-07T04:59:45.131Z. La fecha se
+    persiste indirectamente junto al fill y el multiplicador efectivo se guarda en
+    ``mm_shadow_fills``: una modificación futura del schedule no reescribe el pasado.
+
+    Las series sin un cambio verificado conservan M=1. Es deliberadamente conservador
+    para el shadow y, sobre todo, evita aplicar el 0.5 de MLB a NFL u otra serie.
+    """
+    series = ticker.split("-", 1)[0].upper()
+    when = as_of or datetime.now(UTC)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    if series == "KXMLBGAME" and when >= datetime(2026, 8, 7, 4, 59, 45, 131000, tzinfo=UTC):
+        return Fraction(1, 2)
+    return Fraction(1, 1)
+
+
+def kalshi_fee_cents(
+    count: int,
+    price_cents: int,
+    *,
+    fee_multiplier: int | float | str | Fraction = 1,
+) -> int:
     """
     Fee de Kalshi para un trade, en centavos.
 
@@ -58,22 +96,27 @@ def kalshi_fee_cents(count: int, price_cents: int) -> int:
     if count == 0 or price_cents == 0 or price_cents == 100:
         return 0
 
-    numerator = 7 * count * price_cents * (100 - price_cents)
-    return (numerator + 9_999) // 10_000
+    multiplier = _multiplier(fee_multiplier)
+    numerator = 7 * count * price_cents * (100 - price_cents) * multiplier.numerator
+    denominator = 10_000 * multiplier.denominator
+    return (numerator + denominator - 1) // denominator
 
 
-def kalshi_maker_fee_cents(count: int, price_cents: int) -> int:
+def kalshi_maker_fee_cents(
+    count: int,
+    price_cents: int,
+    *,
+    fee_multiplier: int | float | str | Fraction = 1,
+) -> int:
     """
     Fee de MAKER de Kalshi para un fill de orden resting, en centavos.
 
-    Fórmula oficial (fee schedule "Last updated and effective: July 7, 2026",
-    verificado 2026-08-13 contra el PDF por el agente web):
+    Fórmula oficial del schedule maker:
         maker fee = round up(M × 0.0175 × C × P × (1−P))
-    — ¼ de la tasa de taker (0.07). El multiplicador M de las series DEPORTIVAS
-    es 1 (fila literal: "KXMLBGAME | Professional Baseball Game | 1 | 1"); el
-    M=0 existe solo en series no deportivas (KXBTCY, KXCPI, KXFED…). La creencia
-    "maker $0 en deportes" del dossier del plan era FALSA — murió contra el PDF
-    antes de encender ningún flag, que es exactamente para lo que estaba el gate.
+    — ¼ de la tasa de taker (0.07). M es POR SERIE y puede cambiar: KXMLBGAME pasó
+    a M=0.5 el 2026-08-07, mientras NFL/NBA/EPL seguían en M=1 al verificarse el
+    2026-08-22. El hot path obtiene y valida M con GET /series; esta función solo
+    ejecuta la aritmética exacta del multiplicador que recibe.
 
     Se cobra AL EJECUTAR la orden resting (cancelar es gratis). Mismo ceil por
     orden que la taker: medirla a count=1 sobreestima por contrato.
@@ -99,5 +142,7 @@ def kalshi_maker_fee_cents(count: int, price_cents: int) -> int:
     if count == 0 or price_cents == 0 or price_cents == 100:
         return 0
 
-    numerator = 7 * count * price_cents * (100 - price_cents)
-    return (numerator + 39_999) // 40_000
+    multiplier = _multiplier(fee_multiplier)
+    numerator = 7 * count * price_cents * (100 - price_cents) * multiplier.numerator
+    denominator = 40_000 * multiplier.denominator
+    return (numerator + denominator - 1) // denominator

@@ -1,186 +1,464 @@
-"""
-Tablero del gate maker — el filtro de contaminación y la regla del n mínimo.
-
-Por qué existe el script (2026-08-14): una lectura ad-hoc del gate mezcló NUEVE filas
-del bug del mark congelado (#235 — markout2 no independiente) en el agregado y dio
-avg −11.09¢ sobre "n=11" cuando la muestra limpia era n=2. Un veredicto de plata no
-puede depender de que quien consulta se acuerde de filtrar.
-"""
+"""Contrato del gate económico M5 F1-v2."""
 
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from scripts.tablero_gate import CORTE_MARK_CONGELADO, tablero
+from scripts.tablero_gate import METRIC_VERSION, margen_teorico, tablero, zona_muerta
+from src.strategies.fair_value_book import FAIR_METHOD_VERSION
 
 
-def _db(tmp_path, filas):
-    """filas = [(created_at, markout1, markout2, quote_jump, fee_cents, fee_eff)]"""
-    p = tmp_path / "t.db"
-    con = sqlite3.connect(p)
+def _db(
+    tmp_path, rows: list[tuple], *, current_schema: bool = True, run_status: str = "clean"
+) -> str:
+    path = tmp_path / "gate.db"
+    con = sqlite3.connect(path)
+    extra = (
+        ", metric_version TEXT, experiment_id TEXT, event_ticker TEXT, "
+        "fee_multiplier REAL, fee_type TEXT, fee_source TEXT, fee_base_multiplier REAL, "
+        "fee_base_type TEXT, fee_override_multiplier REAL, fee_override_type TEXT, "
+        "fee_schedule_observed_at TEXT, exchange_environment TEXT, "
+        "fair_method_version TEXT, fair_odds_event_id TEXT, fair_sport_key TEXT, "
+        "fair_bookmaker_keys TEXT, fair_book_count INTEGER, fair_oldest_book_update TEXT, "
+        "fair_newest_book_update TEXT, fair_min_books INTEGER, fair_max_book_age_min REAL, "
+        "fair_computed_at TEXT, fair_odds_regions TEXT, fair_sport_keys_config TEXT, "
+        "fair_cache_ttl_sec REAL, fair_ttl_sec REAL, "
+        "commence_time TEXT, seconds_to_kickoff REAL, "
+        "fee_model TEXT, markout2_age_sec REAL, "
+        "policy_require_pregame INTEGER, policy_kickoff_buffer_sec REAL, "
+        "quote_seconds_to_kickoff REAL, side TEXT, rule TEXT, yes_bid INTEGER, "
+        "yes_ask INTEGER, crossed_depth NUMERIC"
+        if current_schema
+        else ""
+    )
     con.execute(
-        "CREATE TABLE mm_shadow_fills (id INTEGER PRIMARY KEY, created_at TEXT, "
-        "markout1_cents REAL, markout2_cents REAL, quote_jump_cents REAL, "
-        "fee_cents INT, fee_effective_cents INT, price_cents INT DEFAULT 50)"
+        "create table mm_shadow_fills (id integer primary key, ticker text, created_at text, "
+        "count integer, price_cents integer, markout2_cents real, fee_effective_cents integer"
+        + extra
+        + ")"
     )
-    con.executemany(
-        "INSERT INTO mm_shadow_fills (created_at, markout1_cents, markout2_cents, "
-        "quote_jump_cents, fee_cents, fee_effective_cents) VALUES (?,?,?,?,?,?)",
-        filas,
+    columns = (
+        "ticker, created_at, count, price_cents, markout2_cents, fee_effective_cents, "
+        "metric_version, experiment_id, event_ticker, fee_multiplier, fee_type, fee_source, "
+        "fee_base_multiplier, fee_base_type, fee_override_multiplier, fee_override_type, "
+        "fee_schedule_observed_at, exchange_environment, "
+        "fair_method_version, fair_odds_event_id, fair_sport_key, fair_bookmaker_keys, "
+        "fair_book_count, fair_oldest_book_update, fair_newest_book_update, fair_min_books, "
+        "fair_max_book_age_min, fair_computed_at, fair_odds_regions, fair_sport_keys_config, "
+        "fair_cache_ttl_sec, fair_ttl_sec, "
+        "commence_time, seconds_to_kickoff, "
+        "fee_model, markout2_age_sec, policy_require_pregame, "
+        "policy_kickoff_buffer_sec, quote_seconds_to_kickoff, side, rule, yes_bid, yes_ask, "
+        "crossed_depth"
     )
+    if current_schema:
+        placeholders = ",".join("?" for _ in columns.split(","))
+        con.executemany(f"insert into mm_shadow_fills ({columns}) values ({placeholders})", rows)
+        con.execute(
+            "create table mm_experiment_runs (id integer primary key, experiment_id text, "
+            "status text, reason text, started_at text, ended_at text)"
+        )
+        experiments = {row[7] for row in rows if row[6] == METRIC_VERSION and row[7]}
+        for experiment in experiments:
+            con.execute(
+                "insert into mm_experiment_runs "
+                "(experiment_id,status,started_at,ended_at) values (?,?,?,?)",
+                (
+                    experiment,
+                    run_status,
+                    datetime(2026, 8, 22, tzinfo=UTC).isoformat(),
+                    datetime(2026, 9, 22, tzinfo=UTC).isoformat()
+                    if run_status == "clean"
+                    else None,
+                ),
+            )
+    else:
+        con.executemany(
+            "insert into mm_shadow_fills (ticker,created_at,count,price_cents,"
+            "markout2_cents,fee_effective_cents) values (?,?,?,?,?,?)",
+            [row[:6] for row in rows],
+        )
     con.commit()
     con.close()
-    return str(p)
+    return str(path)
 
 
-def test_excluye_los_fills_del_mark_congelado(tmp_path):
-    """EL CASO REAL: 2 filas contaminadas con markout2 = −19 no deben arrastrar el
-    promedio de la muestra limpia."""
-    db = _db(
-        tmp_path,
-        [
-            ("2026-08-13 23:38", -19.0, -19.0, None, 18, 18),  # pre-#235: contaminada
-            ("2026-08-13 23:39", -19.5, -19.5, None, 18, 18),  # pre-#235: contaminada
-            ("2026-08-14 22:45", 2.5, -9.0, 0.0, 18, 5),  # limpia
-        ],
+def _row(
+    event: int,
+    *,
+    day: int = 0,
+    markout: float | None = 2.0,
+    version: str | None = METRIC_VERSION,
+    experiment: str = "exp-a",
+    require_pregame: bool = True,
+    buffer_sec: float = 120.0,
+    fill_seconds: float = 7_200.0,
+    quote_seconds: float = 7_260.0,
+    fee_effective: int = 1,
+    markout2_age: float = 360.0,
+    side: str = "buy",
+    yes_bid: int = 40,
+    yes_ask: int = 46,
+    rule: str | None = None,
+    fee_multiplier: float = 0.5,
+    fee_source: str = "series",
+    fee_override_multiplier: float | None = None,
+    fee_override_type: str | None = None,
+    exchange_environment: str = "production",
+    crossed_depth: str | None = "1.00",
+    event_ticker_override: str | None = None,
+    market_ticker_override: str | None = None,
+) -> tuple:
+    created = datetime(2026, 8, 22, tzinfo=UTC) + timedelta(days=day)
+    event_ticker = event_ticker_override or f"KXMLBGAME-E{event:04d}"
+    market_ticker = market_ticker_override or f"{event_ticker}-YES"
+    return (
+        market_ticker,
+        created.isoformat(),
+        1,
+        50,
+        markout,
+        fee_effective,
+        version,
+        experiment if version else None,
+        event_ticker if version else None,
+        fee_multiplier if version else None,
+        "quadratic_with_maker_fees" if version else None,
+        fee_source if version else None,
+        0.5 if version else None,
+        "quadratic_with_maker_fees" if version else None,
+        fee_override_multiplier if version else None,
+        fee_override_type if version else None,
+        created.isoformat() if version else None,
+        exchange_environment if version else None,
+        FAIR_METHOD_VERSION,
+        f"odds-{event}",
+        "baseball_mlb",
+        "pinnacle,draftkings,fanduel",
+        3,
+        (created - timedelta(minutes=1)).isoformat(),
+        (created - timedelta(seconds=30)).isoformat(),
+        3,
+        15.0,
+        (created - timedelta(seconds=30)).isoformat(),
+        "us",
+        "baseball_mlb",
+        60.0,
+        120.0,
+        (created + timedelta(hours=2)).isoformat() if version else None,
+        fill_seconds if version else None,
+        "maker" if version else None,
+        markout2_age if version else None,
+        int(require_pregame) if version else None,
+        buffer_sec if version else None,
+        quote_seconds if version else None,
+        side,
+        rule or (f"ask {yes_ask} < bid 50" if side == "buy" else f"bid {yes_bid} > ask 50"),
+        yes_bid,
+        yes_ask,
+        crossed_depth,
     )
-    salida = tablero(db, half_spread=5)
-
-    assert "CONTAMINADOS (pre-#235" in salida and ": 2 —" in salida
-    assert "MUESTRA LIMPIA: n=1" in salida
-    assert "-9.00¢" in salida  # el promedio limpio, sin el −19 de las contaminadas
 
 
-def test_no_declara_veredicto_con_n_chico(tmp_path):
-    """La regla que evita el auto-engaño: n=1 no es un resultado."""
-    db = _db(tmp_path, [("2026-08-14 22:45", 2.5, -9.0, 0.0, 18, 5)])
+def test_legacy_se_muestra_pero_no_puede_graduar(tmp_path):
+    db = _db(tmp_path, [_row(1, version=None)])
+    output = tablero(db)
 
-    salida = tablero(db, half_spread=5)
+    assert "COHORTE LEGACY — SOLO DIAGNÓSTICO" in output
+    assert "fills=0/500" in output
+    assert "F2/F3 bloqueados" in output
 
-    assert "VEREDICTO: SIN DATOS" in salida
-    assert "FALLA" not in salida and "PASA" not in salida
+
+def test_n_pequeno_positivo_no_declara_pasa(tmp_path):
+    db = _db(tmp_path, [_row(1), _row(2)])
+    output = tablero(db, half_spread=20)  # el spread no cambia la economía del markout
+
+    assert "media neta/contrato=+1.000¢" in output
+    assert "SIN DATOS SUFICIENTES" in output
+    assert "PASA F1" not in output
 
 
-def test_segmenta_el_contrafactual_del_blindaje(tmp_path):
-    """blindaje@5 = subconjunto con quote_jump < 5; los saltos van aparte."""
-    db = _db(
-        tmp_path,
-        [
-            ("2026-08-14 22:45", 2.5, -1.0, 0.0, 18, 5),  # calmo
-            ("2026-08-14 22:50", -10.0, -12.0, 16.5, 18, 5),  # salto
-            ("2026-08-14 22:55", -3.0, -4.0, None, 18, 5),  # sin etiqueta
-        ],
+def test_markout_neto_negativo_falla_sin_volver_a_sumar_spread(tmp_path):
+    db = _db(tmp_path, [_row(1, markout=0.5)])  # 0.5 - fee 1.0 = -0.5c
+    output = tablero(db, half_spread=5)
+
+    assert "media neta/contrato=-0.500¢" in output
+    assert "FALLA ECONOMÍA" in output
+
+
+def test_agrupa_fills_correlacionados_por_evento(tmp_path):
+    rows = [_row(1), _row(1), _row(1), _row(2)]
+    output = tablero(_db(tmp_path, rows))
+
+    assert "fills=4/500 | eventos=2/100" in output
+
+
+def test_identidad_oficial_impide_contar_mercados_como_eventos(tmp_path):
+    event_ticker = "KXMLBGAME-ONE-EVENT"
+    rows = [
+        _row(
+            market,
+            day=market % 30,
+            event_ticker_override=event_ticker,
+            market_ticker_override=f"{event_ticker}-MARKET{market:03d}",
+        )
+        for market in range(100)
+        for _ in range(5)
+    ]
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "fills=500/500 | eventos=1/100 | días=30/30" in output
+    assert "SIN DATOS SUFICIENTES" in output
+    assert "PASA F1" not in output
+
+
+def test_no_mezcla_configuraciones_y_elije_la_cohorte_mas_reciente(tmp_path):
+    old = _row(1, markout=20.0, experiment="exp-old")
+    newest = _row(2, day=10, markout=0.5, experiment="exp-new")
+    output = tablero(_db(tmp_path, [old, newest]))
+
+    assert "experiment_id=exp-new" in output
+    assert "media neta/contrato=-0.500¢" in output
+    assert "+19.000¢" not in output
+
+
+def test_pasa_solo_con_muestra_independiente_y_economia_positiva(tmp_path):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "fills=500/500 | eventos=100/100 | días=30/30" in output
+    assert "LCB95 block-bootstrap=+1.000¢" in output
+    assert "VEREDICTO: PASA F1-v2" in output
+    assert "NO autoriza producción" in output
+
+
+def test_no_aprueba_implicitamente_la_ultima_cohorte_con_fills(tmp_path):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    output = tablero(_db(tmp_path, rows))
+
+    assert "REQUIERE --experiment-id explícito" in output
+    assert "PASA F1" not in output
+
+
+def test_no_aprueba_si_un_evento_repetido_hace_perder_el_total(tmp_path):
+    # Regresión adversarial: la media no ponderada por evento era +1.88c, aunque 401/500
+    # fills pertenecían a un evento que perdía 10c/fill y el total era -7.624c/fill.
+    rows = [_row(0, day=0, markout=-9.0) for _ in range(401)]
+    rows.extend(_row(event, day=event % 39, markout=3.0) for event in range(1, 100))
+
+    output = tablero(_db(tmp_path, rows))
+
+    assert "fills=500/500 | eventos=100/100 | días=39/30" in output
+    assert "media neta/contrato=-7.624¢" in output
+    assert "FALLA ECONOMÍA" in output
+    assert "PASA F1" not in output
+
+
+def test_concentracion_por_fills_bloquea_evento_dominante_aunque_su_pnl_sea_cero(tmp_path):
+    # El evento dominante queda neto en cero (markout 1c - fee 1c), por lo que una
+    # concentración calculada solo con abs(PnL) lo ocultaba por completo.
+    rows = [_row(0, day=index % 30, markout=1.0) for index in range(401)]
+    rows.extend(_row(event, day=event % 30, markout=2.0) for event in range(1, 100))
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "fills=500/500 | eventos=100/100 | días=30/30" in output
+    assert "concentración fills/evento=80.2%" in output
+    assert "FALLA GATE" in output
+    assert "PASA F1" not in output
+
+
+def test_fill_observado_despues_del_cutoff_bloquea_toda_la_cohorte(tmp_path):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    rows[-1] = _row(99, day=29, fill_seconds=119.0)
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
+
+
+def test_buffer_persistido_no_esta_hardcodeado_a_120(tmp_path):
+    rows = [
+        _row(
+            event,
+            day=event % 30,
+            buffer_sec=300.0,
+            fill_seconds=360.0,
+            quote_seconds=420.0,
+        )
+        for event in range(100)
+        for _ in range(5)
+    ]
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=0" in output
+    assert "VEREDICTO: PASA F1-v2" in output
+
+
+def test_require_pregame_false_no_puede_graduar(tmp_path):
+    rows = [
+        _row(event, day=event % 30, require_pregame=False) for event in range(100) for _ in range(5)
+    ]
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
+
+
+def test_markouts_faltantes_no_desaparecen_del_denominador(tmp_path):
+    completos = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    faltantes = [
+        _row(event + 100, day=event % 30, markout=None) for event in range(100) for _ in range(5)
+    ]
+
+    output = tablero(_db(tmp_path, completos + faltantes), experiment_id="exp-a")
+
+    assert "fills=500/500" in output  # antes este numerador solo veía los completos buenos
+    assert "violaciones de política/metadata=500" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
+
+
+def test_fee_persistida_debe_coincidir_con_formula_y_ceil(tmp_path):
+    rows = [
+        _row(event, day=event % 30, markout=0.5, fee_effective=0)
+        for event in range(100)
+        for _ in range(5)
+    ]
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=500" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
+
+
+def test_overrides_distintos_por_evento_no_corrompen_la_cohorte(tmp_path):
+    base = _row(1)
+    overridden = _row(
+        2,
+        fee_multiplier=1.0,
+        fee_source="event_override",
+        fee_override_multiplier=1.0,
+        fee_override_type="quadratic_with_maker_fees",
     )
-    salida = tablero(db, half_spread=5)
 
-    assert "blindaje@5" in salida and "solo saltos" in salida and "sin etiqueta" in salida
-    # cada segmento con su n: 1/1/1
-    assert salida.count("n=1 ") >= 3
+    output = tablero(_db(tmp_path, [base, overridden]), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=0" in output
+
+
+def test_un_mismo_evento_con_dos_schedules_inconsistentes_bloquea(tmp_path):
+    base = _row(1)
+    changed = _row(
+        1,
+        fee_multiplier=1.0,
+        fee_source="event_override",
+        fee_override_multiplier=1.0,
+        fee_override_type="quadratic_with_maker_fees",
+    )
+
+    output = tablero(_db(tmp_path, [base, changed]), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+
+
+def test_f1_demo_o_provenance_incompleta_no_pueden_graduar(tmp_path):
+    demo = _row(1, exchange_environment="demo")
+    bad_provenance = list(_row(2))
+    bad_provenance[18] = "metodo-desconocido"  # fair_method_version
+
+    output = tablero(_db(tmp_path, [demo, tuple(bad_provenance)]), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=2" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+
+
+def test_markout_t5_debe_tener_al_menos_300_segundos(tmp_path):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    rows[-1] = _row(99, day=29, markout2_age=299.9)
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
+
+
+@pytest.mark.parametrize("bad_markout", [float("inf"), 99.0, 0.25])
+def test_markout_debe_ser_finito_fisicamente_posible_y_en_medio_centavo(tmp_path, bad_markout):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    rows[-1] = _row(99, day=29, markout=bad_markout)
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
+
+
+def test_run_activo_o_crasheado_bloquea_la_cohorte(tmp_path):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+
+    output = tablero(_db(tmp_path, rows, run_status="running"), experiment_id="exp-a")
+
+    assert "cadena de custodia: clean=0 no-clean=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
 
 
 @pytest.mark.parametrize(
-    ("avg2", "esperado"),
-    [(-2.0, "PASA"), (-8.0, "FALLA")],
+    "bad_row",
+    [
+        _row(99, yes_bid=2_700, yes_ask=-2_900),
+        _row(99, yes_bid=60, yes_ask=40),
+        _row(99, rule="ask 46 < bid 49"),
+        _row(99, side="sell", yes_bid=40, yes_ask=46),
+    ],
 )
-def test_umbral_del_gate_con_n_suficiente(tmp_path, avg2, esperado):
-    """Con n≥100 el veredicto SÍ se declara, contra −(spread/2) = −5¢."""
-    filas = [(f"2026-08-14 22:{i % 60:02d}", avg2, avg2, 0.0, 18, 5) for i in range(105)]
-    db = _db(tmp_path, filas)
+def test_bbo_o_regla_incoherente_no_pueden_graduar(tmp_path, bad_row):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    rows[-1] = bad_row
 
-    salida = tablero(db, half_spread=5)
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
 
-    assert f"VEREDICTO: {esperado}" in salida
-
-
-def test_el_corte_es_el_fix_del_mark_congelado():
-    """CONTROL de documentación: el corte no es una fecha mágica — es #235."""
-    assert CORTE_MARK_CONGELADO.startswith("2026-08-14")
+    assert "violaciones de política/metadata=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
 
 
-# =====================================================
-# Margen teórico — el chequeo PRE-gate (2026-08-14)
-# =====================================================
-# Bartlett/O'Hara (41,6M trades): el revenue del MM en broad-based (ganador del juego,
-# = lo que M5 cotiza) es 0.82¢/contrato, y su fuente NO es el spread sino el sesgo
-# conductual del retail. El fee de Kalshi es proporcional a p(1−p) → máximo en 50¢.
-# Consecuencia: en la zona media el margen del maker es NEGATIVO antes de la primera
-# pérdida por selección adversa. El gate no debe gastar semanas midiendo eso.
+@pytest.mark.parametrize("crossed_depth", [None, "0.33", "NaN"])
+def test_depth_cruzada_debe_cubrir_el_count_persistido(tmp_path, crossed_depth):
+    rows = [_row(event, day=event % 30) for event in range(100) for _ in range(5)]
+    rows[-1] = _row(99, day=29, crossed_depth=crossed_depth)
+
+    output = tablero(_db(tmp_path, rows), experiment_id="exp-a")
+
+    assert "violaciones de política/metadata=1" in output
+    assert "FALLA VALIDEZ DE POLÍTICA" in output
+    assert "PASA F1" not in output
 
 
-def test_margen_negativo_en_la_zona_media():
-    from scripts.tablero_gate import margen_teorico
-
-    assert margen_teorico(50) < 0  # la peor: fee round-trip 0.875¢ vs 0.82¢
-    assert margen_teorico(45) < 0
-    assert margen_teorico(40) < 0
+def test_schema_legacy_sin_columnas_nuevas_es_compatible(tmp_path):
+    output = tablero(_db(tmp_path, [_row(1, version=None)], current_schema=False))
+    assert "COHORTE LEGACY" in output
+    assert "SIN DATOS F1-v2" in output
 
 
-def test_margen_positivo_en_las_colas():
-    from scripts.tablero_gate import margen_teorico
-
-    assert margen_teorico(20) > 0.25
-    assert margen_teorico(10) > 0.5
-    assert margen_teorico(80) == pytest.approx(margen_teorico(20))  # simétrico en p(1−p)
+def test_mlb_medio_ya_no_tiene_zona_muerta_con_medio_multiplicador():
+    assert margen_teorico(50, fee_multiplier=0.5) == pytest.approx(0.3825)
+    assert zona_muerta(fee_multiplier=0.5) is None
 
 
-def test_la_zona_muerta_es_el_centro():
-    """El conjunto viable es DISJUNTO (dos colas); lo que se reporta es el pozo del
-    medio, que es justo donde M5 cotiza ganadores de partido."""
-    from scripts.tablero_gate import zona_muerta
-
-    zm = zona_muerta()
-    assert zm is not None
-    lo, hi = zm
-    assert lo <= 50 <= hi  # 50¢ está DENTRO de la zona muerta
-    assert lo > 30 and hi < 70  # y el pozo no llega a las colas
-
-
-def test_el_tablero_avisa_si_la_mayoria_cae_en_zona_muerta(tmp_path):
-    """El caso real de M5: ganadores de partido cotizados en 40-60¢."""
-    db = _db(
-        tmp_path,
-        [
-            ("2026-08-14 22:45", 1.0, 1.0, 0.0, 18, 5),
-            ("2026-08-14 22:46", 1.0, 1.0, 0.0, 18, 5),
-        ],
-    )
-    salida = tablero(db, half_spread=5)
-
-    assert "MARGEN TEÓRICO" in salida
-    assert "2/2 (100%) en zona de margen ≤0" in salida
-    assert "MAYORÍA EN ZONA MUERTA" in salida
-    assert "ZONA MUERTA" in salida
-
-
-def test_lista_los_fills_del_brazo_de_rescate(tmp_path):
-    """Los fills FUERA de 38-62¢ son los únicos con margen teórico positivo — el primer
-    dato de la palanca #1 (cotizar las colas). El script los lista solo; no hay que
-    acordarse de una query aparte."""
-    db = _db(
-        tmp_path,
-        [
-            ("2026-08-14 22:45", -1.0, -2.0, 0.0, 18, 5),
-            ("2026-08-14 22:46", 3.0, 4.0, 0.0, 18, 5),
-        ],
-    )
-    con = sqlite3.connect(db)
-    con.execute("UPDATE mm_shadow_fills SET price_cents = 50 WHERE id = 1")
-    con.execute("UPDATE mm_shadow_fills SET price_cents = 22 WHERE id = 2")  # cola
-    con.commit()
-    con.close()
-
-    salida = tablero(db, half_spread=5)
-
-    assert "BRAZO DE RESCATE: 1 fill(s) FUERA de la zona muerta" in salida
-    assert "22¢ (margen teórico +0.219¢)" in salida  # 0.82 − 3.5×0.22×0.78 = 0.2194
-    assert "mk1=+3.00¢" in salida
-
-
-def test_avisa_cuando_el_brazo_de_rescate_no_tiene_datos(tmp_path):
-    db = _db(tmp_path, [("2026-08-14 22:45", -1.0, -2.0, 0.0, 18, 5)])
-
-    salida = tablero(db, half_spread=5)
-
-    assert "brazo de rescate: 0 fills fuera de la zona muerta" in salida
+def test_control_multiplicador_uno_reproduce_la_antigua_zona_muerta():
+    assert margen_teorico(50, fee_multiplier=1.0) < 0
+    assert zona_muerta(fee_multiplier=1.0) is not None

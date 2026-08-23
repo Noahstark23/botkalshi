@@ -177,7 +177,7 @@ def test_integer_implementation_matches_official_formula():
 # Fee de MAKER (verificada 2026-08-13 contra el PDF oficial July 7, 2026)
 # =====================================================
 # maker = round up(M × 0.0175 × C × P × (1−P)) — ¼ del taker, multiplicador 1 en
-# deportes ("KXMLBGAME | 1 | 1"). El $0 existe solo en series no deportivas.
+# maker deportiva (M=1 en estas referencias históricas; MLB actual se prueba aparte).
 
 
 def test_maker_fee_ejemplo_oficial_cuarto_del_taker():
@@ -200,3 +200,20 @@ def test_maker_fee_bordes():
     assert kalshi_maker_fee_cents(0, 50) == 0
     assert kalshi_maker_fee_cents(100, 0) == 0
     assert kalshi_maker_fee_cents(100, 100) == 0
+
+
+def test_maker_fee_respeta_multiplicador_de_serie_y_ceil_por_orden():
+    from src.math.fees import kalshi_maker_fee_cents
+
+    assert kalshi_maker_fee_cents(10, 50, fee_multiplier=1) == 5
+    assert kalshi_maker_fee_cents(10, 50, fee_multiplier=0.5) == 3
+    # A count=1 ambos redondean a un centavo: no se puede prorratear la fee nominal.
+    assert kalshi_maker_fee_cents(1, 50, fee_multiplier=1) == 1
+    assert kalshi_maker_fee_cents(1, 50, fee_multiplier=0.5) == 1
+
+
+def test_fee_multiplier_invalido_falla_loud():
+    from src.math.fees import kalshi_maker_fee_cents
+
+    with pytest.raises(ValueError, match="fee_multiplier"):
+        kalshi_maker_fee_cents(1, 50, fee_multiplier=-0.5)

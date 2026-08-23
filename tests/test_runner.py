@@ -17,10 +17,14 @@ def reset_botstate():
     BotState.last_error_at = None
     BotState.is_paused = False
     BotState.pause_reason = None
+    BotState.motor5_enabled = False
+    BotState.motor5_task_running = False
     yield
     BotState.last_error = None
     BotState.is_paused = False
     BotState.pause_reason = None
+    BotState.motor5_enabled = False
+    BotState.motor5_task_running = False
 
 
 @pytest.fixture
@@ -38,6 +42,41 @@ def mock_runner_settings():
         s.HEALTH_PORT = 8080
         m.return_value = s
         yield s
+
+
+@pytest.mark.asyncio
+async def test_motor5_terminal_failure_propagates_to_supervisor(mock_runner_settings):
+    """Una task M5 muerta debe despertar FIRST_EXCEPTION; no puede retornar 'éxito'."""
+    s = mock_runner_settings
+    s.MOTOR_MM_ENABLED = True
+    s.TRADING_ENABLED = False
+    s.MOTOR_MM_EXECUTION_ENABLED = False
+    s.MOTOR_MM_MAX_TICKERS = 5
+    s.MOTOR_MM_SERIES = "KXMLBGAME"
+    s.MOTOR_MM_EXPERIMENT_ID = "m5-f1-test"
+    s.MOTOR_MM_HALF_SPREAD_CENTS = 5
+    s.MOTOR_MM_EDGE_SKEW_CENTS = 0
+    s.MOTOR_MM_QUOTE_SIZE_CONTRACTS = 1
+    s.MOTOR_MM_MAX_INVENTORY_CONTRACTS = 5
+    s.MOTOR_MM_FAIR_TTL_SEC = 120
+    s.MOTOR_MM_REQUIRE_PREGAME = True
+    s.MOTOR_MM_KICKOFF_BUFFER_SEC = 120
+    s.MOTOR_MM_MAX_EXPOSURE_USD = 5
+    s.MOTOR_MM_FEES_AS_MAKER = True
+    s.MOTOR_MM_JUMP_RETREAT_CENTS = 5
+    engine = MagicMock()
+    engine.run = AsyncMock(side_effect=RuntimeError("m5 terminal"))
+
+    with (
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+        patch("src.strategies.motor_5_mm.engine.Motor5Engine", return_value=engine),
+    ):
+        runner = ProductionRunner()
+        with pytest.raises(RuntimeError, match="m5 terminal"):
+            await runner._run_motor5_mm()
+
+    assert BotState.last_error is not None and "m5 terminal" in BotState.last_error
+    assert BotState.motor5_task_running is False
 
 
 @pytest.mark.asyncio
@@ -300,6 +339,41 @@ async def test_motor2_entry_requires_both_flags(
         mock_client.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_motor2_terminal_failure_propagates_to_supervisor(mock_runner_settings):
+    s = mock_runner_settings
+    s.MOTOR_2_SPORTSBOOK_ENABLED = True
+    s.TRADING_ENABLED = False
+    s.MOTOR2_SERIES = "KXMLBGAME"
+    s.ODDS_API_KEY = ""
+    s.MOTOR_2_MIN_EDGE_PCT = 3.0
+    s.MOTOR_2_MAX_EDGE_PCT = 8.0
+    s.MOTOR_2_MAX_STAKE_PCT = 1.0
+    s.MOTOR_2_MIN_BOOKS = 3
+    s.MOTOR_2_MAX_BOOK_AGE_MIN = 15.0
+    s.MOTOR_2_FEE_AT_STAKE_COUNT = True
+    s.MOTOR_2_BURST_INTERVAL_SEC = 60.0
+    s.MOTOR_2_BURST_WINDOW_MIN = 45.0
+    s.MOTOR_6_LINEMOVE_ENABLED = False
+    runner = ProductionRunner()
+    runner._capture = MagicMock()
+
+    fake_poller = MagicMock()
+    fake_poller.run = AsyncMock(side_effect=RuntimeError("m2 terminal"))
+    with (
+        patch("src.runner.asyncio.sleep", new=AsyncMock()),
+        patch("src.runner.RiskManager"),
+        patch(
+            "src.strategies.motor_2_consensus.poller.Motor2ShadowPoller",
+            return_value=fake_poller,
+        ),
+        pytest.raises(RuntimeError, match="m2 terminal"),
+    ):
+        await runner._run_motor2_shadow()
+
+    assert BotState.last_error is not None and "m2 terminal" in BotState.last_error
+
+
 @pytest.mark.parametrize("m6_enabled", [True, False])
 @pytest.mark.asyncio
 async def test_motor2_poller_wiring_includes_burst_and_linemove(mock_runner_settings, m6_enabled):
@@ -378,6 +452,17 @@ def test_task_list_includes_motor1_arb_only_when_enabled(mock_runner_settings):
     # El append está gateado por el flag (no incondicional).
     assert "if self.settings.MOTOR_1_ARBITRAGE_ENABLED:" in src
     assert 'name="motor1_arb"' in src
+
+
+def test_supervisor_no_convierte_excepcion_de_task_en_exit_cero():
+    """Regresión de falsa salud: una task fallida debe llegar al except fatal/exit 1."""
+    import inspect
+
+    import src.runner as runner_mod
+
+    src = inspect.getsource(runner_mod.ProductionRunner.run)
+    assert "if failures:" in src
+    assert 'raise RuntimeError(f"Task {task_name} crashed' in src
 
 
 @pytest.mark.asyncio
