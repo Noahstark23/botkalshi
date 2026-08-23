@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from src.storage.models import EdgeWindow, FairKickoffSnapshot, Motor2FunnelSnapshot, get_session
-from src.strategies.fair_value_book import FairValueBook
+from src.strategies.fair_value_book import FairProvenance, FairValueBook
 from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_2_consensus.sources import KalshiQuoteSource, OddsSource
@@ -132,6 +132,9 @@ class Motor2ShadowPoller:
 
         diag: dict[str, float] = {}
         fair_out: dict[str, float] = {}
+        fair_commence_out: dict[str, datetime] = {}
+        fair_event_out: dict[str, str] = {}
+        fair_provenance_out: dict[str, FairProvenance] = {}
         signals = find_signals(
             kalshi_events,
             odds_events,
@@ -141,6 +144,9 @@ class Motor2ShadowPoller:
             one_per_event=self._one_per_event,
             max_stake_pct=self._max_stake_pct,
             fair_out=fair_out,
+            fair_commence_out=fair_commence_out,
+            fair_event_out=fair_event_out,
+            fair_provenance_out=fair_provenance_out,
             max_edge=self._max_edge,
             min_books=self._min_books,
             max_book_age_min=self._max_book_age_min,
@@ -149,7 +155,12 @@ class Motor2ShadowPoller:
         # Canal Motor 5 (F1 shadow): publica el fair de todo outcome matcheado SOLO con
         # odds reales — un fair del fixture fake no es precio de referencia para cotizar.
         if self._odds.is_live and fair_out:
-            FairValueBook.publish(fair_out)
+            FairValueBook.publish(
+                fair_out,
+                commence_times=fair_commence_out,
+                event_tickers=fair_event_out,
+                provenances=fair_provenance_out,
+            )
             logger.info(f"motor2.fair_book publicados={len(fair_out)}")
             # CLV-al-kickoff (Propuesta 2026-08-13): en el ÚLTIMO ciclo antes del
             # kickoff, el fair de cada ticker se persiste como su "cierre" — el

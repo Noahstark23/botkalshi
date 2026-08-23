@@ -14,6 +14,26 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Perfil mínimo que puede producir un fair auditable para M5. Deliberadamente no se
+# incluyen series de soccer doméstico todavía: el matcher de M2 no las conoce y
+# aceptarlas en config volvería a crear el estado "verde, pero fair_fresh=0".
+_M5_SERIES_SPORT_PREFIXES: dict[str, tuple[str, ...]] = {
+    "KXMLBGAME": ("baseball",),
+    "KXNFLGAME": ("americanfootball",),
+    "KXNBAGAME": ("basketball",),
+    "KXWCGAME": ("soccer",),
+    "KXMENWORLDCUP": ("soccer",),
+}
+_M5_BASE_DISCOVERY_SERIES = {
+    "KXMLBGAME",
+    "KXWCGAME",
+    "KXMENWORLDCUP",
+}
+
+
+def _csv_set(value: str) -> set[str]:
+    return {item.strip().upper() for item in value.split(",") if item.strip()}
+
 
 class Settings(BaseSettings):
     """Configuración del bot validada al arranque."""
@@ -526,6 +546,16 @@ class Settings(BaseSettings):
         default=False,
         description="RESERVADO F2+: en F1 no existe executor. En producción, True falla el boot (fail-loud, no un no-op engañoso).",
     )
+    MOTOR_MM_SERIES: str = Field(
+        default="KXMLBGAME",
+        description="CSV de series admitidas en la cohorte M5; F1-v2 comienza solo con MLB",
+    )
+    MOTOR_MM_EXPERIMENT_ID: str = Field(
+        default="m5-f1c-2026-08-22-mlb",
+        min_length=3,
+        max_length=64,
+        description="Etiqueta humana de cohorte; cambiarla si cambia el fair/config upstream",
+    )
     MOTOR_MM_MAX_TICKERS: int = Field(
         default=10, ge=1, le=100, description="Máx tickers cotizados por tick (Motor 5)"
     )
@@ -533,7 +563,9 @@ class Settings(BaseSettings):
         default=3, ge=1, le=20, description="Half-spread alrededor del fair (cents) (Motor 5)"
     )
     MOTOR_MM_QUOTE_SIZE_CONTRACTS: int = Field(
-        default=10, ge=1, description="Contratos por lado de cada quote shadow (Motor 5)"
+        default=1,
+        ge=1,
+        description="Contratos por lado; F1-v2 exige 1 hasta tener tape/profundidad",
     )
     MOTOR_MM_MAX_INVENTORY_CONTRACTS: int = Field(
         default=50,
@@ -551,9 +583,18 @@ class Settings(BaseSettings):
         description="Lean del centro de quotes hacia el lado con edge vs el book (¢). 0 = off.",
     )
     MOTOR_MM_FAIR_TTL_SEC: float = Field(
-        default=600.0,
+        default=360.0,
         gt=0,
-        description="Edad máx del fair de Motor 2 para cotizar (2 ciclos del poller por default)",
+        description="Edad máx del fair M2; F1-v2 usa 360s para cubrir el poll base de 300s",
+    )
+    MOTOR_MM_REQUIRE_PREGAME: bool = Field(
+        default=True,
+        description="Exige kickoff conocido y retira quotes antes del inicio",
+    )
+    MOTOR_MM_KICKOFF_BUFFER_SEC: float = Field(
+        default=120.0,
+        ge=0.0,
+        description="Segundos antes del kickoff en que M5 deja de cotizar",
     )
     # LLAVE F3 (plan §5.3): la ejecución del MM en PRODUCCIÓN exige el OK explícito de
     # Noel, documentado. OK otorgado 2026-07-02 ("tienes mi ok") — pero el ORDEN de §5
@@ -571,17 +612,11 @@ class Settings(BaseSettings):
         gt=0.0,
         description="Techo duro (USD) del costo abierto del Motor 5 (canary F3)",
     )
-    # APUESTA 1 (plan 2026-08-12; VERIFICADA 2026-08-13 contra el PDF oficial del fee
-    # schedule "July 7, 2026") — el "fee fantasma": el quoter cobraba fee de TAKER (0.07)
-    # a las DOS patas de un round-trip que por construcción es MAKER (post_only GTC). El
-    # maker real de deportes NO es $0 (eso era falso — murió contra el PDF antes de tocar
-    # nada): es ¼ del taker (0.0175, multiplicador 1, fila "KXMLBGAME | 1 | 1"), cobrado
-    # al ejecutar la resting (cancelar es gratis). Round-trip maker en zona media ≈
-    # 1¢/contrato a size=10 → spreads ≥2¢ rentables; el modelo taker exigía ≥4¢ y
-    # auto-excluía a M5 de su hábitat. False (default) = modelo taker legacy.
+    # El tipo/multiplicador se consulta en GET /series y se valida fail-closed. MLB usa
+    # M=0.5 desde 2026-08-07; no se extrapola a NFL/NBA/otra serie.
     MOTOR_MM_FEES_AS_MAKER: bool = Field(
         default=False,
-        description="True = quoter e inventario shadow usan la fee REAL de maker (¼ del taker, kalshi_maker_fee_cents); False = modelo taker legacy",
+        description="True = quoter e inventario shadow usan fee maker observada por serie; False = modelo taker legacy",
     )
     # RETIRO POR SALTO (Apuesta 1, blindaje del maker — primer dato del gate 2026-08-13:
     # 4 fills en un juego EN VIVO con markout −18/−20¢ a T+5min, ambos lados perdiendo a
@@ -673,7 +708,7 @@ class Settings(BaseSettings):
     # Con la cuota de 20k quemándose en días, RECOMENDADO "us" (una región) salvo que el
     # fair de Pinnacle esté justificado por edge medido (hoy el edge de M2 es ~0.06pp vs
     # umbral 3pp: no lo está).
-    ODDS_API_REGIONS: str = "eu,us"
+    ODDS_API_REGIONS: str = "us"
     # Caché con TTL del cliente odds (incidente créditos 2026-07-19): el poller pedía las
     # MISMAS cuotas por sport_key cada ciclo (y el burst acelera a 60s) — dentro del TTL
     # se sirve la respuesta cacheada sin gastar créditos. Las cuotas no se mueven cada
@@ -980,6 +1015,73 @@ class Settings(BaseSettings):
                 f"  (b) montá el archivo en {self.KALSHI_PRIVATE_KEY_PATH} "
                 f"(los file mounts del panel NO funcionan en apps compose) o generalo "
                 f"localmente con scripts/gen_keys.py."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _motor5_profile_is_auditable(self) -> Settings:
+        """M5 depende de M2 live; una dependencia ausente debe romper el boot.
+
+        Históricamente M5 podía completar ticks y mantener /health verde con M2 apagado,
+        Odds fake, fees taker o una serie que discovery nunca suscribía. El resultado era
+        cero quotes indefinidamente y ninguna señal operacional de que el experimento no
+        existía. F1 es cero órdenes, pero sus datos sí deben ser reproducibles.
+        """
+        if not self.MOTOR_MM_ENABLED:
+            if self.MOTOR_MM_EXECUTION_ENABLED:
+                raise ValueError("MOTOR_MM_EXECUTION_ENABLED=true requiere MOTOR_MM_ENABLED=true")
+            return self
+
+        problems: list[str] = []
+        if not self.MOTOR_MM_EXECUTION_ENABLED and self.KALSHI_ENV != "production":
+            problems.append("KALSHI_ENV=production (F1 mide el book real; ejecución sigue OFF)")
+        if not self.MOTOR_2_SPORTSBOOK_ENABLED:
+            problems.append("MOTOR_2_SPORTSBOOK_ENABLED=true")
+        if not self.ODDS_API_KEY.strip():
+            problems.append("ODDS_API_KEY no vacía (odds LIVE, no fixture fake)")
+        if not self.MOTOR_MM_FEES_AS_MAKER:
+            problems.append("MOTOR_MM_FEES_AS_MAKER=true")
+        if self.MOTOR_2_MIN_BOOKS < 3:
+            problems.append("MOTOR_2_MIN_BOOKS>=3")
+        if not (0 < self.MOTOR_2_MAX_BOOK_AGE_MIN <= 15):
+            problems.append("0<MOTOR_2_MAX_BOOK_AGE_MIN<=15")
+        if self.MOTOR_MM_FAIR_TTL_SEC < 300:
+            problems.append("MOTOR_MM_FAIR_TTL_SEC>=300 (poll M2 base=300s)")
+        if self.MOTOR_MM_QUOTE_SIZE_CONTRACTS != 1:
+            problems.append("MOTOR_MM_QUOTE_SIZE_CONTRACTS=1 en F1-v2")
+        if not self.MOTOR_MM_REQUIRE_PREGAME or self.MOTOR_MM_KICKOFF_BUFFER_SEC <= 0:
+            problems.append("MOTOR_MM_REQUIRE_PREGAME=true y KICKOFF_BUFFER_SEC>0")
+
+        mm_series = _csv_set(self.MOTOR_MM_SERIES)
+        if len(mm_series) != 1:
+            problems.append("MOTOR_MM_SERIES con exactamente una serie")
+        else:
+            series = next(iter(mm_series))
+            required_prefixes = _M5_SERIES_SPORT_PREFIXES.get(series)
+            if required_prefixes is None:
+                problems.append(f"serie {series} sin onboarding M2/M5 validado")
+            else:
+                sport_keys = _csv_set(self.ODDS_API_SPORT_KEYS)
+                if not any(
+                    key.lower().startswith(prefix)
+                    for key in sport_keys
+                    for prefix in required_prefixes
+                ):
+                    problems.append(
+                        f"ODDS_API_SPORT_KEYS compatible con {series} "
+                        f"({','.join(required_prefixes)})"
+                    )
+
+            if series not in _csv_set(self.MOTOR2_SERIES):
+                problems.append(f"{series} incluida en MOTOR2_SERIES")
+
+            discovery = _M5_BASE_DISCOVERY_SERIES | _csv_set(self.DISCOVERY_EXTRA_SERIES)
+            if series not in discovery:
+                problems.append(f"{series} incluida en DISCOVERY_EXTRA_SERIES")
+
+        if problems:
+            raise ValueError(
+                "MOTOR_MM_ENABLED=true exige un perfil F1 auditable: " + "; ".join(problems)
             )
         return self
 

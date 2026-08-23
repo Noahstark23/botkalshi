@@ -36,6 +36,7 @@ from src.clients.odds_api import OddsEvent
 from src.math.fees import kalshi_fee_cents
 from src.math.kelly import quarter_kelly_size
 from src.math.no_vig import implied_prob, remove_vig_multiplicative
+from src.strategies.fair_value_book import FairProvenance
 from src.strategies.motor_2_consensus.matcher import (
     canonical_name,
     match_outcomes,
@@ -133,6 +134,7 @@ def _consensus_fair_probs(
     min_books: int = 1,
     max_book_age_min: float | None = None,
     now: datetime | None = None,
+    provenance_out: dict[str, object] | None = None,
 ) -> dict[str, float]:
     """
     Probabilidad JUSTA por outcome canónico: MEDIANA de la prob implícita de cada
@@ -146,8 +148,8 @@ def _consensus_fair_probs(
       - min_books: el único gate previo era >=2 OUTCOMES — UNA casa podía formar el
         "consenso" entero. Con pocas casas el fair hereda el shading recreativo y el
         edge medido puede ser 100% ruido (n_books solo se logueaba).
-      - Frescura: una línea congelada/suspendida (last_update viejo) entra igual que
-        una fresca. Books sin last_update NO se filtran (fail-open, fixtures/tests).
+      - Frescura: con un límite configurado, una línea congelada o sin last_update se
+        descarta. Sin timestamp no existe evidencia para una cohorte científica.
     """
     # Set de REFERENCIA (set canónico más frecuente entre casas). Cada casa entra al
     # consenso solo con el set COMPLETO e IDÉNTICO (deuda auditoría 2026-07-01: agregar
@@ -160,11 +162,16 @@ def _consensus_fair_probs(
     book_keys: set[str] = set()
     skipped_books = 0
     stale_books = 0
+    unknown_age_books = 0
+    accepted_updates: list[datetime] = []
     ref_now = now or datetime.now(UTC)
     for bk in odds_event.bookmakers:
-        if max_book_age_min is not None and bk.last_update is not None:
+        if max_book_age_min is not None:
+            if bk.last_update is None:
+                unknown_age_books += 1
+                continue
             age_min = (ref_now - bk.last_update).total_seconds() / 60.0
-            if age_min > max_book_age_min:
+            if age_min < 0 or age_min > max_book_age_min:
                 stale_books += 1
                 continue  # línea vencida: no aporta información fresca al consenso
         for mk in bk.markets:
@@ -179,12 +186,15 @@ def _consensus_fair_probs(
                 skipped_books += 1
                 continue  # set distinto/incompleto → esta casa NO entra al consenso
             book_keys.add(bk.key)
+            if bk.last_update is not None:
+                accepted_updates.append(bk.last_update)
             for cn, p in probs.items():
                 probs_por_outcome.setdefault(cn, []).append(p)
-    if skipped_books or stale_books:
+    if skipped_books or stale_books or unknown_age_books:
         logger.info(
             f"motor2.consensus.books_descartadas event={getattr(odds_event, 'id', '?')} "
-            f"set_distinto={skipped_books} stale={stale_books}"
+            f"set_distinto={skipped_books} stale={stale_books} "
+            f"sin_timestamp={unknown_age_books}"
         )
     if len(probs_por_outcome) < 2:
         return {}
@@ -197,6 +207,12 @@ def _consensus_fair_probs(
     names = list(probs_por_outcome)
     med_implied = [median(probs_por_outcome[n]) for n in names]
     fair = remove_vig_multiplicative(med_implied)
+    if provenance_out is not None:
+        provenance_out.update(
+            bookmaker_keys=tuple(sorted(book_keys)),
+            oldest_book_update=min(accepted_updates) if accepted_updates else None,
+            newest_book_update=max(accepted_updates) if accepted_updates else None,
+        )
     logger.info(
         f"motor2.consensus event={getattr(odds_event, 'id', '?')} n_books={len(book_keys)} "
         f"outcomes={len(names)} fair={ {n: round(p, 4) for n, p in zip(names, fair, strict=True)} }"
@@ -267,6 +283,9 @@ def find_signals(
     one_per_event: bool = True,
     max_stake_pct: float = 0.0,
     fair_out: dict[str, float] | None = None,
+    fair_commence_out: dict[str, datetime] | None = None,
+    fair_event_out: dict[str, str] | None = None,
+    fair_provenance_out: dict[str, FairProvenance] | None = None,
     max_edge: float | None = None,
     min_books: int = 1,
     max_book_age_min: float | None = None,
@@ -399,8 +418,13 @@ def find_signals(
         # par, el evento Kalshi del miércoles apostaba contra la línea del martes).
         chosen, select_reject = _select_candidate(ke.event_key, candidates, now)
         if chosen is not None:
+            fair_metadata: dict[str, object] = {}
             fair = _consensus_fair_probs(
-                chosen, min_books=min_books, max_book_age_min=max_book_age_min, now=now
+                chosen,
+                min_books=min_books,
+                max_book_age_min=max_book_age_min,
+                now=now,
+                provenance_out=fair_metadata,
             )
             if not fair:
                 best_reason = "no_fair"
@@ -422,6 +446,21 @@ def find_signals(
                     # caller decide si publicarlo (el poller solo lo hace con odds LIVE).
                     if fair_out is not None:
                         fair_out[q.market_ticker] = fp
+                    if fair_commence_out is not None:
+                        fair_commence_out[q.market_ticker] = chosen.commence_time
+                    if fair_event_out is not None:
+                        fair_event_out[q.market_ticker] = ke.event_key
+                    if fair_provenance_out is not None:
+                        fair_provenance_out[q.market_ticker] = FairProvenance(
+                            event_ticker=ke.event_key,
+                            odds_event_id=chosen.id,
+                            sport_key=chosen.sport_key,
+                            bookmaker_keys=tuple(fair_metadata.get("bookmaker_keys", ())),
+                            oldest_book_update=fair_metadata.get("oldest_book_update"),
+                            newest_book_update=fair_metadata.get("newest_book_update"),
+                            min_books=min_books,
+                            max_book_age_min=max_book_age_min,
+                        )
                     event_signals.extend(
                         _signals_for_outcome(
                             q,

@@ -422,6 +422,10 @@ class KalshiRestClient:
         """Detalle de un evento con sus markets."""
         return await self._request("GET", f"/events/{event_ticker}")
 
+    async def get_series(self, series_ticker: str) -> dict:
+        """Detalle público de una serie, incluida su política de fees vigente."""
+        return await self._request("GET", f"/series/{series_ticker}")
+
     async def list_markets(
         self,
         *,

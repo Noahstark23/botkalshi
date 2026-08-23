@@ -30,9 +30,8 @@ _RETENTION_DAYS: dict[str, tuple[str, int]] = {
     "orderbook_events": ("received_at", 2),
     "market_snapshots": ("captured_at", 7),
     "mm_quotes": ("created_at", 7),
-    # 30d (2026-08-13): los fills son EL dato del gate maker de 2-3 semanas — con 7d la
-    # poda borraba la muestra del gate a mitad del período. Volumen ínfimo (~decenas).
-    "mm_shadow_fills": ("created_at", 30),
+    # mm_shadow_fills NO entra: es el ledger científico y la trayectoria de inventario
+    # de una cohorte F1. Podarlo puede borrar pérdidas y convertir un FAIL en PASS.
     "fair_kickoff_snapshots": ("captured_at", 30),  # el "cierre" del CLV, mismo plazo
     "mm_funnel_snapshots": ("created_at", 7),
     "motor2_funnel_snapshots": ("created_at", 14),

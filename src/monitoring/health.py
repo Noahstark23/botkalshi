@@ -42,6 +42,9 @@ BLIND_MIN_INITIALIZED_FRACTION = 0.5
 # El mismo error del latch, un nivel más adentro: una condición satisfecha por un pico
 # instantáneo. Ahora limpiar el reloj exige salud SOSTENIDA este tiempo.
 BLIND_CLEAR_SEC = 60.0
+MOTOR5_HEARTBEAT_MAX_AGE_SEC = 150.0  # > 2 ticks normales de 60s
+MOTOR5_FAIR_FLOW_GRACE_SEC = 600.0
+MOTOR5_QUOTE_FLOW_GRACE_SEC = 600.0
 
 
 class BotState:
@@ -74,6 +77,24 @@ class BotState:
     # ceguera solo se limpia con BLIND_CLEAR_SEC de salud SOSTENIDA — un blip de 1s
     # post-siembra no borra los minutos de ceguera acumulados.
     books_healthy_since: float | None = None
+    motor5_enabled: bool = False
+    motor5_task_running: bool = False
+    last_motor5_tick_started: datetime | None = None
+    last_motor5_tick: datetime | None = None
+    motor5_experiment_id: str | None = None
+    motor5_last_fair_fresh: int = 0
+    motor5_last_book_attempted: int = 0
+    motor5_last_quoted: int = 0
+    motor5_last_skip_no_book: int = 0
+    motor5_last_skip_fee_policy: int = 0
+    motor5_fee_policy_blocked: bool = False
+    motor5_no_fair_since: datetime | None = None
+    # Fairs elegibles pero TODOS sus REST books fallaron: sin este reloj M5 podía
+    # quedar ready indefinidamente con fair_fresh>0, quoted=0 y miles de skip_no_book.
+    motor5_no_quote_since: datetime | None = None
+    motor5_book_flow_blocked: bool = False
+    motor5_experiment_invalid: bool = False
+    motor5_experiment_invalid_reason: str | None = None
 
     # TTL del last_error: un error mas viejo que esto se considera rancio y se limpia,
     # para que el dashboard no quede mostrando un error ya superado tras la recuperacion.
@@ -87,6 +108,59 @@ class BotState:
     def record_error(cls, message: str) -> None:
         cls.last_error = message[:500]
         cls.last_error_at = datetime.now(UTC)
+
+    @classmethod
+    def motor5_heartbeat(
+        cls,
+        *,
+        experiment_id: str,
+        fair_fresh: int,
+        book_attempted: int,
+        quoted: int,
+        skip_no_book: int,
+        skip_fee_policy: int,
+    ) -> None:
+        now = datetime.now(UTC)
+        cls.last_motor5_tick = now
+        cls.motor5_experiment_id = experiment_id
+        cls.motor5_last_fair_fresh = fair_fresh
+        cls.motor5_last_book_attempted = book_attempted
+        cls.motor5_last_quoted = quoted
+        cls.motor5_last_skip_no_book = skip_no_book
+        cls.motor5_last_skip_fee_policy = skip_fee_policy
+        cls.motor5_fee_policy_blocked = fair_fresh > 0 and quoted == 0 and skip_fee_policy > 0
+        if fair_fresh > 0:
+            cls.motor5_no_fair_since = None
+        elif cls.motor5_no_fair_since is None:
+            cls.motor5_no_fair_since = cls.last_motor5_tick
+
+        # fair_fresh puede ser 20 pero max_tickers=5: el denominador correcto son los
+        # REST books que este tick realmente intentó, no todo el universo pre-cap.
+        all_eligible_books_missing = (
+            book_attempted > 0 and quoted == 0 and skip_no_book >= book_attempted
+        )
+        if all_eligible_books_missing:
+            if cls.motor5_no_quote_since is None:
+                cls.motor5_no_quote_since = now
+            age = (now - cls.motor5_no_quote_since).total_seconds()
+            newly_blocked = not cls.motor5_book_flow_blocked and age >= MOTOR5_QUOTE_FLOW_GRACE_SEC
+            cls.motor5_book_flow_blocked = age >= MOTOR5_QUOTE_FLOW_GRACE_SEC
+            if newly_blocked:
+                message = (
+                    "motor5 sin books utilizables durante la gracia: "
+                    f"fair_fresh={fair_fresh} attempted={book_attempted} "
+                    f"skip_no_book={skip_no_book} quoted=0"
+                )
+                logger.error(message)
+                cls.record_error(message)
+        else:
+            cls.motor5_no_quote_since = None
+            cls.motor5_book_flow_blocked = False
+
+    @classmethod
+    def motor5_tick_started(cls, *, experiment_id: str) -> None:
+        cls.last_motor5_tick_started = datetime.now(UTC)
+        cls.motor5_experiment_id = experiment_id
 
     @classmethod
     def current_error(cls) -> str | None:
@@ -193,6 +267,12 @@ async def health() -> dict[str, Any]:
                 or (mono - BotState.books_blind_since) < BLIND_GRACE_SEC
             )
 
+    # LIVENESS, no progreso: una llamada REST puede agotar retries y un tick con cinco
+    # books superar 150s. Reiniciar durante esa latencia crea un crash-loop/rate-limit.
+    # La frescura del último ciclo vive en /ready; acá solo exigimos que la task siga viva.
+    if BotState.motor5_enabled:
+        checks["motor5_task_alive"] = BotState.motor5_task_running
+
     all_ok = all(checks.values())
 
     response = {
@@ -223,6 +303,22 @@ async def ready() -> dict[str, Any]:
         "capture_running": BotState.capture_running,
         "ws_alive": BotState.last_ws_message is not None,
     }
+    if BotState.motor5_enabled:
+        age = (
+            (datetime.now(UTC) - BotState.last_motor5_tick).total_seconds()
+            if BotState.last_motor5_tick is not None
+            else None
+        )
+        checks["motor5_task_alive"] = age is not None and age < MOTOR5_HEARTBEAT_MAX_AGE_SEC
+        checks["motor5_fee_policy"] = not BotState.motor5_fee_policy_blocked
+        checks["motor5_book_flow"] = not BotState.motor5_book_flow_blocked
+        checks["motor5_experiment_integrity"] = not BotState.motor5_experiment_invalid
+        no_fair_age = (
+            (datetime.now(UTC) - BotState.motor5_no_fair_since).total_seconds()
+            if BotState.motor5_no_fair_since is not None
+            else 0.0
+        )
+        checks["motor5_fair_flow"] = no_fair_age < MOTOR5_FAIR_FLOW_GRACE_SEC
 
     if not all(checks.values()):
         raise HTTPException(status_code=503, detail={"ready": False, "checks": checks})
@@ -326,6 +422,43 @@ async def status() -> dict[str, Any]:
             "last_error_at": (
                 BotState.last_error_at.isoformat() if BotState.last_error_at else None
             ),
+            "motor5": {
+                "enabled": BotState.motor5_enabled,
+                "task_running": BotState.motor5_task_running,
+                "last_tick_started": (
+                    BotState.last_motor5_tick_started.isoformat()
+                    if BotState.last_motor5_tick_started
+                    else None
+                ),
+                "last_tick": (
+                    BotState.last_motor5_tick.isoformat() if BotState.last_motor5_tick else None
+                ),
+                "experiment_id": BotState.motor5_experiment_id,
+                "fair_fresh": BotState.motor5_last_fair_fresh,
+                "book_attempted": BotState.motor5_last_book_attempted,
+                "quoted": BotState.motor5_last_quoted,
+                "skip_no_book": BotState.motor5_last_skip_no_book,
+                "skip_fee_policy": BotState.motor5_last_skip_fee_policy,
+                "fee_policy_blocked": BotState.motor5_fee_policy_blocked,
+                "no_quote_since": (
+                    BotState.motor5_no_quote_since.isoformat()
+                    if BotState.motor5_no_quote_since
+                    else None
+                ),
+                "book_flow_blocked": BotState.motor5_book_flow_blocked,
+                "no_fair_since": (
+                    BotState.motor5_no_fair_since.isoformat()
+                    if BotState.motor5_no_fair_since
+                    else None
+                ),
+                "fair_flow_blocked": (
+                    BotState.motor5_no_fair_since is not None
+                    and (now - BotState.motor5_no_fair_since).total_seconds()
+                    >= MOTOR5_FAIR_FLOW_GRACE_SEC
+                ),
+                "experiment_invalid": BotState.motor5_experiment_invalid,
+                "experiment_invalid_reason": BotState.motor5_experiment_invalid_reason,
+            },
         },
         "config": {
             "environment": settings.KALSHI_ENV,

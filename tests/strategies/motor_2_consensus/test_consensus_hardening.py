@@ -65,19 +65,20 @@ def test_median_resists_single_soft_book():
 
 def test_stale_book_filtered_by_last_update():
     """Una línea congelada hace 2h queda FUERA del consenso con max_book_age_min=15;
-    las frescas y las sin last_update (fail-open) entran."""
+    las frescas entran y una casa sin timestamp falla cerrada."""
     ev = _event(
-        _bk("fresca", LINEA, last_update=NOW - timedelta(minutes=3)),
+        _bk("fresca_a", LINEA, last_update=NOW - timedelta(minutes=3)),
+        _bk("fresca_b", LINEA, last_update=NOW - timedelta(minutes=4)),
         _bk(
             "congelada",
             {"Los Angeles Lakers": 3.5, "Boston Celtics": 1.3},
             last_update=NOW - timedelta(hours=2),
         ),
-        _bk("sin_ts", LINEA),  # last_update=None → no se filtra
+        _bk("sin_ts", LINEA),  # last_update=None → sin evidencia, se descarta
     )
     fair = _consensus_fair_probs(ev, min_books=2, max_book_age_min=15.0, now=NOW)
     assert fair  # las 2 usables forman consenso
-    ev_limpio = _event(_bk("fresca", LINEA), _bk("sin_ts", LINEA))
+    ev_limpio = _event(_bk("fresca_a", LINEA), _bk("fresca_b", LINEA))
     fair_limpio = _consensus_fair_probs(ev_limpio, min_books=2)
     for name, p in fair.items():
         assert p == pytest.approx(fair_limpio[name], abs=1e-9)  # la congelada no aportó

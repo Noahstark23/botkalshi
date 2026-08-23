@@ -221,8 +221,10 @@ class ProductionRunner:
         """
         if not self.settings.MOTOR_MM_ENABLED:
             return  # opt-in; default off → no-op
-        await asyncio.sleep(20)  # dejar que init_db / boot terminen
+        BotState.motor5_enabled = True
+        BotState.motor5_task_running = True
         try:
+            await asyncio.sleep(20)  # dejar que init_db / boot terminen
             from src.strategies.motor_5_mm.engine import Motor5Engine
             from src.strategies.motor_5_mm.fill_feed import MMFillFeed
 
@@ -244,22 +246,35 @@ class ProductionRunner:
                     logger.warning("motor5: sin data_capture → fill feed WS no adjuntado")
             await Motor5Engine(
                 max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
+                series_csv=self.settings.MOTOR_MM_SERIES,
+                experiment_label=self.settings.MOTOR_MM_EXPERIMENT_ID,
                 half_spread_cents=self.settings.MOTOR_MM_HALF_SPREAD_CENTS,
                 edge_skew_cents=self.settings.MOTOR_MM_EDGE_SKEW_CENTS,
                 quote_size_contracts=self.settings.MOTOR_MM_QUOTE_SIZE_CONTRACTS,
                 max_inventory_contracts=self.settings.MOTOR_MM_MAX_INVENTORY_CONTRACTS,
                 fair_ttl_sec=self.settings.MOTOR_MM_FAIR_TTL_SEC,
+                require_pregame=self.settings.MOTOR_MM_REQUIRE_PREGAME,
+                kickoff_buffer_sec=self.settings.MOTOR_MM_KICKOFF_BUFFER_SEC,
                 trading_enabled=trading,
                 risk_manager=risk,
                 fill_feed=fill_feed,
                 mm_exposure_cap_usd=self.settings.MOTOR_MM_MAX_EXPOSURE_USD,
                 fees_as_maker=self.settings.MOTOR_MM_FEES_AS_MAKER,
                 jump_retreat_cents=self.settings.MOTOR_MM_JUMP_RETREAT_CENTS,
+                exchange_environment=self.settings.KALSHI_ENV,
+                fair_min_books=self.settings.MOTOR_2_MIN_BOOKS,
+                fair_max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
+                fair_odds_regions=self.settings.ODDS_API_REGIONS,
+                fair_sport_keys_config=self.settings.ODDS_API_SPORT_KEYS,
+                fair_cache_ttl_sec=self.settings.ODDS_API_CACHE_TTL_SEC,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor5_mm runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+            raise
+        finally:
+            BotState.motor5_task_running = False
 
     async def _run_motor1_arb(self) -> None:
         """
@@ -335,7 +350,8 @@ class ProductionRunner:
 
         El flip a odds reales es POR CONFIG: con ODDS_API_KEY seteada → LiveOddsSource
         (odds reales, sport_keys/regions de settings); vacía → FakeOddsSource (fixture).
-        Best-effort: si cae, se registra y la task termina — NO tira el bot.
+        Si cae, se registra y se propaga al supervisor. M5 depende de este fair: tragar
+        la excepción deja el proceso verde pero estructuralmente incapaz de cotizar.
         """
         if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
             return  # opt-in; default off → no-op (no toca nada en prod)
@@ -438,6 +454,7 @@ class ProductionRunner:
             msg = f"motor2 runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+            raise
 
     async def _run_motor2_exits(self) -> None:
         """
@@ -763,10 +780,17 @@ class ProductionRunner:
                 return_when=asyncio.FIRST_EXCEPTION,
             )
 
-            # Si alguna task crasheó, log y marcar
+            # Si alguna task crasheó, log y marcar. Después de cancelar las hermanas se
+            # PROPAGA: retornar 0 convertía un Motor5DataIntegrityError en shutdown limpio
+            # y borraba del orquestador la diferencia entre experimento sano y corrupto.
+            failures: list[tuple[str, BaseException]] = []
             for task in done:
-                if task.exception():
-                    err = f"Task {task.get_name()} crashed: {task.exception()}"
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    failures.append((task.get_name(), exc))
+                    err = f"Task {task.get_name()} crashed: {exc}"
                     logger.exception(err)
                     BotState.record_error(err)
 
@@ -774,6 +798,10 @@ class ProductionRunner:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+            if failures:
+                task_name, failure = failures[0]
+                raise RuntimeError(f"Task {task_name} crashed: {failure}") from failure
 
             self._record_run_end()
             return 0

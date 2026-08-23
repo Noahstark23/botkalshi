@@ -26,6 +26,18 @@ def fake_key(tmp_path: Path) -> Path:
     return p
 
 
+def _enable_m5_f1_profile(monkeypatch) -> None:
+    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
+    monkeypatch.setenv("ODDS_API_KEY", "test-odds-key")
+    monkeypatch.setenv("MOTOR_MM_FEES_AS_MAKER", "true")
+    monkeypatch.setenv("MOTOR_MM_REQUIRE_PREGAME", "true")
+    monkeypatch.setenv("MOTOR_MM_KICKOFF_BUFFER_SEC", "120")
+    monkeypatch.setenv("MOTOR_MM_SERIES", "KXMLBGAME")
+    monkeypatch.setenv("MOTOR2_SERIES", "KXMLBGAME")
+    monkeypatch.setenv("ODDS_API_SPORT_KEYS", "baseball_mlb")
+
+
 def test_settings_loads_minimum_required(fake_key: Path, monkeypatch):
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
@@ -191,7 +203,7 @@ def test_motor_mm_execution_in_production_requires_f3_key(fake_key: Path, monkey
     monkeypatch.setenv("KALSHI_ENV", "production")
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
-    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    _enable_m5_f1_profile(monkeypatch)
     monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
 
     with pytest.raises(ValidationError, match="llave F3"):
@@ -203,7 +215,7 @@ def test_motor_mm_f3_key_wrong_value_still_blocks(fake_key: Path, monkeypatch):
     monkeypatch.setenv("KALSHI_ENV", "production")
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
-    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    _enable_m5_f1_profile(monkeypatch)
     monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
     monkeypatch.setenv("MOTOR_MM_F3_ACK", "noel-ok-f3")  # case incorrecto
 
@@ -218,8 +230,7 @@ def test_motor_mm_f3_key_unlocks_production(fake_key: Path, monkeypatch):
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
     monkeypatch.setenv("TRADING_ENABLED", "true")
-    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
-    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    _enable_m5_f1_profile(monkeypatch)
     monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
     monkeypatch.setenv("MOTOR_MM_F3_ACK", "NOEL-OK-F3")
 
@@ -235,23 +246,24 @@ def test_motor_mm_execution_allowed_in_demo(fake_key: Path, monkeypatch):
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
     monkeypatch.setenv("TRADING_ENABLED", "true")
-    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    _enable_m5_f1_profile(monkeypatch)
     monkeypatch.setenv("MOTOR_MM_EXECUTION_ENABLED", "true")
 
     s = Settings()
     assert s.MOTOR_MM_EXECUTION_ENABLED and s.KALSHI_ENV == "demo"
 
 
-def test_motor_mm_alone_does_not_count_as_enabled_motor(fake_key: Path, monkeypatch):
-    """MOTOR_MM_ENABLED en F1 no puede operar capital → NO satisface el guard 'ningún
-    motor habilitado' con TRADING_ENABLED=true (misma regla que los *_EXECUTION)."""
+def test_motor_mm_without_live_upstream_fails_loud(fake_key: Path, monkeypatch):
+    """M5 no puede quedar healthy con M2/fair apagado: el boot explica la dependencia."""
     monkeypatch.setenv("KALSHI_ENV", "production")
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
     monkeypatch.setenv("TRADING_ENABLED", "true")
     monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
 
-    with pytest.raises(ValidationError, match="ningún motor"):
+    monkeypatch.setenv("ODDS_API_KEY", "")
+
+    with pytest.raises(ValidationError, match="perfil F1 auditable"):
         Settings()
 
 
@@ -262,8 +274,63 @@ def test_motor_mm_shadow_config_valid_in_production(fake_key: Path, monkeypatch)
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
     monkeypatch.setenv("TRADING_ENABLED", "true")
-    monkeypatch.setenv("MOTOR_2_SPORTSBOOK_ENABLED", "true")
-    monkeypatch.setenv("MOTOR_MM_ENABLED", "true")
+    _enable_m5_f1_profile(monkeypatch)
 
     s = Settings()
     assert s.MOTOR_MM_ENABLED and not s.MOTOR_MM_EXECUTION_ENABLED
+
+
+def test_motor_mm_f1_rechaza_demo_para_no_mezclar_books(fake_key: Path, monkeypatch):
+    monkeypatch.setenv("KALSHI_ENV", "demo")
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    _enable_m5_f1_profile(monkeypatch)
+
+    with pytest.raises(ValidationError, match="KALSHI_ENV=production"):
+        Settings()
+
+
+def test_motor_mm_rejects_series_missing_from_motor2(fake_key: Path, monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    _enable_m5_f1_profile(monkeypatch)
+    monkeypatch.setenv("MOTOR2_SERIES", "KXNFLGAME")
+
+    with pytest.raises(ValidationError, match="KXMLBGAME incluida en MOTOR2_SERIES"):
+        Settings()
+
+
+def test_motor_mm_new_game_series_requires_discovery_extra(fake_key: Path, monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    _enable_m5_f1_profile(monkeypatch)
+    monkeypatch.setenv("MOTOR_MM_SERIES", "KXNFLGAME")
+    monkeypatch.setenv("MOTOR2_SERIES", "KXNFLGAME")
+    monkeypatch.setenv("ODDS_API_SPORT_KEYS", "americanfootball_nfl")
+    monkeypatch.setenv("DISCOVERY_EXTRA_SERIES", "")
+
+    with pytest.raises(ValidationError, match="DISCOVERY_EXTRA_SERIES"):
+        Settings()
+
+
+def test_motor_mm_rejects_unonboarded_soccer_series(fake_key: Path, monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    _enable_m5_f1_profile(monkeypatch)
+    monkeypatch.setenv("MOTOR_MM_SERIES", "KXEPLGAME")
+    monkeypatch.setenv("MOTOR2_SERIES", "KXEPLGAME")
+    monkeypatch.setenv("ODDS_API_SPORT_KEYS", "soccer_epl")
+    monkeypatch.setenv("DISCOVERY_EXTRA_SERIES", "KXEPLGAME")
+
+    with pytest.raises(ValidationError, match="sin onboarding M2/M5 validado"):
+        Settings()
+
+
+def test_motor_mm_f1_rechaza_quote_size_mayor_a_uno(fake_key: Path, monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-id-12345")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(fake_key))
+    _enable_m5_f1_profile(monkeypatch)
+    monkeypatch.setenv("MOTOR_MM_QUOTE_SIZE_CONTRACTS", "10")
+
+    with pytest.raises(ValidationError, match="QUOTE_SIZE_CONTRACTS=1"):
+        Settings()

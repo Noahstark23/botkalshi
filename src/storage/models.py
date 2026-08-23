@@ -13,6 +13,7 @@ Schema:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from loguru import logger
@@ -325,6 +326,9 @@ class MMShadowFill(SQLModel, table=True):
     side: str = Field(max_length=4)  # "buy" | "sell"
     price_cents: int
     count: int
+    # Profundidad fixed-point de la punta que cruzó la quote. F1 solo afirma ``count``
+    # si este size observado lo cubre; Decimal evita convertir 0.33 en 0 o en 1.
+    crossed_depth: Decimal | None = Field(default=None, max_digits=38, decimal_places=18)
     fee_cents: int = 0  # comisión real del fill (kalshi_fee_cents con count)
     rule: str = Field(max_length=50)  # p.ej. "ask 38 < bid 40"
     inventory_after: int = 0
@@ -352,6 +356,43 @@ class MMShadowFill(SQLModel, table=True):
     # juzga el gate es deuda que cuesta veredictos.
     fee_model: str | None = Field(default=None, max_length=8)  # "taker" | "maker"
     fee_effective_cents: int | None = None
+    # Cohorte F1-v2 (2026-08-22): el gate anterior mezclaba mark de fair externo, asumía
+    # fill completo de size=10 y usaba M=1 aun después del cambio de MLB a M=0.5.
+    # Versionar la métrica impide que esas filas incompatibles vuelvan a aprobar dinero.
+    metric_version: str | None = Field(default=None, max_length=24)
+    experiment_id: str | None = Field(default=None, max_length=48, index=True)
+    event_ticker: str | None = Field(default=None, max_length=100, index=True)
+    fee_multiplier: float | None = None
+    fee_type: str | None = Field(default=None, max_length=40)
+    fee_source: str | None = Field(default=None, max_length=20)
+    fee_base_multiplier: float | None = None
+    fee_base_type: str | None = Field(default=None, max_length=40)
+    fee_override_multiplier: float | None = None
+    fee_override_type: str | None = Field(default=None, max_length=40)
+    fee_schedule_observed_at: datetime | None = None
+    exchange_environment: str | None = Field(default=None, max_length=16)
+    fair_method_version: str | None = Field(default=None, max_length=40)
+    fair_odds_event_id: str | None = Field(default=None, max_length=100)
+    fair_sport_key: str | None = Field(default=None, max_length=80)
+    fair_bookmaker_keys: str | None = Field(default=None, max_length=500)
+    fair_book_count: int | None = None
+    fair_oldest_book_update: datetime | None = None
+    fair_newest_book_update: datetime | None = None
+    fair_min_books: int | None = None
+    fair_max_book_age_min: float | None = None
+    fair_computed_at: datetime | None = None
+    fair_odds_regions: str | None = Field(default=None, max_length=100)
+    fair_sport_keys_config: str | None = Field(default=None, max_length=500)
+    fair_cache_ttl_sec: float | None = None
+    fair_ttl_sec: float | None = None
+    commence_time: datetime | None = None
+    seconds_to_kickoff: float | None = None
+    # Política legible de la cohorte. El hash de experiment_id separa configs, pero el
+    # gate no debe adivinar qué significaba: valida creación Y observación del fill contra
+    # el buffer persistido (un cruce visto tras el cutoff es ambiguo y bloquea graduación).
+    policy_require_pregame: bool | None = None
+    policy_kickoff_buffer_sec: float | None = None
+    quote_seconds_to_kickoff: float | None = None
     # Salto del mark en el tick en que se CREÓ la quote que llenó (2026-08-14): con
     # esto el análisis reconstruye la política de CUALQUIER umbral de blindaje desde los
     # mismos datos (blindaje@X = subconjunto con quote_jump_cents < X). En shadow la
@@ -363,6 +404,24 @@ class MMShadowFill(SQLModel, table=True):
     # quote) vs fills calmos — el gate juzga la economía de los calmos por separado.
     mark_jump_cents: float | None = None
     created_at: datetime = Field(default_factory=_utc_now, index=True)
+
+
+class MMExperimentRun(SQLModel, table=True):
+    """Cadena de custodia de una cohorte M5.
+
+    Un proceso que muere o pierde un intervalo de una quote no puede desaparecer del
+    denominador. ``running`` queda durable ante un crash; ``invalid`` registra una brecha
+    observacional; solo ``clean`` permite que el gate considere la cohorte completa.
+    """
+
+    __tablename__ = "mm_experiment_runs"
+
+    id: int | None = Field(default=None, primary_key=True)
+    experiment_id: str = Field(index=True, max_length=48)
+    status: str = Field(default="running", max_length=12)  # running|clean|invalid
+    reason: str | None = Field(default=None, max_length=500)
+    started_at: datetime = Field(default_factory=_utc_now, index=True)
+    ended_at: datetime | None = None
 
 
 class FairKickoffSnapshot(SQLModel, table=True):
@@ -405,6 +464,8 @@ class MMFunnelSnapshot(SQLModel, table=True):
     skip_unprofitable: int = 0
     skip_degenerate: int = 0
     skip_fair_range: int = 0
+    skip_fee_policy: int = 0
+    skip_pregame: int = 0
     fills: int = 0
     inventory_abs: int = 0  # Σ|net| simulado
     mtm_pnl_cents: int = 0  # PnL mark-to-market neto de fees (el número del gate)
@@ -519,6 +580,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("mm_shadow_fills", "fill_fair_prob", "FLOAT"),
     ("mm_shadow_fills", "yes_bid", "INTEGER"),
     ("mm_shadow_fills", "yes_ask", "INTEGER"),
+    ("mm_shadow_fills", "crossed_depth", "NUMERIC(38,18)"),
     # Apuesta 1: markout del maker shadow (selección adversa medida por fill).
     ("mm_shadow_fills", "markout1_cents", "FLOAT"),
     ("mm_shadow_fills", "markout1_age_sec", "FLOAT"),
@@ -528,7 +590,48 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("mm_shadow_fills", "fee_model", "VARCHAR(8)"),  # taker|maker — la tabla se auto-describe
     ("mm_shadow_fills", "fee_effective_cents", "INTEGER"),
     ("mm_shadow_fills", "quote_jump_cents", "FLOAT"),  # contrafactual de umbral de blindaje
+    ("mm_shadow_fills", "metric_version", "VARCHAR(24)"),
+    ("mm_shadow_fills", "experiment_id", "VARCHAR(48)"),
+    ("mm_shadow_fills", "event_ticker", "VARCHAR(100)"),
+    ("mm_shadow_fills", "fee_multiplier", "FLOAT"),
+    ("mm_shadow_fills", "fee_type", "VARCHAR(40)"),
+    ("mm_shadow_fills", "fee_source", "VARCHAR(20)"),
+    ("mm_shadow_fills", "fee_base_multiplier", "FLOAT"),
+    ("mm_shadow_fills", "fee_base_type", "VARCHAR(40)"),
+    ("mm_shadow_fills", "fee_override_multiplier", "FLOAT"),
+    ("mm_shadow_fills", "fee_override_type", "VARCHAR(40)"),
+    ("mm_shadow_fills", "fee_schedule_observed_at", "DATETIME"),
+    ("mm_shadow_fills", "exchange_environment", "VARCHAR(16)"),
+    ("mm_shadow_fills", "fair_method_version", "VARCHAR(40)"),
+    ("mm_shadow_fills", "fair_odds_event_id", "VARCHAR(100)"),
+    ("mm_shadow_fills", "fair_sport_key", "VARCHAR(80)"),
+    ("mm_shadow_fills", "fair_bookmaker_keys", "VARCHAR(500)"),
+    ("mm_shadow_fills", "fair_book_count", "INTEGER"),
+    ("mm_shadow_fills", "fair_oldest_book_update", "DATETIME"),
+    ("mm_shadow_fills", "fair_newest_book_update", "DATETIME"),
+    ("mm_shadow_fills", "fair_min_books", "INTEGER"),
+    ("mm_shadow_fills", "fair_max_book_age_min", "FLOAT"),
+    ("mm_shadow_fills", "fair_computed_at", "DATETIME"),
+    ("mm_shadow_fills", "fair_odds_regions", "VARCHAR(100)"),
+    ("mm_shadow_fills", "fair_sport_keys_config", "VARCHAR(500)"),
+    ("mm_shadow_fills", "fair_cache_ttl_sec", "FLOAT"),
+    ("mm_shadow_fills", "fair_ttl_sec", "FLOAT"),
+    ("mm_shadow_fills", "commence_time", "DATETIME"),
+    ("mm_shadow_fills", "seconds_to_kickoff", "FLOAT"),
+    ("mm_shadow_fills", "policy_require_pregame", "BOOLEAN"),
+    ("mm_shadow_fills", "policy_kickoff_buffer_sec", "FLOAT"),
+    ("mm_shadow_fills", "quote_seconds_to_kickoff", "FLOAT"),
+    ("mm_funnel_snapshots", "skip_fee_policy", "INTEGER DEFAULT 0"),
+    ("mm_funnel_snapshots", "skip_pregame", "INTEGER DEFAULT 0"),
 ]
+
+# Índices que create_all agrega a DBs nuevas pero que las tablas existentes no reciben.
+# El gate F1 filtra por cohorte+métrica+fecha; sin este compuesto una muestra creciente
+# obliga a escanear toda la tabla en cada revisión.
+_INDEX_MIGRATIONS: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS ix_mm_shadow_fills_experiment_metric_created "
+    "ON mm_shadow_fills (experiment_id, metric_version, created_at)",
+)
 
 
 def _existing_columns(conn: Any, table: str) -> set[str]:
@@ -554,6 +657,10 @@ def apply_migrations(engine: Any) -> None:
             if column not in existing:
                 conn.exec_driver_sql(f'ALTER TABLE {table} ADD COLUMN "{column}" {col_type}')
                 logger.info(f"migration: ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        mm_fill_columns = _existing_columns(conn, "mm_shadow_fills")
+        if {"experiment_id", "metric_version", "created_at"} <= mm_fill_columns:
+            for statement in _INDEX_MIGRATIONS:
+                conn.exec_driver_sql(statement)
 
 
 def init_db() -> None:

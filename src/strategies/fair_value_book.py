@@ -31,17 +31,35 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+FAIR_METHOD_VERSION = "m2-median-complete-h2h-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class FairProvenance:
+    event_ticker: str
+    odds_event_id: str
+    sport_key: str
+    bookmaker_keys: tuple[str, ...]
+    oldest_book_update: datetime | None
+    newest_book_update: datetime | None
+    min_books: int
+    max_book_age_min: float | None
+    method_version: str = FAIR_METHOD_VERSION
+
 
 @dataclass(frozen=True, slots=True)
 class FairValue:
     fair_prob: float  # [0.0, 1.0], post no-vig (shape de ConsensusSignal.odds_api_fair_prob)
     computed_at: datetime  # aware UTC
+    commence_time: datetime | None = None  # kickoff del evento; None = no apto para M5 F1-v2
+    event_ticker: str | None = None  # identidad oficial Kalshi; nunca se deriva del market ticker
+    provenance: FairProvenance | None = None
 
 
 # Clave del store proceso-global. Vive en `sys` (SIEMPRE el mismo objeto sin importar cuántas
 # veces se cargue este módulo) → un solo dict compartido por todas las copias de la clase.
 # Versionada por si el shape de FairValue cambia entre deploys en caliente.
-_GLOBAL_STORE_ATTR = "__botkalshi_fair_value_book_v1__"
+_GLOBAL_STORE_ATTR = "__botkalshi_fair_value_book_v2__"
 
 
 def _shared_book() -> dict[str, FairValue]:
@@ -61,13 +79,27 @@ class FairValueBook:
     ver el incidente 2026-07-09 en el docstring del módulo."""
 
     @classmethod
-    def publish(cls, fairs: dict[str, float], *, now: datetime | None = None) -> None:
+    def publish(
+        cls,
+        fairs: dict[str, float],
+        *,
+        now: datetime | None = None,
+        commence_times: dict[str, datetime] | None = None,
+        event_tickers: dict[str, str] | None = None,
+        provenances: dict[str, FairProvenance] | None = None,
+    ) -> None:
         """Upsert de los fairs del ciclo. NO borra tickers ausentes: un partido que este
         ciclo no matcheó (odds API parcial) conserva su último fair y expira por TTL."""
         now = now or datetime.now(UTC)
         book = _shared_book()
         for ticker, prob in fairs.items():
-            book[ticker] = FairValue(fair_prob=prob, computed_at=now)
+            book[ticker] = FairValue(
+                fair_prob=prob,
+                computed_at=now,
+                commence_time=(commence_times or {}).get(ticker),
+                event_ticker=(event_tickers or {}).get(ticker),
+                provenance=(provenances or {}).get(ticker),
+            )
 
     @classmethod
     def fresh(cls, ttl_sec: float, *, now: datetime | None = None) -> dict[str, FairValue]:

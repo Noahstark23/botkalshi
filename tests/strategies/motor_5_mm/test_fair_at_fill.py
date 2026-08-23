@@ -130,6 +130,8 @@ def test_migracion_agrega_columnas_a_tabla_existente(tmp_path):
     with engine.begin() as conn:
         cols = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(mm_shadow_fills)")}
         assert {"quote_fair_prob", "fill_fair_prob", "yes_bid", "yes_ask"} <= cols
+        indexes = {r[1] for r in conn.exec_driver_sql("PRAGMA index_list(mm_shadow_fills)")}
+        assert "ix_mm_shadow_fills_experiment_metric_created" in indexes
         row = conn.exec_driver_sql(
             "SELECT quote_fair_prob, fill_fair_prob, yes_bid, yes_ask "
             "FROM mm_shadow_fills WHERE ticker='T-VIEJA'"

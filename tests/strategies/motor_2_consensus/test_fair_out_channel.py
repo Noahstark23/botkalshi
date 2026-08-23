@@ -44,6 +44,7 @@ def _fixture(commence: datetime) -> tuple[KalshiEventQuotes, OddsEvent]:
             Bookmaker(
                 key="pinnacle",
                 title="P",
+                last_update=NOW - timedelta(minutes=1),
                 markets=(
                     Market(
                         key="h2h",
@@ -76,6 +77,99 @@ def test_fair_out_covers_all_matched_outcomes_not_only_signals():
     assert set(fair_out) == {f"{ke.event_key}-PHI", f"{ke.event_key}-NYM"}
     assert fair_out[f"{ke.event_key}-PHI"] == pytest.approx(0.62, abs=0.01)
     assert fair_out[f"{ke.event_key}-NYM"] == pytest.approx(0.38, abs=0.01)
+
+
+def test_fair_out_transporta_kickoff_por_ticker():
+    kickoff = NOW + timedelta(hours=6)
+    ke, odds = _fixture(kickoff)
+    fair_out: dict[str, float] = {}
+    commence_out: dict[str, datetime] = {}
+
+    find_signals(
+        [ke],
+        [odds],
+        min_edge=0.03,
+        now=NOW,
+        fair_out=fair_out,
+        fair_commence_out=commence_out,
+    )
+
+    assert set(commence_out) == set(fair_out)
+    assert set(commence_out.values()) == {kickoff}
+
+
+def test_fair_out_transporta_event_ticker_oficial():
+    ke, odds = _fixture(NOW + timedelta(hours=6))
+    fair_out: dict[str, float] = {}
+    event_out: dict[str, str] = {}
+
+    find_signals(
+        [ke],
+        [odds],
+        min_edge=0.03,
+        now=NOW,
+        fair_out=fair_out,
+        fair_event_out=event_out,
+    )
+
+    assert set(event_out) == set(fair_out)
+    assert set(event_out.values()) == {ke.event_key}
+
+
+def test_fair_out_transporta_provenance_de_books_frescos():
+    ke, odds = _fixture(NOW + timedelta(hours=6))
+    fair_out: dict[str, float] = {}
+    provenance_out = {}
+
+    find_signals(
+        [ke],
+        [odds],
+        min_edge=0.03,
+        now=NOW,
+        fair_out=fair_out,
+        fair_provenance_out=provenance_out,
+        min_books=1,
+        max_book_age_min=15,
+    )
+
+    assert set(provenance_out) == set(fair_out)
+    provenance = next(iter(provenance_out.values()))
+    assert provenance.event_ticker == ke.event_key
+    assert provenance.odds_event_id == odds.id
+    assert provenance.bookmaker_keys == ("pinnacle",)
+    assert provenance.oldest_book_update == NOW - timedelta(minutes=1)
+
+
+def test_fair_con_filtro_de_edad_rechaza_book_sin_timestamp():
+    ke, odds = _fixture(NOW + timedelta(hours=6))
+    bookmaker = odds.bookmakers[0]
+    odds_without_timestamp = OddsEvent(
+        id=odds.id,
+        sport_key=odds.sport_key,
+        commence_time=odds.commence_time,
+        home_team=odds.home_team,
+        away_team=odds.away_team,
+        bookmakers=(
+            Bookmaker(
+                key=bookmaker.key,
+                title=bookmaker.title,
+                markets=bookmaker.markets,
+                last_update=None,
+            ),
+        ),
+    )
+    fair_out: dict[str, float] = {}
+
+    find_signals(
+        [ke],
+        [odds_without_timestamp],
+        now=NOW,
+        fair_out=fair_out,
+        min_books=1,
+        max_book_age_min=15,
+    )
+
+    assert fair_out == {}
 
 
 def test_unmatched_event_publishes_nothing():

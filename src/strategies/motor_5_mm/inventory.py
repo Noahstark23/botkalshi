@@ -20,7 +20,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.math.fees import kalshi_fee_cents, kalshi_maker_fee_cents
+from src.math.fees import (
+    kalshi_fee_cents,
+    kalshi_maker_fee_cents,
+)
 from src.strategies.motor_5_mm.shadow_fill import ShadowFill
 
 
@@ -49,12 +52,14 @@ class InventoryBook:
         self.positions: dict[str, TickerInventory] = {}
         self._fees_as_maker = fees_as_maker
 
-    def apply_fill(self, fill: ShadowFill) -> TickerInventory:
+    def apply_fill(
+        self, fill: ShadowFill, *, fee_multiplier: int | float | str = 1
+    ) -> TickerInventory:
         inv = self.positions.setdefault(fill.ticker, TickerInventory())
         fee = (
-            kalshi_maker_fee_cents(fill.count, fill.price_cents)
+            kalshi_maker_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
             if self._fees_as_maker
-            else kalshi_fee_cents(fill.count, fill.price_cents)
+            else kalshi_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
         )
         if fill.side == "buy":
             inv.net_contracts += fill.count
