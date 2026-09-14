@@ -1,0 +1,38 @@
+# Standalone compose: NEVER merge with the legacy root docker-compose.yml.
+services:
+  lab:
+    image: botkalshi-research-bootstrap:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LAB_PYTHON_IMAGE: ${LAB_PYTHON_IMAGE:?Run lab.sh prepare first}
+    command: ["serve", "--data", "/data"]
+    user: "10001:10001"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - lab_data:/data
+    init: true
+    restart: "no"
+    stop_grace_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "python", "/opt/lab/runtime.py", "healthcheck", "--data", "/data"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+volumes:
+  lab_data:
