@@ -1,0 +1,20 @@
+{
+  "schema_version": "research-assessment-v1",
+  "packet_id": "SYNTHETIC-NO-MARKET-001",
+  "packet_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "mode": "OFFLINE",
+  "decision": "WAIT",
+  "market_ticker": null,
+  "generated_at": "2026-09-14T19:24:00Z",
+  "summary": "Fixture sintética: no hay cotización, contrato ni capital real confirmados. No es recomendación.",
+  "evidence_ids": [],
+  "counter_evidence_ids": [],
+  "missing_fields": [
+    "contract_rules",
+    "executable_ask",
+    "fee_policy",
+    "independent_probability",
+    "reconciled_bank"
+  ],
+  "execution_authorized": false
+}
