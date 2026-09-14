@@ -1,0 +1,8 @@
+.local/
+__pycache__/
+*.pyc
+.env
+*.pem
+*.key
+*.sqlite*
+*.db*
