@@ -59,7 +59,7 @@ else
   git -C "$STAGING" checkout --detach FETCH_HEAD
   [[ "$(git -C "$STAGING" rev-parse HEAD)" == "$SHA" ]] || exit 2
   find "$STAGING" -type d -exec chmod 0755 {} +
-  find "$STAGING" -type f -exec chmod 0644 {} +
+  find "$STAGING" -type f -exec chmod a+rX,u+w,go-w {} +
   mv "$STAGING" "$RELEASE"
 fi
 [[ -f "$RELEASE/infra/digitalocean-shadow/reporting.py" ]] || { echo 'Release sin verificador; no se instala.' >&2; exit 2; }
