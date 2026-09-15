@@ -1,0 +1,35 @@
+[Unit]
+Description=botkalshi autonomous research collector (shadow-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botkalshi
+Group=botkalshi
+WorkingDirectory=/opt/botkalshi/infra/digitalocean-shadow
+EnvironmentFile=-/etc/botkalshi-research.env
+ExecStart=/usr/bin/python3 /opt/botkalshi/infra/digitalocean-shadow/collector.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/botkalshi-research
+UMask=0077
+MemoryMax=700M
+CPUQuota=80%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
