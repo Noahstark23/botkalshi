@@ -1,35 +1,26 @@
-# DigitalOcean shadow collector
+# DigitalOcean: colector y verificación de investigación
 
-Servicio autónomo de **investigación**, no de ejecución. Lee mercados públicos de Kalshi y opcionalmente The Odds API, guarda snapshots SQLite y exporta `packets/latest.json` para revisión externa/IA.
+No contiene órdenes ni integra todavía M2/M5 o un modelo. `collector.py` captura una serie de mercados públicos y produce paquetes; no es un barrido multiactivo completo. `reporting.py` comprueba frescura/coherencia local y crea borradores, nunca envía WhatsApp o publica contenido.
 
-## Seguridad
+## Estado y documentación
 
-- Rechaza claves privadas/API de Kalshi y flags de ejecución.
-- No implementa crear/cancelar órdenes, posiciones, balances ni depósitos.
-- No abre puertos; UFW deja solo SSH.
-- Corre como usuario `botkalshi` con hardening de systemd.
-- `ODDS_API_KEY` es opcional y debe configurarse solo en `/etc/botkalshi-research.env` del servidor, nunca en GitHub o chat.
+Leer [memoria operativa](../../docs/operations/BOT_MEMORY.md), [runbook](../../docs/operations/RUNBOOK.md), [integraciones](../../docs/operations/INTEGRATIONS.md) y [contenido](../../docs/operations/CONTENT.md).
 
-## Despliegue
+VM activa no demuestra proceso instalado. Este paquete no se ha desplegado remotamente desde la sesión que lo generó; falta acceso a terminal. Los tests locales no sustituyen verificación en Ubuntu/systemd.
 
-En un Ubuntu 24.04 nuevo, clonar la rama `feat/digitalocean-shadow-20260915` y ejecutar como root:
+## Instalación revisada
+
+El comando antiguo sin argumentos queda sustituido. Desde un checkout revisado, en la consola del Droplet dedicado Ubuntu 24.04:
 
 ```bash
-bash /opt/botkalshi/infra/digitalocean-shadow/install.sh
+REV="$(git rev-parse HEAD)"
+bash infra/digitalocean-shadow/install.sh "$REV" --dedicated-research-host
 ```
 
-El instalador crea `/var/lib/botkalshi-research`, instala y activa `botkalshi-research.service`, y valida que `health.json` indique `SHADOW_READONLY` y `execution_authorized=false`.
+El instalador usa `/opt/botkalshi-research/releases/$REV`, conserva directorios existentes, ejecuta tests y requiere nueva captura después del arranque. Si no se verifica en 180 segundos, detiene el servicio sin borrar datos. No configura firewall/SSH ni añade claves. APIs pagadas requieren revisión aparte y no se habilitan por esta instalación.
 
-Comprobación:
+Para verificar y producir borradores: seguir RUNBOOK.md. No usar el compose/runner legacy ni copiar claves históricas.
 
-```bash
-systemctl status botkalshi-research
-journalctl -u botkalshi-research -n 100 --no-pager
-cat /var/lib/botkalshi-research/health.json
-```
+## Qué falta
 
-Sin `ODDS_API_KEY`, Kalshi público sigue capturándose pero `sportsbook.status` queda `NOT_CONFIGURED`. Eso es un estado válido, no se inventa M2.
-
-## IA
-
-El paquete JSON es el punto de integración. Esta versión **no llama automáticamente a OpenAI** ni usa la suscripción de ChatGPT como API. Un worker de IA se añadirá aparte, con Structured Outputs y presupuesto propio, después de validar captura, frescura y matching. Ninguna salida IA tendrá permiso de ejecución.
+Matching, reglas, fees, quotes ejecutables, fuentes independientes, timestamps por libro, presupuesto persistente de proveedores y evaluación del experimento. Un reporte `CAPTURE_VERIFIED_LOCAL` confirma solamente esos archivos, no rentabilidad ni integración IA. Un paquete o borrador no equivale a mensaje enviado, canal creado o video publicado.
