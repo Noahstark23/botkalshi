@@ -17,7 +17,7 @@ Política propuesta por el operador; no autorización de operaciones. Los límit
 
 La unidad se reduce a `min(2 USD, 1% del capital conciliado)` si cae el capital y no sube automáticamente por ganancias. Persistir la unidad aprobada: una recuperación/reinicio no autoriza ratchet ascendente. Redondear el presupuesto hacia abajo a la unidad monetaria operable. No préstamos, margen prestado, apalancamiento, Kelly, martingala, reposición de pérdidas, promediar a la baja, perseguir cuotas o aumentar por rachas.
 
-La prueba se mantiene separada de obligaciones, vivienda, reserva, capital empresarial y cartera patrimonial. No constituye financiación de ninguna de esas metas. La revisión metodológica a 30 días desde inicio confirmado no obliga a operar, valida estadísticamente una ventaja ni permite aumentar capital.
+La prueba se mantiene separada de obligaciones, vivienda, reserva, capital empresarial y cartera patrimonial. No constituye financiación de ninguna de esas metas. La revisión metodológica a 30 días desde inicio confirmado no obliga a operar, no valida estadísticamente una ventaja y no permite aumentar capital por sí sola.
 
 ## Requisitos anteriores a cualquier elegibilidad
 
