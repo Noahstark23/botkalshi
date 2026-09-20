@@ -1,0 +1,54 @@
+[Unit]
+Description=botkalshi sanitized Telegram alert for a failed AI cycle
+After=network-online.target botkalshi-research.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=botkalshi-telegram
+Group=botkalshi-telegram
+SupplementaryGroups=botkalshi-ai
+WorkingDirectory=/opt/botkalshi/infra/digitalocean-shadow
+LoadCredential=telegram_bot_token:/etc/botkalshi-telegram/telegram_bot_token
+LoadCredential=telegram_chat_id:/etc/botkalshi-telegram/telegram_chat_id
+Environment=TRADING_ENABLED=false
+Environment=MOTOR_MM_EXECUTION_ENABLED=false
+Environment=MOTOR_1_EXECUTION_ENABLED=false
+Environment=MOTOR_2_EXECUTION_ENABLED=false
+Environment=MOTOR_2_ENTRY_EXECUTION_ENABLED=false
+Environment=MOTOR_3_EXECUTION_ENABLED=false
+Environment=MOTOR_REST_EXECUTION_ENABLED=false
+Environment=PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=KALSHI_API_KEY_ID KALSHI_PRIVATE_KEY KALSHI_PRIVATE_KEY_PATH OPENAI_API_KEY BOTKALSHI_OPENAI_MODEL PYTHONOPTIMIZE PYTHONPATH PYTHONHOME PYTHONINSPECT
+ExecStart=/usr/bin/python3 /opt/botkalshi/infra/digitalocean-shadow/telegram_notifier.py --data /var/lib/botkalshi-research --state-data /var/lib/botkalshi-integrations notify --event ai-failure
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+ProcSubset=pid
+KeyringMode=private
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/botkalshi-integrations/telegram
+InaccessiblePaths=-/etc/botkalshi-research.env -/etc/botkalshi-assistant.env -/etc/botkalshi-assistant
+UMask=0077
+LimitCORE=0
+MemoryMax=128M
+CPUQuota=25%
+TasksMax=24
+TimeoutStartSec=60
+
+# Triggered only by OnFailure= on the isolated assistant service.

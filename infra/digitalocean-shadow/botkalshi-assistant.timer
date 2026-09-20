@@ -2,9 +2,10 @@
 Description=Periodic botkalshi structured AI assessment
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=15min
+OnActiveSec=2min
+OnUnitInactiveSec=15min
 RandomizedDelaySec=60
+AccuracySec=30s
 Persistent=false
 Unit=botkalshi-assistant.service
 

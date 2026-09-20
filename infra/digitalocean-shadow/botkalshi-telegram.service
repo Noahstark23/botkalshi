@@ -1,17 +1,16 @@
 [Unit]
-Description=botkalshi structured AI assessment (no trading authority)
+Description=botkalshi bounded Telegram technical notifier (no trading authority)
 After=network-online.target botkalshi-research.service
 Wants=network-online.target
-OnSuccess=botkalshi-telegram.service
-OnFailure=botkalshi-telegram-ai-failure.service
 
 [Service]
 Type=oneshot
-User=botkalshi-ai
-Group=botkalshi-ai
+User=botkalshi-telegram
+Group=botkalshi-telegram
+SupplementaryGroups=botkalshi-ai
 WorkingDirectory=/opt/botkalshi/infra/digitalocean-shadow
-EnvironmentFile=/etc/botkalshi-assistant.env
-LoadCredential=openai_api_key:/etc/botkalshi-assistant/openai_api_key
+LoadCredential=telegram_bot_token:/etc/botkalshi-telegram/telegram_bot_token
+LoadCredential=telegram_chat_id:/etc/botkalshi-telegram/telegram_chat_id
 Environment=TRADING_ENABLED=false
 Environment=MOTOR_MM_EXECUTION_ENABLED=false
 Environment=MOTOR_1_EXECUTION_ENABLED=false
@@ -20,9 +19,9 @@ Environment=MOTOR_2_ENTRY_EXECUTION_ENABLED=false
 Environment=MOTOR_3_EXECUTION_ENABLED=false
 Environment=MOTOR_REST_EXECUTION_ENABLED=false
 Environment=PYTHONDONTWRITEBYTECODE=1
-UnsetEnvironment=KALSHI_API_KEY_ID KALSHI_PRIVATE_KEY KALSHI_PRIVATE_KEY_PATH TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID PYTHONOPTIMIZE PYTHONPATH PYTHONHOME PYTHONINSPECT
-ExecStartPre=+/usr/libexec/botkalshi-prepare-integration-access ai
-ExecStart=/usr/bin/python3 /opt/botkalshi/infra/digitalocean-shadow/assistant_bridge.py --data /var/lib/botkalshi-research --state-data /var/lib/botkalshi-integrations assess --provider openai
+UnsetEnvironment=KALSHI_API_KEY_ID KALSHI_PRIVATE_KEY KALSHI_PRIVATE_KEY_PATH OPENAI_API_KEY BOTKALSHI_OPENAI_MODEL PYTHONOPTIMIZE PYTHONPATH PYTHONHOME PYTHONINSPECT
+ExecStartPre=+/usr/libexec/botkalshi-prepare-integration-access telegram
+ExecStart=/usr/bin/python3 /opt/botkalshi/infra/digitalocean-shadow/telegram_notifier.py --data /var/lib/botkalshi-research --state-data /var/lib/botkalshi-integrations notify --event auto
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -44,19 +43,19 @@ RestrictNamespaces=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/botkalshi-integrations/assistant
+ReadWritePaths=/var/lib/botkalshi-integrations/telegram
 # Root ExecStartPre refreshes ACL xattrs; the service UID receives only r-- ACLs.
 ReadWritePaths=-/var/lib/botkalshi-research/health.json
 ReadWritePaths=-/var/lib/botkalshi-research/coverage.json
 ReadWritePaths=-/var/lib/botkalshi-research/risk-status.json
 ReadWritePaths=-/var/lib/botkalshi-research/packets/latest.json
-InaccessiblePaths=-/etc/botkalshi-research.env -/etc/botkalshi-telegram -/var/lib/botkalshi-integrations/telegram
-UMask=0027
+InaccessiblePaths=-/etc/botkalshi-research.env -/etc/botkalshi-assistant.env -/etc/botkalshi-assistant
+UMask=0077
 LimitCORE=0
-MemoryMax=256M
-CPUQuota=50%
-TasksMax=32
-TimeoutStartSec=75
+MemoryMax=128M
+CPUQuota=25%
+TasksMax=24
+TimeoutStartSec=60
 
-# This template is not installed or enabled automatically. Review the Unix-user
-# separation and environment file before use; never put Kalshi credentials here.
+# This unit reads only the dedicated Telegram environment file. It never loads
+# the collector or OpenAI environment and has no order/cancel/funding capability.

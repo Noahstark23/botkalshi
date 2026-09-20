@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic botkalshi Telegram technical status notification
+
+[Timer]
+OnActiveSec=90s
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30
+AccuracySec=15s
+Persistent=false
+Unit=botkalshi-telegram.service
+
+[Install]
+WantedBy=timers.target
+
+# The notifier persists a bounded fingerprint and suppresses unchanged status,
+# so this cadence does not imply a Telegram message every five minutes.

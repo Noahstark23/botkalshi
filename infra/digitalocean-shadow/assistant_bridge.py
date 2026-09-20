@@ -8,14 +8,19 @@ order, cancellation, transfer, shell, or arbitrary-command capability.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
+import ssl
+import stat
 import sys
+import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from cycle_verifier import CycleVerificationError, verify_cycle
 from reporting import EvidenceError, read_object
@@ -56,17 +61,112 @@ class BridgeError(RuntimeError):
     """A bridge operation failed without granting additional authority."""
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    """Keep credentials pinned to the configured HTTPS API origin."""
+
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def _open_https(request: Request, *, timeout: float):
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    opener = build_opener(
+        ProxyHandler({}),
+        HTTPSHandler(context=context),
+        _NoRedirect(),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def _read_credential(env_name: str, credential_name: str) -> str:
+    """Read a systemd credential, with an environment fallback for local tests."""
+
+    credentials_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if credentials_dir:
+        path = Path(credentials_dir) / credential_name
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            descriptor = None
+        except OSError:
+            raise BridgeError(f"{credential_name} credential is unreadable") from None
+        if descriptor is None:
+            raise BridgeError(f"{credential_name} credential is missing")
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4096:
+                raise BridgeError(f"{credential_name} credential is invalid")
+            raw = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+        if len(raw) > 4096:
+            raise BridgeError(f"{credential_name} credential is too large")
+        try:
+            value = raw.decode("utf-8").strip()
+        except UnicodeError:
+            raise BridgeError(f"{credential_name} credential is invalid") from None
+        if not value or any(character.isspace() for character in value):
+            raise BridgeError(f"{credential_name} credential is invalid")
+        return value
+    return os.environ.get(env_name, "").strip()
+
+
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
+    if path.parent.is_symlink() or path.is_symlink():
         raise BridgeError("output path cannot be a symlink")
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        # The isolated botkalshi-ai group may include the read-only Telegram
+        # notifier.  The containing directory is not accessible to other users.
+        os.fchmod(descriptor, 0o640)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise BridgeError("output path cannot be a symlink")
+        os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or path.is_symlink():
+        raise BridgeError("lock path cannot be a symlink")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError:
+        raise BridgeError("assistant operation lock is unavailable") from None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise BridgeError("assistant operation lock is invalid")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BridgeError("another assistant operation is already running") from None
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _read_optional(path: Path) -> dict[str, Any] | None:
@@ -88,8 +188,18 @@ def load_artifacts(data_dir: Path) -> tuple[dict[str, Any] | None, ...]:
     )
 
 
-def current_control(data_dir: Path) -> dict[str, Any]:
-    state = _read_optional(data_dir / "assistant" / "control-state.json")
+def _assistant_state_dir(data_dir: Path, state_data_dir: Path | None = None) -> Path:
+    """Locate integration state separately from collector-owned research data."""
+
+    return (state_data_dir or data_dir) / "assistant"
+
+
+def current_control(
+    data_dir: Path,
+    *,
+    state_data_dir: Path | None = None,
+) -> dict[str, Any]:
+    state = _read_optional(_assistant_state_dir(data_dir, state_data_dir) / "control-state.json")
     if not isinstance(state, dict) or type(state.get("paused")) is not bool:
         return {
             "schema_version": "botkalshi-assistant-control-v1",
@@ -107,26 +217,40 @@ def current_control(data_dir: Path) -> dict[str, Any]:
     }
 
 
-def set_pause(data_dir: Path, *, paused: bool, reason: str, actor: str) -> dict[str, Any]:
-    clean_reason = " ".join(reason.strip().split())
-    if not clean_reason or len(clean_reason) > 240:
-        raise BridgeError("pause reason must contain 1-240 characters")
-    if actor not in {"operator", "ai-defensive-pause"}:
-        raise BridgeError("invalid control actor")
-    state = {
-        "schema_version": "botkalshi-assistant-control-v1",
-        "paused": paused,
-        "reason": clean_reason,
-        "updated_at": datetime.now(UTC).isoformat(),
-        "updated_by": actor,
-        "scope": "AI_ASSESSMENT_ONLY",
-        "trading_state_changed": False,
-    }
-    _atomic_write(data_dir / "assistant" / "control-state.json", state)
-    return state
+def set_pause(
+    data_dir: Path,
+    *,
+    paused: bool,
+    reason: str,
+    actor: str,
+    state_data_dir: Path | None = None,
+) -> dict[str, Any]:
+    assistant_dir = _assistant_state_dir(data_dir, state_data_dir)
+    with _exclusive_lock(assistant_dir / "control-state.lock"):
+        clean_reason = " ".join(reason.strip().split())
+        if not clean_reason or len(clean_reason) > 240:
+            raise BridgeError("pause reason must contain 1-240 characters")
+        if actor not in {"operator", "ai-defensive-pause"}:
+            raise BridgeError("invalid control actor")
+        state = {
+            "schema_version": "botkalshi-assistant-control-v1",
+            "paused": paused,
+            "reason": clean_reason,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_by": actor,
+            "scope": "AI_ASSESSMENT_ONLY",
+            "trading_state_changed": False,
+        }
+        _atomic_write(assistant_dir / "control-state.json", state)
+        return state
 
 
-def build_status(data_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
+def build_status(
+    data_dir: Path,
+    *,
+    now: datetime | None = None,
+    state_data_dir: Path | None = None,
+) -> dict[str, Any]:
     health, packet, coverage, risk = load_artifacts(data_dir)
     verification = verify_cycle(
         health,
@@ -135,7 +259,9 @@ def build_status(data_dir: Path, *, now: datetime | None = None) -> dict[str, An
         risk,
         now=now or datetime.now(UTC),
     )
-    latest = _read_optional(data_dir / "assistant" / "assessment-latest.json")
+    latest = _read_optional(
+        _assistant_state_dir(data_dir, state_data_dir) / "assessment-latest.json"
+    )
     latest_summary = None
     if isinstance(latest, dict):
         latest_summary = {
@@ -149,7 +275,7 @@ def build_status(data_dir: Path, *, now: datetime | None = None) -> dict[str, An
         "schema_version": "botkalshi-assistant-status-v1",
         "checked_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
         "cycle": verification,
-        "control": current_control(data_dir),
+        "control": current_control(data_dir, state_data_dir=state_data_dir),
         "latest_assessment": latest_summary,
         "capabilities": {
             "read_verified_snapshot": True,
@@ -183,10 +309,16 @@ def build_snapshot(data_dir: Path, *, now: datetime | None = None) -> dict[str, 
     }
 
 
-def latest_assessment(data_dir: Path) -> dict[str, Any]:
+def latest_assessment(
+    data_dir: Path,
+    *,
+    state_data_dir: Path | None = None,
+) -> dict[str, Any]:
     """Return the latest bounded assessment, rejecting any authority escalation."""
 
-    value = read_object(data_dir / "assistant" / "assessment-latest.json")
+    value = read_object(
+        _assistant_state_dir(data_dir, state_data_dir) / "assessment-latest.json"
+    )
     if value.get("schema_version") != "botkalshi-assistant-assessment-v1":
         raise BridgeError("latest assessment schema invalid")
     if value.get("execution_authorized") is not False:
@@ -318,16 +450,25 @@ def _assert_ai_environment() -> None:
             raise BridgeError("AI bridge requires every execution flag to remain false")
 
 
-def _extract_output_text(body: dict[str, Any]) -> str:
+def _extract_output_text(body: object) -> str:
+    if not isinstance(body, dict):
+        raise BridgeError("OpenAI response body was not an object")
+    if body.get("status") != "completed":
+        raise BridgeError("OpenAI response was not completed")
+    output_texts: list[str] = []
     for item in body.get("output", []) if isinstance(body.get("output"), list) else []:
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
         for content in item.get("content", []) if isinstance(item.get("content"), list) else []:
-            if isinstance(content, dict) and content.get("type") == "output_text":
-                text = content.get("text")
-                if isinstance(text, str):
-                    return text
-    raise BridgeError("OpenAI response did not contain output_text")
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "refusal":
+                raise BridgeError("OpenAI refused the assessment")
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                output_texts.append(content["text"])
+    if len(output_texts) != 1:
+        raise BridgeError("OpenAI response did not contain exactly one output_text")
+    return output_texts[0]
 
 
 def _validate_assessment(value: object) -> dict[str, Any]:
@@ -364,9 +505,9 @@ def _validate_assessment(value: object) -> dict[str, Any]:
 
 def _openai_assessment(model_input: dict[str, Any], *, model: str) -> dict[str, Any]:
     _assert_ai_environment()
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = _read_credential("OPENAI_API_KEY", "openai_api_key")
     if not api_key:
-        raise BridgeError("OPENAI_API_KEY is required for provider=openai")
+        raise BridgeError("OpenAI API credential is required for provider=openai")
     if not model or len(model) > 80:
         raise BridgeError("an explicit OpenAI model is required")
     user_text = json.dumps(model_input, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -404,7 +545,12 @@ def _openai_assessment(model_input: dict[str, Any], *, model: str) -> dict[str, 
         method="POST",
     )
     try:
-        with urlopen(request, timeout=45) as response:
+        with _open_https(request, timeout=45) as response:
+            response_status = getattr(response, "status", None)
+            if response_status is None:
+                response_status = response.getcode()
+            if response_status != 200:
+                raise BridgeError("OpenAI response status was not successful")
             raw = response.read(1_000_001)
     except HTTPError as exc:
         raise BridgeError(f"OpenAI HTTP {exc.code}") from None
@@ -415,22 +561,23 @@ def _openai_assessment(model_input: dict[str, Any], *, model: str) -> dict[str, 
     try:
         body = json.loads(raw)
         result = json.loads(_extract_output_text(body))
-    except (json.JSONDecodeError, UnicodeError, TypeError):
+    except (json.JSONDecodeError, UnicodeError, TypeError, RecursionError):
         raise BridgeError("OpenAI response invalid") from None
     return _validate_assessment(result)
 
 
-def assess(
+def _assess_locked(
     data_dir: Path,
     *,
     provider: str,
     model: str | None = None,
     now: datetime | None = None,
+    state_data_dir: Path | None = None,
 ) -> dict[str, Any]:
     now = (now or datetime.now(UTC)).astimezone(UTC)
     health, packet, coverage, risk = load_artifacts(data_dir)
     verification = verify_cycle(health, packet, coverage, risk, now=now)
-    control = current_control(data_dir)
+    control = current_control(data_dir, state_data_dir=state_data_dir)
     effective_model: str | None = None
     if verification["technical_status"] != "VERIFIED":
         result = {
@@ -486,17 +633,40 @@ def assess(
         "order_capability_present": False,
         "commands_executed": [],
     }
-    _atomic_write(data_dir / "assistant" / "assessment-latest.json", assessment)
+    assessment_path = (
+        _assistant_state_dir(data_dir, state_data_dir) / "assessment-latest.json"
+    )
+    _atomic_write(assessment_path, assessment)
     if assessment["decision"] == "PAUSE_RESEARCH":
         set_pause(
             data_dir,
             paused=True,
             reason="AI defensive pause: " + assessment["summary"][:200],
             actor="ai-defensive-pause",
+            state_data_dir=state_data_dir,
         )
         assessment["commands_executed"] = ["PAUSE_RESEARCH"]
-        _atomic_write(data_dir / "assistant" / "assessment-latest.json", assessment)
+        _atomic_write(assessment_path, assessment)
     return assessment
+
+
+def assess(
+    data_dir: Path,
+    *,
+    provider: str,
+    model: str | None = None,
+    now: datetime | None = None,
+    state_data_dir: Path | None = None,
+) -> dict[str, Any]:
+    assistant_dir = _assistant_state_dir(data_dir, state_data_dir)
+    with _exclusive_lock(assistant_dir / "assessment.lock"):
+        return _assess_locked(
+            data_dir,
+            provider=provider,
+            model=model,
+            now=now,
+            state_data_dir=state_data_dir,
+        )
 
 
 def _print(value: dict[str, Any]) -> None:
@@ -506,6 +676,14 @@ def _print(value: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument(
+        "--state-data",
+        type=Path,
+        help=(
+            "root for integration-owned state; defaults to --data for backward "
+            "compatibility"
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     sub.add_parser("snapshot")
@@ -520,15 +698,21 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "status":
-            result = build_status(args.data)
+            result = build_status(args.data, state_data_dir=args.state_data)
         elif args.command == "snapshot":
             result = build_snapshot(args.data)
         elif args.command == "latest-assessment":
-            result = latest_assessment(args.data)
+            result = latest_assessment(args.data, state_data_dir=args.state_data)
         elif args.command == "pause":
-            result = set_pause(args.data, paused=True, reason=args.reason, actor="operator")
+            result = set_pause(
+                args.data,
+                paused=True,
+                reason=args.reason,
+                actor="operator",
+                state_data_dir=args.state_data,
+            )
         elif args.command == "resume-simulation":
-            status = build_status(args.data)
+            status = build_status(args.data, state_data_dir=args.state_data)
             if status["cycle"]["technical_status"] != "VERIFIED":
                 raise BridgeError("cannot resume assessments with a blocked cycle")
             result = set_pause(
@@ -536,9 +720,15 @@ def main() -> int:
                 paused=False,
                 reason="operator confirmed simulation-only assessment",
                 actor="operator",
+                state_data_dir=args.state_data,
             )
         else:
-            result = assess(args.data, provider=args.provider, model=args.model)
+            result = assess(
+                args.data,
+                provider=args.provider,
+                model=args.model,
+                state_data_dir=args.state_data,
+            )
         _print(result)
         return 0
     except (BridgeError, CycleVerificationError, EvidenceError, OSError, ValueError) as exc:

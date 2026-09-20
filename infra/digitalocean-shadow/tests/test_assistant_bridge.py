@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -106,6 +107,35 @@ class AssistantBridgeTests(unittest.TestCase):
         self.assertFalse(state["paused"])
         self.assertFalse(state["trading_state_changed"])
 
+    def test_integration_state_can_be_isolated_from_collector_data(self):
+        state_data = Path(self.tmp.name + "-integration-state")
+        self.addCleanup(shutil.rmtree, state_data, True)
+        bridge.set_pause(
+            self.data,
+            paused=False,
+            reason="simulation only",
+            actor="operator",
+            state_data_dir=state_data,
+        )
+        result = bridge.assess(
+            self.data,
+            provider="offline",
+            now=self.NOW,
+            state_data_dir=state_data,
+        )
+        status = bridge.build_status(
+            self.data,
+            now=self.NOW,
+            state_data_dir=state_data,
+        )
+        latest = bridge.latest_assessment(self.data, state_data_dir=state_data)
+
+        self.assertFalse((self.data / "assistant").exists())
+        self.assertTrue((state_data / "assistant" / "control-state.json").is_file())
+        self.assertTrue((state_data / "assistant" / "assessment-latest.json").is_file())
+        self.assertEqual(result["assessment_id"], latest["assessment_id"])
+        self.assertFalse(status["control"]["paused"])
+
     def test_offline_assessment_writes_bounded_no_action(self):
         bridge.set_pause(self.data, paused=False, reason="simulation only", actor="operator")
         result = bridge.assess(self.data, provider="offline", now=self.NOW)
@@ -158,3 +188,113 @@ class AssistantBridgeTests(unittest.TestCase):
         }
         with self.assertRaises(bridge.BridgeError):
             bridge._validate_assessment(value)
+
+    def test_openai_response_must_be_completed_and_not_a_refusal(self):
+        with self.assertRaisesRegex(bridge.BridgeError, "not an object"):
+            bridge._extract_output_text([])
+        with self.assertRaisesRegex(bridge.BridgeError, "not completed"):
+            bridge._extract_output_text({"status": "incomplete", "output": []})
+        with self.assertRaisesRegex(bridge.BridgeError, "refused"):
+            bridge._extract_output_text(
+                {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "refusal", "refusal": "not returned"}],
+                        }
+                    ],
+                }
+            )
+
+    def test_openai_uses_systemd_credential_and_strict_nonstored_output(self):
+        credentials = self.data / "credentials"
+        credentials.mkdir()
+        (credentials / "openai_api_key").write_text("sk-test-only\n", encoding="utf-8")
+        assessment = {
+            "decision": "NO_ACTION",
+            "confidence": 1.0,
+            "summary": "safe",
+            "evidence_ids": ["cycle-1"],
+            "blockers": [],
+            "proposed_commands": ["NOOP"],
+        }
+        response_body = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": json.dumps(assessment)}
+                    ],
+                }
+            ],
+        }
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                self.limit = limit
+                return json.dumps(response_body).encode("utf-8")
+
+        def fake_open(request, *, timeout):
+            captured["payload"] = json.loads(request.data)
+            captured["authorization"] = request.get_header("Authorization")
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIALS_DIRECTORY": str(credentials)},
+            clear=True,
+        ), patch.object(bridge, "_open_https", side_effect=fake_open):
+            result = bridge._openai_assessment({"cycle": "cycle-1"}, model="test-model")
+
+        self.assertEqual(result, assessment)
+        self.assertEqual(captured["authorization"], "Bearer sk-test-only")
+        self.assertIs(captured["payload"]["store"], False)
+        self.assertIs(captured["payload"]["text"]["format"]["strict"], True)
+        self.assertEqual(captured["timeout"], 45)
+
+    def test_configured_credential_directory_does_not_fall_back_to_environment(self):
+        credentials = self.data / "empty-credentials"
+        credentials.mkdir()
+        with patch.dict(
+            os.environ,
+            {
+                "CREDENTIALS_DIRECTORY": str(credentials),
+                "OPENAI_API_KEY": "must-not-be-used",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(bridge.BridgeError, "credential is missing"):
+                bridge._read_credential("OPENAI_API_KEY", "openai_api_key")
+
+    def test_openai_http_client_disables_proxies_and_redirects(self):
+        opener = unittest.mock.MagicMock()
+        with patch.object(bridge, "build_opener", return_value=opener) as builder:
+            bridge._open_https(bridge.Request(bridge.OPENAI_ENDPOINT), timeout=12)
+        handlers = builder.call_args.args
+        proxy_handlers = [item for item in handlers if isinstance(item, bridge.ProxyHandler)]
+        redirect_handlers = [item for item in handlers if isinstance(item, bridge._NoRedirect)]
+        self.assertTrue(not proxy_handlers or all(item.proxies == {} for item in proxy_handlers))
+        self.assertEqual(len(redirect_handlers), 1)
+        self.assertIsNone(
+            redirect_handlers[0].redirect_request(
+                None,
+                None,
+                302,
+                "redirect",
+                {},
+                "https://untrusted.invalid",
+            )
+        )
+        opener.open.assert_called_once()
