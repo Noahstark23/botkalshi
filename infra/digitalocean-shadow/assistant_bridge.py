@@ -164,6 +164,38 @@ def build_status(data_dir: Path, *, now: datetime | None = None) -> dict[str, An
     }
 
 
+def build_snapshot(data_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
+    """Return a bounded, verified, credential-free research snapshot."""
+
+    checked_at = (now or datetime.now(UTC)).astimezone(UTC)
+    health, packet, coverage, risk = load_artifacts(data_dir)
+    verification = verify_cycle(health, packet, coverage, risk, now=checked_at)
+    if verification["technical_status"] != "VERIFIED":
+        raise BridgeError("research snapshot is unavailable because the cycle is not verified")
+    assert isinstance(packet, dict) and isinstance(coverage, dict) and isinstance(risk, dict)
+    return {
+        "schema_version": "botkalshi-assistant-snapshot-v1",
+        "checked_at": checked_at.isoformat(),
+        "cycle": verification,
+        "snapshot": _model_input(verification, packet, coverage, risk),
+        "execution_authorized": False,
+        "order_capability_present": False,
+    }
+
+
+def latest_assessment(data_dir: Path) -> dict[str, Any]:
+    """Return the latest bounded assessment, rejecting any authority escalation."""
+
+    value = read_object(data_dir / "assistant" / "assessment-latest.json")
+    if value.get("schema_version") != "botkalshi-assistant-assessment-v1":
+        raise BridgeError("latest assessment schema invalid")
+    if value.get("execution_authorized") is not False:
+        raise BridgeError("latest assessment attempted to authorize execution")
+    if value.get("order_capability_present") is not False:
+        raise BridgeError("latest assessment attempted to claim order capability")
+    return value
+
+
 def _bounded_levels(value: object) -> dict[str, list[list[str]]]:
     if not isinstance(value, dict):
         return {}
@@ -476,6 +508,8 @@ def main() -> int:
     parser.add_argument("--data", type=Path, required=True)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("snapshot")
+    sub.add_parser("latest-assessment")
     pause = sub.add_parser("pause")
     pause.add_argument("--reason", required=True)
     resume = sub.add_parser("resume-simulation")
@@ -487,6 +521,10 @@ def main() -> int:
     try:
         if args.command == "status":
             result = build_status(args.data)
+        elif args.command == "snapshot":
+            result = build_snapshot(args.data)
+        elif args.command == "latest-assessment":
+            result = latest_assessment(args.data)
         elif args.command == "pause":
             result = set_pause(args.data, paused=True, reason=args.reason, actor="operator")
         elif args.command == "resume-simulation":

@@ -114,6 +114,25 @@ class AssistantBridgeTests(unittest.TestCase):
         self.assertEqual(result["commands_executed"], [])
         self.assertTrue((self.data / "assistant" / "assessment-latest.json").is_file())
 
+    def test_snapshot_is_verified_bounded_and_non_executing(self):
+        result = bridge.build_snapshot(self.data, now=self.NOW)
+        self.assertEqual(result["cycle"]["technical_status"], "VERIFIED")
+        self.assertEqual(result["snapshot"]["market_sample"][0]["ticker"], "SYN-1")
+        self.assertFalse(result["execution_authorized"])
+        self.assertFalse(result["order_capability_present"])
+
+    def test_latest_assessment_rejects_authority_escalation(self):
+        self.write(
+            "assistant/assessment-latest.json",
+            {
+                "schema_version": "botkalshi-assistant-assessment-v1",
+                "execution_authorized": True,
+                "order_capability_present": False,
+            },
+        )
+        with self.assertRaises(bridge.BridgeError):
+            bridge.latest_assessment(self.data)
+
     def test_blocked_cycle_never_calls_external_provider(self):
         packet = json.loads((self.data / "packets/latest.json").read_text())
         packet["packet_id"] = "other"

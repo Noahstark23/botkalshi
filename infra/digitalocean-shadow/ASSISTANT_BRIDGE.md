@@ -21,6 +21,21 @@ python3 infra/digitalocean-shadow/assistant_bridge.py \
   --data /var/lib/botkalshi-research status
 ```
 
+Obtener el snapshot público, verificado y acotado que puede consumir un asistente:
+
+```bash
+python3 infra/digitalocean-shadow/assistant_bridge.py \
+  --data /var/lib/botkalshi-research snapshot
+```
+
+Leer la última evaluación después de volver a comprobar que no reclama autoridad
+de ejecución:
+
+```bash
+python3 infra/digitalocean-shadow/assistant_bridge.py \
+  --data /var/lib/botkalshi-research latest-assessment
+```
+
 Habilitar únicamente evaluaciones de simulación:
 
 ```bash
@@ -79,6 +94,26 @@ assistant/assessment-latest.json
 ```
 
 La evaluación conserva hashes de los cuatro artefactos fuente y el ID de ciclo. Una evaluación no es una señal validada, un fill ni una autorización financiera.
+
+## Conector de ChatGPT/Codex
+
+El plugin personal `botkalshi-control` traduce cuatro herramientas MCP a los
+comandos fijos `status`, `snapshot`, `latest-assessment` y `pause`. Puede ejecutar
+el puente en el mismo host o mediante SSH en modo batch con verificación estricta
+de la clave del host. No acepta comandos arbitrarios ni publica una herramienta de
+reanudación.
+
+Para un host remoto se configuran, fuera del repositorio:
+
+```text
+BOTKALSHI_SSH_TARGET=usuario@host
+BOTKALSHI_REMOTE_BRIDGE_SCRIPT=/ruta/absoluta/assistant_bridge.py
+BOTKALSHI_REMOTE_DATA_DIR=/var/lib/botkalshi-research
+```
+
+La conexión sólo estará operativa cuando el código esté desplegado en el host,
+SSH batch esté autorizado para una cuenta restringida y la clave del host ya se
+encuentre verificada. Crear el plugin no realiza ninguno de esos cambios.
 
 ## Lector de cuenta independiente
 
