@@ -6,11 +6,14 @@ Missing or invalid reconciliation means no real-money entry is eligible.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import json
 import os
 from pathlib import Path
 from typing import Any
+
+from cycle_contract import RISK_SCHEMA
 
 CENT = Decimal("0.01")
 REFERENCE_BANK = Decimal("200.00")
@@ -18,6 +21,8 @@ REFERENCE_UNIT = Decimal("2.00")
 WEEKLY_STOP = Decimal("12.00")
 EXPERIMENT_STOP = Decimal("20.00")
 MAX_INPUT_BYTES = 64_000
+MAX_RECONCILED_AGE = timedelta(hours=24)
+ALLOWED_DECLARATIVE_SOURCES = frozenset({"confirmed-fill-ledger"})
 
 
 class RiskInputError(ValueError):
@@ -42,7 +47,33 @@ def _fmt(value: Decimal | None) -> str | None:
     return None if value is None else f"{value.quantize(CENT):.2f}"
 
 
-def build_status(raw: dict[str, Any] | None) -> dict[str, Any]:
+def _reconciled_at(value: object, *, now: datetime) -> datetime:
+    if not isinstance(value, str) or not value.strip() or len(value) > 64:
+        raise RiskInputError("capital_reconciled_at is required")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise RiskInputError("capital_reconciled_at invalid") from None
+    if parsed.tzinfo is None:
+        raise RiskInputError("capital_reconciled_at must include a timezone")
+    try:
+        moment = parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
+        raise RiskInputError("capital_reconciled_at outside supported UTC range") from None
+    if moment > now:
+        raise RiskInputError("capital_reconciled_at is in the future")
+    if now - moment > MAX_RECONCILED_AGE:
+        raise RiskInputError("capital_reconciled_at is stale")
+    return moment
+
+
+def build_status(
+    raw: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+    cycle_id: str | None = None,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
     """Return policy status from an explicitly reconciled input snapshot.
 
     Required for a REAL_SEPARATED state:
@@ -56,8 +87,11 @@ def build_status(raw: dict[str, Any] | None) -> dict[str, Any]:
 
     The output is advisory/fail-closed. execution_authorized is always False.
     """
+    now = (now or datetime.now(UTC)).astimezone(UTC)
     base = {
-        "schema_version": "botkalshi-risk-status-v1",
+        "schema_version": RISK_SCHEMA,
+        "cycle_id": cycle_id,
+        "generated_at": generated_at or now.isoformat(),
         "reference_bank_usd": _fmt(REFERENCE_BANK),
         "reference_unit_cap_usd": _fmt(REFERENCE_UNIT),
         "weekly_pause_loss_usd": _fmt(WEEKLY_STOP),
@@ -96,12 +130,18 @@ def build_status(raw: dict[str, Any] | None) -> dict[str, Any]:
     today_new = _money(raw.get("today_new_risk_usd"), field="today_new_risk_usd")
     week_pnl = _money(raw.get("week_net_pnl_usd"), field="week_net_pnl_usd", allow_negative=True)
     cumulative_pnl = _money(raw.get("cumulative_net_pnl_usd"), field="cumulative_net_pnl_usd", allow_negative=True)
-    reconciled_at = raw.get("capital_reconciled_at")
+    reconciled_at = _reconciled_at(raw.get("capital_reconciled_at"), now=now)
     source = raw.get("source")
-    if not isinstance(reconciled_at, str) or not reconciled_at.strip():
-        raise RiskInputError("capital_reconciled_at is required")
-    if not isinstance(source, str) or not source.strip():
-        raise RiskInputError("source is required")
+    if source not in ALLOWED_DECLARATIVE_SOURCES:
+        raise RiskInputError("source is not an allowed reconciliation source")
+    for field in (
+        "evidence_verified",
+        "execution_authorized",
+        "order_capability_present",
+        "real_entry_eligible",
+    ):
+        if field in raw and raw[field] is not False:
+            raise RiskInputError(f"{field} cannot grant authority")
 
     unit = min(REFERENCE_UNIT, (capital * Decimal("0.01")).quantize(CENT, rounding=ROUND_DOWN))
     max_open = (unit * 3).quantize(CENT)
@@ -133,16 +173,17 @@ def build_status(raw: dict[str, Any] | None) -> dict[str, Any]:
     if paused_weekly or paused_experiment or mode != "REAL_SEPARATED" or capital <= 0:
         headroom = Decimal("0.00")
 
-    eligible = headroom > 0
-    if eligible and not reasons:
-        reasons.append("dentro de límites de decisión; ejecución sigue fuera de este sistema")
+    illustrative_headroom = headroom
+    headroom = Decimal("0.00")
+    eligible = False
+    reasons.append("account evidence is declarative; real entry remains disabled")
 
     return {
         **base,
-        "bank_state": "RECONCILED" if mode == "REAL_SEPARATED" else "SIMULATION",
+        "bank_state": "DECLARED" if mode == "REAL_SEPARATED" else "SIMULATION",
         "mode": mode,
         "capital_reconciled_usd": _fmt(capital),
-        "capital_reconciled_at": reconciled_at,
+        "capital_reconciled_at": reconciled_at.isoformat(),
         "source": source,
         "unit_usd": _fmt(unit),
         "max_open_risk_usd": _fmt(max_open),
@@ -152,6 +193,7 @@ def build_status(raw: dict[str, Any] | None) -> dict[str, Any]:
         "week_net_pnl_usd": _fmt(week_pnl),
         "cumulative_net_pnl_usd": _fmt(cumulative_pnl),
         "new_risk_headroom_usd": _fmt(headroom),
+        "illustrative_headroom_usd": _fmt(illustrative_headroom),
         "real_entry_eligible": eligible,
         "reasons": reasons,
     }
@@ -184,14 +226,27 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def write_status(data_dir: Path) -> dict[str, Any]:
+def write_status(
+    data_dir: Path,
+    *,
+    now: datetime | None = None,
+    cycle_id: str | None = None,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
     input_path = data_dir / "risk-input.json"
     output_path = data_dir / "risk-status.json"
     try:
-        status = build_status(_load_input(input_path))
+        status = build_status(
+            _load_input(input_path),
+            now=now,
+            cycle_id=cycle_id,
+            generated_at=generated_at,
+        )
     except RiskInputError as exc:
         status = {
-            "schema_version": "botkalshi-risk-status-v1",
+            "schema_version": RISK_SCHEMA,
+            "cycle_id": cycle_id,
+            "generated_at": generated_at or (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
             "bank_state": "INVALID_INPUT_FAIL_CLOSED",
             "reference_bank_usd": _fmt(REFERENCE_BANK),
             "reference_unit_cap_usd": _fmt(REFERENCE_UNIT),

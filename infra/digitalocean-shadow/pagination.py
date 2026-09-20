@@ -9,6 +9,13 @@ from datetime import UTC, datetime, timedelta
 import re
 from typing import Callable
 
+from cycle_contract import (
+    COVERAGE_SCHEMA,
+    MAX_ORDERBOOKS,
+    CycleContractError,
+    validate_orderbook_limit,
+)
+
 
 class PaginationError(RuntimeError):
     """Provider data cannot be trusted enough to continue this cycle."""
@@ -36,7 +43,7 @@ def collect_paginated(
     horizon_hours: int = 72,
     page_size: int = 100,
     max_pages: int = 50,
-    max_orderbooks: int = 200,
+    max_orderbooks: int = MAX_ORDERBOOKS,
     orderbook_depth: int = 20,
 ) -> tuple[list[dict], dict]:
     """Discover every page up to explicit safety caps, then fetch near-term books.
@@ -46,8 +53,12 @@ def collect_paginated(
     """
     if not re.fullmatch(r"[A-Z0-9_-]{3,128}", series):
         raise PaginationError("invalid series ticker")
-    if not (1 <= page_size <= 1000 and 1 <= max_pages <= 200 and 1 <= max_orderbooks <= 2000):
+    if not (1 <= page_size <= 1000 and 1 <= max_pages <= 200):
         raise PaginationError("invalid pagination limits")
+    try:
+        validate_orderbook_limit(max_orderbooks)
+    except CycleContractError as exc:
+        raise PaginationError(str(exc)) from None
     if not (1 <= horizon_hours <= 24 * 30 and 1 <= orderbook_depth <= 100):
         raise PaginationError("invalid collection horizon")
 
@@ -122,7 +133,7 @@ def collect_paginated(
         })
 
     coverage = {
-        "schema_version": "botkalshi-coverage-v1",
+        "schema_version": COVERAGE_SCHEMA,
         "generated_at": now.isoformat(),
         "series": series,
         "horizon_hours": horizon_hours,

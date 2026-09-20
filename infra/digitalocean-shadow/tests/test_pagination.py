@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
 import importlib.util
 from pathlib import Path
+import sys
 import unittest
 
 BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
 spec = importlib.util.spec_from_file_location("pagination", BASE / "pagination.py")
 pagination = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pagination)
@@ -95,6 +97,19 @@ class PaginationTests(unittest.TestCase):
         )
         self.assertEqual(markets, [])
         self.assertEqual(coverage["invalid_close_time"], 1)
+
+    def test_cap_above_shared_contract_is_rejected_before_network(self):
+        r = FakeReader([], {})
+        with self.assertRaises(pagination.PaginationError):
+            pagination.collect_paginated(
+                r,
+                origin="https://example.test",
+                series="KXMLBGAME",
+                sanitize_levels=levels,
+                now=self.NOW,
+                max_orderbooks=101,
+            )
+        self.assertEqual(r.market_calls, 0)
 
 
 if __name__ == "__main__":

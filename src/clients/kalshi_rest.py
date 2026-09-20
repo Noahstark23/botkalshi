@@ -371,11 +371,19 @@ class KalshiRestClient:
             params["cursor"] = cursor
         return await self._request("GET", "/portfolio/positions", params=params)
 
-    async def get_fills(self, *, limit: int = 100, ticker: str | None = None) -> dict:
+    async def get_fills(
+        self,
+        *,
+        limit: int = 100,
+        ticker: str | None = None,
+        cursor: str | None = None,
+    ) -> dict:
         """Fills recientes (trades ejecutados de tu cuenta)."""
         params: dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
         return await self._request("GET", "/portfolio/fills", params=params)
 
     async def get_settlements(

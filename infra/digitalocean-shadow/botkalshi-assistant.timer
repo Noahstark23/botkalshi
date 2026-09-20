@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic botkalshi structured AI assessment
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+Persistent=false
+Unit=botkalshi-assistant.service
+
+[Install]
+WantedBy=timers.target
+
+# Deliberately not enabled by install.sh: each run has API cost and must be an
+# explicit operator decision after the service/environment separation is reviewed.

@@ -7,9 +7,11 @@ order capabilities.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import os
 
 import collector
+from cycle_contract import MAX_ORDERBOOKS
 from pagination import PaginationError, collect_paginated
 from risk_guard import write_status
 
@@ -32,7 +34,9 @@ def _collect_kalshi(reader) -> list[dict]:
     horizon_hours = _int_env("BOTKALSHI_HORIZON_HOURS", 72, 1, 24 * 30)
     page_size = _int_env("BOTKALSHI_PAGE_SIZE", 100, 1, 1000)
     max_pages = _int_env("BOTKALSHI_MAX_PAGES", 50, 1, 200)
-    max_orderbooks = _int_env("BOTKALSHI_MAX_ORDERBOOKS", 200, 1, 2000)
+    max_orderbooks = _int_env(
+        "BOTKALSHI_MAX_ORDERBOOKS", MAX_ORDERBOOKS, 1, MAX_ORDERBOOKS
+    )
     try:
         markets, coverage = collect_paginated(
             reader,
@@ -54,8 +58,20 @@ def _collect_kalshi(reader) -> list[dict]:
 
 def _cycle_with_risk(reader, con, odds_cache):
     result = _ORIGINAL_CYCLE(reader, con, odds_cache)
+    packet_path = collector.DATA_DIR / "packets" / "latest.json"
+    try:
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+        cycle_id = packet["packet_id"]
+        generated_at = packet["generated_at"]
+        coverage_path = collector.DATA_DIR / "coverage.json"
+        coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+        coverage["cycle_id"] = cycle_id
+        collector.atomic_write(coverage_path, coverage)
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+        cycle_id = None
+        generated_at = None
     # Missing/invalid reconciliation is represented fail-closed in risk-status.json.
-    write_status(collector.DATA_DIR)
+    write_status(collector.DATA_DIR, cycle_id=cycle_id, generated_at=generated_at)
     return result
 
 

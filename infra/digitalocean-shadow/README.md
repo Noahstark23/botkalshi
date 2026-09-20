@@ -1,6 +1,8 @@
 # DigitalOcean: colector y verificación de investigación
 
-No contiene órdenes ni integra todavía M2/M5 o un modelo. `collector.py` captura una serie de mercados públicos y produce paquetes; no es un barrido multiactivo completo. `reporting.py` comprueba frescura/coherencia local y crea borradores, nunca envía WhatsApp o publica contenido.
+No contiene órdenes ni integra todavía M2/M5. `collector.py` captura una serie de mercados públicos y produce paquetes; no es un barrido multiactivo completo. `reporting.py` crea borradores y `cycle_verifier.py` comprueba que health, packet, coverage y risk pertenecen al mismo ciclo.
+
+`assistant_bridge.py` es el canal acotado para un evaluador de IA. Puede leer un ciclo verificado, escribir una evaluación estructurada y activar una pausa defensiva. No recibe claves de Kalshi, no tiene herramientas de orden, no puede reanudarse solo y no modifica flags de trading. Ver [puente del asistente](ASSISTANT_BRIDGE.md).
 
 ## Estado y documentación
 
@@ -24,3 +26,5 @@ Para verificar y producir borradores: seguir RUNBOOK.md. No usar el compose/runn
 ## Qué falta
 
 Matching, reglas, fees, quotes ejecutables, fuentes independientes, timestamps por libro, presupuesto persistente de proveedores y evaluación del experimento. Un reporte `CAPTURE_VERIFIED_LOCAL` confirma solamente esos archivos, no rentabilidad ni integración IA. Un paquete o borrador no equivale a mensaje enviado, canal creado o video publicado.
+
+El lector de cuenta está separado en `scripts/read_research_account.py`. Sólo ejecuta GET de balance, posiciones y fills, y produce evidencia saneada con `reconciled=false`; no habilita dinero real. Integrar un ledger conciliado, reservas, posiciones UNKNOWN y pausas persistentes sigue siendo requisito antes de cualquier discusión de ejecución.
