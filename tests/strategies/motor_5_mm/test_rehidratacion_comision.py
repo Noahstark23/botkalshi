@@ -20,8 +20,9 @@ línea:
       — que es exactamente el oráculo de aceptación "Reinicio: igual resultado que ejecución
       ininterrumpida".
 
-Y la tarifa se mueve, que es la razón de fondo. El 22-sep el operador leyó la fuente primaria
-(`GET /trade-api/v2/series/KXMLBGAME`): `fee_multiplier: 0.5`,
+Y la tarifa se mueve, que es la razón de fondo. El 22-sep ChatGPT leyó la fuente primaria
+pública (`GET /trade-api/v2/series/KXMLBGAME`; esta sesión no pudo consultarla — el proxy de
+salida denegó la conexión): `fee_multiplier: 0.5`,
 `fee_type: quadratic_with_maker_fees`, `last_updated_ts: 2026-09-16`. Eso establece la tarifa
 ACTUAL de la serie, no la que regía en cada fecha pasada — `last_updated_ts` no es la fecha
 de entrada en vigor, y Kalshi documenta overrides por EVENTO (`fee_multiplier_override`).

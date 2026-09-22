@@ -28,7 +28,12 @@ from src.strategies.motor_5_mm.shadow_fill import ShadowFill
 
 
 def validar_fee_registrada(valor: object) -> int:
-    """Una comisión GRABADA es válida solo si es un entero ≥ 0 en centavos.
+    """Una comisión GRABADA en `mm_shadow_fills` es válida solo si es un entero ≥ 0.
+
+    ALCANCE: este es el contrato del esquema LEGACY de esta tabla (`fee_effective_cents`
+    INTEGER, en centavos). NO es el formato general de Kalshi, que publica comisiones en
+    dólares con precisión de seis decimales; un adaptador futuro para ese formato se
+    versiona aparte, sin truncar a centavos.
 
     Reproducir un dato histórico no es aceptar cualquier valor: la comisión neta de Kalshi
     es no negativa, y SQLite tiene tipado dinámico — una columna INTEGER guarda un REAL o

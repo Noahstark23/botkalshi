@@ -12,8 +12,8 @@ pudo alcanzar** figura como BLOCKED con su causa, no como pendiente genérico.
 
 | Elemento | Estado | Evidencia y fecha |
 |---|---|---|
-| C1 — fila M5, comisión y estado de reserva verificados | **BLOCKED** | `infra/digitalocean-shadow/m5_ledger_bridge.py` **no existe en la rama publicada** (`ls` del directorio, 22-sep: está `m5_bank_bridge.py`, no `m5_ledger_bridge.py`). El candidato vive solo en la Mac, fuera del alcance de esta sesión. Sin el archivo no se revisa 6.1 ni 6.2 sin reescribir a ciegas trabajo local. |
-| C1 — cierre contable y recuperación | **PARCIAL — recuperación PASS, cierre PENDING** | **Recuperación:** regresión 6.3 reproducida y corregida, más la validación de contrato que señaló el operador. 12 casos en `tests/strategies/motor_5_mm/test_rehidratacion_comision.py`; suite principal **1.687 passed**; suite de research **323 OK** (aparte). **Cierre contable (6.4/6.5):** no abordado. |
+| C1 — fila M5, comisión y estado de reserva verificados | **PASS — nivel componente local** | Candidato recibido como texto del operador (SHA-256 `77d850fc…dbdf4`, idéntico al consignado), incorporado **verbatim** (`52e5e8f`), pasada mecánica de ruff con AST verificado idéntico (`9bdff14`), y arreglo (`3f2c401`). 21 pruebas del bridge + 8 del banco: **17 de 21 pasaban con el candidato intacto; las 4 que fallaban reproducían 6.2** (liberada reportada como `RESERVED`, repetición activa indistinguible, banco inexistente creado en un rechazo). Suite de research **352 OK**. Acredita un componente probado localmente con fixtures, **no** el productor ni el circuito. |
+| C1 — cierre contable y recuperación | **PARCIAL — recuperación PASS, cierre PENDING** | **Recuperación:** regresión 6.3 reproducida y corregida, más la validación de contrato que señaló el operador. 12 casos en `tests/strategies/motor_5_mm/test_rehidratacion_comision.py`; suite principal **1.687 passed**. **Cierre contable (6.4/6.5):** no abordado — una reserva no es un cierre ni una ganancia. |
 | C2 — M1 conectado y alcance explícito | **PENDING** | No abordado. |
 | C2 — M2, M5, M3 y Radar conectados | **PENDING** | No abordado. |
 | C2 — capital común, resultados y reporte | **PENDING** | No abordado. |
@@ -44,7 +44,8 @@ Arreglo: `apply_fill` acepta `fee_cents_recorded` y lo usa verbatim; la rehidrat
 falta. Ninguna cohorte se "arregla" rellenando defaults.
 
 **Corrección (22-sep, revisión del operador):** antes escribí que el multiplicador estaba "en
-disputa". Ya no: el operador leyó la fuente primaria, `GET /series/KXMLBGAME`, que publica
+disputa". Ya no: ChatGPT leyó la fuente primaria pública (revisión compartida por el
+operador), `GET /series/KXMLBGAME`, que publica
 `fee_multiplier: 0.5` (`quadratic_with_maker_fees`, `last_updated_ts: 2026-09-16`). Esta
 sesión **no pudo verificarlo por su cuenta** — el proxy de salida denegó la conexión a
 `api.elections.kalshi.com` por política de la organización, y no se reintentó por otra vía.
@@ -78,18 +79,33 @@ cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue sie
 | 22-sep, 2ª iteración | idem **después** | 12 passed |
 | 22-sep, 2ª iteración | `pytest -q` (suite principal) | **1.687 passed**, 0 fallos, 0 omitidos |
 | 22-sep, 2ª iteración | `python3 -m unittest discover -s tests` en `infra/digitalocean-shadow/` | **323 OK**, 0 omitidos |
+| 22-sep, 3ª iteración, base `05713bf` | `python3 -m unittest -v test_collector` (archivo hermano, fuera de `tests/`) | **6 OK** — mismos IDs que el log P3A |
+| 22-sep, 3ª iteración, candidato `52e5e8f` | `python3 -m unittest tests.test_m5_ledger_bridge` | **17 OK, 3 failures, 1 error** — 6.2 reproducido |
+| 22-sep, 3ª iteración, `3f2c401` | idem | **21 OK** |
+| 22-sep, 3ª iteración, `3f2c401` | `python3 -m unittest tests.test_simulation_bank_outcome` | **8 OK** (incluye 2 de concurrencia con hilos) |
+| 22-sep, 3ª iteración, `3f2c401` | `unittest discover -s tests` en `infra/digitalocean-shadow/` | **352 OK** (= 323 + 21 + 8), 0 omitidos |
+| 22-sep, 3ª iteración, `3f2c401` | `pytest -q` (suite principal) | **1.687 passed** — `src/` y `tests/` sin cambios desde `05713bf` |
+
+Entorno de todas las filas: Linux x86_64, Python 3.12.3, venv del repo, sockets bloqueados en
+los tests de research. Nivel acreditado: **componente probado localmente**. No hay prueba de
+integración del circuito ni de despliegue.
 
 **Qué acredita cada número, y qué no** (corrección del operador: los conteos no se sustituyen):
 
 - **1.687** es la suite principal. `pyproject.toml:56` fija `testpaths = ["tests"]`, así que
   **no incluye** la suite de research. Las 1.680 que reporté antes tampoco la incluían; lo
   presenté como "suite completa" y no lo era.
-- **323** es la suite de research, corrida aparte con `unittest`. El registro P3A dice **329**
-  en el mismo commit `21088dc9` (Python 3.14.7 / macOS). Acá son 323 en Python 3.12.3 / Linux,
-  sin omitidos. **La diferencia de 6 no está explicada** y no se le atribuye causa sin evidencia.
+- **323** fue la suite de research con `unittest discover -s tests`. **Corrección:** dije que la
+  diferencia con las 329 del registro P3A "no estaba explicada" — la causa era mi propio
+  comando. `discover -s tests` excluye el archivo hermano `infra/digitalocean-shadow/test_collector.py`,
+  que tiene 6 pruebas (señalado por el operador). Las corrí aparte en este entorno: los **6 OK**,
+  con los mismos identificadores que el log P3A. No se reetiqueta "329 OK" por suma: son dos
+  selecciones distintas, corridas y registradas por separado.
 - **Ruff** verde cubre solo `src/` y `tests/` — lo mismo que el CI. Sobre
-  `infra/digitalocean-shadow/`: **58 errores y 27 archivos sin formato**. Deuda previa que el
-  CI no ve; no se tocó en este cambio (serían 27 archivos ajenos).
+  `infra/digitalocean-shadow/`: **58 errores y 27 archivos sin formato**, medido **igual** en la
+  base `21088dc9` y en `3f2c401` con la misma configuración (worktree de la base). Es deuda
+  previa, no introducida acá; los 3 archivos nuevos quedan limpios y el único error en un
+  archivo tocado (`simulation_bank.py:38`, I001) está en un bloque de imports no modificado.
 - **La fase Docker del CI no se verificó**: hay CLI pero no daemon
   (`/var/run/docker.sock` no existe). No se levantó uno.
 - **El CI de GitHub no corrió en #264**: `ci.yml` filtra `pull_request: branches: [main]` y el
@@ -106,21 +122,22 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 
 ## Lo que falta, con la intervención exacta
 
-1. **`m5_ledger_bridge.py`** — el operador confirmó que existe en su Mac
-   (`botkalshi-issue256-m5-ledger-verify/infra/digitalocean-shadow/`), sin validar. Son tres
-   ubicaciones distintas: la Mac, este contenedor en la nube y el droplet; dar acceso al
-   repositorio no conecta las otras dos. **Intervención:** publicarlo en una rama del repo.
-   Sin eso no se cierra 6.1 ni 6.2, y reconstruirlo a ciegas destruiría trabajo no validado.
-2. **C3 completo** — requiere una sesión con acceso al droplet. Esta no lo tiene y no hay
+1. **Cierre contable (6.4/6.5)** — la próxima unidad: ganancia, pérdida, liquidación positiva y
+   negativa sobre USD 200 ficticios, repetición, reinicio, cierre parcial e inversión de signo.
+   Reservar y liberar ya son coherentes; reconocer un resultado todavía no existe.
+2. **`fee_model` sin contrastar** en la recuperación de 6.3 (limitación abierta de #264).
+3. **C3 completo** — requiere una sesión con acceso al droplet. Esta no lo tiene y no hay
    forma autorizada de obtenerlo desde acá.
-3. **Resolver la comisión por evento y fecha** — la fuente actual de la serie ya está (0.5,
-   leída por el operador). Falta el mecanismo que resuelva `fee_multiplier_override` por
+4. **Resolver la comisión por evento y fecha** — la fuente actual de la serie ya está (0.5,
+   leída por ChatGPT el 22-sep; esta sesión no pudo consultarla). Falta el mecanismo que resuelva `fee_multiplier_override` por
    evento y el valor vigente en cada momento, en vez de un multiplicador fijo en código. Hoy
    `maker_fee_multiplier_for_ticker` (`src/math/fees.py`) codifica un corte fijo al
    2026-08-07: consistente con el 0.5 actual para la serie, pero no mira overrides por evento.
 
-## Advertencia operativa vigente, ajena a este encargo
+## Historial operativo, ajeno a este encargo — NO es estado actual
 
-El bot de producción lleva **~33 días caído** (crash-loop desde el 20-ago) y la clave API
-`BotCoolify` expuesta ~102 días en repo público **sigue sin revocar**. Nada de este encargo
-lo toca: es simulación. Pero ninguna de las dos cosas se arregla sola.
+Última observación que tuvo esta sesión, **21-ago-2026**: el container de producción en
+crash-loop (`RestartCount 464`) y la clave `BotCoolify` sin revocar. **Nada de eso se volvió a
+verificar desde entonces**, y esta sesión no tiene acceso al host ni a la cuenta: no puede
+certificar el estado actual, ni favorable ni desfavorable. Figura como historial fechado, no
+como afirmación presente. Tampoco se inspeccionaron secretos para comprobarlo.
