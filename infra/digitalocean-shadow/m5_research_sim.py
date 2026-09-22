@@ -191,19 +191,12 @@ def _resolve_fair(entries: list[dict] | None, *, market: dict, now: datetime, p:
     }
 
 
-def _resolve_fee(entries: list[dict] | None, *, market: dict, now: datetime, p: Params) -> dict:
-    """The effective schedule of THIS event: an event-level entry is required, because a
-    series schedule alone cannot rule out an event override (fee_policy, 2026-08-22)."""
-    if not entries:
-        raise _BlockedError("BLOCKED_NO_FEE")
-    if len(entries) > 1:
-        raise _BlockedError("BLOCKED_NO_FEE", "AMBIGUOUS_FEE")
-    item = entries[0]
+def _fee_candidate(item: dict, *, series: str, at: datetime, now: datetime, p: Params) -> dict:
+    """One fee entry checked as evidence of the schedule in force AT `at` (not "now")."""
     if item.get("fee_type") != FEE_TYPE:
         raise _BlockedError("BLOCKED_NO_FEE", "UNSUPPORTED_FEE_TYPE")
     if item.get("source") not in _FEE_SOURCES:
         raise _BlockedError("BLOCKED_NO_FEE", "INVALID_FEE_SOURCE")
-    series = market["ticker"].split("-", 1)[0]
     if item.get("series_ticker") != series:
         raise _BlockedError("BLOCKED_NO_FEE", "FEE_SERIES_MISMATCH")
     text = item.get("fee_multiplier")
@@ -217,16 +210,80 @@ def _resolve_fee(entries: list[dict] | None, *, market: dict, now: datetime, p: 
         raise _BlockedError("BLOCKED_NO_FEE", "INVALID_FEE_OBSERVED_AT")
     if observed > now + MAX_INPUT_FUTURE_SKEW:
         raise _BlockedError("BLOCKED_NO_FEE", "FEE_IN_FUTURE")
-    if now - observed > timedelta(seconds=p.fee_ttl_sec):
-        raise _BlockedError("BLOCKED_NO_FEE", "FEE_STALE")
+    window = {}
+    for bound in ("effective_from", "effective_until"):
+        raw = item.get(bound)
+        if raw is None:
+            window[bound] = None
+            continue
+        moment = _aware(raw)
+        if moment is None:
+            raise _BlockedError("BLOCKED_NO_FEE", f"INVALID_FEE_{bound.upper()}")
+        window[bound] = moment
+    start, until = window["effective_from"], window["effective_until"]
+    if start is not None and until is not None and until <= start:
+        raise _BlockedError("BLOCKED_NO_FEE", "INVALID_FEE_WINDOW")
+    if (start is not None and at < start) or (until is not None and at >= until):
+        raise _BlockedError("BLOCKED_NO_FEE", "FEE_NOT_IN_FORCE_AT_MOMENT")
+    ttl = timedelta(seconds=p.fee_ttl_sec)
+    if observed <= at:
+        # Read BEFORE the moment: valid for at most the TTL after that original read.
+        if at - observed > ttl:
+            raise _BlockedError("BLOCKED_NO_FEE", "FEE_STALE")
+    else:
+        # Read AFTER the moment: it proves the past only if the official schedule states
+        # it was already in force then. Never re-dated to the moment it is used.
+        if start is None or observed - at > ttl:
+            raise _BlockedError("BLOCKED_NO_FEE", "FEE_OBSERVED_AFTER_MOMENT")
     return {
         "fee_type": FEE_TYPE,
         "fee_multiplier": str(multiplier),
         "source": item["source"],
         "series_ticker": series,
-        "event_ticker": market["event_ticker"],
         "observed_at": observed.isoformat(),
+        "effective_from": start.isoformat() if start else None,
+        "effective_until": until.isoformat() if until else None,
     }
+
+
+def _resolve_fee(
+    entries: list[dict] | None,
+    *,
+    market: dict,
+    now: datetime,
+    p: Params,
+    at: datetime | None = None,
+) -> dict:
+    """The effective schedule of THIS event at moment `at` (default: now). An event-level
+    entry is required — a series schedule alone cannot rule out an event override
+    (fee_policy, 2026-08-22). Several entries are allowed when they describe distinct
+    windows (a scheduled change); two that both claim `at` with different schedules are
+    ambiguous and block."""
+    at = at or now
+    if not entries:
+        raise _BlockedError("BLOCKED_NO_FEE")
+    series = market["ticker"].split("-", 1)[0]
+    valid: list[dict] = []
+    last: _BlockedError | None = None
+    for item in entries:
+        try:
+            valid.append(_fee_candidate(item, series=series, at=at, now=now, p=p))
+        except _BlockedError as exc:
+            last = exc
+    if not valid:
+        raise last or _BlockedError("BLOCKED_NO_FEE")
+    schedules = {(v["fee_type"], v["fee_multiplier"], v["source"]) for v in valid}
+    if len(schedules) > 1:
+        raise _BlockedError("BLOCKED_NO_FEE", "AMBIGUOUS_FEE")
+    chosen = max(valid, key=lambda v: v["observed_at"])
+    return {**chosen, "event_ticker": market["event_ticker"]}
+
+
+def _same_schedule(a: dict, b: dict) -> bool:
+    return (a["fee_type"], Fraction(a["fee_multiplier"])) == (
+        b["fee_type"],
+        Fraction(b["fee_multiplier"]),
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -362,6 +419,25 @@ def _live_quotes(db: Path) -> list[dict]:
     ]
 
 
+def _fingerprint(obj: object) -> str:
+    text = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode()).hexdigest()[:32]
+
+
+def _book_view(book: dict) -> dict:
+    return {
+        "observed_at": book["observed_at"].isoformat(),
+        "best_yes_bid": book["best_yes_bid"],
+        "best_yes_ask": book["best_yes_ask"],
+        "bid_depth": book["bid_depth"],
+        "ask_depth": book["ask_depth"],
+    }
+
+
+def _quote_market(ev: dict) -> dict:
+    return {"ticker": ev["ticker"], "event_ticker": ev["event_ticker"]}
+
+
 def _evaluate_quote(
     db: Path,
     q: dict,
@@ -369,9 +445,18 @@ def _evaluate_quote(
     packet_id: str,
     generated_at: datetime,
     reviews: dict,
+    fees: dict,
     now: datetime,
     p: Params,
 ) -> dict:
+    """Step 2-3 for ONE live quote and THIS observation.
+
+    If (quote, observation) is already stored — a replayed cycle after a restart — the
+    stored result is RETURNED, never recomputed: after the fill, the quote's remainder is
+    smaller, and recomputing from that later state would rewrite what happened. The
+    observation's input is fingerprinted; a replay whose input differs is reported as a
+    contradiction and writes nothing (no money moves).
+    """
     ev = q["evidence"]
     ticker = ev["ticker"]
     row: dict[str, Any] = {"admission_key": q["admission_key"], "ticker": ticker}
@@ -380,32 +465,56 @@ def _evaluate_quote(
         return row
     try:
         book = _book_from_review(reviews.get(ticker), packet_id=packet_id)
+        gap_reasons = None
+        fingerprint = _fingerprint({"book": _book_view(book)})
     except _BlockedError as gap:
-        observed = generated_at
+        book = None
+        gap_reasons = gap.reasons
+        fingerprint = _fingerprint({"gap": gap.reasons, "observed_at": generated_at.isoformat()})
+
+    stored = bank.get_quote_observation(
+        db, admission_key=q["admission_key"], observation_id=packet_id
+    )
+    if stored is not None:
+        if stored["payload"]["detail"].get("input_fingerprint") != fingerprint:
+            row.update(status="CONTRADICTORY_REPLAY", stored_outcome=stored["outcome"])
+            return row
+        row.update(
+            status="REPLAY",
+            stored_outcome=stored["outcome"],
+            fills=stored["payload"]["fills"],
+            pending_fills=stored["payload"].get("pending_fills", []),
+        )
+        if book is not None:
+            row["_book"] = book
+        return row
+
+    if book is None:
         result = bank.record_quote_observation(
             db,
             admission_key=q["admission_key"],
             observation_id=packet_id,
-            observed_at=observed,
+            observed_at=generated_at,
             outcome="GAP",
-            detail={"reasons": gap.reasons},
+            detail={"reasons": gap_reasons, "input_fingerprint": fingerprint},
             now=now,
         )
-        row.update(status="GAP", reasons=gap.reasons, outcome=result["outcome"])
+        row.update(status="GAP", reasons=gap_reasons, outcome=result["outcome"])
         return row
+
     last_seen = max(
         filter(None, (_aware(q["activation_observed_at"]), _aware(q["last_observed_at"])))
     )
-    detail: dict[str, Any] = {}
+    detail: dict[str, Any] = {"input_fingerprint": fingerprint}
     gap_sec = (book["observed_at"] - last_seen).total_seconds()
     if gap_sec > p.max_observation_gap_sec:
         # Fills in the unobserved interval are unknowable: flagged, never invented.
-        detail = {"uncertain": True, "unobserved_interval_sec": int(gap_sec)}
-    multiplier = Fraction(ev["fee"]["fee_multiplier"])
-    fills = []
+        detail.update(uncertain=True, unobserved_interval_sec=int(gap_sec))
+    crossings = []
     for side, price_key in (("buy", "bid_cents"), ("sell", "ask_cents")):
         price = ev[price_key]
-        remaining = ev["size"] - q["filled"][side]
+        # The per-side cap spans the quote's whole life: booked AND pending fills count.
+        remaining = ev["size"] - q["committed"][side]
         if price is None or remaining <= 0:
             continue
         one_side = QuoteSet(
@@ -423,17 +532,50 @@ def _evaluate_quote(
             best_yes_ask_depth=book["ask_depth"],
             observable_count_cap=p.observable_count_cap,
         ):
-            fills.append(
-                {
-                    "side": fill.side,
-                    "price_cents": fill.price_cents,
-                    "count": fill.count,
-                    "fee_cents": kalshi_maker_fee_cents(
-                        fill.count, fill.price_cents, fee_multiplier=multiplier
-                    ),
-                }
+            crossings.append(
+                {"side": fill.side, "price_cents": fill.price_cents, "count": fill.count}
             )
             detail.setdefault("rules", []).append(fill.rule)
+    # The fee must be verified for the OBSERVATION's moment, from its original evidence.
+    try:
+        fee = _resolve_fee(
+            fees.get(ev["event_ticker"]),
+            market=_quote_market(ev),
+            now=now,
+            p=p,
+            at=book["observed_at"],
+        )
+        detail["fee"] = fee
+        row["fee_state"] = "OK" if _same_schedule(fee, ev["fee"]) else "CHANGED"
+    except _BlockedError as exc:
+        fee = None
+        detail["fee_unverified"] = exc.reasons
+        row["fee_state"] = "UNVERIFIED"
+    if fee is None and crossings:
+        # Crossed, but no verified fee: pending — neither booked with a guessed fee nor
+        # dropped. The reservation stays held until it is resolved.
+        result = bank.record_quote_observation(
+            db,
+            admission_key=q["admission_key"],
+            observation_id=packet_id,
+            observed_at=book["observed_at"],
+            outcome="UNVERIFIED",
+            pending_fills=crossings,
+            detail=detail,
+            now=now,
+        )
+        row.update(status="UNVERIFIED", pending_fills=crossings, outcome=result["outcome"])
+        row["_book"] = book
+        return row
+    fills = [
+        {
+            **c,
+            "fee_cents": kalshi_maker_fee_cents(
+                c["count"], c["price_cents"], fee_multiplier=Fraction(fee["fee_multiplier"])
+            ),
+        }
+        for c in crossings
+    ]
     result = bank.record_quote_observation(
         db,
         admission_key=q["admission_key"],
@@ -455,12 +597,76 @@ def _evaluate_quote(
     return row
 
 
+def _resolve_pending(db: Path, *, fees: dict, now: datetime, p: Params) -> list[dict]:
+    """Book pending (UNVERIFIED) fills once a fee valid AT their original moment exists.
+    Evidence read later proves the past only through the official schedule's window."""
+    out = []
+    for q in bank.list_admissions(db, origin=ORIGIN):
+        ev = q["evidence"] if isinstance(q["evidence"], dict) else {}
+        if ev.get("cohort") != COHORT:
+            continue
+        for pending in q["unresolved_observations"]:
+            moment = _aware(pending["observed_at"])
+            try:
+                fee = _resolve_fee(
+                    fees.get(ev["event_ticker"]), market=_quote_market(ev), now=now, p=p, at=moment
+                )
+            except _BlockedError as exc:
+                out.append(
+                    {
+                        **pending,
+                        "admission_key": q["admission_key"],
+                        "status": "STILL_UNVERIFIED",
+                        "reasons": exc.reasons,
+                    }
+                )
+                continue
+            stored = bank.get_quote_observation(
+                db, admission_key=q["admission_key"], observation_id=pending["observation_id"]
+            )
+            multiplier = Fraction(fee["fee_multiplier"])
+            fees_by_side = {
+                f["side"]: kalshi_maker_fee_cents(
+                    f["count"], f["price_cents"], fee_multiplier=multiplier
+                )
+                for f in stored["payload"]["pending_fills"]
+            }
+            result = bank.resolve_unverified_observation(
+                db,
+                admission_key=q["admission_key"],
+                observation_id=pending["observation_id"],
+                fee_cents_by_side=fees_by_side,
+                fee_evidence=fee,
+                now=now,
+            )
+            out.append(
+                {
+                    **pending,
+                    "admission_key": q["admission_key"],
+                    "status": result["outcome"],
+                    "breaches": result["breaches"],
+                }
+            )
+    return out
+
+
 def _withdraw_reason(
-    q: dict, *, book: dict | None, market: dict | None, fair_ok: bool, now: datetime, p: Params
+    q: dict,
+    *,
+    book: dict | None,
+    market: dict | None,
+    fair_ok: bool,
+    fee_state: str,
+    now: datetime,
+    p: Params,
 ) -> str | None:
     ev = q["evidence"]
+    if not q["reservation_active"]:
+        return "RESERVATION_NOT_ACTIVE"
+    if q["unresolved_observations"]:
+        return "FEE_UNVERIFIED"
     sides = [s for s, k in (("buy", "bid_cents"), ("sell", "ask_cents")) if ev[k] is not None]
-    if all(ev["size"] - q["filled"][s] <= 0 for s in sides):
+    if all(ev["size"] - q["committed"][s] <= 0 for s in sides):
         return "FULLY_FILLED"
     activated = _aware(q["activation_observed_at"])
     if now - activated >= timedelta(seconds=p.quote_ttl_sec):
@@ -472,6 +678,10 @@ def _withdraw_reason(
         return "MARKET_NOT_OPEN"
     if not fair_ok:
         return "FAIR_UNAVAILABLE"
+    if fee_state == "UNVERIFIED":
+        return "FEE_UNVERIFIED"
+    if fee_state == "CHANGED":
+        return "FEE_CHANGED"
     if book is not None and p.jump_retreat_cents > 0:
         mid_x2 = book["best_yes_bid"] + book["best_yes_ask"]
         if abs(mid_x2 - ev["book"]["mid_x2"]) >= 2 * p.jump_retreat_cents:
@@ -559,10 +769,30 @@ def run_cycle(
                 }
             )
 
+    # Pending crossings whose fee is now verifiable AT their original moment are booked.
+    try:
+        report["resolutions"] = _resolve_pending(db, fees=fees, now=now, p=params)
+    except bank.SimulationBankError as exc:
+        report["resolutions"] = []
+        report["errors"].append({"stage": "resolve_pending", "error": str(exc)})
+
     # 2-3. Previously active quotes against THIS observation; then withdrawals.
     live = _live_quotes(db)
     books: dict[str, dict] = {}
+    fee_states: dict[str, str] = {}
     for q in live:
+        if not q["reservation_active"]:
+            # Unbacked (released out of band, or settled): not executable. Withdrawn
+            # below; never evaluated, so it can neither fill nor be forgotten.
+            report["evaluations"].append(
+                {
+                    "admission_key": q["admission_key"],
+                    "ticker": q["evidence"]["ticker"],
+                    "status": "NOT_EXECUTABLE",
+                    "reasons": ["RESERVATION_NOT_ACTIVE"],
+                }
+            )
+            continue
         try:
             row = _evaluate_quote(
                 db,
@@ -570,6 +800,7 @@ def run_cycle(
                 packet_id=packet_id,
                 generated_at=generated_at,
                 reviews=reviews,
+                fees=fees,
                 now=now,
                 p=params,
             )
@@ -578,6 +809,16 @@ def run_cycle(
             continue
         if "_book" in row:
             books[q["admission_key"]] = row.pop("_book")
+        if "fee_state" in row:
+            fee_states[q["admission_key"]] = row["fee_state"]
+        if row["status"] == "CONTRADICTORY_REPLAY":
+            report["errors"].append(
+                {
+                    "admission_key": q["admission_key"],
+                    "error": "CONTRADICTORY_REPLAY: "
+                    "stored result kept; this observation's input differs from the recorded one",
+                }
+            )
         report["evaluations"].append(row)
     withdrawn_tickers: set[str] = set()
     for q in _live_quotes(db):
@@ -593,8 +834,27 @@ def run_cycle(
             fair_ok = True
         except _BlockedError:
             fair_ok = False
+        fee_state = fee_states.get(q["admission_key"])
+        if fee_state is None:
+            # Not evaluated this cycle (gap, replay): is the fee verifiable NOW?
+            try:
+                fee_now = _resolve_fee(
+                    fees.get(q["evidence"]["event_ticker"]),
+                    market=_quote_market(q["evidence"]),
+                    now=now,
+                    p=params,
+                )
+                fee_state = "OK" if _same_schedule(fee_now, q["evidence"]["fee"]) else "CHANGED"
+            except _BlockedError:
+                fee_state = "UNVERIFIED"
         reason = _withdraw_reason(
-            q, book=books.get(q["admission_key"]), market=market, fair_ok=fair_ok, now=now, p=params
+            q,
+            book=books.get(q["admission_key"]),
+            market=market,
+            fair_ok=fair_ok,
+            fee_state=fee_state,
+            now=now,
+            p=params,
         )
         if reason is None:
             continue
@@ -670,6 +930,11 @@ def run_cycle(
         for b in snapshot["breaches"]
         if b["origin"] == ORIGIN and b["position_key"].startswith(POSITION_PREFIX)
     ]
+    report["bank"]["m5_unresolved_quote_observations"] = [
+        u
+        for u in snapshot["unresolved_quote_observations"]
+        if u["admission_key"].startswith("m5r1:")
+    ]
     report["status"] = "OK" if not report["errors"] else "OK_WITH_ERRORS"
     return report
 
@@ -695,6 +960,12 @@ def _propose(
     if not _market_open(market, now):
         raise _BlockedError("MARKET_NOT_OPEN")
     position_key = f"{POSITION_PREFIX}{ticker}"
+    if any(
+        q["position_key"] == position_key and q["unresolved_observations"]
+        for q in bank.list_admissions(db, origin=ORIGIN)
+    ):
+        # Inventory is unknown until the pending crossing is booked: no new quote on it.
+        raise _BlockedError("BLOCKED_UNRESOLVED_FILL")
     if inputs_problem is not None:
         raise _BlockedError("BLOCKED_NO_FAIR", inputs_problem)
     # 4. Validate fair, fee and book.
@@ -774,6 +1045,7 @@ def _propose(
         risk_cents=risk,
         proposed_at=book["observed_at"],
         evidence=evidence,
+        max_count_per_side=size,
         now=now,
     )
     row = {

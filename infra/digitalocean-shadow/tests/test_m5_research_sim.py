@@ -281,27 +281,49 @@ class ReplayAndRestartTests(SimTestCase):
         self.assertEqual(len(self.admissions()), 1)
         self.assertEqual(self.snap(at(0))["reserved_usd"], "0.50")
 
-    def test_restart_replays_fill_and_accounting_identically(self):
+    def test_full_cycle_replay_after_fill_and_restart_recovers_the_stored_result(self):
+        """Regression (review of 3712749): the whole run_cycle is repeated after a fill and
+        a restart. Before the fix the adapter recomputed from the LATER remainder (buy
+        already filled → no fill) and hit a conflict. Now it reuses what was stored."""
         self.cycle("c1", at(0))
-        self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))])
+        first = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))])
         before = self.snap(at(1))
         importlib.reload(bank)
         importlib.reload(sim)
-        # The same observation evaluated again after the restart: stored, not recomputed.
+        again = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))])
+        self.assertEqual(again["status"], "OK", again["errors"])
+        [evaluation] = again["evaluations"]
+        self.assertEqual(evaluation["status"], "REPLAY")
+        self.assertEqual(evaluation["fills"], first["evaluations"][0]["fills"])
+        self.assertEqual(self.snap(at(1)), before)
+        self.assertEqual(len(self.m5_events()), 1)
+
+    def test_contradictory_replay_is_reported_and_moves_no_money(self):
+        self.cycle("c1", at(0))
+        self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))])
+        before = self.snap(at(1))
+        # Same observation id, different book: a contradiction, not a new observation.
+        again = self.cycle("c2", at(1), [self.market(CALM, now=at(1))])
+        self.assertEqual(again["evaluations"][0]["status"], "CONTRADICTORY_REPLAY")
+        self.assertIn("CONTRADICTORY_REPLAY", again["errors"][0]["error"])
+        self.assertEqual(self.snap(at(1)), before)
+        self.assertEqual(len(self.m5_events()), 1)
+
+    def test_side_cap_is_enforced_by_the_bank_over_the_quote_life(self):
+        self.cycle("c1", at(0))
+        self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))])
         [q] = self.admissions()
-        replay = bank.record_quote_observation(
-            self.db,
-            admission_key=q["admission_key"],
-            observation_id="c2",
-            observed_at=datetime.fromisoformat(q["last_observed_at"]),
-            outcome="EVALUATED",
-            fills=[{"side": "buy", "price_cents": 45, "count": 1, "fee_cents": 1}],
-            detail={"rules": ["ask 44 < bid 45"]},
-            now=at(1),
-        )
-        self.assertEqual(replay["outcome"], "REPLAY")
-        after = self.snap(at(1))
-        self.assertEqual(before, after)
+        self.assertEqual((q["max_count_per_side"], q["committed"]["buy"]), (1, 1))
+        with self.assertRaisesRegex(bank.SimulationBankValidationError, "SIDE_LIMIT_EXCEEDED"):
+            bank.record_quote_observation(
+                self.db,
+                admission_key=q["admission_key"],
+                observation_id="forged",
+                observed_at=at(2),
+                outcome="EVALUATED",
+                fills=[{"side": "buy", "price_cents": 45, "count": 1, "fee_cents": 1}],
+                now=at(2),
+            )
         self.assertEqual(len(self.m5_events()), 1)
 
     def test_changed_result_for_a_recorded_observation_is_a_conflict(self):
@@ -400,6 +422,39 @@ class NoReactivationTests(SimTestCase):
         self.assertEqual(
             (done["outcome"], done["reason"]), ("NOT_ACTIVATED", "RESERVATION_NOT_ACTIVE")
         )
+
+    def test_activation_replay_after_out_of_band_release_is_not_active(self):
+        """Regression (review of 3712749): admit → activate → release out of band →
+        replay activate_admission with the original observation. The REPLAY branch used
+        to answer active=True, and the next cycle filled the unbacked quote."""
+        self.cycle("c1", at(0))
+        [q] = self.admissions()
+        bank.release(self.db, idempotency_key=q["reservation_key"])
+        again = bank.activate_admission(
+            self.db,
+            admission_key=q["admission_key"],
+            observation_id="c1",
+            observed_at=datetime.fromisoformat(q["activation_observed_at"]),
+            now=at(0.5),
+        )
+        self.assertEqual(
+            (again["outcome"], again["active"], again["reason"]),
+            ("REPLAY", False, "RESERVATION_NOT_ACTIVE"),
+        )
+        report = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))])
+        self.assertEqual(report["evaluations"][0]["status"], "NOT_EXECUTABLE")
+        self.assertEqual(report["withdrawals"][0]["reason"], "RESERVATION_NOT_ACTIVE")
+        self.assertEqual(self.m5_events(), [])
+        with self.assertRaisesRegex(bank.SimulationBankValidationError, "QUOTE_WITHDRAWN"):
+            bank.record_quote_observation(
+                self.db,
+                admission_key=q["admission_key"],
+                observation_id="c3",
+                observed_at=at(2),
+                outcome="EVALUATED",
+                fills=[],
+                now=at(2),
+            )
 
     def test_withdrawn_quote_cannot_fill(self):
         self.cycle("c1", at(0))
@@ -666,6 +721,148 @@ class RunnerWiringTests(unittest.TestCase):
         report = json.loads((self.data / "m5" / "latest.json").read_text())
         self.assertEqual(report["status"], "BLOCKED_NO_BANK")
         self.assertFalse((self.data / "simulation-bank.sqlite3").exists())
+
+
+class FeeDuringQuoteTests(SimTestCase):
+    """Regression (review of 3712749): _evaluate_quote booked every fill with the fee
+    captured at quote time, even when the fee evidence had expired or changed since."""
+
+    def no_fee(self, now):
+        data = self.inputs(now)
+        data["fees"] = []
+        return data
+
+    def test_fee_gone_keeps_the_crossing_pending_not_booked_nor_dropped(self):
+        self.cycle("c1", at(0))
+        report = self.cycle(
+            "c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=self.no_fee(at(1))
+        )
+        [evaluation] = report["evaluations"]
+        self.assertEqual(evaluation["status"], "UNVERIFIED")
+        self.assertEqual(
+            evaluation["pending_fills"], [{"side": "buy", "price_cents": 45, "count": 1}]
+        )
+        self.assertEqual(self.m5_events(), [])  # no fee was attributed
+        [w] = report["withdrawals"]
+        self.assertEqual((w["reason"], w["reservation_released"]), ("FEE_UNVERIFIED", False))
+        snap = self.snap(at(1))
+        self.assertEqual(snap["reserved_usd"], "0.50")  # the possible exposure stays held
+        self.assertEqual(len(snap["unresolved_quote_observations"]), 1)  # visible, not hidden
+        self.assertEqual(len(report["bank"]["m5_unresolved_quote_observations"]), 1)
+        # Inventory is unknown until resolved: no new quote on that market.
+        later = self.cycle("c3", at(2), inputs=self.no_fee(at(2)))
+        self.assertIn("BLOCKED_UNRESOLVED_FILL", later["blocked"][TICKER])
+
+    def test_pending_crossing_is_booked_with_evidence_valid_at_its_moment(self):
+        self.cycle("c1", at(0))
+        self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=self.no_fee(at(1)))
+        # Read later, but the official schedule states it was in force since before c2.
+        data = self.inputs(at(3), fee_age=0)
+        data["fees"][0]["effective_from"] = (T0 - timedelta(days=30)).isoformat()
+        report = self.cycle("c3", at(3), inputs=data)
+        [res] = report["resolutions"]
+        self.assertEqual(res["status"], "RESOLVED")
+        [event] = self.m5_events()
+        self.assertEqual(event[:4], ("buy", 45, 1, 1))
+        # Once resolved, the market is no longer blocked: c3 quotes it again (new identity).
+        [q] = [a for a in self.admissions() if a["activation_observation"] == "c1"]
+        self.assertEqual(event[4], q["admission_key"])
+        stored = bank.get_quote_observation(
+            self.db, admission_key=q["admission_key"], observation_id="c2"
+        )
+        self.assertEqual(stored["resolution"]["fee"]["fee_multiplier"], "1/2")
+        self.assertEqual(self.snap(at(3))["unresolved_quote_observations"], [])
+
+    def test_later_evidence_without_schedule_window_does_not_rejuvenate(self):
+        self.cycle("c1", at(0))
+        self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=self.no_fee(at(1)))
+        report = self.cycle("c3", at(3), inputs=self.inputs(at(3), fee_age=0))
+        [res] = report["resolutions"]
+        self.assertEqual(res["status"], "STILL_UNVERIFIED")
+        self.assertIn("FEE_OBSERVED_AFTER_MOMENT", res["reasons"])
+        self.assertEqual(self.m5_events(), [])
+
+    def test_fee_stale_at_the_observation_is_unverified(self):
+        self.cycle("c1", at(0))
+        # The only evidence is the original read, now older than the TTL at c2's moment.
+        data = self.inputs(at(0))
+        data["fees"][0]["observed_at"] = (at(1) - timedelta(seconds=3_700)).isoformat()
+        report = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=data)
+        self.assertEqual(report["evaluations"][0]["status"], "UNVERIFIED")
+
+    def test_fee_changed_books_the_verified_new_schedule_and_withdraws(self):
+        self.cycle("c1", at(0))
+        data = self.inputs(at(1))
+        data["fees"][0]["fee_multiplier"] = "3"
+        report = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=data)
+        [evaluation] = report["evaluations"]
+        # ceil(7*45*55*3/40000) = 2: the cost actually in force, adverse or not.
+        self.assertEqual(evaluation["fills"][0]["fee_cents"], 2)
+        self.assertEqual(evaluation["fee_state"], "CHANGED")
+        self.assertEqual(report["withdrawals"][0]["reason"], "FEE_CHANGED")
+
+    def test_scheduled_change_ends_the_old_schedule_at_its_time(self):
+        self.cycle("c1", at(0))
+        data = self.inputs(at(1))
+        data["fees"][0]["effective_until"] = at(0.5).isoformat()  # changed before c2
+        report = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=data)
+        self.assertEqual(report["evaluations"][0]["status"], "UNVERIFIED")
+
+    def test_fee_is_verified_at_the_observation_not_at_evaluation_time(self):
+        """A schedule that entered into force AFTER the book was observed (between the
+        observation and its evaluation) does not verify that observation."""
+        self.cycle("c1", at(0))
+        data = self.inputs(at(1))
+        data["fees"][0]["effective_from"] = (at(1) - timedelta(seconds=1)).isoformat()
+        report = self.cycle("c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=data)
+        self.assertEqual(report["evaluations"][0]["status"], "UNVERIFIED")
+
+    def test_pending_fill_counts_against_the_remainder_of_a_live_quote(self):
+        """If a quote with a pending crossing is still live when the next observation is
+        evaluated, the pending contract is part of the side's committed count."""
+        self.cycle("c1", at(0))
+        [q] = self.admissions()
+        bank.record_quote_observation(
+            self.db,
+            admission_key=q["admission_key"],
+            observation_id="cX",
+            observed_at=at(0.5),
+            outcome="UNVERIFIED",
+            pending_fills=[{"side": "buy", "price_cents": 45, "count": 1}],
+            now=at(0.5),
+        )
+        # No fee evidence at c2: the pending crossing stays pending (not resolved first).
+        report = self.cycle(
+            "c2", at(1), [self.market(BUY_CROSS, now=at(1))], inputs=self.no_fee(at(1))
+        )
+        self.assertEqual(report["errors"], [])  # no second buy was even attempted
+        self.assertEqual(report["evaluations"][0]["status"], "EVALUATED")
+        self.assertEqual(report["evaluations"][0]["fills"], [])
+        self.assertEqual(self.m5_events(), [])
+        [q] = self.admissions()
+        self.assertEqual(q["committed"]["buy"], 1)
+
+    def test_bank_refuses_an_observation_for_an_unbacked_quote(self):
+        self.cycle("c1", at(0))
+        [q] = self.admissions()
+        bank.release(self.db, idempotency_key=q["reservation_key"])  # not withdrawn
+        with self.assertRaisesRegex(bank.SimulationBankValidationError, "RESERVATION_NOT_ACTIVE"):
+            bank.record_quote_observation(
+                self.db,
+                admission_key=q["admission_key"],
+                observation_id="c2",
+                observed_at=at(1),
+                outcome="EVALUATED",
+                fills=[{"side": "buy", "price_cents": 45, "count": 1, "fee_cents": 1}],
+                now=at(1),
+            )
+
+    def test_two_schedules_claiming_the_same_moment_are_ambiguous(self):
+        data = self.inputs(at(0))
+        other = dict(data["fees"][0], fee_multiplier="1")
+        data["fees"].append(other)
+        report = self.cycle("c1", at(0), inputs=data)
+        self.assertIn("AMBIGUOUS_FEE", report["blocked"][TICKER])
 
 
 if __name__ == "__main__":
