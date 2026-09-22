@@ -13,8 +13,15 @@ Keeps the five areas SEPARATE, never merged into one verdict:
   - radar             — NOT_CONNECTED (no producer in the code);
   - exits_settlements — PENDING (no simulated exit or settlement of M5 positions yet).
 
-Ten public cycles do NOT require ten fills: a cycle is counted when its report exists
-with a cycle id, whatever its status (BLOCKED_NO_FAIR is an honest outcome, not a gap).
+Two different counts, never confused (review of da71325):
+  - RECORDED cycles: every report with a cycle id, whatever its status. A cycle blocked
+    by BLOCKED_NO_FAIR is recorded honestly — but it proves nothing about the circuit.
+  - QUALIFYING cycles (what C3 accredits): status OK, no errors, no inputs problem, and
+    evidence that the circuit was USABLE in that cycle — a proposal that reached the
+    bank's decision (so fair, fee and book were all valid then), or an EVALUATED live
+    quote whose fee was verified for that observation. Fills are NOT required: a usable
+    cycle that crossed nothing still qualifies.
+C3 needs >= 10 distinct qualifying cycle ids in the analysed window.
 The restart mark hashes every stored event and admission up to the last `seq` before
 the restart; after it, the same prefix must hash identically (nothing lost or rewritten).
 """
@@ -145,7 +152,35 @@ def check_restart(path: Path, mark: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_report(data: Path, *, cycles: int | None = 10) -> dict[str, Any]:
+C3_MIN_QUALIFYING_CYCLES = 10
+_DECIDED = frozenset({"ADMITTED", "REJECTED"})
+_VERIFIED_FEE = frozenset({"OK", "CHANGED"})
+
+
+def qualification(row: dict) -> str | None:
+    """None if this cycle qualifies for C3; otherwise the first reason it does not."""
+    if not row.get("cycle_id"):
+        return "NO_CYCLE_ID"
+    if row.get("status") != "OK":
+        return f"STATUS_{row.get('status')}"
+    if row.get("errors"):
+        return "ERRORS"
+    if row.get("inputs_problem"):
+        return f"INPUTS_{row['inputs_problem']}"
+    if any(p.get("decision") in _DECIDED for p in row.get("proposals") or []):
+        return None
+    if any(
+        e.get("status") == "EVALUATED" and e.get("fee_state") in _VERIFIED_FEE
+        for e in row.get("evaluations") or []
+    ):
+        return None
+    blocked = [reasons[0] for reasons in (row.get("blocked") or {}).values() if reasons]
+    if blocked:
+        return f"ALL_BLOCKED_{Counter(blocked).most_common(1)[0][0]}"
+    return "NO_USABLE_CIRCUIT"
+
+
+def build_report(data: Path, *, cycles: int | None = None) -> dict[str, Any]:
     rows = _cycles(data, cycles)
     statuses = Counter(r.get("status") for r in rows)
     blocked = Counter()
@@ -164,6 +199,14 @@ def build_report(data: Path, *, cycles: int | None = 10) -> dict[str, Any]:
             evaluations[e.get("status")] += 1
             fills += len(e.get("fills") or []) if e.get("status") == "EVALUATED" else 0
     cycle_ids = [r.get("cycle_id") for r in rows if r.get("cycle_id")]
+    not_qualifying = Counter()
+    qualifying_ids = set()
+    for r in rows:
+        reason = qualification(r)
+        if reason is None:
+            qualifying_ids.add(r["cycle_id"])
+        else:
+            not_qualifying[reason] += 1
     m1 = None
     m1_path = data / "m1" / "latest.json"
     if m1_path.exists():
@@ -183,8 +226,11 @@ def build_report(data: Path, *, cycles: int | None = 10) -> dict[str, Any]:
         "m5_local_tested": "NOT_MEASURED_HERE — evidence is the test suite recorded in CIERRE",
         "m5_public": {
             "cycles_recorded": len(rows),
-            "distinct_cycle_ids": len(set(cycle_ids)),
-            "ten_public_cycles": len(set(cycle_ids)) >= 10,
+            "distinct_cycle_ids_recorded": len(set(cycle_ids)),
+            "qualifying_cycles": len(qualifying_ids),
+            "not_qualifying_reasons": dict(not_qualifying),
+            "c3_min_qualifying_cycles": C3_MIN_QUALIFYING_CYCLES,
+            "c3_cycles_met": len(qualifying_ids) >= C3_MIN_QUALIFYING_CYCLES,
             "fills_required_for_c3": False,
             "statuses": dict(statuses),
             "blocked_first_reason": dict(blocked),
@@ -204,7 +250,7 @@ def build_report(data: Path, *, cycles: int | None = 10) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data", required=True, type=Path)
-    parser.add_argument("--cycles", type=int, default=10)
+    parser.add_argument("--cycles", type=int, default=None, help="window (default: all recorded)")
     parser.add_argument("--save-restart-mark", type=Path)
     parser.add_argument("--check-restart-mark", type=Path)
     args = parser.parse_args(argv)

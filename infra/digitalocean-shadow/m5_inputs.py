@@ -68,7 +68,7 @@ ODDS_SPORT = "baseball_mlb"
 PILOT_PARAMS = {"regions": "us", "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso"}
 PILOT_COST_PER_CALL = 1  # markets (1) × regions (1)
 MAX_PILOT_BUDGET = 10
-MIN_PILOT_INTERVAL_SEC = 600
+MIN_PILOT_INTERVAL_SEC = 1_800  # the published pilot limit: at most one call every 30 min
 CONSENSUS_MIN_BOOKS = 3  # M5 F1-v2 contract: MOTOR_2_MIN_BOOKS >= 3
 CONSENSUS_MAX_BOOK_AGE_MIN = 15.0  # M5 F1-v2 contract: 0 < MOTOR_2_MAX_BOOK_AGE_MIN <= 15
 FEE_REFRESH_SEC = 600

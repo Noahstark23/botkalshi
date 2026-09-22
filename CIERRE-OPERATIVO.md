@@ -118,6 +118,8 @@ cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue sie
 | 22-sep, 7ª iteración, `ec00e48` | 16 mutaciones del productor (crédito no persistido antes de la llamada, presupuesto excedible, clave legible, presupuesto > 10, env reabre el ledger, costo inesperado, fair fechado por la descarga, sin frescura, línea futura, cambios de otra serie, override parcial, override que prueba el pasado, refetch en cada ciclo, evidencia sin vencer, …) | **16/16 detectadas** |
 | 22-sep, 7ª iteración, `ec00e48` | `unittest discover -s tests` (venv) y `env -i /usr/bin/python3 -S -m unittest discover -s tests` | **523 OK** en ambos |
 | 22-sep, 7ª iteración, `ec00e48` | `unittest test_collector` / `pytest -q` / ruff `src tests` / ruff `infra/` | **6 OK** / **1.702 passed** / limpio / **63 = 63** |
+| 22-sep, 8ª iteración (revisión de ChatGPT sobre `da71325`) | tests nuevos contra el código de `da71325` | **5 fallan**: intervalo de 10 min aceptado; 10 ciclos bloqueados contados como C3 |
+| 22-sep, 8ª iteración | 7 mutaciones del criterio de C3 y del piso de intervalo | **7/7 detectadas**, 3 de ellas después de aislar cada condición en su test |
 
 Entorno de todas las filas: Linux x86_64, Python 3.12.3, venv del repo, sockets bloqueados en
 los tests de research. Nivel acreditado: **componente probado localmente**. No hay prueba de
@@ -169,8 +171,14 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
       **verificar con `env` en el proceso**, no por el mensaje del editor.
    5. Antes de reiniciar: `python3 m5_c3_report.py --data … --save-restart-mark /tmp/mark.json`.
       Después: `--check-restart-mark /tmp/mark.json` → debe decir `PRESERVED`.
-   6. Tras ≥10 ciclos: `python3 m5_c3_report.py --data … --cycles 10`. **Diez ciclos
-      públicos no exigen diez fills**; sin piloto de fair, lo honesto es `BLOCKED_NO_FAIR`.
+   6. `python3 m5_c3_report.py --data …`. Lo que acredita C3 es
+      `m5_public.c3_cycles_met = true`: **≥ 10 ciclos APTOS distintos**. Un ciclo es apto si
+      tiene estado OK, no tiene errores ni problemas de entradas, y muestra un circuito
+      utilizable: una propuesta que llegó a la decisión del banco, o una cotización viva
+      EVALUADA con la fee verificada. **No exige fills.** Los ciclos bloqueados (por ejemplo
+      `BLOCKED_NO_FAIR`) se registran como honestos pero **no cuentan**; su motivo sale en
+      `not_qualifying_reasons`. (Corrección de la revisión de `da71325`: antes contaba
+      cualquier ciclo con id.)
    7. Mirar `producer.fee` en `m5/latest.json`: si `/series/fee_changes` no tiene el shape
       documentado, sale `FEE_CHANGES_UNREADABLE`, y ese es el primer dato público que falta.
 2. **Piloto de fair con The Odds API — requiere habilitación del propietario.** El plan

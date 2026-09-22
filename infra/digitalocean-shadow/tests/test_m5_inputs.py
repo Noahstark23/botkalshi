@@ -305,6 +305,13 @@ class PilotTests(ProducerTestCase):
         self.assertEqual(self.fetch(reader, env)["status"], "OWNER_KEY_FILE_NOT_PROVISIONED")
         self.assertEqual(reader.calls, [])
 
+    def test_interval_below_thirty_minutes_is_refused(self):
+        """The published pilot limit is one call every >= 30 min; 10 min is not allowed."""
+        reader = self.odds_reader()
+        result = self.fetch(reader, self.pilot_env(self.key_file(), interval="1799"))
+        self.assertEqual(result["status"], "PILOT_INTERVAL_TOO_SHORT")
+        self.assertEqual(reader.calls, [])
+
     def test_budget_above_ten_is_refused(self):
         self.assertEqual(
             self.fetch(self.odds_reader(), self.pilot_env(self.key_file(), budget="11"))["status"],
@@ -345,10 +352,10 @@ class PilotTests(ProducerTestCase):
         )
 
     def test_budget_of_ten_is_never_exceeded(self):
-        env = self.pilot_env(self.key_file(), interval="600")
+        env = self.pilot_env(self.key_file(), interval="1800")
         reader = self.odds_reader(headers={"x-requests-last": "1"})
         outcomes = [
-            self.fetch(reader, env, now=NOW + timedelta(minutes=10 * i))["status"]
+            self.fetch(reader, env, now=NOW + timedelta(minutes=30 * i))["status"]
             for i in range(12)
         ]
         self.assertEqual(outcomes.count("FETCHED"), 10)
@@ -356,10 +363,10 @@ class PilotTests(ProducerTestCase):
         self.assertEqual(len(reader.calls), 10)
 
     def test_raising_the_env_budget_does_not_reopen_a_spent_ledger(self):
-        env = self.pilot_env(self.key_file(), budget="3", interval="600")
+        env = self.pilot_env(self.key_file(), budget="3", interval="1800")
         reader = self.odds_reader(headers={"x-requests-last": "1"})
         for i in range(4):
-            self.fetch(reader, env, now=NOW + timedelta(minutes=10 * i))
+            self.fetch(reader, env, now=NOW + timedelta(minutes=30 * i))
         self.assertEqual(len(reader.calls), 3)
         env["BOTKALSHI_ODDS_PILOT_BUDGET"] = "10"
         self.assertEqual(
@@ -383,7 +390,7 @@ class PilotTests(ProducerTestCase):
         )
 
     def test_unexpected_cost_halts_the_pilot(self):
-        env = self.pilot_env(self.key_file(), interval="600")
+        env = self.pilot_env(self.key_file(), interval="1800")
         reader = self.odds_reader(headers={"x-requests-last": "2"})
         self.fetch(reader, env)
         self.assertEqual(self.fetch(reader, env, now=NOW + timedelta(hours=1))["status"], "HALTED")
@@ -546,28 +553,72 @@ class OperatorScriptTests(ProducerTestCase):
                 init_sim_bank.main(["--data", str(self.data), "--initial-capital-usd", "500.00"]), 2
             )
 
-    def test_c3_report_counts_cycles_not_fills_and_keeps_areas_apart(self):
+    def c3(self, rows):
         import m5_c3_report
 
-        for i in range(10):
-            research_runner._append_bounded(
-                self.data / "m5" / "cycles.jsonl",
-                {
-                    "cycle_id": f"c{i}",
-                    "status": "OK",
-                    "blocked": {"T": ["BLOCKED_NO_FAIR"]},
-                    "proposals": [],
-                    "evaluations": [],
-                    "withdrawals": [],
-                },
-            )
-        report = m5_c3_report.build_report(self.data, cycles=10)
-        self.assertIs(report["m5_public"]["ten_public_cycles"], True)
-        self.assertEqual(report["m5_public"]["fills_booked"], 0)
-        self.assertIs(report["m5_public"]["fills_required_for_c3"], False)
+        for row in rows:
+            research_runner._append_bounded(self.data / "m5" / "cycles.jsonl", row)
+        return m5_c3_report.build_report(self.data)
+
+    @staticmethod
+    def cycle(i, **kw):
+        row = {
+            "cycle_id": f"c{i}",
+            "status": "OK",
+            "errors": [],
+            "inputs_problem": None,
+            "blocked": {},
+            "proposals": [],
+            "evaluations": [],
+            "withdrawals": [],
+        }
+        row.update(kw)
+        return row
+
+    def test_ten_blocked_cycles_are_recorded_but_do_not_qualify(self):
+        """Review of da71325: ten BLOCKED_NO_FAIR cycles are honest, not C3 evidence."""
+        report = self.c3([self.cycle(i, blocked={"T": ["BLOCKED_NO_FAIR"]}) for i in range(10)])
+        public = report["m5_public"]
+        self.assertEqual(public["distinct_cycle_ids_recorded"], 10)
+        self.assertEqual(public["qualifying_cycles"], 0)
+        self.assertIs(public["c3_cycles_met"], False)
+        self.assertEqual(public["not_qualifying_reasons"], {"ALL_BLOCKED_BLOCKED_NO_FAIR": 10})
+
+    def test_errors_inputs_problems_and_unverified_fees_do_not_qualify(self):
+        decided = [{"decision": "ADMITTED", "active": True}]  # would qualify on its own
+        rows = [
+            self.cycle(0, errors=[{"error": "x"}], proposals=decided),
+            self.cycle(1, inputs_problem="NO_INPUTS_FILE", proposals=decided),
+            self.cycle(2, status="OK_WITH_ERRORS", proposals=decided),
+            self.cycle(3, evaluations=[{"status": "UNVERIFIED"}]),
+            self.cycle(4, evaluations=[{"status": "EVALUATED", "fee_state": "UNVERIFIED"}]),
+            self.cycle(5, evaluations=[{"status": "GAP"}]),
+            self.cycle(6, evaluations=[{"status": "REPLAY"}]),
+        ]
+        self.assertEqual(self.c3(rows)["m5_public"]["qualifying_cycles"], 0)
+
+    def test_usable_cycles_qualify_without_fills(self):
+        rows = [
+            self.cycle(i, proposals=[{"decision": "ADMITTED", "active": True}]) for i in range(5)
+        ]
+        rows += [self.cycle(i, proposals=[{"decision": "REJECTED"}]) for i in range(5, 8)]
+        rows += [
+            self.cycle(i, evaluations=[{"status": "EVALUATED", "fee_state": "OK", "fills": []}])
+            for i in range(8, 10)
+        ]
+        report = self.c3(rows)
+        public = report["m5_public"]
+        self.assertEqual(public["qualifying_cycles"], 10)
+        self.assertIs(public["c3_cycles_met"], True)
+        self.assertEqual(public["fills_booked"], 0)
+        self.assertIs(public["fills_required_for_c3"], False)
         self.assertEqual(report["radar"], "NOT_CONNECTED")
         self.assertEqual(report["exits_settlements"], "PENDING")
         self.assertIn("NOT_MEASURED_HERE", report["m5_local_tested"])
+
+    def test_a_repeated_cycle_id_counts_once(self):
+        rows = [self.cycle(0, proposals=[{"decision": "ADMITTED"}]) for _ in range(10)]
+        self.assertEqual(self.c3(rows)["m5_public"]["qualifying_cycles"], 1)
 
     def test_restart_mark_detects_a_rewritten_history(self):
         import sqlite3
