@@ -22,6 +22,14 @@ Contract:
     admitted only inside a `BEGIN IMMEDIATE` transaction that re-checks
     `sum(active) + amount <= capital`, so concurrent callers can never push
     reserved above capital.
+  - `reserve_with_evidence` is `reserve` plus a caller-supplied evidence object
+    persisted in the SAME transaction as the reservation row — never two writes,
+    never a reservation with no evidence or evidence with no reservation. Replay
+    rules are identical to `reserve`, extended to the evidence: the SAME key with
+    the SAME (origin, cycle_id, amount_usd, evidence) is a no-op; any field
+    differing — including evidence — raises. `reserve` and `reserve_with_evidence`
+    share one locked code path, so both are visible through the same
+    `active_reservations` (evidence is `None` for reservations made via `reserve`).
   - `release` is idempotent by `idempotency_key`; it frees a reservation and never
     manufactures balance. Releasing an unknown key is a fail-closed error, not a no-op.
   - `revision` increments once per real state change (init, a new reservation, a first
@@ -31,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import re
 import sqlite3
@@ -41,6 +50,7 @@ SCHEMA_VERSION = "botkalshi-simulation-bank-v1"
 _MONEY_RE = re.compile(r"(?:0|[1-9][0-9]{0,9})(?:\.[0-9]{1,2})?")
 _ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 _MAX_MONEY_LEN = 32
+_MAX_EVIDENCE_JSON_BYTES = 4_096
 
 
 class SimulationBankError(Exception):
@@ -101,6 +111,18 @@ def _parse_id(value: Any, *, field: str) -> str:
     return value
 
 
+def _canonical_evidence_json(value: Any) -> str:
+    if not isinstance(value, dict):
+        raise SimulationBankValidationError("evidence must be an object")
+    try:
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise SimulationBankValidationError("evidence must be JSON-serializable") from exc
+    if len(canonical.encode("utf-8")) > _MAX_EVIDENCE_JSON_BYTES:
+        raise SimulationBankValidationError("evidence exceeds bounded size")
+    return canonical
+
+
 def _check_path_safety(db_path: Path) -> None:
     # is_symlink() uses lstat and does not require the link target to exist, so this
     # also catches dangling symlinks — exists() alone would follow the link and miss them.
@@ -111,6 +133,10 @@ def _check_path_safety(db_path: Path) -> None:
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
+    # Unchanged P2 shape: an existing P2 DB already has these two tables and
+    # CREATE TABLE IF NOT EXISTS is a no-op for it — the evidence column is
+    # added below by an explicit, idempotent ALTER so P2 files migrate in
+    # place instead of needing a reset.
     con.executescript("""
     CREATE TABLE IF NOT EXISTS simulation_bank (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -129,6 +155,16 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
       released_at TEXT
     );
     """)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_reservations)").fetchall()}
+    if "evidence_json" not in columns:
+        try:
+            con.execute("ALTER TABLE simulation_reservations ADD COLUMN evidence_json TEXT")
+        except sqlite3.OperationalError as exc:
+            # Two connections can race this check-then-add outside BEGIN IMMEDIATE;
+            # the loser's ALTER fails on the column the winner already added, which
+            # is the intended outcome, not a real error.
+            if "duplicate column name" not in str(exc):
+                raise
 
 
 @contextlib.contextmanager
@@ -158,10 +194,22 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         "SELECT COALESCE(SUM(amount_cents), 0) FROM simulation_reservations WHERE status = 'ACTIVE'"
     ).fetchone()[0]
     active = con.execute(
-        "SELECT idempotency_key, origin, cycle_id, amount_cents, created_at "
+        "SELECT idempotency_key, origin, cycle_id, amount_cents, created_at, evidence_json "
         "FROM simulation_reservations WHERE status = 'ACTIVE' "
         "ORDER BY created_at, idempotency_key"
     ).fetchall()
+    active_reservations = []
+    for key, origin, cycle_id, amount_cents, reserved_at, evidence_json in active:
+        active_reservations.append({
+            "idempotency_key": key,
+            "origin": origin,
+            "cycle_id": cycle_id,
+            "amount_usd": _usd(amount_cents),
+            "created_at": reserved_at,
+            # None for rows written by plain reserve() (P2 callers, or the P2
+            # rows that predate the evidence_json migration on this file).
+            "evidence": json.loads(evidence_json) if evidence_json is not None else None,
+        })
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "SIMULATION_ONLY",
@@ -175,16 +223,7 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         "revision": revision,
         "created_at": created_at,
         "updated_at": updated_at,
-        "active_reservations": [
-            {
-                "idempotency_key": key,
-                "origin": origin,
-                "cycle_id": cycle_id,
-                "amount_usd": _usd(amount_cents),
-                "created_at": reserved_at,
-            }
-            for key, origin, cycle_id, amount_cents, reserved_at in active
-        ],
+        "active_reservations": active_reservations,
     }
 
 
@@ -223,6 +262,62 @@ def init_bank(db_path: str | Path, *, initial_capital_usd: str) -> dict[str, Any
             raise
 
 
+def _reserve_locked(
+    con: sqlite3.Connection,
+    *,
+    key: str,
+    origin_value: str,
+    cycle_value: str,
+    amount_cents: int,
+    evidence_json: str | None,
+) -> None:
+    """The one locked reservation code path shared by `reserve` and
+    `reserve_with_evidence`. Caller already holds BEGIN IMMEDIATE. Replay of the
+    same key compares the FULL payload including evidence_json — for plain
+    `reserve` that is always None on both sides, so its replay rule is
+    unaffected; for `reserve_with_evidence` a differing evidence is a conflict
+    exactly like a differing amount.
+    """
+    bank_row = con.execute(
+        "SELECT initial_capital_cents FROM simulation_bank WHERE id = 1"
+    ).fetchone()
+    if bank_row is None:
+        raise SimulationBankNotInitializedError("bank has not been initialized")
+    capital_cents = bank_row[0]
+    existing = con.execute(
+        "SELECT origin, cycle_id, amount_cents, evidence_json FROM simulation_reservations "
+        "WHERE idempotency_key = ?",
+        (key,),
+    ).fetchone()
+    if existing is not None:
+        if existing != (origin_value, cycle_value, amount_cents, evidence_json):
+            raise SimulationBankConflictError(
+                "idempotency_key already used with a different reservation payload"
+            )
+        # Idempotent replay: identical payload (evidence included), no new
+        # charge, no revision bump.
+        return
+    reserved_cents = con.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM simulation_reservations "
+        "WHERE status = 'ACTIVE'"
+    ).fetchone()[0]
+    if amount_cents > capital_cents - reserved_cents:
+        raise SimulationBankInsufficientFundsError(
+            "reservation would exceed available capital"
+        )
+    now = _now()
+    con.execute(
+        "INSERT INTO simulation_reservations "
+        "(idempotency_key, origin, cycle_id, amount_cents, status, created_at, evidence_json) "
+        "VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)",
+        (key, origin_value, cycle_value, amount_cents, now, evidence_json),
+    )
+    con.execute(
+        "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
+        (now,),
+    )
+
+
 def reserve(
     db_path: str | Path,
     *,
@@ -247,44 +342,60 @@ def reserve(
     with _connect(path) as con:
         con.execute("BEGIN IMMEDIATE")
         try:
-            bank_row = con.execute(
-                "SELECT initial_capital_cents FROM simulation_bank WHERE id = 1"
-            ).fetchone()
-            if bank_row is None:
-                raise SimulationBankNotInitializedError("bank has not been initialized")
-            capital_cents = bank_row[0]
-            existing = con.execute(
-                "SELECT origin, cycle_id, amount_cents FROM simulation_reservations "
-                "WHERE idempotency_key = ?",
-                (key,),
-            ).fetchone()
-            if existing is not None:
-                if existing != (origin_value, cycle_value, amount_cents):
-                    raise SimulationBankConflictError(
-                        "idempotency_key already used with a different reservation payload"
-                    )
-                # Idempotent replay: identical payload, no new charge, no revision bump.
-            else:
-                reserved_cents = con.execute(
-                    "SELECT COALESCE(SUM(amount_cents), 0) FROM simulation_reservations "
-                    "WHERE status = 'ACTIVE'"
-                ).fetchone()[0]
-                if amount_cents > capital_cents - reserved_cents:
-                    raise SimulationBankInsufficientFundsError(
-                        "reservation would exceed available capital"
-                    )
-                now = _now()
-                con.execute(
-                    "INSERT INTO simulation_reservations "
-                    "(idempotency_key, origin, cycle_id, amount_cents, status, created_at) "
-                    "VALUES (?, ?, ?, ?, 'ACTIVE', ?)",
-                    (key, origin_value, cycle_value, amount_cents, now),
-                )
-                con.execute(
-                    "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? "
-                    "WHERE id = 1",
-                    (now,),
-                )
+            _reserve_locked(
+                con,
+                key=key,
+                origin_value=origin_value,
+                cycle_value=cycle_value,
+                amount_cents=amount_cents,
+                evidence_json=None,
+            )
+            result = _snapshot(con)
+            con.execute("COMMIT")
+            return result
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def reserve_with_evidence(
+    db_path: str | Path,
+    *,
+    idempotency_key: str,
+    origin: str,
+    cycle_id: str,
+    amount_usd: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """`reserve` plus a caller-supplied evidence object, committed together.
+
+    `evidence` must be a bounded, JSON-serializable object; it is canonicalized
+    (sorted keys, no whitespace) before comparison or storage so two evidence
+    dicts that differ only in key order are treated as identical. Replay rules
+    match `reserve`, extended to evidence: the SAME key with the SAME
+    (origin, cycle_id, amount_usd, evidence) is a no-op; ANY differing field —
+    including evidence — raises SimulationBankConflictError. The insert and the
+    evidence are written by the same statement inside the same BEGIN IMMEDIATE
+    as the reservation itself, so there is never a reservation without evidence
+    or evidence without a reservation.
+    """
+    path = Path(db_path)
+    key = _parse_id(idempotency_key, field="idempotency_key")
+    origin_value = _parse_id(origin, field="origin")
+    cycle_value = _parse_id(cycle_id, field="cycle_id")
+    amount_cents = _parse_cents(amount_usd, field="amount_usd")
+    evidence_json = _canonical_evidence_json(evidence)
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            _reserve_locked(
+                con,
+                key=key,
+                origin_value=origin_value,
+                cycle_value=cycle_value,
+                amount_cents=amount_cents,
+                evidence_json=evidence_json,
+            )
             result = _snapshot(con)
             con.execute("COMMIT")
             return result

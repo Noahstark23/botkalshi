@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -42,7 +43,7 @@ class ModuleImportTests(unittest.TestCase):
         import ast
 
         tree = ast.parse((BASE / "simulation_bank.py").read_text())
-        allowed = {"__future__", "contextlib", "datetime", "pathlib", "re", "sqlite3", "typing"}
+        allowed = {"__future__", "contextlib", "datetime", "json", "pathlib", "re", "sqlite3", "typing"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -334,6 +335,192 @@ class PathSafetyTests(SimulationBankTestCase):
         link_dir.symlink_to(real_dir, target_is_directory=True)
         with self.assertRaises(bank.SimulationBankValidationError):
             bank.init_bank(link_dir / "sim-bank.sqlite3", initial_capital_usd="100.00")
+
+
+class ReserveWithEvidenceTests(SimulationBankTestCase):
+    def setUp(self):
+        super().setUp()
+        bank.init_bank(self.db_path, initial_capital_usd="100.00")
+
+    def test_reserve_with_evidence_persists_evidence_alongside_reservation(self):
+        evidence = {"fill_id": 1, "formula": "buy: price*count+fee"}
+        snap = bank.reserve_with_evidence(
+            self.db_path,
+            idempotency_key="k1",
+            origin="M5",
+            cycle_id="c1",
+            amount_usd="30.00",
+            evidence=evidence,
+        )
+        self.assertEqual(snap["reserved_usd"], "30.00")
+        self.assertEqual(len(snap["active_reservations"]), 1)
+        self.assertEqual(snap["active_reservations"][0]["evidence"], evidence)
+
+    def test_plain_reserve_shows_evidence_none_alongside_reserve_with_evidence(self):
+        bank.reserve(self.db_path, idempotency_key="k1", origin="M1", cycle_id="c1", amount_usd="10.00")
+        bank.reserve_with_evidence(
+            self.db_path,
+            idempotency_key="k2",
+            origin="M5",
+            cycle_id="c2",
+            amount_usd="20.00",
+            evidence={"a": 1},
+        )
+        snap = bank.get_snapshot(self.db_path)
+        by_key = {row["idempotency_key"]: row for row in snap["active_reservations"]}
+        self.assertIsNone(by_key["k1"]["evidence"])
+        self.assertEqual(by_key["k2"]["evidence"], {"a": 1})
+
+    def test_identical_replay_with_evidence_does_not_double_charge(self):
+        evidence = {"fill_id": 1}
+        first = bank.reserve_with_evidence(
+            self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+            amount_usd="30.00", evidence=evidence,
+        )
+        second = bank.reserve_with_evidence(
+            self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+            amount_usd="30.00", evidence=evidence,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(second["revision"], first["revision"])
+
+    def test_replay_with_evidence_reordered_keys_is_still_identical(self):
+        bank.reserve_with_evidence(
+            self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+            amount_usd="30.00", evidence={"a": 1, "b": 2},
+        )
+        # Canonical JSON sorts keys, so key order must not matter for replay equality.
+        snap = bank.reserve_with_evidence(
+            self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+            amount_usd="30.00", evidence={"b": 2, "a": 1},
+        )
+        self.assertEqual(len(snap["active_reservations"]), 1)
+
+    def test_conflicting_evidence_same_key_blocks_and_leaves_original_untouched(self):
+        bank.reserve_with_evidence(
+            self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+            amount_usd="30.00", evidence={"a": 1},
+        )
+        with self.assertRaises(bank.SimulationBankConflictError):
+            bank.reserve_with_evidence(
+                self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+                amount_usd="30.00", evidence={"a": 2},
+            )
+        snap = bank.get_snapshot(self.db_path)
+        self.assertEqual(snap["active_reservations"][0]["evidence"], {"a": 1})
+        self.assertEqual(snap["reserved_usd"], "30.00")
+
+    def test_non_dict_evidence_blocks(self):
+        for bad in ("not-a-dict", 5, None, [1, 2], True):
+            with self.assertRaises(bank.SimulationBankValidationError):
+                bank.reserve_with_evidence(
+                    self.db_path, idempotency_key="bad", origin="M5", cycle_id="c1",
+                    amount_usd="1.00", evidence=bad,
+                )
+
+    def test_oversized_evidence_blocks(self):
+        huge = {"blob": "x" * 5_000}
+        with self.assertRaises(bank.SimulationBankValidationError):
+            bank.reserve_with_evidence(
+                self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+                amount_usd="1.00", evidence=huge,
+            )
+        snap = bank.get_snapshot(self.db_path)
+        self.assertEqual(snap["active_reservations"], [])
+
+    def test_insufficient_funds_with_evidence_reserves_nothing(self):
+        with self.assertRaises(bank.SimulationBankInsufficientFundsError):
+            bank.reserve_with_evidence(
+                self.db_path, idempotency_key="k1", origin="M5", cycle_id="c1",
+                amount_usd="150.00", evidence={"a": 1},
+            )
+        snap = bank.get_snapshot(self.db_path)
+        self.assertEqual(snap["active_reservations"], [])
+        self.assertEqual(snap["reserved_usd"], "0.00")
+
+
+class P2SchemaMigrationTests(SimulationBankTestCase):
+    def _reservation_columns(self) -> set[str]:
+        con = sqlite3.connect(str(self.db_path))
+        try:
+            return {row[1] for row in con.execute("PRAGMA table_info(simulation_reservations)").fetchall()}
+        finally:
+            con.close()
+
+    def _create_p2_schema_db(self) -> None:
+        # Mirrors the P2 shape of _ensure_schema BEFORE evidence_json existed —
+        # built with a raw sqlite3 connection, deliberately bypassing this module,
+        # so the migration path is exercised against a file this module never wrote.
+        con = sqlite3.connect(str(self.db_path))
+        try:
+            con.executescript("""
+            CREATE TABLE simulation_bank (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              initial_capital_cents INTEGER NOT NULL,
+              revision INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE simulation_reservations (
+              idempotency_key TEXT PRIMARY KEY,
+              origin TEXT NOT NULL,
+              cycle_id TEXT NOT NULL,
+              amount_cents INTEGER NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'RELEASED')),
+              created_at TEXT NOT NULL,
+              released_at TEXT
+            );
+            """)
+            con.execute(
+                "INSERT INTO simulation_bank VALUES (1, 10000, 1, '2026-01-01T00:00:00+00:00', "
+                "'2026-01-01T00:00:00+00:00')"
+            )
+            con.execute(
+                "INSERT INTO simulation_reservations VALUES "
+                "('old-key', 'M1', 'old-cycle', 500, 'ACTIVE', '2026-01-01T00:00:00+00:00', NULL)"
+            )
+            con.commit()
+        finally:
+            con.close()
+        self.assertNotIn(
+            "evidence_json", self._reservation_columns(),
+            "test fixture must start on the pre-migration P2 shape",
+        )
+
+    def test_reading_a_p2_db_migrates_in_place_and_preserves_old_row_with_no_evidence(self):
+        self._create_p2_schema_db()
+        snap = bank.get_snapshot(self.db_path)
+        self.assertEqual(snap["initial_capital_usd"], "100.00")
+        self.assertEqual(snap["reserved_usd"], "5.00")
+        self.assertEqual(snap["available_usd"], "95.00")
+        self.assertEqual(len(snap["active_reservations"]), 1)
+        old_row = snap["active_reservations"][0]
+        self.assertEqual(old_row["idempotency_key"], "old-key")
+        self.assertIsNone(old_row["evidence"])
+        self.assertIn("evidence_json", self._reservation_columns())
+
+    def test_new_reservations_after_migration_carry_evidence_alongside_old_evidence_free_row(self):
+        self._create_p2_schema_db()
+        bank.get_snapshot(self.db_path)  # triggers the migration
+        bank.reserve_with_evidence(
+            self.db_path, idempotency_key="new-key", origin="M5", cycle_id="new-cycle",
+            amount_usd="10.00", evidence={"fill_id": 42},
+        )
+        snap = bank.get_snapshot(self.db_path)
+        by_key = {row["idempotency_key"]: row for row in snap["active_reservations"]}
+        self.assertIsNone(by_key["old-key"]["evidence"])
+        self.assertEqual(by_key["new-key"]["evidence"], {"fill_id": 42})
+        self.assertEqual(snap["reserved_usd"], "15.00")
+
+    def test_plain_reserve_still_works_against_a_migrated_p2_db(self):
+        self._create_p2_schema_db()
+        bank.get_snapshot(self.db_path)  # triggers the migration
+        snap = bank.reserve(
+            self.db_path, idempotency_key="legacy-style", origin="M1", cycle_id="c2", amount_usd="5.00"
+        )
+        by_key = {row["idempotency_key"]: row for row in snap["active_reservations"]}
+        self.assertIsNone(by_key["legacy-style"]["evidence"])
+        self.assertIsNone(by_key["old-key"]["evidence"])
 
 
 def _cents(usd: str) -> int:
