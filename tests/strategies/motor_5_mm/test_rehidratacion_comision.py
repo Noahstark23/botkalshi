@@ -20,10 +20,13 @@ línea:
       — que es exactamente el oráculo de aceptación "Reinicio: igual resultado que ejecución
       ininterrumpida".
 
-Y hay un agravante concreto: el multiplicador maker de KXMLBGAME está EN DISPUTA (el código
-afirma 0.5 desde 2026-08-07; el PDF oficial verificado el 13-ago dice 1). Mientras esa
-pregunta siga abierta, recalcular comisiones en cada arranque es exactamente lo que no hay
-que hacer — el hecho grabado es el único dato que no se mueve bajo nuestros pies.
+Y la tarifa se mueve, que es la razón de fondo. El 22-sep el operador leyó la fuente primaria
+(`GET /trade-api/v2/series/KXMLBGAME`): `fee_multiplier: 0.5`,
+`fee_type: quadratic_with_maker_fees`, `last_updated_ts: 2026-09-16`. Eso establece la tarifa
+ACTUAL de la serie, no la que regía en cada fecha pasada — `last_updated_ts` no es la fecha
+de entrada en vigor, y Kalshi documenta overrides por EVENTO (`fee_multiplier_override`).
+Recalcular en cada arranque aplicaría la tarifa de hoy a fills de otro momento: la comisión
+grabada es el único dato que no se mueve bajo nuestros pies.
 
 El test existente `test_rehidrata_inventario_de_la_misma_cohorte` solo afirma
 `net_contracts == 1`: nunca mira la comisión. Ese es el hueco que se cierra acá.
@@ -179,3 +182,101 @@ def test_cohorte_ajena_no_entra_en_la_recuperacion():
 
     assert eng._inventory.net(TICKER) == 0
     assert TICKER not in eng._inventory.positions
+
+
+# ---------------------------------------------------------------------------------------
+# Reproducir fielmente ≠ aceptar cualquier valor (revisión del operador, 22-sep).
+#
+# `fee_cents_recorded` se usaba verbatim sin validar tipo ni signo: bloquear `None` no es
+# lo mismo que rechazar un dato corrupto. La comisión neta de Kalshi es NO NEGATIVA y
+# entera en centavos; un booleano, un float, un texto o un negativo violan ese contrato y
+# se rechazan ANTES de tocar el inventario. El cero documentado sigue siendo válido: un
+# dato ausente y un cero son hechos distintos. La prueba de 999¢ demostraba que no se
+# recalcula; no demostraba integridad de la evidencia — eso es lo que se agrega acá.
+# ---------------------------------------------------------------------------------------
+
+
+def _corromper(fila_id: int, valor) -> None:
+    """Escribe un valor fuera de contrato por SQL crudo, saltando el ORM.
+
+    SQLite tiene tipado dinámico: una columna INTEGER guarda un REAL o un TEXT sin
+    quejarse, y el driver los devuelve con su tipo nativo. Es la corrupción que la
+    recuperación puede encontrarse de verdad, no una hipótesis del test."""
+    from sqlalchemy import text
+
+    with get_session() as s:
+        s.connection().execute(
+            text("UPDATE mm_shadow_fills SET fee_effective_cents = :v WHERE id = :id"),
+            {"v": valor, "id": fila_id},
+        )
+        s.commit()
+
+
+@pytest.mark.parametrize(
+    ("valor", "motivo"),
+    [
+        (-5, "negativa"),
+        (2.5, "no entera (REAL en la columna)"),
+        ("abc", "texto"),
+    ],
+)
+def test_fee_registrada_fuera_de_contrato_bloquea(valor, motivo):
+    eng = _engine(fees_as_maker=True)
+    fila_id = _persistir(eng, fee_model="taker", fee_effective_cents=2, fee_multiplier=1.0)
+    _corromper(fila_id, valor)
+
+    with pytest.raises(Motor5DataIntegrityError) as exc:
+        eng._rehidratar_inventory()
+    assert str(fila_id) in str(exc.value), f"comisión {motivo}: el bloqueo no nombra la fila"
+
+
+def test_fila_corrupta_no_deja_inventario_parcial():
+    """Sin mutaciones contables ante evidencia inválida: validar TODO antes de aplicar.
+
+    Si la fila 2 de 3 está corrupta y la recuperación ya aplicó la 1, el inventario queda
+    a medio reconstruir — posición y caja de una trayectoria que nunca existió. Se valida
+    la cohorte entera primero; recién ahí se aplica."""
+    eng = _engine(fees_as_maker=True)
+    _persistir(eng, fee_model="taker", fee_effective_cents=2, fee_multiplier=1.0)
+    corrupta = _persistir(eng, fee_model="taker", fee_effective_cents=2, fee_multiplier=1.0)
+    _persistir(eng, fee_model="taker", fee_effective_cents=2, fee_multiplier=1.0)
+    _corromper(corrupta, -1)
+
+    with pytest.raises(Motor5DataIntegrityError):
+        eng._rehidratar_inventory()
+
+    assert eng._inventory.positions == {}, "Quedó inventario parcial tras el bloqueo"
+
+
+def test_apply_fill_rechaza_booleano_antes_de_mutar():
+    """La trampa de Python: `isinstance(True, int)` es True, así que `True` pasaría como 1¢.
+
+    Y el rechazo tiene que ocurrir ANTES del `setdefault`: si no, deja una entrada vacía
+    en `positions` para un ticker que nunca operó."""
+    book = InventoryBook(fees_as_maker=True)
+    fill = ShadowFill(ticker=TICKER, side="buy", price_cents=47, count=1, rule="test")
+
+    with pytest.raises(ValueError, match="comisión"):
+        book.apply_fill(fill, fee_cents_recorded=True)
+
+    assert book.positions == {}, "El rechazo dejó una entrada creada en positions"
+
+
+def test_apply_fill_rechaza_negativo_sin_mutar():
+    book = InventoryBook(fees_as_maker=True)
+    fill = ShadowFill(ticker=TICKER, side="buy", price_cents=47, count=1, rule="test")
+
+    with pytest.raises(ValueError, match="comisión"):
+        book.apply_fill(fill, fee_cents_recorded=-1)
+
+    assert book.positions == {}
+
+
+def test_apply_fill_acepta_cero_documentado():
+    """CONTROL: el cero es un valor válido del contrato, no un dato ausente."""
+    book = InventoryBook(fees_as_maker=True)
+    fill = ShadowFill(ticker=TICKER, side="buy", price_cents=47, count=1, rule="test")
+
+    inv = book.apply_fill(fill, fee_cents_recorded=0)
+
+    assert inv.fees_cents == 0 and inv.net_contracts == 1

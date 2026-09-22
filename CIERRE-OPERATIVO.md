@@ -13,7 +13,7 @@ pudo alcanzar** figura como BLOCKED con su causa, no como pendiente genérico.
 | Elemento | Estado | Evidencia y fecha |
 |---|---|---|
 | C1 — fila M5, comisión y estado de reserva verificados | **BLOCKED** | `infra/digitalocean-shadow/m5_ledger_bridge.py` **no existe en la rama publicada** (`ls` del directorio, 22-sep: está `m5_bank_bridge.py`, no `m5_ledger_bridge.py`). El candidato vive solo en la Mac, fuera del alcance de esta sesión. Sin el archivo no se revisa 6.1 ni 6.2 sin reescribir a ciegas trabajo local. |
-| C1 — cierre contable y recuperación | **PARCIAL — recuperación PASS, cierre PENDING** | **Recuperación:** regresión 6.3 reproducida y corregida. 5 pruebas nuevas en `tests/strategies/motor_5_mm/test_rehidratacion_comision.py`; 130 pruebas de M5 verdes; suite completa **1.680 passed**. **Cierre contable (6.4/6.5):** no abordado en esta sesión. |
+| C1 — cierre contable y recuperación | **PARCIAL — recuperación PASS, cierre PENDING** | **Recuperación:** regresión 6.3 reproducida y corregida, más la validación de contrato que señaló el operador. 12 casos en `tests/strategies/motor_5_mm/test_rehidratacion_comision.py`; suite principal **1.687 passed**; suite de research **323 OK** (aparte). **Cierre contable (6.4/6.5):** no abordado. |
 | C2 — M1 conectado y alcance explícito | **PENDING** | No abordado. |
 | C2 — M2, M5, M3 y Radar conectados | **PENDING** | No abordado. |
 | C2 — capital común, resultados y reporte | **PENDING** | No abordado. |
@@ -43,9 +43,27 @@ Arreglo: `apply_fill` acepta `fee_cents_recorded` y lo usa verbatim; la rehidrat
 `row.fee_effective_cents` y **bloquea** (`Motor5DataIntegrityError`, nombrando la fila) si
 falta. Ninguna cohorte se "arregla" rellenando defaults.
 
-Agravante que lo hace urgente: el multiplicador maker de KXMLBGAME sigue **en disputa** (el
-código afirma 0.5 desde 2026-08-07; el PDF oficial verificado el 13-ago dice 1). Mientras esa
-pregunta esté abierta, recalcular comisiones en cada arranque es lo peor que se puede hacer.
+**Corrección (22-sep, revisión del operador):** antes escribí que el multiplicador estaba "en
+disputa". Ya no: el operador leyó la fuente primaria, `GET /series/KXMLBGAME`, que publica
+`fee_multiplier: 0.5` (`quadratic_with_maker_fees`, `last_updated_ts: 2026-09-16`). Esta
+sesión **no pudo verificarlo por su cuenta** — el proxy de salida denegó la conexión a
+`api.elections.kalshi.com` por política de la organización, y no se reintentó por otra vía.
+
+Lo que esa fuente establece es la tarifa **actual** de la serie, no la que regía en cada
+fecha: `last_updated_ts` no es fecha de entrada en vigor, y Kalshi documenta overrides por
+evento. Eso **refuerza** el arreglo en vez de debilitarlo: la tarifa de hoy no puede
+reescribir el pasado, así que la comisión grabada manda. Y **no** debe fijarse 0.5 en código
+de forma permanente: hay que resolver la comisión por evento y momento.
+
+### Segunda iteración — reproducir no es aceptar cualquier valor
+
+El operador señaló que `fee_cents_recorded` se usaba verbatim sin validar tipo ni signo:
+bloquear `None` no es rechazar un dato corrupto. Reproducido con **6 pruebas que fallaban**
+(negativo, REAL, TEXT —SQLite los guarda sin quejarse—, booleano, e inventario parcial ante
+una fila corrupta en medio). Arreglo: `validar_fee_registrada()` exige entero ≥ 0 y excluye
+`bool` antes del chequeo de `int` (en Python `isinstance(True, int)` es True). El rechazo
+ocurre **antes** del `setdefault`, sin dejar entradas vacías. La rehidratación valida la
+cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue siendo válido.
 
 ### Registro de validación
 
@@ -54,8 +72,28 @@ pregunta esté abierta, recalcular comisiones en cada arranque es lo peor que se
 | 22-sep ~17:54 | `pytest tests/strategies/motor_5_mm/ -q` (base `21088dc9`) | 125 passed |
 | 22-sep ~17:55 | `pytest tests/.../test_rehidratacion_comision.py -q` (antes del fix) | **4 failed, 1 passed** — regresión reproducida |
 | 22-sep ~17:57 | idem (después del fix) | 5 passed |
-| 22-sep ~17:58 | `pytest -q` (suite completa) | **1.680 passed**, 0 fallos, 0 omitidos |
+| 22-sep ~17:58 | `pytest -q` (suite principal, `testpaths = ["tests"]`) | 1.680 passed |
 | 22-sep ~17:59 | `ruff check src tests` + `ruff format --check src tests` | limpio |
+| 22-sep, 2ª iteración | pruebas de validación de contrato **antes** del fix | **6 failed, 6 passed** — hallazgo del operador reproducido |
+| 22-sep, 2ª iteración | idem **después** | 12 passed |
+| 22-sep, 2ª iteración | `pytest -q` (suite principal) | **1.687 passed**, 0 fallos, 0 omitidos |
+| 22-sep, 2ª iteración | `python3 -m unittest discover -s tests` en `infra/digitalocean-shadow/` | **323 OK**, 0 omitidos |
+
+**Qué acredita cada número, y qué no** (corrección del operador: los conteos no se sustituyen):
+
+- **1.687** es la suite principal. `pyproject.toml:56` fija `testpaths = ["tests"]`, así que
+  **no incluye** la suite de research. Las 1.680 que reporté antes tampoco la incluían; lo
+  presenté como "suite completa" y no lo era.
+- **323** es la suite de research, corrida aparte con `unittest`. El registro P3A dice **329**
+  en el mismo commit `21088dc9` (Python 3.14.7 / macOS). Acá son 323 en Python 3.12.3 / Linux,
+  sin omitidos. **La diferencia de 6 no está explicada** y no se le atribuye causa sin evidencia.
+- **Ruff** verde cubre solo `src/` y `tests/` — lo mismo que el CI. Sobre
+  `infra/digitalocean-shadow/`: **58 errores y 27 archivos sin formato**. Deuda previa que el
+  CI no ve; no se tocó en este cambio (serían 27 archivos ajenos).
+- **La fase Docker del CI no se verificó**: hay CLI pero no daemon
+  (`/var/run/docker.sock` no existe). No se levantó uno.
+- **El CI de GitHub no corrió en #264**: `ci.yml` filtra `pull_request: branches: [main]` y el
+  PR apunta a la rama de #263. Es CI ausente, no fallida — y vale igual para #257→#263.
 
 Alcance de red: ninguna prueba salió a red. No se tocó la DB de producción. No se instaló ni
 actualizó ninguna dependencia.
@@ -68,12 +106,18 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 
 ## Lo que falta, con la intervención exacta
 
-1. **`m5_ledger_bridge.py`** — pegá el archivo (o publicalo en una rama). Sin él no se cierra
-   6.1 ni 6.2, y reescribirlo a ciegas destruiría trabajo local no validado.
+1. **`m5_ledger_bridge.py`** — el operador confirmó que existe en su Mac
+   (`botkalshi-issue256-m5-ledger-verify/infra/digitalocean-shadow/`), sin validar. Son tres
+   ubicaciones distintas: la Mac, este contenedor en la nube y el droplet; dar acceso al
+   repositorio no conecta las otras dos. **Intervención:** publicarlo en una rama del repo.
+   Sin eso no se cierra 6.1 ni 6.2, y reconstruirlo a ciegas destruiría trabajo no validado.
 2. **C3 completo** — requiere una sesión con acceso al droplet. Esta no lo tiene y no hay
    forma autorizada de obtenerlo desde acá.
-3. **El multiplicador maker de KXMLBGAME** — la fuente del 0.5. Es el dato más barato de
-   conseguir y el que más mueve la aritmética del gate.
+3. **Resolver la comisión por evento y fecha** — la fuente actual de la serie ya está (0.5,
+   leída por el operador). Falta el mecanismo que resuelva `fee_multiplier_override` por
+   evento y el valor vigente en cada momento, en vez de un multiplicador fijo en código. Hoy
+   `maker_fee_multiplier_for_ticker` (`src/math/fees.py`) codifica un corte fijo al
+   2026-08-07: consistente con el 0.5 actual para la serie, pero no mira overrides por evento.
 
 ## Advertencia operativa vigente, ajena a este encargo
 

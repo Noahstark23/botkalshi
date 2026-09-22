@@ -63,7 +63,7 @@ from src.strategies.motor_5_mm.fee_policy import (
     UnsupportedSeriesFeeError,
 )
 from src.strategies.motor_5_mm.fill_feed import MMFillFeed
-from src.strategies.motor_5_mm.inventory import InventoryBook
+from src.strategies.motor_5_mm.inventory import InventoryBook, validar_fee_registrada
 from src.strategies.motor_5_mm.quoter import QuoteSet, compute_quote
 from src.strategies.motor_5_mm.reconciler import MMReconciler
 from src.strategies.motor_5_mm.shadow_fill import ShadowFill, fills_for_quote
@@ -396,18 +396,31 @@ class Motor5Engine:
                 )
         except Exception as exc:
             raise Motor5DataIntegrityError("no se pudo rehidratar el inventario shadow") from exc
+        # La comisión GRABADA manda: recalcularla con el modo vivo reescribe el pasado
+        # (cohorte taker rehidratada en modo maker → 2¢ reales reconstruidos como 1¢).
+        # Una comisión ausente BLOQUEA: el `or 1` previo convertía un None (o un 0.0
+        # falsy) en el multiplicador COMPLETO — sustitución silenciosa, la misma clase de
+        # error que la fee ~100× de 2026-07-01. Una cohorte sin evidencia suficiente se
+        # identifica y se separa; no se arregla rellenando defaults.
+        #
+        # DOS PASADAS a propósito: se valida la cohorte ENTERA antes de aplicar una sola
+        # fila. Si la fila 2 de 3 está corrupta y la 1 ya se aplicó, el inventario queda a
+        # medio reconstruir — posición y caja de una trayectoria que nunca existió.
+        validadas: list[tuple[MMShadowFill, int]] = []
         for row in rows:
-            # La comisión GRABADA manda: recalcularla con el modo vivo reescribe el pasado
-            # (cohorte taker rehidratada en modo maker → 2¢ reales reconstruidos como 1¢).
-            # Y una comisión ausente BLOQUEA: el `or 1` previo convertía un None (o un 0.0
-            # falsy) en el multiplicador COMPLETO — sustitución silenciosa, la misma clase
-            # de error que la fee ~100× de 2026-07-01. Una cohorte sin evidencia suficiente
-            # se identifica y se separa; no se arregla rellenando defaults.
             if row.fee_effective_cents is None:
                 raise Motor5DataIntegrityError(
                     f"fill {row.id} de la cohorte {self._experiment_id} no tiene "
                     "fee_effective_cents: no se puede reproducir su comisión sin inventarla"
                 )
+            try:
+                fee = validar_fee_registrada(row.fee_effective_cents)
+            except ValueError as exc:
+                raise Motor5DataIntegrityError(
+                    f"fill {row.id} de la cohorte {self._experiment_id}: {exc}"
+                ) from exc
+            validadas.append((row, fee))
+        for row, fee in validadas:
             self._inventory.apply_fill(
                 ShadowFill(
                     ticker=row.ticker,
@@ -416,7 +429,7 @@ class Motor5Engine:
                     count=row.count,
                     rule=row.rule,
                 ),
-                fee_cents_recorded=row.fee_effective_cents,
+                fee_cents_recorded=fee,
             )
         if rows:
             logger.info(
