@@ -13,7 +13,7 @@ pudo alcanzar** figura como BLOCKED con su causa, no como pendiente genérico.
 | Elemento | Estado | Evidencia y fecha |
 |---|---|---|
 | C1 — fila M5, comisión y estado de reserva verificados | **PASS — nivel componente local** | Candidato recibido como texto del operador (SHA-256 `77d850fc…dbdf4`, idéntico al consignado), incorporado **verbatim** (`52e5e8f`), pasada mecánica de ruff con AST verificado idéntico (`9bdff14`), y arreglo (`3f2c401`). 21 pruebas del bridge + 8 del banco: **17 de 21 pasaban con el candidato intacto; las 4 que fallaban reproducían 6.2** (liberada reportada como `RESERVED`, repetición activa indistinguible, banco inexistente creado en un rechazo). Suite de research **352 OK**. Acredita un componente probado localmente con fixtures, **no** el productor ni el circuito. |
-| C1 — cierre contable y recuperación | **PARCIAL — recuperación PASS, cierre PENDING** | **Recuperación:** regresión 6.3 reproducida y corregida, más la validación de contrato que señaló el operador. 12 casos en `tests/strategies/motor_5_mm/test_rehidratacion_comision.py`; suite principal **1.687 passed**. **Cierre contable (6.4/6.5):** no abordado — una reserva no es un cierre ni una ganancia. |
+| C1 — cierre contable y recuperación | **PASS — nivel componente local** | **Recuperación (6.3):** comisión grabada reproducida y validada; 12 casos; suite principal **1.687 passed**. **Cierre contable (6.4/6.5, `c59b8e5`):** una sola fuente de eventos en la SQLite del banco, proyección derivada en cada lectura; los 4 oráculos sobre USD 200 dan exacto (+0.10 → 200.10; −0.07 → 199.93; +0.59 → 200.59; −0.41 → 199.59); repetición, reinicio, cierre parcial, inversión de signo, concurrencia, migración y fallo entre escrituras cubiertos. 24 tests; **8/8 mutaciones detectadas**. Suite de research **376 OK**. Todavía **no** conectado a ningún motor: el M5 real no escribe eventos. |
 | C2 — M1 conectado y alcance explícito | **PENDING** | No abordado. |
 | C2 — M2, M5, M3 y Radar conectados | **PENDING** | No abordado. |
 | C2 — capital común, resultados y reporte | **PENDING** | No abordado. |
@@ -85,6 +85,11 @@ cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue sie
 | 22-sep, 3ª iteración, `3f2c401` | `python3 -m unittest tests.test_simulation_bank_outcome` | **8 OK** (incluye 2 de concurrencia con hilos) |
 | 22-sep, 3ª iteración, `3f2c401` | `unittest discover -s tests` en `infra/digitalocean-shadow/` | **352 OK** (= 323 + 21 + 8), 0 omitidos |
 | 22-sep, 3ª iteración, `3f2c401` | `pytest -q` (suite principal) | **1.687 passed** — `src/` y `tests/` sin cambios desde `05713bf` |
+| 22-sep, 4ª iteración, `c59b8e5` | `unittest tests.test_simulation_ledger` | **24 OK** |
+| 22-sep, 4ª iteración, `c59b8e5` | 8 mutaciones deliberadas del ledger (sin liberar al quedar plano, liberar en parcial, comisión ×2, comisión ×0, LIFO, liquidar sin posición, admisión ciega a pérdidas, saltar validación de vínculo) | **8/8 rompen tests**. LIFO sobrevivía hasta agregar el caso de dos lotes |
+| 22-sep, 4ª iteración, `c59b8e5` | `unittest discover -s tests` en `infra/digitalocean-shadow/` | **376 OK** (= 352 + 24) |
+| 22-sep, 4ª iteración, `c59b8e5` | `unittest test_collector` | **6 OK** |
+| 22-sep, 4ª iteración | ruff `infra/` base vs HEAD | 58 = 58; test nuevo limpio |
 
 Entorno de todas las filas: Linux x86_64, Python 3.12.3, venv del repo, sockets bloqueados en
 los tests de research. Nivel acreditado: **componente probado localmente**. No hay prueba de
@@ -122,13 +127,18 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 
 ## Lo que falta, con la intervención exacta
 
-1. **Cierre contable (6.4/6.5)** — la próxima unidad: ganancia, pérdida, liquidación positiva y
-   negativa sobre USD 200 ficticios, repetición, reinicio, cierre parcial e inversión de signo.
-   Reservar y liberar ya son coherentes; reconocer un resultado todavía no existe.
-2. **`fee_model` sin contrastar** en la recuperación de 6.3 (limitación abierta de #264).
-3. **C3 completo** — requiere una sesión con acceso al droplet. Esta no lo tiene y no hay
+1. **C2/7.1 — la ruta vertical M5**: hoy el bridge reserva y el ledger contabiliza, pero nada
+   une las dos cosas. Falta que un fill M5 verificado se registre como evento con su reserva,
+   de punta a punta con fixtures identificadas, antes de extender a M1 y Radar.
+2. **C2/7.2 — admisión previa**: la reserva de hoy ocurre DESPUÉS de observar el fill
+   hipotético. Eso es observación contable, no prueba de que la cotización se podía financiar.
+3. **C2/7.3 — política única**: `risk_guard.py` fija `REFERENCE_UNIT = 2.00` y deriva
+   6.00 de riesgo abierto y diario; la especificación del encargo dice riesgo habitual USD 1 y
+   máximo USD 2 por operación. Discrepancia documentada, no resuelta, y sin ampliar límites.
+4. **`fee_model` sin contrastar** en la recuperación de 6.3 (limitación abierta de #264).
+5. **C3 completo** — requiere una sesión con acceso al droplet. Esta no lo tiene y no hay
    forma autorizada de obtenerlo desde acá.
-4. **Resolver la comisión por evento y fecha** — la fuente actual de la serie ya está (0.5,
+6. **Resolver la comisión por evento y fecha** — la fuente actual de la serie ya está (0.5,
    leída por ChatGPT el 22-sep; esta sesión no pudo consultarla). Falta el mecanismo que resuelva `fee_multiplier_override` por
    evento y el valor vigente en cada momento, en vez de un multiplicador fijo en código. Hoy
    `maker_fee_multiplier_for_ticker` (`src/math/fees.py`) codifica un corte fijo al
