@@ -16,7 +16,9 @@ pudo alcanzar** figura como BLOCKED con su causa, no como pendiente genérico.
 | C1 — cierre contable y recuperación | **PASS — nivel componente local** | **Recuperación (6.3):** comisión grabada reproducida y validada; 12 casos; suite principal **1.687 passed**. **Cierre contable (6.4/6.5, `c59b8e5`):** una sola fuente de eventos en la SQLite del banco, proyección derivada en cada lectura; los 4 oráculos sobre USD 200 dan exacto (+0.10 → 200.10; −0.07 → 199.93; +0.59 → 200.59; −0.41 → 199.59); repetición, reinicio, cierre parcial, inversión de signo, concurrencia, migración y fallo entre escrituras cubiertos. 24 tests; **8/8 mutaciones detectadas**. Suite de research **376 OK**. Todavía **no** conectado a ningún motor: el M5 real no escribe eventos. |
 | C2 — política única de riesgo (opción A corregida) | **PASS — nivel componente local** | `risk_policy.py` (`deaca89`): unidad = min(USD 2, 1 % del capital simulado) truncada al centavo; habitual = media unidad; tope por operación y por tesis = 1 unidad; abierto y diario = 3 unidades (nunca > USD 6); pausas USD 12 semanal y USD 20 del experimento. `risk_guard` y `bank_batch_review` llaman a la misma función. `REFERENCE_UNIT` sigue en 2; no se fijó 6. 13 pruebas propias. |
 | C2 — admisión previa, reserva, fill y evento contable | **PASS — nivel componente local** | `c6cb010`: `admit_proposal` decide y reserva en una sola transacción contra el estado compartido de todos los orígenes; el fill cita la admisión y consume su riesgo admitido **acumulado** (los fills parciales de una cotización no reservan dos veces); períodos por fecha del hecho en America/Los_Angeles; un fill sin admisión, con admisión rechazada/retirada o por encima de lo admitido **se registra** con incumplimiento. Replay almacenado validado fila por fila (`4985afa`). 39 pruebas nuevas; 13 mutaciones de regla detectadas. |
-| C2 — M1, M5 y Radar conectados al presupuesto común | **PENDING — decisión de arquitectura** | Ningún motor llama todavía a `admit_proposal`. `research_runner.py` y `m1_observation.py` no tocan el banco; no existe productor de Radar en el código (solo el origen declarado en `bank_batch_review`); el cotizador de M5 vive en el bot principal (`src/`), no en el servicio de research. |
+| C2 — ruta M5 en research (cohorte `m5-research-rest-v1`) | **PASS — nivel componente local** | `f2397e8`, por decisión del propietario («Simular M5 en research»). Captura → review estricto de M1 → candidata (`compute_quote`) → `admit_proposal` → `activate_admission` → fill **solo** en observaciones posteriores (`record_quote_observation`, atómico) → evento contable. 41 pruebas de aceptación (lista del CTO completa, más controles); 15 de 16 mutaciones detectadas. Flag `BOTKALSHI_M5_RESEARCH_ENABLED` **apagado por defecto**. Sin productor de fair en el droplet → el estado real sería `BLOCKED_NO_FAIR`. |
+| C2 — M1 en el presupuesto común | **PENDING** | M1 sigue en research con su atribución (review por ciclo), pero todavía **no** llama a `admit_proposal`: no emite propuestas con riesgo, solo diagnóstico. |
+| C2 — Radar | **NOT_CONNECTED** | No hay productor en el código. No se sustituye por señales inventadas. |
 | C2 — M2 referencia, M3 salidas simuladas, reporte único | **PENDING** | No abordado. |
 | C3 — acceso, respaldo y rollback | **BLOCKED** | Esta sesión es un contenedor efímero en la nube sin acceso SSH ni consola al droplet `botkalshi-research-sfo3`. No se intentó ni se simuló. |
 | C3 — SHA desplegado y diez ciclos públicos | **BLOCKED** | Misma causa. Sin lectura nueva del host, el release `435d1d9b` sigue siendo referencia histórica, no estado actual. |
@@ -99,6 +101,13 @@ cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue sie
 | 22-sep, 5ª iteración, `c6cb010` | `pytest -q` (suite principal) | **1.689 passed** (+2 de `test_dependencias_espejadas`, `10911ac`) |
 | 22-sep, 5ª iteración, `c6cb010` | `ruff check src tests` + `ruff format --check src tests` | limpio |
 | 22-sep, 5ª iteración, `c6cb010` | ruff `infra/` base `21088dc9` vs HEAD, mismo comando | **63 = 63**. El 58 de la fila anterior no se reprodujo con este comando; lo que se compara es base contra HEAD. `simulation_bank.py` ya estaba sin formato en la base: no se reformateó (sin formato masivo) |
+| 22-sep, 6ª iteración, `f2397e8` | `unittest tests.test_m5_research_sim` | **41 OK** |
+| 22-sep, 6ª iteración, `f2397e8` | `unittest discover -s tests` en `infra/digitalocean-shadow/` | **476 OK** |
+| 22-sep, 6ª iteración, `f2397e8` | `unittest test_collector` | **6 OK** |
+| 22-sep, 6ª iteración, antes del arreglo | `env -i /usr/bin/python3 -S -c "import research_runner"` | **`ModuleNotFoundError: No module named 'src'`**: la rama apilada no arrancaba con el python del sistema (el venv lo tapaba) |
+| 22-sep, 6ª iteración, `f2397e8` | idem | importa (también `m5_research_sim`); fijado por test |
+| 22-sep, 6ª iteración, `f2397e8` | 16 mutaciones (banco: misma observación, observación anterior, plano libera pendiente, activa con reserva liberada, retirada sigue llenando, observación re-evaluada; adaptador: riesgo bilateral sumado, precisión incompatible, fair vencido, sin TTL, sin barrido, replay reactiva, re-cotiza en el ciclo del retiro, evalúa la generadora, brecha sin incertidumbre, fee inventada) | **15/16 detectadas**. Sobrevive «replay reactiva» del adaptador: el banco la rechaza igual (`WITHDRAWN`); es una defensa redundante, no un hueco |
+| 22-sep, 6ª iteración, `f2397e8` | ruff `infra/` | **63 = 63** vs base; archivos nuevos limpios y formateados |
 
 Entorno de todas las filas: Linux x86_64, Python 3.12.3, venv del repo, sockets bloqueados en
 los tests de research. Nivel acreditado: **componente probado localmente**. No hay prueba de
@@ -136,14 +145,19 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 
 ## Lo que falta, con la intervención exacta
 
-1. **C2 — conectar los motores al presupuesto común (decisión pendiente).** El banco ya tiene
-   la cadena entera admisión → reserva → fill → evento contable, pero ningún motor la usa.
-   Para M5 hay dos caminos y la elección no es técnica: (a) el bot principal (`src/`, Coolify)
-   llama al banco de research antes de cada cotización, o (b) el servicio de research simula
-   la cotización M5 reutilizando el cotizador de `src/` y el bot principal no participa.
-   M1 se puede conectar desde `research_runner` en cualquiera de los dos; Radar no tiene
-   productor en el código.
-2. **Camino legacy** `reserve()` + `reservation_key`: sigue existiendo y no pasa por la
+1. **M5 research en el droplet (C3, requiere acceso autorizado).** Tres pasos del operador,
+   en este orden, y ninguno es automático:
+   (a) crear el banco ficticio con capital explícito
+   (`simulation_bank.init_bank(ruta, initial_capital_usd="200.00")`). El runner **nunca** lo
+   crea, y sin banco reporta `BLOCKED_NO_BANK`;
+   (b) proveer `m5/inputs.json` (`botkalshi-m5-research-inputs-v1`) con el fair y la fee de
+   cada evento, más su fuente y su fecha. Hoy **no hay productor**: sin él todo queda en
+   `BLOCKED_NO_FAIR`. Producirlo con The Odds API sería un gasto nuevo y está fuera de
+   alcance;
+   (c) `BOTKALSHI_M5_RESEARCH_ENABLED=true`.
+2. **M1 al presupuesto común**: hoy M1 solo diagnostica y no propone riesgo. Conectarlo
+   requiere definir qué sería una propuesta de M1 (tamaño y tesis) — no se inventa.
+2b. **Camino legacy** `reserve()` + `reservation_key`: sigue existiendo y no pasa por la
    política. `m5_ledger_bridge` reserva al observar el fill (C1); con C2 eso equivale a un fill
    sin admisión previa. Se retira o se reetiqueta cuando se conecte el productor, no antes.
 3. **C2/7.3 — resuelto** por decisión del propietario (opción A corregida, `deaca89`).
