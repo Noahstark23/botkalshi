@@ -69,3 +69,208 @@ class AccountReaderTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ar.AccountReadError):
             await ar.collect_account_snapshot(Broken())
+
+    async def test_non_object_row_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_positions(self, *, limit, cursor=None):
+                return {"market_positions": ["not-a-dict"], "cursor": ""}
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_invalid_ticker_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_positions(self, *, limit, cursor=None):
+                return {"market_positions": [{"ticker": "bad ticker!!"}], "cursor": ""}
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_invalid_trade_id_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [{"trade_id": "bad id!!", "ticker": "KX-SYN"}],
+                    "cursor": "",
+                }
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_invalid_row_on_second_page_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_positions(self, *, limit, cursor=None):
+                if cursor is None:
+                    return {
+                        "market_positions": [{"ticker": "KX-SYN", "position": "2"}],
+                        "cursor": "p2",
+                    }
+                return {"market_positions": ["not-a-dict"], "cursor": ""}
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_bool_number_field_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {"trade_id": "trade-1", "ticker": "KX-SYN", "count": True}
+                    ],
+                    "cursor": "",
+                }
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_nan_number_field_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {"trade_id": "trade-1", "ticker": "KX-SYN", "count": "nan"}
+                    ],
+                    "cursor": "",
+                }
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_infinity_number_field_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {
+                            "trade_id": "trade-1",
+                            "ticker": "KX-SYN",
+                            "count": "infinity",
+                        }
+                    ],
+                    "cursor": "",
+                }
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_float_number_field_rejects_whole_snapshot(self):
+        class Broken(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {"trade_id": "trade-1", "ticker": "KX-SYN", "count": 2.5}
+                    ],
+                    "cursor": "",
+                }
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+    async def test_price_zero_is_preserved_not_replaced_by_yes_price(self):
+        class Client(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {
+                            "trade_id": "trade-1",
+                            "ticker": "KX-SYN",
+                            "price": 0,
+                            "yes_price": "0.40",
+                        }
+                    ],
+                    "cursor": "",
+                }
+
+        result = await ar.collect_account_snapshot(Client())
+        self.assertEqual(result["fills"][0]["price"], "0")
+
+    async def test_price_explicit_none_stays_unknown_no_fallback(self):
+        class Client(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {
+                            "trade_id": "trade-1",
+                            "ticker": "KX-SYN",
+                            "price": None,
+                            "yes_price": "0.40",
+                        }
+                    ],
+                    "cursor": "",
+                }
+
+        result = await ar.collect_account_snapshot(Client())
+        self.assertIsNone(result["fills"][0]["price"])
+
+    async def test_price_absent_falls_back_to_legacy_yes_price(self):
+        class Client(FakeClient):
+            async def get_fills(self, *, limit, cursor=None):
+                return {
+                    "fills": [
+                        {
+                            "trade_id": "trade-1",
+                            "ticker": "KX-SYN",
+                            "yes_price": "0.40",
+                        }
+                    ],
+                    "cursor": "",
+                }
+
+        result = await ar.collect_account_snapshot(Client())
+        self.assertEqual(result["fills"][0]["price"], "0.40")
+
+    async def test_valid_int_and_decimal_numbers_are_preserved(self):
+        class Client(FakeClient):
+            async def get_positions(self, *, limit, cursor=None):
+                return {
+                    "market_positions": [
+                        {"ticker": "KX-SYN", "position": 3, "market_exposure": "1.50"}
+                    ],
+                    "cursor": "",
+                }
+
+        result = await ar.collect_account_snapshot(Client())
+        position = result["positions"][0]
+        self.assertEqual(position["position"], "3")
+        self.assertEqual(position["market_exposure_cents"], "1.50")
+
+    async def test_duplicate_ticker_rejects_snapshot(self):
+        class Broken(FakeClient):
+            async def get_positions(self, *, limit, cursor=None):
+                return {
+                    "market_positions": [
+                        {"ticker": "KX-SYN", "position": "1"},
+                        {"ticker": "KX-SYN", "position": "2"},
+                    ],
+                    "cursor": "",
+                }
+
+        with self.assertRaises(ar.AccountReadError):
+            await ar.collect_account_snapshot(Broken())
+
+
+class SafeNumberTests(unittest.TestCase):
+    def test_zero_negative_exponent_notation_rejected(self):
+        with self.assertRaises(ar.AccountReadError):
+            ar._safe_number("0e-9999999", field="count")
+
+    def test_zero_positive_exponent_notation_rejected(self):
+        with self.assertRaises(ar.AccountReadError):
+            ar._safe_number("0e+9999999", field="count")
+
+    def test_huge_int_magnitude_rejected(self):
+        with self.assertRaises(ar.AccountReadError):
+            ar._safe_number(10**5000, field="count")
+
+    def test_invalid_string_rejected(self):
+        with self.assertRaises(ar.AccountReadError):
+            ar._safe_number("banana", field="count")
+
+    def test_valid_zero_and_signed_decimals_preserved(self):
+        self.assertEqual(ar._safe_number("0", field="count"), "0")
+        self.assertEqual(ar._safe_number("-0", field="count"), "-0")
+        self.assertEqual(ar._safe_number("+0", field="count"), "0")
+        self.assertEqual(ar._safe_number("0.00", field="count"), "0.00")
+        self.assertEqual(ar._safe_number("-1.5", field="count"), "-1.5")
+        self.assertEqual(ar._safe_number("+3", field="count"), "3")
+        self.assertIsNone(ar._safe_number(None, field="count"))

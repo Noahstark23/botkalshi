@@ -40,48 +40,73 @@ def _safe_id(value: object, *, required: bool = False) -> str | None:
     return None
 
 
-def _safe_number(value: object) -> str | None:
-    if value is None or isinstance(value, bool):
+_MAX_NUMBER_CHARS = 32
+_MAX_NUMBER_EXPONENT = 15
+_MAX_INT_MAGNITUDE = 10**_MAX_NUMBER_CHARS
+_NUMBER_PATTERN = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?")
+
+
+def _safe_number(value: object, *, field: str) -> str | None:
+    """Return a sanitized decimal string, or None only when value is absent (unknown)."""
+    if value is None:
         return None
+    if isinstance(value, bool):
+        raise AccountReadError(f"{field} invalid")
+    if isinstance(value, int):
+        if abs(value) >= _MAX_INT_MAGNITUDE:
+            raise AccountReadError(f"{field} invalid")
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise AccountReadError(f"{field} invalid")
+    if not text or len(text) > _MAX_NUMBER_CHARS:
+        raise AccountReadError(f"{field} invalid")
+    if not _NUMBER_PATTERN.fullmatch(text):
+        raise AccountReadError(f"{field} invalid")
     try:
-        number = Decimal(str(value))
+        number = Decimal(text)
     except (InvalidOperation, TypeError, ValueError):
-        return None
+        raise AccountReadError(f"{field} invalid") from None
     if not number.is_finite():
-        return None
+        raise AccountReadError(f"{field} invalid")
+    if number != 0 and not (-_MAX_NUMBER_EXPONENT <= number.adjusted() <= _MAX_NUMBER_EXPONENT):
+        raise AccountReadError(f"{field} invalid")
     return format(number, "f")
 
 
-def _sanitize_position(raw: object) -> dict[str, Any] | None:
+def _sanitize_position(raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        return None
-    ticker = _safe_id(raw.get("ticker") or raw.get("market_ticker"), required=False)
-    if ticker is None:
-        return None
+        raise AccountReadError("position row invalid")
+    ticker = _safe_id(raw.get("ticker") or raw.get("market_ticker"), required=True)
     return {
         "ticker": ticker,
-        "position": _safe_number(raw.get("position")),
-        "market_exposure_cents": _safe_number(raw.get("market_exposure")),
-        "realized_pnl_cents": _safe_number(raw.get("realized_pnl")),
-        "fees_paid_cents": _safe_number(raw.get("fees_paid")),
+        "position": _safe_number(raw.get("position"), field="position"),
+        "market_exposure_cents": _safe_number(raw.get("market_exposure"), field="market_exposure"),
+        "realized_pnl_cents": _safe_number(raw.get("realized_pnl"), field="realized_pnl"),
+        "fees_paid_cents": _safe_number(raw.get("fees_paid"), field="fees_paid"),
     }
 
 
-def _sanitize_fill(raw: object) -> dict[str, Any] | None:
+def _sanitize_fill(raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        return None
-    ticker = _safe_id(raw.get("ticker") or raw.get("market_ticker"), required=False)
-    trade_id = _safe_id(raw.get("trade_id") or raw.get("fill_id"), required=False)
-    if ticker is None or trade_id is None:
-        return None
+        raise AccountReadError("fill row invalid")
+    ticker = _safe_id(raw.get("ticker") or raw.get("market_ticker"), required=True)
+    trade_id = _safe_id(raw.get("trade_id") or raw.get("fill_id"), required=True)
+    if "price" in raw:
+        price = _safe_number(raw.get("price"), field="price")
+    elif "yes_price" in raw:
+        price = _safe_number(raw.get("yes_price"), field="yes_price")
+    else:
+        price = None
     return {
         "trade_id": trade_id,
         "ticker": ticker,
         "order_id": _safe_id(raw.get("order_id"), required=False),
         "side": raw.get("side") if raw.get("side") in {"yes", "no", "bid", "ask"} else None,
         "action": raw.get("action") if raw.get("action") in {"buy", "sell"} else None,
-        "count": _safe_number(raw.get("count")),
-        "price": _safe_number(raw.get("price") or raw.get("yes_price")),
+        "count": _safe_number(raw.get("count"), field="count"),
+        "price": price,
         "created_time": raw.get("created_time") if isinstance(raw.get("created_time"), str) else None,
         "is_taker": raw.get("is_taker") if type(raw.get("is_taker")) is bool else None,
     }
@@ -109,7 +134,8 @@ async def _collect_pages(
                 break
         if source is None:
             raise AccountReadError("provider rows missing")
-        rows.extend(clean for item in source if (clean := sanitizer(item)) is not None)
+        for item in source:
+            rows.append(sanitizer(item))
         next_cursor = body.get("cursor")
         if next_cursor in (None, ""):
             return rows
