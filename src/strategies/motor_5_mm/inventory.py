@@ -53,14 +53,32 @@ class InventoryBook:
         self._fees_as_maker = fees_as_maker
 
     def apply_fill(
-        self, fill: ShadowFill, *, fee_multiplier: int | float | str = 1
+        self,
+        fill: ShadowFill,
+        *,
+        fee_multiplier: int | float | str = 1,
+        fee_cents_recorded: int | None = None,
     ) -> TickerInventory:
+        """Aplica un fill. `fee_cents_recorded` REPRODUCE una comisión ya cobrada.
+
+        La recuperación de una cohorte (engine._rehidratar_inventory) pasa el
+        `fee_effective_cents` de la fila: el hecho histórico manda sobre cualquier
+        recálculo. Recalcular en cada arranque hace que la comisión dependa del modo
+        VIVO del engine (`_fees_as_maker`) y del multiplicador vigente, así que una
+        cohorte grabada como taker rehidratada en modo maker cambiaba de caja al
+        reiniciar — medido: 2¢ reales reconstruidos como 1¢. Con el multiplicador de
+        KXMLBGAME todavía en disputa (0.5 vs 1), el hecho grabado es el único dato que
+        no se mueve bajo nuestros pies.
+        """
         inv = self.positions.setdefault(fill.ticker, TickerInventory())
-        fee = (
-            kalshi_maker_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
-            if self._fees_as_maker
-            else kalshi_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
-        )
+        if fee_cents_recorded is not None:
+            fee = fee_cents_recorded
+        else:
+            fee = (
+                kalshi_maker_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
+                if self._fees_as_maker
+                else kalshi_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
+            )
         if fill.side == "buy":
             inv.net_contracts += fill.count
             inv.cash_cents -= fill.price_cents * fill.count

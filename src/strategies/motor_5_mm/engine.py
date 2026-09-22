@@ -397,6 +397,17 @@ class Motor5Engine:
         except Exception as exc:
             raise Motor5DataIntegrityError("no se pudo rehidratar el inventario shadow") from exc
         for row in rows:
+            # La comisión GRABADA manda: recalcularla con el modo vivo reescribe el pasado
+            # (cohorte taker rehidratada en modo maker → 2¢ reales reconstruidos como 1¢).
+            # Y una comisión ausente BLOQUEA: el `or 1` previo convertía un None (o un 0.0
+            # falsy) en el multiplicador COMPLETO — sustitución silenciosa, la misma clase
+            # de error que la fee ~100× de 2026-07-01. Una cohorte sin evidencia suficiente
+            # se identifica y se separa; no se arregla rellenando defaults.
+            if row.fee_effective_cents is None:
+                raise Motor5DataIntegrityError(
+                    f"fill {row.id} de la cohorte {self._experiment_id} no tiene "
+                    "fee_effective_cents: no se puede reproducir su comisión sin inventarla"
+                )
             self._inventory.apply_fill(
                 ShadowFill(
                     ticker=row.ticker,
@@ -405,7 +416,7 @@ class Motor5Engine:
                     count=row.count,
                     rule=row.rule,
                 ),
-                fee_multiplier=row.fee_multiplier or 1,
+                fee_cents_recorded=row.fee_effective_cents,
             )
         if rows:
             logger.info(
