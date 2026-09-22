@@ -39,7 +39,9 @@ Contract:
     P&L. The projection is derived on every read, never stored. Policy in
     `ACCOUNTING_POLICY`: FIFO price lots per (origin, position_key), fees expensed once
     when paid, settlement at 0/100 per YES. Linked reservations are released only when
-    the position is flat or settled, in the same transaction as the closing event.
+    the position is flat or settled, in the same transaction as the closing event —
+    and, for an admitted quote, only once it was also withdrawn (a flat position with a
+    quote still pending keeps that quote's risk).
     Snapshots add `realized_pnl_usd`, `capital_usd` (= initial + realized),
     `available_usd` (= capital − reserved) and `positions`; an open position's
     `valuation` is `UNKNOWN_NO_MARK`, never a guessed price.
@@ -50,6 +52,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, date, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -151,6 +154,15 @@ def _check_path_safety(db_path: Path) -> None:
         raise SimulationBankValidationError("db parent directory must not be a symlink")
 
 
+_ADMISSION_LIFECYCLE_COLUMNS = (
+    "activated_at",
+    "activation_observation",
+    "activation_observed_at",
+    "withdrawn_at",
+    "withdraw_reason",
+)
+
+
 def _ensure_schema(con: sqlite3.Connection) -> None:
     # Unchanged P2 shape: an existing P2 DB already has these two tables and
     # CREATE TABLE IF NOT EXISTS is a no-op for it — the evidence column is
@@ -236,7 +248,30 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
       policy_version TEXT NOT NULL,
       evidence_json TEXT,
       created_at TEXT NOT NULL,
+      -- Quote lifecycle (C2, M5 research): an ADMITTED proposal becomes executable in
+      -- the simulation only when activated against the observation that generated it,
+      -- and stops being so when withdrawn. Its reservation is released only once it is
+      -- withdrawn AND nothing it filled is still open — never merely because the
+      -- position went flat while the quote could still fill.
+      activated_at TEXT,
+      activation_observation TEXT,
+      activation_observed_at TEXT,
+      withdrawn_at TEXT,
+      withdraw_reason TEXT,
       CHECK ((decision = 'ADMITTED') = (reservation_key IS NOT NULL))
+    );
+    -- One row per (admitted quote, later observation) it was evaluated against, written
+    -- in the SAME transaction as the fills that observation produced. A restart replays
+    -- the row instead of re-evaluating: no double fill, no fill from the observation
+    -- that generated the quote, and data gaps are recorded as uncertainty, not skipped.
+    CREATE TABLE IF NOT EXISTS simulation_quote_observations (
+      admission_key TEXT NOT NULL,
+      observation_id TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK (outcome IN ('EVALUATED', 'GAP')),
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (admission_key, observation_id)
     );
     """)
     event_columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_events)")}
@@ -247,6 +282,14 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             # assigned to a period) — never silently dated "now".
             try:
                 con.execute(f"ALTER TABLE simulation_events ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
+    admission_columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_admissions)")}
+    for column in _ADMISSION_LIFECYCLE_COLUMNS:
+        if column not in admission_columns:
+            try:
+                con.execute(f"ALTER TABLE simulation_admissions ADD COLUMN {column} TEXT")
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc):
                     raise
@@ -291,6 +334,8 @@ def _connect(db_path: Path):
 #   - Reservations linked to a position's fills are released only when the position is
 #     flat or settled, in the SAME transaction that records the closing event. A partial
 #     close keeps them (conservative: never frees capital before the exit is complete).
+#     An admitted quote NOT yet withdrawn keeps its reservation even when flat: it can
+#     still fill. A settlement ends every quote on the position.
 #   - Releasing a reservation changes availability, never realized P&L. An open position
 #     has no stored mark here, so its valuation is UNKNOWN — never marked at 50 or at a
 #     guessed price, and never counted as a gain.
@@ -1073,6 +1118,39 @@ def _record_event(
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     path = Path(db_path)
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            if con.execute("SELECT 1 FROM simulation_bank WHERE id = 1").fetchone() is None:
+                raise SimulationBankNotInitializedError("bank has not been initialized")
+            result = _record_event_locked(con, event, now)
+            result["snapshot"] = _snapshot(con, now=now)
+            con.execute("COMMIT")
+            return result
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def _pending_admission_reservations(con: sqlite3.Connection, keys: list[str]) -> set[str]:
+    """Reservations of admissions whose quote was NOT withdrawn: still able to fill."""
+    if not keys:
+        return set()
+    marks = ", ".join("?" for _ in keys)
+    return {
+        row[0]
+        for row in con.execute(
+            f"SELECT reservation_key FROM simulation_admissions WHERE reservation_key IN ({marks}) "
+            "AND decision = 'ADMITTED' AND withdrawn_at IS NULL",
+            keys,
+        )
+    }
+
+
+def _record_event_locked(
+    con: sqlite3.Connection, event: dict[str, Any], now: datetime
+) -> dict[str, Any]:
+    """Record one event inside the caller's BEGIN IMMEDIATE. No snapshot, no commit."""
     # When the fill arrives by admission, its reservation is DERIVED from the admission
     # and is not part of what the caller said — so replay compares the caller's fields.
     compared = tuple(
@@ -1080,125 +1158,118 @@ def _record_event(
         if not (f == "reservation_key" and event["admission_key"] is not None)
     )
     payload = tuple(event[f] for f in compared)
-    with _connect(path) as con:
-        con.execute("BEGIN IMMEDIATE")
-        try:
-            if con.execute("SELECT 1 FROM simulation_bank WHERE id = 1").fetchone() is None:
-                raise SimulationBankNotInitializedError("bank has not been initialized")
-            existing = con.execute(
-                f"SELECT {', '.join(compared)} FROM simulation_events WHERE event_key = ?",
-                (event["event_key"],),
-            ).fetchone()
-            if existing is not None:
-                if tuple(existing) != payload:
-                    raise SimulationBankConflictError(
-                        "event_key already used with a different event payload"
-                    )
-                # Identical replay: no new event, no reservation change, no revision bump.
-                positions = _fold(con)
-                key = (event["origin"], event["position_key"])
-                result = {
-                    "outcome": "REPLAY",
-                    "position": _position_view(key, positions[key]),
-                    "snapshot": _snapshot(con, now=now),
-                }
-                con.execute("COMMIT")
-                return result
-            _check_moment_not_future(event["occurred_at"], now, field="occurred_at")
-            positions, history = _fold_full(con)
-            key = (event["origin"], event["position_key"])
-            if event["kind"] == "SETTLEMENT" and key not in positions:
-                raise SimulationBankValidationError("NOTHING_TO_SETTLE: no such position")
-            pos = positions.setdefault(key, _Position())
+    existing = con.execute(
+        f"SELECT {', '.join(compared)} FROM simulation_events WHERE event_key = ?",
+        (event["event_key"],),
+    ).fetchone()
+    if existing is not None:
+        if tuple(existing) != payload:
+            raise SimulationBankConflictError(
+                "event_key already used with a different event payload"
+            )
+        # Identical replay: no new event, no reservation change, no revision bump.
+        positions = _fold(con)
+        key = (event["origin"], event["position_key"])
+        return {
+            "outcome": "REPLAY",
+            "breach": None,
+            "position": _position_view(key, positions[key]),
+        }
+    _check_moment_not_future(event["occurred_at"], now, field="occurred_at")
+    positions, history = _fold_full(con)
+    key = (event["origin"], event["position_key"])
+    if event["kind"] == "SETTLEMENT" and key not in positions:
+        raise SimulationBankValidationError("NOTHING_TO_SETTLE: no such position")
+    pos = positions.setdefault(key, _Position())
 
-            linked_key = event["reservation_key"]
-            covered_cents: int | None = None
-            breach: str | None = None
-            if event["kind"] == "FILL":
-                admission = _resolve_admission(con, event)
-                if admission is not None and linked_key is not None:
-                    raise SimulationBankValidationError(
-                        "a fill cites either an admission or a reservation, not both"
+    linked_key = event["reservation_key"]
+    covered_cents: int | None = None
+    breach: str | None = None
+    if event["kind"] == "FILL":
+        admission = _resolve_admission(con, event)
+        if admission is not None and linked_key is not None:
+            raise SimulationBankValidationError(
+                "a fill cites either an admission or a reservation, not both"
+            )
+        if admission is not None:
+            # Admission path. Its reservation covers the CUMULATIVE opening risk
+            # of the fills citing it, up to what was admitted — while it is still
+            # ACTIVE. A withdrawn/expired quote, or a position already closed
+            # (reservation released), leaves the fill RECORDED but uncovered.
+            if admission["decision"] == "ADMITTED":
+                res = admission["reservation_key"]
+                status = con.execute(
+                    "SELECT status FROM simulation_reservations WHERE idempotency_key = ?",
+                    (res,),
+                ).fetchone()
+                if status is not None and status[0] == "ACTIVE":
+                    already = sum(
+                        h["opening_risk_cents"] for h in history
+                        if h["admission_key"] == event["admission_key"]
                     )
-                if admission is not None:
-                    # Admission path. Its reservation covers the CUMULATIVE opening risk
-                    # of the fills citing it, up to what was admitted — while it is still
-                    # ACTIVE. A withdrawn/expired quote, or a position already closed
-                    # (reservation released), leaves the fill RECORDED but uncovered.
-                    if admission["decision"] == "ADMITTED":
-                        res = admission["reservation_key"]
-                        status = con.execute(
-                            "SELECT status FROM simulation_reservations WHERE idempotency_key = ?",
-                            (res,),
-                        ).fetchone()
-                        if status is not None and status[0] == "ACTIVE":
-                            already = sum(
-                                h["opening_risk_cents"] for h in history
-                                if h["admission_key"] == event["admission_key"]
-                            )
-                            linked_key = res
-                            covered_cents = max(0, admission["risk_cents"] - already)
-                elif linked_key is not None:
-                    # Legacy path: an explicit reservation, fully validated (must exist,
-                    # be ACTIVE, same origin, not already backing a fill).
-                    _check_reservation_link(con, linked_key, event["origin"])
-                    covered_cents = con.execute(
-                        "SELECT amount_cents FROM simulation_reservations WHERE idempotency_key = ?",
-                        (linked_key,),
-                    ).fetchone()[0]
-                opening = _opening_risk_cents(
-                    pos,
-                    side=event["side"],
-                    price=event["price_cents"],
-                    count=event["count"],
-                    fee=event["fee_cents"],
-                )
-                if opening > 0:
-                    if covered_cents is None:
-                        # Recorded and flagged, never dropped: dropping an adverse fill
-                        # would fabricate a favorable history.
-                        had_admission = admission is not None and admission["decision"] == "ADMITTED"
-                        breach = "ADMISSION_EXCEEDED" if had_admission else "UNADMITTED"
-                    elif opening > covered_cents:
-                        breach = "ADMISSION_EXCEEDED"
-            _apply_row(
-                pos,
-                event["kind"],
-                event["side"],
-                event["price_cents"],
-                event["count"],
-                event["fee_cents"],
-                event["payout_cents"],
-                linked_key,
-            )
-            stored = dict(event, reservation_key=linked_key)
-            written = now.astimezone(UTC).isoformat()
-            columns = ("event_key", *_EVENT_FIELDS, "breach", "created_at")
-            con.execute(
-                f"INSERT INTO simulation_events ({', '.join(columns)}) "
-                f"VALUES ({', '.join('?' for _ in columns)})",
-                (event["event_key"], *(stored[f] for f in _EVENT_FIELDS), breach, written),
-            )
-            if not pos.lots:
-                # Flat or settled: the risk earmark ends in the SAME transaction as the
-                # closing event. A crash between them cannot leave freed capital with
-                # no recorded close, nor a recorded close with its capital still held.
-                _release_linked_locked(con, pos.reservation_keys, written)
-            con.execute(
-                "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
-                (written,),
-            )
-            result = {
-                "outcome": "RECORDED",
-                "breach": breach,
-                "position": _position_view(key, pos),
-                "snapshot": _snapshot(con, now=now),
-            }
-            con.execute("COMMIT")
-            return result
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
+                    linked_key = res
+                    covered_cents = max(0, admission["risk_cents"] - already)
+        elif linked_key is not None:
+            # Legacy path: an explicit reservation, fully validated (must exist,
+            # be ACTIVE, same origin, not already backing a fill).
+            _check_reservation_link(con, linked_key, event["origin"])
+            covered_cents = con.execute(
+                "SELECT amount_cents FROM simulation_reservations WHERE idempotency_key = ?",
+                (linked_key,),
+            ).fetchone()[0]
+        opening = _opening_risk_cents(
+            pos,
+            side=event["side"],
+            price=event["price_cents"],
+            count=event["count"],
+            fee=event["fee_cents"],
+        )
+        if opening > 0:
+            if covered_cents is None:
+                # Recorded and flagged, never dropped: dropping an adverse fill
+                # would fabricate a favorable history.
+                had_admission = admission is not None and admission["decision"] == "ADMITTED"
+                breach = "ADMISSION_EXCEEDED" if had_admission else "UNADMITTED"
+            elif opening > covered_cents:
+                breach = "ADMISSION_EXCEEDED"
+    _apply_row(
+        pos,
+        event["kind"],
+        event["side"],
+        event["price_cents"],
+        event["count"],
+        event["fee_cents"],
+        event["payout_cents"],
+        linked_key,
+    )
+    stored = dict(event, reservation_key=linked_key)
+    written = now.astimezone(UTC).isoformat()
+    columns = ("event_key", *_EVENT_FIELDS, "breach", "created_at")
+    con.execute(
+        f"INSERT INTO simulation_events ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        (event["event_key"], *(stored[f] for f in _EVENT_FIELDS), breach, written),
+    )
+    if not pos.lots:
+        # Flat or settled: the risk earmark ends in the SAME transaction as the
+        # closing event. A crash between them cannot leave freed capital with
+        # no recorded close, nor a recorded close with its capital still held.
+        # EXCEPT a quote still pending (admitted, not withdrawn): flat does not
+        # mean it cannot fill again. A settlement ends every quote.
+        keys = pos.reservation_keys
+        if event["kind"] != "SETTLEMENT":
+            pending = _pending_admission_reservations(con, keys)
+            keys = [k for k in keys if k not in pending]
+        _release_linked_locked(con, keys, written)
+    con.execute(
+        "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
+        (written,),
+    )
+    return {
+        "outcome": "RECORDED",
+        "breach": breach,
+        "position": _position_view(key, pos),
+    }
 
 
 def record_fill(
@@ -1423,6 +1494,9 @@ def admit_proposal(
                     "decision": decision,
                     "reasons": json.loads(reasons_json),
                     "reservation_key": reservation_key,
+                    # A historically ADMITTED replay does NOT reactivate a released
+                    # reservation; the caller must see that it is no longer backed.
+                    "reservation_active": _reservation_active(con, reservation_key),
                     "snapshot": _snapshot(con, now=now),
                 }
                 con.execute("COMMIT")
@@ -1470,6 +1544,7 @@ def admit_proposal(
                 "decision": decision,
                 "reasons": reasons,
                 "reservation_key": reservation_key,
+                "reservation_active": reservation_key is not None,
                 "limits_usd": {
                     k: _usd(lim[k])
                     for k in ("unit", "habitual", "max_per_thesis", "max_open", "max_daily",
@@ -1484,48 +1559,358 @@ def admit_proposal(
             raise
 
 
+def _reservation_active(con: sqlite3.Connection, reservation_key: str | None) -> bool:
+    if reservation_key is None:
+        return False
+    row = con.execute(
+        "SELECT status FROM simulation_reservations WHERE idempotency_key = ?", (reservation_key,)
+    ).fetchone()
+    return row is not None and row[0] == "ACTIVE"
+
+
+_REASON_RE = re.compile(r"[A-Z0-9_]{1,40}")
+
+
+def _parse_reason(value: Any) -> str:
+    if not isinstance(value, str) or not _REASON_RE.fullmatch(value):
+        raise SimulationBankValidationError("reason must be an UPPER_SNAKE code")
+    return value
+
+
 def withdraw_admission(
-    db_path: str | Path, *, admission_key: str, now: datetime | None = None
+    db_path: str | Path,
+    *,
+    admission_key: str,
+    reason: str = "WITHDRAWN",
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """The quote was withdrawn or expired: release its reservation if still ACTIVE and
-    no fill cites it yet. Once a (partial) fill cites it, the reservation stays until
-    the position is flat or settled — conservative: the unfilled remainder stays held
-    rather than guessing it. Idempotent. Today's consumed daily budget is NOT given back — the
-    risk was committed when admitted. A rejected admission has nothing to release."""
+    """The quote was withdrawn or expired: it can no longer fill.
+
+    Marks the admission withdrawn (idempotent: the first reason and time are kept) and
+    releases its reservation if nothing it filled is still open — no fill cited it, or
+    the position is flat. Otherwise the reservation stays until the position is flat or
+    settled: conservative, the filled risk is still held and nothing is guessed about
+    it. Today's consumed daily budget is NOT given back — the risk was committed when
+    admitted. A rejected admission has nothing to withdraw or release."""
     now = now or datetime.now(UTC)
     key = _parse_id(admission_key, field="admission_key")
+    reason = _parse_reason(reason)
     path = Path(db_path)
     with _connect(path) as con:
         con.execute("BEGIN IMMEDIATE")
         try:
             row = con.execute(
-                "SELECT decision, reservation_key FROM simulation_admissions WHERE admission_key = ?",
+                "SELECT decision, reservation_key, origin, position_key, withdrawn_at "
+                "FROM simulation_admissions WHERE admission_key = ?",
                 (key,),
             ).fetchone()
             if row is None:
                 raise SimulationBankNotFoundError("unknown admission_key")
-            decision, reservation_key = row
+            decision, reservation_key, origin, position_key, withdrawn_at = row
+            written = now.astimezone(UTC).isoformat()
             released = 0
+            newly = False
             if decision == "ADMITTED":
+                if withdrawn_at is None:
+                    newly = True
+                    con.execute(
+                        "UPDATE simulation_admissions SET withdrawn_at = ?, withdraw_reason = ? "
+                        "WHERE admission_key = ?",
+                        (written, reason, key),
+                    )
                 spent = con.execute(
                     "SELECT 1 FROM simulation_events WHERE reservation_key = ? LIMIT 1",
                     (reservation_key,),
                 ).fetchone()
-                if spent is None:
-                    written = now.astimezone(UTC).isoformat()
+                pos = _fold(con).get((origin, position_key))
+                if spent is None or pos is None or not pos.lots:
                     released = _release_linked_locked(con, [reservation_key], written)
-                    if released:
-                        con.execute(
-                            "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? "
-                            "WHERE id = 1",
-                            (written,),
-                        )
-            result = {"released": bool(released), "snapshot": _snapshot(con, now=now)}
+                if newly or released:
+                    con.execute(
+                        "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? "
+                        "WHERE id = 1",
+                        (written,),
+                    )
+            result = {
+                "withdrawn": decision == "ADMITTED",
+                "newly_withdrawn": newly,
+                "released": bool(released),
+                "reservation_active": _reservation_active(con, reservation_key),
+                "snapshot": _snapshot(con, now=now),
+            }
             con.execute("COMMIT")
             return result
         except Exception:
             con.execute("ROLLBACK")
             raise
+
+
+_MAX_OBSERVATION_FILLS = 2  # at most one per side of a bilateral quote
+
+
+def activate_admission(
+    db_path: str | Path,
+    *,
+    admission_key: str,
+    observation_id: str,
+    observed_at: datetime,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Make an ADMITTED quote executable in the simulation — only if it still is.
+
+    Checked in ONE transaction: the admission exists and was ADMITTED, its reservation
+    is still ACTIVE, it was not withdrawn, and the generating observation is current
+    (not older than MAX_PROPOSAL_AGE, not in the future). Otherwise it is NOT activated
+    and the reason is returned: a rejected, released or stale admission never yields an
+    active quote. Idempotent for the same observation; a different one is a conflict.
+    Fills can only come from observations strictly AFTER this one.
+    """
+    now = now or datetime.now(UTC)
+    key = _parse_id(admission_key, field="admission_key")
+    obs = _parse_id(observation_id, field="observation_id")
+    moment_text = _parse_moment(observed_at, field="observed_at")
+    path = Path(db_path)
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            row = con.execute(
+                "SELECT decision, reservation_key, withdrawn_at, activation_observation, "
+                "activation_observed_at FROM simulation_admissions WHERE admission_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                raise SimulationBankNotFoundError("unknown admission_key")
+            decision, reservation_key, withdrawn_at, act_obs, act_at = row
+            if act_obs is not None:
+                if (act_obs, act_at) != (obs, moment_text):
+                    raise SimulationBankConflictError(
+                        "admission already activated by a different observation"
+                    )
+                con.execute("COMMIT")
+                return {"outcome": "REPLAY", "active": withdrawn_at is None, "reason": None}
+            reason = None
+            moment = _read_moment(moment_text, field="observed_at")
+            if decision != "ADMITTED":
+                reason = "NOT_ADMITTED"
+            elif withdrawn_at is not None:
+                reason = "WITHDRAWN"
+            elif not _reservation_active(con, reservation_key):
+                reason = "RESERVATION_NOT_ACTIVE"
+            elif moment < now - MAX_PROPOSAL_AGE:
+                reason = "OBSERVATION_NOT_CURRENT"
+            elif moment > now + MAX_PROPOSAL_FUTURE_SKEW:
+                reason = "OBSERVATION_IN_FUTURE"
+            if reason is not None:
+                con.execute("COMMIT")
+                return {"outcome": "NOT_ACTIVATED", "active": False, "reason": reason}
+            written = now.astimezone(UTC).isoformat()
+            con.execute(
+                "UPDATE simulation_admissions SET activated_at = ?, activation_observation = ?, "
+                "activation_observed_at = ? WHERE admission_key = ?",
+                (written, obs, moment_text, key),
+            )
+            con.execute(
+                "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
+                (written,),
+            )
+            con.execute("COMMIT")
+            return {"outcome": "ACTIVATED", "active": True, "reason": None}
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def _observation_event_key(admission_key: str, observation_id: str, side: str) -> str:
+    digest = hashlib.sha256(f"{admission_key}|{observation_id}|{side}".encode()).hexdigest()
+    return f"qf:{digest[:48]}"
+
+
+def record_quote_observation(
+    db_path: str | Path,
+    *,
+    admission_key: str,
+    observation_id: str,
+    observed_at: datetime,
+    outcome: str,
+    fills: list[dict[str, Any]] | None = None,
+    detail: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Evaluate one ACTIVE quote against one LATER observation, atomically.
+
+    `outcome` is EVALUATED (its fills, possibly none) or GAP (the observation could not
+    be used for this quote: missing or invalid book — uncertainty, never a fill and
+    never a close). The observation row and its fills are written in ONE transaction;
+    a replay of the same (quote, observation) returns the stored result and never
+    re-evaluates, so a restart cannot double a fill. Refused: an observation that is
+    the generating one or not strictly after it, a quote not activated or withdrawn.
+    Each fill is recorded as a FILL event citing the admission (its reservation is
+    consumed, never taken again); `fills` items are {side, price_cents, count, fee_cents}.
+    """
+    now = now or datetime.now(UTC)
+    key = _parse_id(admission_key, field="admission_key")
+    obs = _parse_id(observation_id, field="observation_id")
+    moment_text = _parse_moment(observed_at, field="observed_at")
+    if outcome not in ("EVALUATED", "GAP"):
+        raise SimulationBankValidationError("outcome must be EVALUATED or GAP")
+    fills = list(fills or [])
+    if outcome == "GAP" and fills:
+        raise SimulationBankValidationError("a GAP carries no fills")
+    if len(fills) > _MAX_OBSERVATION_FILLS:
+        raise SimulationBankValidationError("at most one fill per side per observation")
+    clean_fills = []
+    for item in fills:
+        if not isinstance(item, dict) or set(item) != {"side", "price_cents", "count", "fee_cents"}:
+            raise SimulationBankValidationError("fill must be {side, price_cents, count, fee_cents}")
+        if item["side"] not in _SIDES:
+            raise SimulationBankValidationError("side must be 'buy' or 'sell'")
+        clean_fills.append({
+            "side": item["side"],
+            "price_cents": _parse_int(
+                item["price_cents"], field="price_cents", lo=_MIN_PRICE_CENTS, hi=_MAX_PRICE_CENTS
+            ),
+            "count": _parse_int(item["count"], field="count", lo=1, hi=_MAX_COUNT),
+            "fee_cents": _parse_int(item["fee_cents"], field="fee_cents", lo=0, hi=_MAX_FEE_CENTS),
+        })
+    if len({f["side"] for f in clean_fills}) != len(clean_fills):
+        raise SimulationBankValidationError("at most one fill per side per observation")
+    payload_json = _canonical_evidence_json({
+        "fills": clean_fills,
+        "detail": detail if detail is not None else {},
+    })
+    path = Path(db_path)
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            existing = con.execute(
+                "SELECT observed_at, outcome, payload_json FROM simulation_quote_observations "
+                "WHERE admission_key = ? AND observation_id = ?",
+                (key, obs),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != (moment_text, outcome, payload_json):
+                    raise SimulationBankConflictError(
+                        "observation already recorded for this quote with a different result"
+                    )
+                result = {"outcome": "REPLAY", "breaches": [], "snapshot": _snapshot(con, now=now)}
+                con.execute("COMMIT")
+                return result
+            row = con.execute(
+                "SELECT origin, position_key, decision, activation_observation, "
+                "activation_observed_at, withdrawn_at FROM simulation_admissions "
+                "WHERE admission_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                raise SimulationBankNotFoundError("unknown admission_key")
+            origin, position_key, decision, act_obs, act_at, withdrawn_at = row
+            if decision != "ADMITTED" or act_obs is None:
+                raise SimulationBankValidationError("QUOTE_NOT_ACTIVE: never activated")
+            if withdrawn_at is not None:
+                raise SimulationBankValidationError("QUOTE_WITHDRAWN: it can no longer fill")
+            if obs == act_obs:
+                raise SimulationBankValidationError(
+                    "SAME_OBSERVATION: the observation that generated a quote cannot fill it"
+                )
+            moment = _read_moment(moment_text, field="observed_at")
+            if moment <= _read_moment(act_at, field="activation_observed_at"):
+                raise SimulationBankValidationError(
+                    "OBSERVATION_NOT_AFTER_QUOTE: fills only from later observations"
+                )
+            _check_moment_not_future(moment_text, now, field="observed_at")
+            written = now.astimezone(UTC).isoformat()
+            breaches = []
+            for item in clean_fills:
+                event = {
+                    "event_key": _observation_event_key(key, obs, item["side"]),
+                    "origin": origin,
+                    "position_key": position_key,
+                    "kind": "FILL",
+                    "side": item["side"],
+                    "price_cents": item["price_cents"],
+                    "count": item["count"],
+                    "fee_cents": item["fee_cents"],
+                    "payout_cents": None,
+                    "reservation_key": None,
+                    "evidence_json": _canonical_evidence_json(
+                        {"admission_key": key, "observation_id": obs}
+                    ),
+                    "occurred_at": moment_text,
+                    "admission_key": key,
+                }
+                recorded = _record_event_locked(con, event, now)
+                if recorded["breach"] is not None:
+                    breaches.append({"side": item["side"], "breach": recorded["breach"]})
+            con.execute(
+                "INSERT INTO simulation_quote_observations "
+                "(admission_key, observation_id, observed_at, outcome, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (key, obs, moment_text, outcome, payload_json, written),
+            )
+            if not clean_fills:
+                con.execute(
+                    "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
+                    (written,),
+                )
+            result = {"outcome": "RECORDED", "breaches": breaches, "snapshot": _snapshot(con, now=now)}
+            con.execute("COMMIT")
+            return result
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def list_admissions(db_path: str | Path, *, origin: str) -> list[dict[str, Any]]:
+    """Read-only view of one origin's admissions with their quote lifecycle.
+
+    `filled` counts contracts per side from the recorded FILL events citing each
+    admission (the ledger is the source; no second counter), `gaps` counts GAP
+    observations, `last_observed_at` is the latest observation evaluated."""
+    origin = _parse_id(origin, field="origin")
+    path = Path(db_path)
+    with _connect(path) as con:
+        rows = con.execute(
+            "SELECT admission_key, thesis_id, position_key, risk_cents, proposed_at, decision, "
+            "reservation_key, evidence_json, activated_at, activation_observation, "
+            "activation_observed_at, withdrawn_at, withdraw_reason "
+            "FROM simulation_admissions WHERE origin = ? ORDER BY proposed_at, admission_key",
+            (origin,),
+        ).fetchall()
+        out = []
+        for (
+            key, thesis, position_key, risk, proposed_at, decision, reservation_key, evidence,
+            activated_at, act_obs, act_at, withdrawn_at, withdraw_reason,
+        ) in rows:
+            filled = dict(con.execute(
+                "SELECT side, COALESCE(SUM(count), 0) FROM simulation_events "
+                "WHERE admission_key = ? AND kind = 'FILL' GROUP BY side",
+                (key,),
+            ).fetchall())
+            gaps, last_seen = con.execute(
+                "SELECT COALESCE(SUM(outcome = 'GAP'), 0), MAX(observed_at) "
+                "FROM simulation_quote_observations WHERE admission_key = ?",
+                (key,),
+            ).fetchone()
+            out.append({
+                "admission_key": key,
+                "thesis_id": thesis,
+                "position_key": position_key,
+                "risk_cents": risk,
+                "proposed_at": proposed_at,
+                "decision": decision,
+                "reservation_key": reservation_key,
+                "reservation_active": _reservation_active(con, reservation_key),
+                "evidence": json.loads(evidence) if evidence is not None else None,
+                "activated_at": activated_at,
+                "activation_observation": act_obs,
+                "activation_observed_at": act_at,
+                "withdrawn_at": withdrawn_at,
+                "withdraw_reason": withdraw_reason,
+                "filled": {"buy": filled.get("buy", 0), "sell": filled.get("sell", 0)},
+                "gaps": gaps,
+                "last_observed_at": last_seen,
+            })
+        return out
 
 
 def get_snapshot(db_path: str | Path, *, now: datetime | None = None) -> dict[str, Any]:

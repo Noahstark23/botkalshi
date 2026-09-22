@@ -200,10 +200,15 @@ class PolicyDecisionTests(AdmissionTestCase):
         self.admit("p1", 100, position="MKT")
         self.fill("f1", "buy", 50, admission="p1", position="MKT")
         closed = self.fill("f2", "sell", 60, position="MKT")
-        self.assertEqual(closed["snapshot"]["active_reservations"], [])
-        self.assertEqual(closed["snapshot"]["open_risk_usd"], "0.00")
-        self.assertEqual(closed["snapshot"]["today_new_risk_usd"], "1.00")
+        # ⚠️ CAMBIO SEMÁNTICO DELIBERADO (dictamen CTO, ruta M5): flat no libera la reserva
+        # de una cotización todavía pendiente — puede volver a llenarse.
+        self.assertEqual(self.active_reservations(), {"adm:p1": "1.00"})
         self.assertEqual(closed["snapshot"]["realized_pnl_usd"], "0.08")
+        done = bank.withdraw_admission(self.db, admission_key="p1", now=NOW)
+        self.assertIs(done["released"], True)
+        self.assertEqual(done["snapshot"]["active_reservations"], [])
+        self.assertEqual(done["snapshot"]["open_risk_usd"], "0.00")
+        self.assertEqual(done["snapshot"]["today_new_risk_usd"], "1.00")
 
     def test_weekly_pause_uses_the_accounting_week_of_the_fact(self):
         self.realize_loss("LOSS", 99, 13, at=MONDAY)  # -12.87 realized on Monday
@@ -366,13 +371,40 @@ class FillByAdmissionTests(AdmissionTestCase):
             [{"event_key": "f3", "origin": "M5", "position_key": "MKT", "breach": "ADMISSION_EXCEEDED"}],
         )
 
-    def test_fill_after_the_position_closed_cannot_reuse_the_admission(self):
+    def test_flat_position_keeps_the_pending_quote_reservation(self):
+        """⚠️ CAMBIO SEMÁNTICO DELIBERADO (dictamen CTO): «No liberes riesgo de cotizaciones
+        pendientes solo porque la posición esté plana». The quote can fill again; that
+        fill is covered by the SAME admission, cumulatively (0.51 + 0.31 ≤ 1.00)."""
         self.admit("p1", 100, position="MKT")
         self.fill("f1", "buy", 50, admission="p1", position="MKT")
-        self.fill("f2", "sell", 55, position="MKT")  # flat → reservation released
+        flat = self.fill("f2", "sell", 55, position="MKT")
+        self.assertEqual(flat["snapshot"]["reserved_usd"], "1.00")
+        reopened = self.fill("f3", "buy", 30, admission="p1", position="MKT")
+        self.assertIsNone(reopened["breach"])
+        self.assertEqual(reopened["snapshot"]["unreserved_open_exposure_usd"], "0.00")
+
+    def test_fill_after_withdrawn_and_flat_cannot_reuse_the_admission(self):
+        self.admit("p1", 100, position="MKT")
+        self.fill("f1", "buy", 50, admission="p1", position="MKT")
+        self.fill("f2", "sell", 55, position="MKT")
+        self.assertIs(bank.withdraw_admission(self.db, admission_key="p1", now=NOW)["released"], True)
         reopened = self.fill("f3", "buy", 30, admission="p1", position="MKT")
         self.assertEqual(reopened["breach"], "ADMISSION_EXCEEDED")
         self.assertEqual(reopened["snapshot"]["unreserved_open_exposure_usd"], "0.30")
+
+    def test_withdrawn_quote_with_open_fill_releases_when_it_goes_flat(self):
+        self.admit("p1", 100, position="MKT")
+        self.fill("f1", "buy", 50, admission="p1", position="MKT")
+        held = bank.withdraw_admission(self.db, admission_key="p1", now=NOW)
+        self.assertEqual((held["released"], held["reservation_active"]), (False, True))
+        closed = self.fill("f2", "sell", 55, position="MKT")
+        self.assertEqual(closed["snapshot"]["active_reservations"], [])
+
+    def test_settlement_ends_a_pending_quote_reservation(self):
+        self.admit("p1", 100, position="MKT")
+        self.fill("f1", "buy", 50, admission="p1", position="MKT")
+        settled = self.settle("s1", 100, position="MKT")
+        self.assertEqual(settled["snapshot"]["active_reservations"], [])
 
     def test_withdrawal_after_a_partial_fill_keeps_the_reservation(self):
         self.admit("p1", 100, position="MKT")
