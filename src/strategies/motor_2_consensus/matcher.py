@@ -29,7 +29,13 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # research service: /usr/bin/python3 without the venv.
+    # Only series_sport_compatible logs; the matching itself is pure. Coolify has loguru.
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 # Convención de fechas de Kalshi (exchange US): el datestamp del event_key es la fecha
 # LOCAL del Este. Un juego a las 10pm ET es "hoy" en el key aunque en UTC ya sea mañana.
