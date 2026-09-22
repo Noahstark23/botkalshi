@@ -1,5 +1,5 @@
 """
-Multiplicador maker POR SERIE — el mecanismo, no el valor en disputa.
+Multiplicador maker POR SERIE — el mecanismo del helper legacy, no una norma del exchange.
 
 POR QUÉ EXISTE (2026-08-26): `maker_fee_multiplier_for_ticker` entró en #250 con CERO
 tests, en un repo con ~1.600. Decide si el fee de MLB se parte al medio, y con eso si la
@@ -7,17 +7,29 @@ zona muerta 38¢-62¢ de `tablero_gate.py` existe o no — o sea, si M5 tiene h�
 banda donde cotiza. Una función de dinero sin cobertura es deuda, y la lección de la fee
 ~100× subestimada (2026-07-01, invalidó meses de análisis) dice exactamente cuánto cuesta.
 
-⚠️ LO QUE ESTE ARCHIVO NO HACE: no valida que M=0.5 sea el valor CORRECTO para KXMLBGAME.
-Ese dato está EN DISPUTA — el código lo afirma desde el 2026-08-07 con timestamp al
-milisegundo, pero el PDF oficial que verificamos el 13-ago (POSTERIOR a esa fecha) dice
-`KXMLBGAME | 1 | 1`. Hasta que aparezca la fuente del 0.5, pinear ese valor sería fijar
-una afirmación sin verificar. Lo que sí se pinea acá es el MECANISMO, que es correcto
-gane quien gane la disputa: aislamiento por serie, corte temporal exacto, y manejo de
-zonas horarias.
+FUENTES DEL 0.5, fechadas y atribuidas (corrección 2026-09-22 — la versión original de este
+docstring trataba el valor como una pregunta abierta sin fuente, y ya no lo es):
+  - 2026-09-22, lectura pública hecha por ChatGPT (no por esta sesión, cuyo proxy de salida
+    denegó la conexión): `GET /trade-api/v2/series/KXMLBGAME` → `fee_multiplier: 0.5`,
+    `fee_type: quadratic_with_maker_fees`, `last_updated_ts: 2026-09-16T00:29:24.467894Z`.
+  - 2026-08-13, lectura del PDF oficial del fee schedule: fila `KXMLBGAME | 1 | 1`. Se
+    conserva como referencia histórica; la respuesta actual no prueba que ese documento
+    nunca haya sido válido.
 
-DIRECCIÓN DEL RIESGO, para cuando se resuelva: si el multiplicador real es 1 y usamos
-0.5, SUBESTIMAMOS la fee → sobreestimamos la rentabilidad → el gate podría graduar una
-estrategia perdedora. El error en esa dirección cuesta plata; en la otra, solo demora.
+Lo que esas fuentes NO establecen: qué multiplicador regía en cada fecha entre medio
+(`last_updated_ts` no es fecha de entrada en vigor), ni el de cada EVENTO — Kalshi documenta
+overrides por evento (`fee_multiplier_override`). El 0.5 no es universal, permanente ni
+automático para todo evento de la serie. Resolver la comisión por evento y momento es otra
+unidad; reproducir la comisión ya grabada de un fill histórico es otra más.
+
+⚠️ LO QUE ESTE ARCHIVO NO HACE: no afirma que el corte fijo del helper (0.5 desde
+2026-08-07T04:59:45.131Z) sea la tarifa vigente de cada evento en cada momento. Pinea el
+MECANISMO del helper legacy: aislamiento por serie, corte temporal exacto, zonas horarias y
+fallback conservador. Ninguna expectativa numérica se cambió en esta corrección.
+
+DIRECCIÓN DEL RIESGO: aplicar 0.5 donde regía 1 SUBESTIMA la fee → sobreestima la
+rentabilidad → el gate podría graduar una estrategia perdedora. El error en esa dirección
+cuesta plata; en la otra, solo demora.
 """
 
 from __future__ import annotations
