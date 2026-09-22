@@ -64,6 +64,14 @@ class Reader:
         self.opener = build_opener(ProxyHandler({}), NoRedirect(), HTTPSHandler(context=ssl.create_default_context()))
 
     def get_json(self, origin: str, path: str, params: dict[str, str | int] | None = None) -> dict | list:
+        return self.get_json_with_headers(origin, path, params)[0]
+
+    def get_json_with_headers(
+        self, origin: str, path: str, params: dict[str, str | int] | None = None,
+        header_names: tuple[str, ...] = (),
+    ) -> tuple[dict | list, dict[str, str]]:
+        """Same allowlisted, redirect-free read; also returns ONLY the named response
+        headers (e.g. a provider's usage counters). Errors never echo the URL."""
         parsed = urlsplit(origin)
         if parsed.scheme != "https" or parsed.hostname not in {"api.elections.kalshi.com", "api.the-odds-api.com"}:
             raise ResearchError("origin not allowlisted")
@@ -75,9 +83,13 @@ class Reader:
         try:
             with self.opener.open(url, timeout=15) as response:
                 raw = response.read(MAX_BODY + 1)
+                headers = {
+                    name: value[:64] for name in header_names
+                    if (value := response.headers.get(name)) is not None
+                }
             if len(raw) > MAX_BODY:
                 raise ResearchError("response too large")
-            return json.loads(raw)
+            return json.loads(raw), headers
         except HTTPError as exc:
             raise ResearchError(f"provider HTTP {exc.code}") from None
         except (URLError, TimeoutError, OSError, ValueError, UnicodeError) as exc:

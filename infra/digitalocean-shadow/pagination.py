@@ -163,6 +163,11 @@ def collect_paginated(
             "ticker": ticker,
             "event_ticker": market.get("event_ticker") if isinstance(market.get("event_ticker"), str) else None,
             "status": market.get("status") if isinstance(market.get("status"), str) else None,
+            # The outcome name M2's matcher crosses against the sportsbook feed (M5 fair).
+            "yes_sub_title": (
+                market["yes_sub_title"][:100]
+                if isinstance(market.get("yes_sub_title"), str) else None
+            ),
             "close_time": close_at.isoformat(),
             "book_observed_at": book_observed_at.isoformat(),
             "levels": sanitize_levels(book),
