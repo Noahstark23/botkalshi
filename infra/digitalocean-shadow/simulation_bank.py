@@ -49,12 +49,15 @@ Contract:
 from __future__ import annotations
 
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 import json
 from pathlib import Path
 import re
 import sqlite3
 from typing import Any
+from zoneinfo import ZoneInfo
+
+import risk_policy
 
 SCHEMA_VERSION = "botkalshi-simulation-bank-v1"
 
@@ -189,6 +192,14 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
       reservation_key TEXT,
       evidence_json TEXT,
       created_at TEXT NOT NULL,
+      -- C2 (2026-09-22): WHEN the fact happened, not when the row was imported. Daily
+      -- and weekly periods are derived from this; reprocessing a historical event must
+      -- never turn it into today's new risk.
+      occurred_at TEXT NOT NULL,
+      admission_key TEXT,
+      -- A recorded fill that the policy did not cover. Recorded, never erased: hiding an
+      -- adverse observation would fabricate a favorable history.
+      breach TEXT CHECK (breach IS NULL OR breach IN ('UNADMITTED', 'ADMISSION_EXCEEDED')),
       -- Defense in depth for the recording contract. NOT the guarantee: a file whose
       -- rows escaped these CHECKs is still refused on replay by _validate_stored_row.
       CHECK (
@@ -202,10 +213,43 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         (kind = 'SETTLEMENT'
           AND side IS NULL AND price_cents IS NULL AND count IS NULL
           AND fee_cents IS NULL AND reservation_key IS NULL
+          AND admission_key IS NULL AND breach IS NULL
           AND typeof(payout_cents) = 'integer' AND payout_cents IN (0, 100))
       )
     );
+    -- C2/7.2 (2026-09-22): ADMISSION BEFORE QUOTING. One row per proposal identity, with
+    -- the decision taken inside the same transaction that reserves its risk. A decision
+    -- is final for its key: replaying the identity returns it; it is never re-evaluated
+    -- later to slip past a cap that has since freed up, and a new tick cannot mint a new
+    -- identity for the same proposal without it being a different proposal.
+    CREATE TABLE IF NOT EXISTS simulation_admissions (
+      admission_key TEXT PRIMARY KEY,
+      origin TEXT NOT NULL,
+      thesis_id TEXT NOT NULL,
+      position_key TEXT NOT NULL,
+      risk_cents INTEGER NOT NULL CHECK (typeof(risk_cents) = 'integer' AND risk_cents > 0),
+      proposed_at TEXT NOT NULL,
+      risk_day TEXT NOT NULL,
+      decision TEXT NOT NULL CHECK (decision IN ('ADMITTED', 'REJECTED')),
+      reasons_json TEXT NOT NULL,
+      reservation_key TEXT,
+      policy_version TEXT NOT NULL,
+      evidence_json TEXT,
+      created_at TEXT NOT NULL,
+      CHECK ((decision = 'ADMITTED') = (reservation_key IS NOT NULL))
+    );
     """)
+    event_columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_events)")}
+    for column in ("occurred_at", "admission_key", "breach"):
+        if column not in event_columns:
+            # A file created before C2 gains the column in place. Its old rows get NULL
+            # occurred_at, which the replay REFUSES (a fact without a date cannot be
+            # assigned to a period) — never silently dated "now".
+            try:
+                con.execute(f"ALTER TABLE simulation_events ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
     columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_reservations)").fetchall()}
     if "evidence_json" not in columns:
         try:
@@ -253,6 +297,15 @@ def _connect(db_path: Path):
 # --------------------------------------------------------------------------------------
 
 ACCOUNTING_POLICY = "FIFO_PRICE_LOTS_FEES_EXPENSED_WHEN_PAID_V1"
+# Accounting periods (C2, 2026-09-22): daily new-risk and weekly P&L are bucketed by the
+# FACT date in this zone — the same zone bank_batch_review already uses. Weeks start
+# Monday. Never by import time.
+ACCOUNTING_ZONE = ZoneInfo("America/Los_Angeles")
+# A NEW proposal must be current. An old one would spend budget on a day it does not
+# belong to; a future one is a clock or identity error. A replay of an already-decided
+# key is exempt — it returns its stored decision whatever its age.
+MAX_PROPOSAL_AGE = timedelta(minutes=5)
+MAX_PROPOSAL_FUTURE_SKEW = timedelta(seconds=60)
 _SIDES = ("buy", "sell")
 _SETTLEMENT_PAYOUTS = (0, 100)
 _MIN_PRICE_CENTS = 1
@@ -272,6 +325,23 @@ class _Position:
 
     def net(self) -> int:
         return sum(sign * qty for sign, _price, qty in self.lots)
+
+    def worst_case_cents(self) -> int:
+        """Maximum further loss of the open lots: a long YES loses its price, a short
+        YES loses (100 - price), per contract."""
+        return sum((price if sign > 0 else 100 - price) * qty for sign, price, qty in self.lots)
+
+
+def _opening_risk_cents(pos: _Position, *, side: str, price: int, count: int, fee: int) -> int:
+    """Worst-case risk a fill ADDS: only the quantity that opens (after FIFO-closing the
+    opposite lots), plus its fee. A pure close adds none. Same formula as the M5 fill
+    review (buy: price*count + fee; sell: (100-price)*count + fee)."""
+    sign = 1 if side == "buy" else -1
+    closable = sum(qty for lot_sign, _p, qty in pos.lots if lot_sign == -sign)
+    opening = max(0, count - closable)
+    if opening == 0:
+        return 0
+    return (price if side == "buy" else 100 - price) * opening + fee
 
 
 def _apply_fill(pos: _Position, *, side: str, price: int, count: int, fee: int) -> None:
@@ -303,22 +373,69 @@ def _apply_settlement(pos: _Position, *, payout: int) -> None:
     pos.settled = True
 
 
-_EVENT_COLUMNS = (
-    "origin, position_key, kind, side, price_cents, count, fee_cents, payout_cents, "
-    "reservation_key, evidence_json"
+# Input payload of an event, in order. Replay of an event_key compares exactly these.
+_EVENT_FIELDS = (
+    "origin",
+    "position_key",
+    "kind",
+    "side",
+    "price_cents",
+    "count",
+    "fee_cents",
+    "payout_cents",
+    "reservation_key",
+    "evidence_json",
+    "occurred_at",
+    "admission_key",
 )
+_EVENT_COLUMNS = ", ".join(_EVENT_FIELDS)
 
 
 def _apply_row(pos: _Position, kind: str, side, price, count, fee, payout, reservation_key) -> None:
     if kind == "FILL":
         _apply_fill(pos, side=side, price=price, count=count, fee=fee)
-        if reservation_key is not None:
+        # Partial fills of one admitted quote cite the SAME reservation: link it once.
+        if reservation_key is not None and reservation_key not in pos.reservation_keys:
             pos.reservation_keys.append(reservation_key)
     else:
         _apply_settlement(pos, payout=payout)
 
 
-def _validate_stored_row(kind, side, price, count, fee, payout, reservation_key, origin, key):
+def _parse_moment(value: Any, *, field: str) -> str:
+    """An AWARE datetime → canonical UTC ISO string. Naive times are refused: a fact
+    whose zone is unknown cannot be placed in a Los Angeles day."""
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise SimulationBankValidationError(f"{field} must be a timezone-aware datetime")
+    return value.astimezone(UTC).isoformat()
+
+
+def _read_moment(text: Any, *, field: str) -> datetime:
+    if not isinstance(text, str):
+        raise SimulationBankValidationError(f"{field} missing: a fact without a date")
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SimulationBankValidationError(f"{field} is not an ISO timestamp") from exc
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise SimulationBankValidationError(f"{field} is not timezone-aware")
+    return moment
+
+
+def _local_day(moment: datetime) -> date:
+    return moment.astimezone(ACCOUNTING_ZONE).date()
+
+
+def _week_start(day: date) -> date:
+    return day - timedelta(days=day.weekday())
+
+
+_BREACHES = ("UNADMITTED", "ADMISSION_EXCEEDED")
+
+
+def _validate_stored_row(
+    kind, side, price, count, fee, payout, reservation_key, origin, key,
+    occurred_at=None, admission_key=None, breach=None,
+):
     """The SAME contract `record_fill` / `record_settlement` enforce, applied on replay.
 
     CTO review 2026-09-22: `_fold` used to feed stored rows straight into the
@@ -328,6 +445,7 @@ def _validate_stored_row(kind, side, price, count, fee, payout, reservation_key,
     """
     _parse_id(origin, field="origin")
     _parse_id(key, field="position_key")
+    _read_moment(occurred_at, field="occurred_at")
     if kind == "FILL":
         if side not in _SIDES:
             raise SimulationBankValidationError("side must be 'buy' or 'sell'")
@@ -338,40 +456,117 @@ def _validate_stored_row(kind, side, price, count, fee, payout, reservation_key,
             raise SimulationBankValidationError("a FILL carries no payout")
         if reservation_key is not None:
             _parse_id(reservation_key, field="reservation_key")
+        if admission_key is not None:
+            _parse_id(admission_key, field="admission_key")
+        if breach is not None and breach not in _BREACHES:
+            raise SimulationBankValidationError(f"unknown breach {breach!r}")
     elif kind == "SETTLEMENT":
         if type(payout) is not int or payout not in _SETTLEMENT_PAYOUTS:
             raise SimulationBankValidationError("payout_cents must be 0 or 100")
-        if any(v is not None for v in (side, price, count, fee, reservation_key)):
+        extra = (side, price, count, fee, reservation_key, admission_key, breach)
+        if any(v is not None for v in extra):
             raise SimulationBankValidationError("a SETTLEMENT carries only its payout")
     else:
         raise SimulationBankValidationError(f"unknown event kind {kind!r}")
 
 
-def _fold(con: sqlite3.Connection) -> dict[tuple[str, str], _Position]:
-    """Replay every stored event in seq order. Deterministic. Each row is validated
-    against the recording contract BEFORE it touches the projection; the first invalid
-    row raises, naming its seq, and no state (partial or otherwise) is returned."""
+def _fold_full(con: sqlite3.Connection) -> tuple[dict[tuple[str, str], _Position], list[dict]]:
+    """Replay every stored event in seq order and return (positions, history).
+
+    Deterministic. Each row is validated against the recording contract BEFORE it
+    touches the projection; the first invalid row raises, naming its seq, and no state
+    (partial or otherwise) is returned. `history` has one entry per event with its
+    FACT date, the realized P&L it produced and the risk it opened — the basis of the
+    daily and weekly periods."""
     positions: dict[tuple[str, str], _Position] = {}
+    history: list[dict] = []
     rows = con.execute(
-        "SELECT seq, origin, position_key, kind, side, price_cents, count, fee_cents, "
-        "payout_cents, reservation_key FROM simulation_events ORDER BY seq"
+        "SELECT seq, event_key, origin, position_key, kind, side, price_cents, count, "
+        "fee_cents, payout_cents, reservation_key, occurred_at, admission_key, breach "
+        "FROM simulation_events ORDER BY seq"
     ).fetchall()
-    for seq, origin, position_key, kind, side, price, count, fee, payout, reservation_key in rows:
+    for (
+        seq, event_key, origin, position_key, kind, side, price, count, fee, payout,
+        reservation_key, occurred_at, admission_key, breach,
+    ) in rows:
         try:
             _validate_stored_row(
-                kind, side, price, count, fee, payout, reservation_key, origin, position_key
+                kind, side, price, count, fee, payout, reservation_key, origin,
+                position_key, occurred_at, admission_key, breach,
             )
             pos = positions.setdefault((origin, position_key), _Position())
+            before = pos.realized_cents
+            opening = (
+                _opening_risk_cents(pos, side=side, price=price, count=count, fee=fee)
+                if kind == "FILL" else 0
+            )
             _apply_row(pos, kind, side, price, count, fee, payout, reservation_key)
         except (SimulationBankValidationError, TypeError) as exc:
             raise SimulationBankIntegrityError(
                 f"stored event seq={seq} does not replay: {exc}"
             ) from exc
-    return positions
+        history.append({
+            "seq": seq,
+            "event_key": event_key,
+            "origin": origin,
+            "position_key": position_key,
+            "kind": kind,
+            "occurred_at": _read_moment(occurred_at, field="occurred_at"),
+            "realized_delta_cents": pos.realized_cents - before,
+            "opening_risk_cents": opening,
+            "reservation_key": reservation_key,
+            "admission_key": admission_key,
+            "breach": breach,
+        })
+    return positions, history
+
+
+def _with_coverage(history: list[dict], amounts: dict[str, int]) -> list[dict]:
+    """Each FILL's opening risk split into covered / uncovered, in seq order.
+
+    A reservation covers the CUMULATIVE opening risk of the fills linked to it, up to
+    its amount — partial fills of one admitted quote draw from the same budget, never
+    twice. Whatever exceeds it (or has no linked reservation) is uncovered."""
+    used: dict[str, int] = {}
+    out = []
+    for h in history:
+        opening = h["opening_risk_cents"]
+        key = h["reservation_key"]
+        covered = 0
+        if key is not None and opening:
+            covered = min(opening, max(0, amounts.get(key, 0) - used.get(key, 0)))
+            used[key] = used.get(key, 0) + covered
+        out.append(dict(h, uncovered_risk_cents=opening - covered))
+    return out
+
+
+def _fold(con: sqlite3.Connection) -> dict[tuple[str, str], _Position]:
+    return _fold_full(con)[0]
 
 
 def _realized_cents(positions: dict[tuple[str, str], _Position]) -> int:
     return sum(pos.realized_cents for pos in positions.values())
+
+
+def _active_reservation_amounts(con: sqlite3.Connection) -> dict[str, int]:
+    return dict(con.execute(
+        "SELECT idempotency_key, amount_cents FROM simulation_reservations WHERE status = 'ACTIVE'"
+    ).fetchall())
+
+
+def _unreserved_exposure_cents(
+    positions: dict[tuple[str, str], _Position], active: dict[str, int]
+) -> int:
+    """Open worst-case NOT covered by an active reservation linked to the position.
+
+    A fill recorded without admission (a breach) still carries real simulated risk; if
+    the admission path ignored it, the next proposal would see capacity that does not
+    exist."""
+    total = 0
+    for pos in positions.values():
+        covered = sum(active.get(key, 0) for key in pos.reservation_keys)
+        total += max(0, pos.worst_case_cents() - covered)
+    return total
 
 
 def _position_view(key: tuple[str, str], pos: _Position) -> dict[str, Any]:
@@ -390,7 +585,65 @@ def _position_view(key: tuple[str, str], pos: _Position) -> dict[str, Any]:
     }
 
 
-def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
+def _period_view(
+    con: sqlite3.Connection,
+    positions: dict[tuple[str, str], _Position],
+    history: list[dict],
+    *,
+    capital_cents: int,
+    now: datetime,
+) -> dict[str, Any]:
+    """Everything the admission policy needs, computed ONE way for both admission and
+    snapshot. Periods come from FACT dates (occurred_at / proposed_at) in
+    ACCOUNTING_ZONE, never from import time."""
+    today = _local_day(now)
+    week = _week_start(today)
+    active = _active_reservation_amounts(con)
+    reserved = sum(active.values())
+    unreserved = _unreserved_exposure_cents(positions, active)
+    realized = _realized_cents(positions)
+    week_realized = sum(
+        h["realized_delta_cents"] for h in history if _week_start(_local_day(h["occurred_at"])) == week
+    )
+    admitted_today = con.execute(
+        "SELECT COALESCE(SUM(risk_cents), 0) FROM simulation_admissions "
+        "WHERE decision = 'ADMITTED' AND risk_day = ?",
+        (today.isoformat(),),
+    ).fetchone()[0]
+    # Risk opened today by fills the policy did NOT admit also consumed today's budget:
+    # all of it for an uncovered fill, the excess over its reservation for a fill that
+    # outgrew it. An admitted-and-covered fill adds nothing (counted once, at admission).
+    amounts = dict(con.execute(
+        "SELECT idempotency_key, amount_cents FROM simulation_reservations"
+    ).fetchall())
+    breached_today = sum(
+        h["uncovered_risk_cents"] for h in _with_coverage(history, amounts)
+        if _local_day(h["occurred_at"]) == today
+    )
+    return {
+        "today": today,
+        "week_start": week,
+        "reserved_cents": reserved,
+        "unreserved_cents": unreserved,
+        "open_risk_cents": reserved + unreserved,
+        "realized_cents": realized,
+        "week_realized_cents": week_realized,
+        "today_new_risk_cents": admitted_today + breached_today,
+        "capital_now_cents": capital_cents + realized,
+    }
+
+
+def _cents_to_micros(cents: int) -> int:
+    return cents * risk_policy.CENT
+
+
+def _micros_to_cents(micros: int) -> int:
+    # Policy caps are whole cents by construction (risk_policy floors to the cent).
+    return micros // risk_policy.CENT
+
+
+def _snapshot(con: sqlite3.Connection, *, now: datetime | None = None) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
     row = con.execute(
         "SELECT initial_capital_cents, revision, created_at, updated_at "
         "FROM simulation_bank WHERE id = 1"
@@ -398,9 +651,6 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
     if row is None:
         raise SimulationBankNotInitializedError("bank has not been initialized")
     capital_cents, revision, created_at, updated_at = row
-    reserved_cents = con.execute(
-        "SELECT COALESCE(SUM(amount_cents), 0) FROM simulation_reservations WHERE status = 'ACTIVE'"
-    ).fetchone()[0]
     active = con.execute(
         "SELECT idempotency_key, origin, cycle_id, amount_cents, created_at, evidence_json "
         "FROM simulation_reservations WHERE status = 'ACTIVE' "
@@ -418,11 +668,10 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
             # rows that predate the evidence_json migration on this file).
             "evidence": json.loads(evidence_json) if evidence_json is not None else None,
         })
-    positions = _fold(con)
-    realized_cents = _realized_cents(positions)
-    # capital = initial fictional capital + realized P&L. Reserved is an earmark on it,
-    # not a loss. With no events this is exactly the pre-accounting snapshot.
-    capital_now_cents = capital_cents + realized_cents
+    positions, history = _fold_full(con)
+    period = _period_view(con, positions, history, capital_cents=capital_cents, now=now)
+    capital_now_cents = period["capital_now_cents"]
+    limits = risk_policy.policy_limits(_cents_to_micros(max(0, capital_now_cents)))
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "SIMULATION_ONLY",
@@ -431,16 +680,34 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         "order_capability_present": False,
         "real_entry_eligible": False,
         "initial_capital_usd": _usd(capital_cents),
-        "realized_pnl_usd": _usd(realized_cents),
+        # capital = initial fictional capital + realized P&L. Reserved is an earmark on
+        # it, not a loss. With no events this is exactly the pre-accounting snapshot.
+        "realized_pnl_usd": _usd(period["realized_cents"]),
         "capital_usd": _usd(capital_now_cents),
-        "reserved_usd": _usd(reserved_cents),
-        "available_usd": _usd(capital_now_cents - reserved_cents),
+        "reserved_usd": _usd(period["reserved_cents"]),
+        "available_usd": _usd(capital_now_cents - period["reserved_cents"]),
         "accounting_policy": ACCOUNTING_POLICY,
+        "accounting_zone": str(ACCOUNTING_ZONE),
+        "risk_day": period["today"].isoformat(),
+        "week_start": period["week_start"].isoformat(),
+        "week_realized_pnl_usd": _usd(period["week_realized_cents"]),
+        "today_new_risk_usd": _usd(period["today_new_risk_cents"]),
+        "open_risk_usd": _usd(period["open_risk_cents"]),
+        "unreserved_open_exposure_usd": _usd(period["unreserved_cents"]),
+        "risk_policy": {
+            "version": risk_policy.POLICY_VERSION,
+            **{k: _usd(_micros_to_cents(v)) for k, v in limits.items()},
+        },
         "revision": revision,
         "created_at": created_at,
         "updated_at": updated_at,
         "active_reservations": active_reservations,
         "positions": [_position_view(key, positions[key]) for key in sorted(positions)],
+        "breaches": [
+            {k: h[k] for k in ("event_key", "origin", "position_key", "breach")}
+            for h in history
+            if h["breach"] is not None
+        ],
     }
 
 
@@ -773,16 +1040,53 @@ def _check_reservation_link(con: sqlite3.Connection, key: str, origin: str) -> N
         raise SimulationBankValidationError("RESERVATION_ALREADY_LINKED: one reservation backs one fill")
 
 
-def _record_event(db_path: str | Path, event: dict[str, Any]) -> dict[str, Any]:
+def _check_moment_not_future(moment_text: str, now: datetime, *, field: str) -> None:
+    if _read_moment(moment_text, field=field) > now + MAX_PROPOSAL_FUTURE_SKEW:
+        raise SimulationBankValidationError(f"{field} is in the future")
+
+
+def _resolve_admission(con: sqlite3.Connection, event: dict[str, Any]) -> dict[str, Any] | None:
+    """The admission a FILL cites, checked against the fill's identity. None if uncited."""
+    key = event["admission_key"]
+    if key is None:
+        return None
+    row = con.execute(
+        "SELECT origin, position_key, decision, reservation_key, risk_cents "
+        "FROM simulation_admissions WHERE admission_key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        raise SimulationBankValidationError("UNKNOWN_ADMISSION: fill cites an admission that does not exist")
+    origin, position_key, decision, reservation_key, risk_cents = row
+    if (origin, position_key) != (event["origin"], event["position_key"]):
+        # Contradictory identity is invalid evidence, not a breach to record.
+        raise SimulationBankValidationError("ADMISSION_IDENTITY_MISMATCH")
+    return {
+        "decision": decision,
+        "reservation_key": reservation_key,
+        "risk_cents": risk_cents,
+    }
+
+
+def _record_event(
+    db_path: str | Path, event: dict[str, Any], *, now: datetime | None = None
+) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
     path = Path(db_path)
-    payload = tuple(event[col.strip()] for col in _EVENT_COLUMNS.split(","))
+    # When the fill arrives by admission, its reservation is DERIVED from the admission
+    # and is not part of what the caller said — so replay compares the caller's fields.
+    compared = tuple(
+        f for f in _EVENT_FIELDS
+        if not (f == "reservation_key" and event["admission_key"] is not None)
+    )
+    payload = tuple(event[f] for f in compared)
     with _connect(path) as con:
         con.execute("BEGIN IMMEDIATE")
         try:
             if con.execute("SELECT 1 FROM simulation_bank WHERE id = 1").fetchone() is None:
                 raise SimulationBankNotInitializedError("bank has not been initialized")
             existing = con.execute(
-                f"SELECT {_EVENT_COLUMNS} FROM simulation_events WHERE event_key = ?",
+                f"SELECT {', '.join(compared)} FROM simulation_events WHERE event_key = ?",
                 (event["event_key"],),
             ).fetchone()
             if existing is not None:
@@ -796,18 +1100,67 @@ def _record_event(db_path: str | Path, event: dict[str, Any]) -> dict[str, Any]:
                 result = {
                     "outcome": "REPLAY",
                     "position": _position_view(key, positions[key]),
-                    "snapshot": _snapshot(con),
+                    "snapshot": _snapshot(con, now=now),
                 }
                 con.execute("COMMIT")
                 return result
-            if event["kind"] == "FILL" and event["reservation_key"] is not None:
-                _check_reservation_link(con, event["reservation_key"], event["origin"])
-            # Validate against the CURRENT derived state before writing anything.
-            positions = _fold(con)
+            _check_moment_not_future(event["occurred_at"], now, field="occurred_at")
+            positions, history = _fold_full(con)
             key = (event["origin"], event["position_key"])
             if event["kind"] == "SETTLEMENT" and key not in positions:
                 raise SimulationBankValidationError("NOTHING_TO_SETTLE: no such position")
             pos = positions.setdefault(key, _Position())
+
+            linked_key = event["reservation_key"]
+            covered_cents: int | None = None
+            breach: str | None = None
+            if event["kind"] == "FILL":
+                admission = _resolve_admission(con, event)
+                if admission is not None and linked_key is not None:
+                    raise SimulationBankValidationError(
+                        "a fill cites either an admission or a reservation, not both"
+                    )
+                if admission is not None:
+                    # Admission path. Its reservation covers the CUMULATIVE opening risk
+                    # of the fills citing it, up to what was admitted — while it is still
+                    # ACTIVE. A withdrawn/expired quote, or a position already closed
+                    # (reservation released), leaves the fill RECORDED but uncovered.
+                    if admission["decision"] == "ADMITTED":
+                        res = admission["reservation_key"]
+                        status = con.execute(
+                            "SELECT status FROM simulation_reservations WHERE idempotency_key = ?",
+                            (res,),
+                        ).fetchone()
+                        if status is not None and status[0] == "ACTIVE":
+                            already = sum(
+                                h["opening_risk_cents"] for h in history
+                                if h["admission_key"] == event["admission_key"]
+                            )
+                            linked_key = res
+                            covered_cents = max(0, admission["risk_cents"] - already)
+                elif linked_key is not None:
+                    # Legacy path: an explicit reservation, fully validated (must exist,
+                    # be ACTIVE, same origin, not already backing a fill).
+                    _check_reservation_link(con, linked_key, event["origin"])
+                    covered_cents = con.execute(
+                        "SELECT amount_cents FROM simulation_reservations WHERE idempotency_key = ?",
+                        (linked_key,),
+                    ).fetchone()[0]
+                opening = _opening_risk_cents(
+                    pos,
+                    side=event["side"],
+                    price=event["price_cents"],
+                    count=event["count"],
+                    fee=event["fee_cents"],
+                )
+                if opening > 0:
+                    if covered_cents is None:
+                        # Recorded and flagged, never dropped: dropping an adverse fill
+                        # would fabricate a favorable history.
+                        had_admission = admission is not None and admission["decision"] == "ADMITTED"
+                        breach = "ADMISSION_EXCEEDED" if had_admission else "UNADMITTED"
+                    elif opening > covered_cents:
+                        breach = "ADMISSION_EXCEEDED"
             _apply_row(
                 pos,
                 event["kind"],
@@ -816,27 +1169,30 @@ def _record_event(db_path: str | Path, event: dict[str, Any]) -> dict[str, Any]:
                 event["count"],
                 event["fee_cents"],
                 event["payout_cents"],
-                event["reservation_key"],
+                linked_key,
             )
-            now = _now()
+            stored = dict(event, reservation_key=linked_key)
+            written = now.astimezone(UTC).isoformat()
+            columns = ("event_key", *_EVENT_FIELDS, "breach", "created_at")
             con.execute(
-                f"INSERT INTO simulation_events (event_key, {_EVENT_COLUMNS}, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event["event_key"], *payload, now),
+                f"INSERT INTO simulation_events ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                (event["event_key"], *(stored[f] for f in _EVENT_FIELDS), breach, written),
             )
             if not pos.lots:
                 # Flat or settled: the risk earmark ends in the SAME transaction as the
                 # closing event. A crash between them cannot leave freed capital with
                 # no recorded close, nor a recorded close with its capital still held.
-                _release_linked_locked(con, pos.reservation_keys, now)
+                _release_linked_locked(con, pos.reservation_keys, written)
             con.execute(
                 "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
-                (now,),
+                (written,),
             )
             result = {
                 "outcome": "RECORDED",
+                "breach": breach,
                 "position": _position_view(key, pos),
-                "snapshot": _snapshot(con),
+                "snapshot": _snapshot(con, now=now),
             }
             con.execute("COMMIT")
             return result
@@ -855,18 +1211,29 @@ def record_fill(
     price_cents: int,
     count: int,
     fee_cents: int,
+    occurred_at: datetime,
+    admission_key: str | None = None,
     reservation_key: str | None = None,
     evidence: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Record one SIMULATED fill. Idempotent by `event_key`.
 
-    `fee_cents` is the fee of THIS fill as given by the caller — this ledger does not
-    recompute tariffs (that is the fill reviewer's job). `reservation_key`, if given,
-    must be an ACTIVE reservation of the same origin not already backing another fill;
-    it is released when the position becomes flat or settles.
+    `occurred_at` is WHEN the fill happened (aware); periods come from it, never from
+    import time. `fee_cents` is the fee of THIS fill as given — this ledger does not
+    recompute tariffs.
 
-    Returns {"outcome": "RECORDED" | "REPLAY", "position": ..., "snapshot": ...}. Any
-    invalid input or state raises before anything is written.
+    The fill cites the risk that backs it by `admission_key` (C2 path: the admission
+    taken BEFORE quoting) or, legacy, by `reservation_key`. The fill never reserves
+    again: partial fills of one admitted quote draw CUMULATIVELY from the admitted risk
+    (a legacy reservation backs exactly one fill), and the reservation is released when
+    the position is flat or settled. A fill whose opening risk has no admission, cites
+    a rejected, withdrawn or already-released one, or takes the cumulative total past
+    what was admitted is RECORDED with a `breach` flag: adverse observations are never
+    erased to keep the history favorable.
+
+    Returns {"outcome": "RECORDED" | "REPLAY", "breach", "position", "snapshot"}. Invalid
+    input or contradictory identity raises before anything is written.
     """
     if side not in _SIDES:
         raise SimulationBankValidationError("side must be 'buy' or 'sell'")
@@ -884,8 +1251,12 @@ def record_fill(
             None if reservation_key is None else _parse_id(reservation_key, field="reservation_key")
         ),
         "evidence_json": None if evidence is None else _canonical_evidence_json(evidence),
+        "occurred_at": _parse_moment(occurred_at, field="occurred_at"),
+        "admission_key": (
+            None if admission_key is None else _parse_id(admission_key, field="admission_key")
+        ),
     }
-    return _record_event(db_path, event)
+    return _record_event(db_path, event, now=now)
 
 
 def record_settlement(
@@ -895,7 +1266,9 @@ def record_settlement(
     origin: str,
     position_key: str,
     payout_cents: int,
+    occurred_at: datetime,
     evidence: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Record the resolution of a position: 0 or 100 cents per YES contract.
 
@@ -917,12 +1290,246 @@ def record_settlement(
         "payout_cents": payout_cents,
         "reservation_key": None,
         "evidence_json": None if evidence is None else _canonical_evidence_json(evidence),
+        "occurred_at": _parse_moment(occurred_at, field="occurred_at"),
+        "admission_key": None,
     }
-    return _record_event(db_path, event)
+    return _record_event(db_path, event, now=now)
 
 
-def get_snapshot(db_path: str | Path) -> dict[str, Any]:
+# --------------------------------------------------------------------------------------
+# Admission BEFORE quoting (C2/7.2). One economic admission per proposal identity:
+# decision + reservation in ONE transaction, against the ONE policy formula
+# (risk_policy) and the shared state of every origin (M1, M5, Radar...).
+# --------------------------------------------------------------------------------------
+
+_MAX_ADMISSION_KEY_LEN = 120  # room for the "adm:" reservation prefix inside _ID_RE's 128
+_MAX_RISK_CENTS = 100_000_000
+_ADMISSION_FIELDS = ("origin", "thesis_id", "position_key", "risk_cents", "proposed_at", "evidence_json")
+
+
+def _admission_limits(
+    con: sqlite3.Connection, *, thesis_id: str, at: datetime
+) -> dict[str, int]:
+    """Policy caps and headrooms at the proposal's FACT time, in cents."""
+    capital_cents = con.execute(
+        "SELECT initial_capital_cents FROM simulation_bank WHERE id = 1"
+    ).fetchone()[0]
+    positions, history = _fold_full(con)
+    period = _period_view(con, positions, history, capital_cents=capital_cents, now=at)
+    limits = risk_policy.policy_limits(_cents_to_micros(max(0, period["capital_now_cents"])))
+    caps = {k: _micros_to_cents(v) for k, v in limits.items()}
+    thesis_open = con.execute(
+        "SELECT COALESCE(SUM(r.amount_cents), 0) FROM simulation_admissions a "
+        "JOIN simulation_reservations r ON r.idempotency_key = a.reservation_key "
+        "WHERE a.thesis_id = ? AND r.status = 'ACTIVE'",
+        (thesis_id,),
+    ).fetchone()[0]
+    return {
+        **caps,
+        "thesis_open": thesis_open,
+        "open_risk": period["open_risk_cents"],
+        "today_new_risk": period["today_new_risk_cents"],
+        "week_realized": period["week_realized_cents"],
+        "realized": period["realized_cents"],
+        "capital_now": period["capital_now_cents"],
+        "reserved": period["reserved_cents"],
+        "risk_day": period["today"].isoformat(),
+    }
+
+
+def _admission_reasons(lim: dict[str, int], risk: int) -> list[str]:
+    weekly_stop = _micros_to_cents(risk_policy.WEEKLY_STOP)
+    experiment_stop = _micros_to_cents(risk_policy.EXPERIMENT_STOP)
+    reasons = []
+    if lim["week_realized"] <= -weekly_stop:
+        reasons.append("PAUSED_WEEKLY")
+    if lim["realized"] <= -experiment_stop:
+        reasons.append("PAUSED_EXPERIMENT")
+    # Sized FROM the habitual budget: a proposal above it is refused, never bumped to
+    # the unit to make it fit.
+    if risk > lim["habitual"]:
+        reasons.append("SIZE_ABOVE_HABITUAL")
+    if lim["thesis_open"] + risk > lim["max_per_thesis"]:
+        reasons.append("THESIS_CAP")
+    if lim["open_risk"] + risk > lim["max_open"]:
+        reasons.append("OPEN_CAP")
+    if lim["today_new_risk"] + risk > lim["max_daily"]:
+        reasons.append("DAILY_CAP")
+    if experiment_stop + lim["realized"] - lim["open_risk"] - risk < 0:
+        reasons.append("EXPERIMENT_CAP")
+    if lim["capital_now"] - lim["reserved"] - risk < 0:
+        reasons.append("CAPITAL")
+    return reasons
+
+
+def admit_proposal(
+    db_path: str | Path,
+    *,
+    admission_key: str,
+    origin: str,
+    thesis_id: str,
+    position_key: str,
+    risk_cents: int,
+    proposed_at: datetime,
+    evidence: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Decide ONE proposal before it is quoted, and reserve its risk if admitted.
+
+    Read-margin, decide and reserve happen inside ONE BEGIN IMMEDIATE, so two motors can
+    never commit the same budget. `risk_cents` is the proposal's worst-case loss
+    INCLUSIVE of costs for the size it wants to quote, sized from the habitual budget.
+
+    The decision is final for `admission_key`: an identical replay returns it (outcome
+    REPLAY) whatever its age — after a restart too — and never re-evaluates; a changed
+    replay is a conflict. A NEW proposal must be current (proposed_at within
+    MAX_PROPOSAL_AGE, not in the future) — reprocessing a historical proposal must not
+    spend today's budget. Periods use the proposal's FACT date in ACCOUNTING_ZONE.
+
+    Returns {"outcome", "decision": "ADMITTED" | "REJECTED", "reasons", "reservation_key",
+    "limits_usd", "snapshot"}. The result never carries authority.
+    """
+    now = now or datetime.now(UTC)
+    key = _parse_id(admission_key, field="admission_key")
+    if len(key) > _MAX_ADMISSION_KEY_LEN:
+        raise SimulationBankValidationError("admission_key too long")
+    fields = {
+        "origin": _parse_id(origin, field="origin"),
+        "thesis_id": _parse_id(thesis_id, field="thesis_id"),
+        "position_key": _parse_id(position_key, field="position_key"),
+        "risk_cents": _parse_int(risk_cents, field="risk_cents", lo=1, hi=_MAX_RISK_CENTS),
+        "proposed_at": _parse_moment(proposed_at, field="proposed_at"),
+        "evidence_json": None if evidence is None else _canonical_evidence_json(evidence),
+    }
+    path = Path(db_path)
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            if con.execute("SELECT 1 FROM simulation_bank WHERE id = 1").fetchone() is None:
+                raise SimulationBankNotInitializedError("bank has not been initialized")
+            existing = con.execute(
+                f"SELECT {', '.join(_ADMISSION_FIELDS)}, decision, reasons_json, reservation_key "
+                "FROM simulation_admissions WHERE admission_key = ?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing[: len(_ADMISSION_FIELDS)]) != tuple(fields[f] for f in _ADMISSION_FIELDS):
+                    raise SimulationBankConflictError(
+                        "admission_key already used with a different proposal"
+                    )
+                decision, reasons_json, reservation_key = existing[len(_ADMISSION_FIELDS):]
+                result = {
+                    "outcome": "REPLAY",
+                    "decision": decision,
+                    "reasons": json.loads(reasons_json),
+                    "reservation_key": reservation_key,
+                    "snapshot": _snapshot(con, now=now),
+                }
+                con.execute("COMMIT")
+                return result
+            moment = _read_moment(fields["proposed_at"], field="proposed_at")
+            if moment < now - MAX_PROPOSAL_AGE:
+                raise SimulationBankValidationError("PROPOSAL_NOT_CURRENT: too old to admit today")
+            if moment > now + MAX_PROPOSAL_FUTURE_SKEW:
+                raise SimulationBankValidationError("PROPOSAL_IN_FUTURE")
+            lim = _admission_limits(con, thesis_id=fields["thesis_id"], at=moment)
+            reasons = _admission_reasons(lim, fields["risk_cents"])
+            decision = "REJECTED" if reasons else "ADMITTED"
+            reservation_key = None
+            written = now.astimezone(UTC).isoformat()
+            if decision == "ADMITTED":
+                reservation_key = f"adm:{key}"
+                _reserve_locked(
+                    con,
+                    key=reservation_key,
+                    origin_value=fields["origin"],
+                    cycle_value=key,
+                    amount_cents=fields["risk_cents"],
+                    evidence_json=_canonical_evidence_json(
+                        {"admission_key": key, "thesis_id": fields["thesis_id"]}
+                    ),
+                )  # bumps revision
+            else:
+                con.execute(
+                    "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
+                    (written,),
+                )
+            con.execute(
+                "INSERT INTO simulation_admissions (admission_key, origin, thesis_id, position_key, "
+                "risk_cents, proposed_at, risk_day, decision, reasons_json, reservation_key, "
+                "policy_version, evidence_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    key, fields["origin"], fields["thesis_id"], fields["position_key"],
+                    fields["risk_cents"], fields["proposed_at"], lim["risk_day"], decision,
+                    json.dumps(reasons), reservation_key, risk_policy.POLICY_VERSION,
+                    fields["evidence_json"], written,
+                ),
+            )
+            result = {
+                "outcome": "RECORDED",
+                "decision": decision,
+                "reasons": reasons,
+                "reservation_key": reservation_key,
+                "limits_usd": {
+                    k: _usd(lim[k])
+                    for k in ("unit", "habitual", "max_per_thesis", "max_open", "max_daily",
+                              "thesis_open", "open_risk", "today_new_risk")
+                },
+                "snapshot": _snapshot(con, now=now),
+            }
+            con.execute("COMMIT")
+            return result
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def withdraw_admission(
+    db_path: str | Path, *, admission_key: str, now: datetime | None = None
+) -> dict[str, Any]:
+    """The quote was withdrawn or expired: release its reservation if still ACTIVE and
+    no fill cites it yet. Once a (partial) fill cites it, the reservation stays until
+    the position is flat or settled — conservative: the unfilled remainder stays held
+    rather than guessing it. Idempotent. Today's consumed daily budget is NOT given back — the
+    risk was committed when admitted. A rejected admission has nothing to release."""
+    now = now or datetime.now(UTC)
+    key = _parse_id(admission_key, field="admission_key")
+    path = Path(db_path)
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            row = con.execute(
+                "SELECT decision, reservation_key FROM simulation_admissions WHERE admission_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                raise SimulationBankNotFoundError("unknown admission_key")
+            decision, reservation_key = row
+            released = 0
+            if decision == "ADMITTED":
+                spent = con.execute(
+                    "SELECT 1 FROM simulation_events WHERE reservation_key = ? LIMIT 1",
+                    (reservation_key,),
+                ).fetchone()
+                if spent is None:
+                    written = now.astimezone(UTC).isoformat()
+                    released = _release_linked_locked(con, [reservation_key], written)
+                    if released:
+                        con.execute(
+                            "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? "
+                            "WHERE id = 1",
+                            (written,),
+                        )
+            result = {"released": bool(released), "snapshot": _snapshot(con, now=now)}
+            con.execute("COMMIT")
+            return result
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def get_snapshot(db_path: str | Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Read-only snapshot. Raises SimulationBankNotInitializedError before init_bank."""
     path = Path(db_path)
     with _connect(path) as con:
-        return _snapshot(con)
+        return _snapshot(con, now=now)

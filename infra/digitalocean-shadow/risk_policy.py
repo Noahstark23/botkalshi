@@ -32,6 +32,9 @@ CENT = 10_000  # microdollars in one cent
 REFERENCE_UNIT = 2 * MICRO  # USD 2.00
 AGGREGATE_UNITS = 3
 POLICY_VERSION = "SIM_UNIT_1PCT_CAP2_HABITUAL_HALF_AGG3_V1"
+# Absolute pauses on NET realized loss (never scaled by capital, never reset by redeploy):
+WEEKLY_STOP = 12 * MICRO  # USD 12 in the accounting week
+EXPERIMENT_STOP = 20 * MICRO  # USD 20 cumulative
 
 
 def _floor_cent(micros: int) -> int:

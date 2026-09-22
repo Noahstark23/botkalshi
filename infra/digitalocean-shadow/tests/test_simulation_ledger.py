@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,6 +33,8 @@ sys.path.insert(0, str(BASE))
 import simulation_bank as bank  # noqa: E402
 
 T = "KXTEST-26"
+# Fact date of every fixture event (in the past, so never "in the future").
+AT = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
 
 
 class LedgerTestCase(unittest.TestCase):
@@ -64,11 +67,17 @@ class LedgerTestCase(unittest.TestCase):
             count=count,
             fee_cents=fee,
             reservation_key=reservation,
+            occurred_at=AT,
         )
 
     def settle(self, key, payout, *, origin="M5", position=T):
         return bank.record_settlement(
-            self.db, event_key=key, origin=origin, position_key=position, payout_cents=payout
+            self.db,
+            event_key=key,
+            origin=origin,
+            position_key=position,
+            payout_cents=payout,
+            occurred_at=AT,
         )
 
     def snap(self):
@@ -205,6 +214,7 @@ class ReplayAndRestartTests(LedgerTestCase):
                 count=count,
                 fee_cents=1,
                 reservation_key=reservation,
+                occurred_at=AT,
             )
         uninterrupted = bank.get_snapshot(other)
 
@@ -378,7 +388,8 @@ class InvalidEvidenceTests(LedgerTestCase):
         try:
             con.execute(
                 "INSERT INTO simulation_events (event_key, origin, position_key, kind, "
-                "payout_cents, created_at) VALUES ('bad', 'M5', 'KXNADA-26', 'SETTLEMENT', 100, 'x')"
+                "payout_cents, created_at, occurred_at) VALUES "
+                "('bad', 'M5', 'KXNADA-26', 'SETTLEMENT', 100, 'x', '2026-09-22T12:00:00+00:00')"
             )
             con.commit()
         finally:
@@ -552,6 +563,7 @@ class FailureConcurrencyMigrationTests(LedgerTestCase):
             count=1,
             fee_cents=1,
             reservation_key="legacy",
+            occurred_at=AT,
         )
         self.assertEqual(bank.get_snapshot(old)["realized_pnl_usd"], "-0.01")
 

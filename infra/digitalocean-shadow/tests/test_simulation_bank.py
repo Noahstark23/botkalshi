@@ -43,7 +43,10 @@ class ModuleImportTests(unittest.TestCase):
         import ast
 
         tree = ast.parse((BASE / "simulation_bank.py").read_text())
-        allowed = {"__future__", "contextlib", "datetime", "json", "pathlib", "re", "sqlite3", "typing"}
+        allowed = {"__future__", "contextlib", "datetime", "json", "pathlib", "re", "sqlite3", "typing",
+                   # 2026-09-22 (C2): accounting periods in America/Los_Angeles, and the ONE
+                   # policy formula — pure, itself importing nothing (test_risk_policy).
+                   "zoneinfo", "risk_policy"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
