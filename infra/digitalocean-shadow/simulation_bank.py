@@ -188,7 +188,22 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
       payout_cents INTEGER,
       reservation_key TEXT,
       evidence_json TEXT,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      -- Defense in depth for the recording contract. NOT the guarantee: a file whose
+      -- rows escaped these CHECKs is still refused on replay by _validate_stored_row.
+      CHECK (
+        (kind = 'FILL'
+          AND side IN ('buy', 'sell')
+          AND typeof(price_cents) = 'integer' AND price_cents BETWEEN 1 AND 99
+          AND typeof(count) = 'integer' AND count BETWEEN 1 AND 1000000
+          AND typeof(fee_cents) = 'integer' AND fee_cents BETWEEN 0 AND 100000000
+          AND payout_cents IS NULL)
+        OR
+        (kind = 'SETTLEMENT'
+          AND side IS NULL AND price_cents IS NULL AND count IS NULL
+          AND fee_cents IS NULL AND reservation_key IS NULL
+          AND typeof(payout_cents) = 'integer' AND payout_cents IN (0, 100))
+      )
     );
     """)
     columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_reservations)").fetchall()}
@@ -303,17 +318,50 @@ def _apply_row(pos: _Position, kind: str, side, price, count, fee, payout, reser
         _apply_settlement(pos, payout=payout)
 
 
+def _validate_stored_row(kind, side, price, count, fee, payout, reservation_key, origin, key):
+    """The SAME contract `record_fill` / `record_settlement` enforce, applied on replay.
+
+    CTO review 2026-09-22: `_fold` used to feed stored rows straight into the
+    projection, so a stored fee_cents = -1 turned realized -0.01 into +0.01 silently
+    (reproduced). Recording validated; replaying did not. A row that would be refused
+    today is refused on replay too, whatever the table's CHECKs say or don't say.
+    """
+    _parse_id(origin, field="origin")
+    _parse_id(key, field="position_key")
+    if kind == "FILL":
+        if side not in _SIDES:
+            raise SimulationBankValidationError("side must be 'buy' or 'sell'")
+        _parse_int(price, field="price_cents", lo=_MIN_PRICE_CENTS, hi=_MAX_PRICE_CENTS)
+        _parse_int(count, field="count", lo=1, hi=_MAX_COUNT)
+        _parse_int(fee, field="fee_cents", lo=0, hi=_MAX_FEE_CENTS)
+        if payout is not None:
+            raise SimulationBankValidationError("a FILL carries no payout")
+        if reservation_key is not None:
+            _parse_id(reservation_key, field="reservation_key")
+    elif kind == "SETTLEMENT":
+        if type(payout) is not int or payout not in _SETTLEMENT_PAYOUTS:
+            raise SimulationBankValidationError("payout_cents must be 0 or 100")
+        if any(v is not None for v in (side, price, count, fee, reservation_key)):
+            raise SimulationBankValidationError("a SETTLEMENT carries only its payout")
+    else:
+        raise SimulationBankValidationError(f"unknown event kind {kind!r}")
+
+
 def _fold(con: sqlite3.Connection) -> dict[tuple[str, str], _Position]:
-    """Replay every stored event in seq order. Deterministic; raises on a history that
-    does not replay (a corrupted row is never skipped)."""
+    """Replay every stored event in seq order. Deterministic. Each row is validated
+    against the recording contract BEFORE it touches the projection; the first invalid
+    row raises, naming its seq, and no state (partial or otherwise) is returned."""
     positions: dict[tuple[str, str], _Position] = {}
     rows = con.execute(
         "SELECT seq, origin, position_key, kind, side, price_cents, count, fee_cents, "
         "payout_cents, reservation_key FROM simulation_events ORDER BY seq"
     ).fetchall()
     for seq, origin, position_key, kind, side, price, count, fee, payout, reservation_key in rows:
-        pos = positions.setdefault((origin, position_key), _Position())
         try:
+            _validate_stored_row(
+                kind, side, price, count, fee, payout, reservation_key, origin, position_key
+            )
+            pos = positions.setdefault((origin, position_key), _Position())
             _apply_row(pos, kind, side, price, count, fee, payout, reservation_key)
         except (SimulationBankValidationError, TypeError) as exc:
             raise SimulationBankIntegrityError(

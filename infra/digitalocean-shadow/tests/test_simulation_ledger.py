@@ -387,6 +387,87 @@ class InvalidEvidenceTests(LedgerTestCase):
             self.snap()
 
 
+# ------------------------------------------------------ stored history is validated too
+
+
+class StoredHistoryValidationTests(LedgerTestCase):
+    """Replay must enforce the SAME contract as recording (CTO review, 2026-09-22).
+
+    `record_fill` validated its inputs, but `_fold` fed stored rows straight into the
+    projection: a stored fee_cents = -1 turned realized P&L from -0.01 into +0.01 with no
+    error (reproduced before the fix). A corrupted history must never publish a state —
+    not a partial one, and certainly not a flattering one."""
+
+    def setUp(self):
+        super().setUp()
+        self.fill("f1", "buy", 40)
+        self.settle_later = False
+
+    def corrupt(self, sql, params=()):
+        con = sqlite3.connect(self.db)
+        try:
+            # Simulates a file whose rows escaped the table CHECKs (older DDL, manual
+            # edit, disk-level damage). The replay guard must hold WITHOUT the CHECKs.
+            con.execute("PRAGMA ignore_check_constraints = ON")
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+
+    def assert_every_read_and_write_refuses(self):
+        with self.assertRaises(bank.SimulationBankIntegrityError) as exc:
+            self.snap()
+        self.assertIn("seq=", str(exc.exception), "the invalid row must be identified")
+        with self.assertRaises(bank.SimulationBankIntegrityError):
+            self.reserve("r-after", "0.10")
+        with self.assertRaises(bank.SimulationBankIntegrityError):
+            self.fill("f-after", "buy", 40)
+
+    def test_corrupted_fill_rows_are_rejected_on_replay(self):
+        cases = {
+            "negative fee": "fee_cents = -1",
+            "fractional fee": "fee_cents = 1.5",
+            "text fee": "fee_cents = 'uno'",
+            "price 0": "price_cents = 0",
+            "price 100": "price_cents = 100",
+            "count 0": "count = 0",
+            "unknown side": "side = 'hold'",
+            "fill with payout": "payout_cents = 100",
+        }
+        for label, assignment in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                self.corrupt(f"UPDATE simulation_events SET {assignment} WHERE event_key = 'f1'")
+                self.assert_every_read_and_write_refuses()
+
+    def test_corrupted_settlement_rows_are_rejected_on_replay(self):
+        self.settle("s1", 100)
+        cases = {
+            "payout 50": "payout_cents = 50",
+            "settlement with fee": "fee_cents = 1",
+            "settlement with side": "side = 'buy'",
+        }
+        for label, assignment in cases.items():
+            with self.subTest(label):
+                self.corrupt(f"UPDATE simulation_events SET {assignment} WHERE event_key = 's1'")
+                self.assert_every_read_and_write_refuses()
+                # restore for the next subtest
+                self.corrupt(
+                    "UPDATE simulation_events SET payout_cents = 100, fee_cents = NULL, "
+                    "side = NULL WHERE event_key = 's1'"
+                )
+
+    def test_table_checks_reject_the_same_rows_at_write_time(self):
+        """Defense in depth: without the pragma, SQLite itself refuses the bad row."""
+        con = sqlite3.connect(self.db)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute("UPDATE simulation_events SET fee_cents = -1 WHERE event_key = 'f1'")
+        finally:
+            con.close()
+        self.assertEqual(self.snap()["realized_pnl_usd"], "-0.01")
+
+
 # -------------------------------------------------------- failure, concurrency, migration
 
 
