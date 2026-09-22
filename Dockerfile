@@ -26,7 +26,7 @@ RUN python -m venv /opt/venv \
         "websockets>=13.0,<17.0" \
         "pydantic>=2.6.0" \
         "pydantic-settings>=2.2.0" \
-        "sqlmodel>=0.0.16" \
+        "sqlmodel>=0.0.16,<0.0.45" \
         "cryptography>=42.0.0" \
         "apscheduler>=3.10.4" \
         "python-telegram-bot>=21.0" \
