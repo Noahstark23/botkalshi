@@ -270,13 +270,20 @@ def _reserve_locked(
     cycle_value: str,
     amount_cents: int,
     evidence_json: str | None,
-) -> None:
+) -> str:
     """The one locked reservation code path shared by `reserve` and
     `reserve_with_evidence`. Caller already holds BEGIN IMMEDIATE. Replay of the
     same key compares the FULL payload including evidence_json — for plain
     `reserve` that is always None on both sides, so its replay rule is
     unaffected; for `reserve_with_evidence` a differing evidence is a conflict
     exactly like a differing amount.
+
+    Returns what actually happened, read inside this same transaction:
+    "CREATED", "REPLAY_ACTIVE" or "REPLAY_RELEASED". An identical replay of a
+    RELEASED key stays a no-op — it is never reactivated — but it must not be
+    reported as if it had reserved anything (C1/6.2, 2026-09-22): a caller that
+    inferred "reserved" from the absence of an exception reported a released
+    reservation as active.
     """
     bank_row = con.execute(
         "SELECT initial_capital_cents FROM simulation_bank WHERE id = 1"
@@ -285,18 +292,18 @@ def _reserve_locked(
         raise SimulationBankNotInitializedError("bank has not been initialized")
     capital_cents = bank_row[0]
     existing = con.execute(
-        "SELECT origin, cycle_id, amount_cents, evidence_json FROM simulation_reservations "
+        "SELECT origin, cycle_id, amount_cents, evidence_json, status FROM simulation_reservations "
         "WHERE idempotency_key = ?",
         (key,),
     ).fetchone()
     if existing is not None:
-        if existing != (origin_value, cycle_value, amount_cents, evidence_json):
+        if existing[:4] != (origin_value, cycle_value, amount_cents, evidence_json):
             raise SimulationBankConflictError(
                 "idempotency_key already used with a different reservation payload"
             )
         # Idempotent replay: identical payload (evidence included), no new
-        # charge, no revision bump.
-        return
+        # charge, no revision bump — and a RELEASED row stays RELEASED.
+        return "REPLAY_ACTIVE" if existing[4] == "ACTIVE" else "REPLAY_RELEASED"
     reserved_cents = con.execute(
         "SELECT COALESCE(SUM(amount_cents), 0) FROM simulation_reservations "
         "WHERE status = 'ACTIVE'"
@@ -316,6 +323,7 @@ def _reserve_locked(
         "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
         (now,),
     )
+    return "CREATED"
 
 
 def reserve(
@@ -379,6 +387,59 @@ def reserve_with_evidence(
     as the reservation itself, so there is never a reservation without evidence
     or evidence without a reservation.
     """
+    _outcome, snapshot = _reserve_with_evidence(
+        db_path,
+        idempotency_key=idempotency_key,
+        origin=origin,
+        cycle_id=cycle_id,
+        amount_usd=amount_usd,
+        evidence=evidence,
+    )
+    return snapshot
+
+
+def reserve_with_evidence_outcome(
+    db_path: str | Path,
+    *,
+    idempotency_key: str,
+    origin: str,
+    cycle_id: str,
+    amount_usd: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """`reserve_with_evidence`, reporting WHAT happened alongside the snapshot.
+
+    Returns {"outcome": "CREATED" | "REPLAY_ACTIVE" | "REPLAY_RELEASED",
+    "reservation_active": bool, "snapshot": <same dict reserve_with_evidence returns>}.
+    The outcome is read inside the same BEGIN IMMEDIATE as the write (or the
+    no-op), so it matches what is persisted — not a guess from the absence of
+    an exception. Same replay and conflict rules as `reserve_with_evidence`; a
+    RELEASED key is never reactivated.
+
+    A separate function on purpose: `reserve_with_evidence` keeps returning the
+    bare snapshot, because callers and tests rely on an identical replay
+    returning a snapshot EQUAL to the original one.
+    """
+    outcome, snapshot = _reserve_with_evidence(
+        db_path,
+        idempotency_key=idempotency_key,
+        origin=origin,
+        cycle_id=cycle_id,
+        amount_usd=amount_usd,
+        evidence=evidence,
+    )
+    return {"outcome": outcome, "reservation_active": outcome != "REPLAY_RELEASED", "snapshot": snapshot}
+
+
+def _reserve_with_evidence(
+    db_path: str | Path,
+    *,
+    idempotency_key: str,
+    origin: str,
+    cycle_id: str,
+    amount_usd: str,
+    evidence: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
     path = Path(db_path)
     key = _parse_id(idempotency_key, field="idempotency_key")
     origin_value = _parse_id(origin, field="origin")
@@ -388,7 +449,7 @@ def reserve_with_evidence(
     with _connect(path) as con:
         con.execute("BEGIN IMMEDIATE")
         try:
-            _reserve_locked(
+            outcome = _reserve_locked(
                 con,
                 key=key,
                 origin_value=origin_value,
@@ -398,7 +459,7 @@ def reserve_with_evidence(
             )
             result = _snapshot(con)
             con.execute("COMMIT")
-            return result
+            return outcome, result
         except Exception:
             con.execute("ROLLBACK")
             raise

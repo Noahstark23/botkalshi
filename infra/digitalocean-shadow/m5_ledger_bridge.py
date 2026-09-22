@@ -3,6 +3,25 @@ The source is an explicit, existing SQLite file opened read-only. Only
 mm_shadow_fills and its schema are read. No account/engine/network imports.
 Verification describes the row snapshot read, not a deployed producer, public
 market observation, current source immutability, or financial authorization.
+
+PROVENANCE: operator's local candidate (Mac,
+botkalshi-issue256-m5-ledger-verify/infra/digitalocean-shadow/m5_ledger_bridge.py),
+delivered as text on 2026-09-22; verbatim copy committed first (SHA-256
+77d850fc86e42ee7c59f109596dc27a01934abf654fa7e8f419d3ec6672dbdf4), then a
+mechanical ruff pass, then the changes below — each its own commit.
+
+Changes from the candidate (C1/6.2):
+  - The answer reflects the PERSISTED reservation state, read by the bank inside
+    its own transaction: RESERVED (created), ALREADY_RESERVED (identical replay
+    of an active one) or ALREADY_RELEASED (identical replay of a released one,
+    never reactivated). The candidate returned RESERVED whenever the bank raised
+    nothing — so a released reservation was reported active.
+  - A missing bank file is BANK_NOT_FOUND. The candidate let the bank module
+    create an empty bank file on a rejected call: a mutation on a failure path.
+
+A reservation is NOT a close and NOT a gain. It earmarks fictional capital for
+one fill's worst-case loss; releasing it restores availability and recognizes
+no P&L. Accounting for exits and settlement is a separate unit.
 """
 
 from __future__ import annotations
@@ -84,6 +103,10 @@ def _paths(source: str | Path, bank: str | Path) -> tuple[Path, Path]:
             raise LedgerEvidenceError("SYMLINK_PATH")
     if not source_path.is_file():
         raise LedgerEvidenceError("SOURCE_NOT_FOUND")
+    if not bank_path.is_file():
+        # simulation_bank connects with mkdir + create: without this check a
+        # REJECTED call would leave a new, empty bank file behind.
+        raise LedgerEvidenceError("BANK_NOT_FOUND")
     if source_path == bank_path or (bank_path.exists() and source_path.samefile(bank_path)):
         raise LedgerEvidenceError("SOURCE_BANK_SAME_FILE")
     return source_path, bank_path
@@ -126,6 +149,8 @@ def _result() -> dict[str, Any]:
         "reason_codes": [],
         "review": None,
         "reservation": None,
+        "reservation_outcome": None,
+        "reservation_active": False,
         "mode": "SIMULATION_ONLY",
         "capital_source": "FICTIONAL_TEST_CAPITAL",
         "evidence_state": "NOT_LEDGER_VERIFIED",
@@ -148,6 +173,10 @@ def apply_ledger_verified_m5_fill(
     across both databases. Producers must not mutate risk fields of an accepted
     fill: a later changed replay is a conflict, not an automatic reconciliation.
     No timestamps/absolute paths enter the idempotent stored evidence.
+
+    `status` is BLOCKED, RESERVED, ALREADY_RESERVED or ALREADY_RELEASED, taken
+    from the bank's persisted outcome (see module docstring). `reservation_active`
+    is False for BLOCKED and for ALREADY_RELEASED.
     """
     result = _result()
     try:
@@ -179,7 +208,7 @@ def apply_ledger_verified_m5_fill(
     verified_review = dict(durable, evidence=evidence, evidence_state=VERIFIED)
     result.update(review=verified_review, evidence_state=VERIFIED)
     try:
-        result["reservation"] = simulation_bank.reserve_with_evidence(
+        booked = simulation_bank.reserve_with_evidence_outcome(
             bank,
             idempotency_key=durable["idempotency_key"],
             origin="M5",
@@ -190,5 +219,18 @@ def apply_ledger_verified_m5_fill(
     except simulation_bank.SimulationBankError as exc:
         result["reason_codes"] = ["BANK_REJECTED", type(exc).__name__]
         return result
-    result["status"] = "RESERVED"
+    result.update(
+        status=_STATUS_BY_OUTCOME[booked["outcome"]],
+        reservation=booked["snapshot"],
+        reservation_outcome=booked["outcome"],
+        reservation_active=booked["reservation_active"],
+    )
     return result
+
+
+# The bank's persisted outcome decides the answer — never "no exception, therefore reserved".
+_STATUS_BY_OUTCOME = {
+    "CREATED": "RESERVED",
+    "REPLAY_ACTIVE": "ALREADY_RESERVED",
+    "REPLAY_RELEASED": "ALREADY_RELEASED",
+}
