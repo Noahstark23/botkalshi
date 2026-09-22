@@ -16,10 +16,12 @@ pudo alcanzar** figura como BLOCKED con su causa, no como pendiente genérico.
 | C1 — cierre contable y recuperación | **PASS — nivel componente local** | **Recuperación (6.3):** comisión grabada reproducida y validada; 12 casos; suite principal **1.687 passed**. **Cierre contable (6.4/6.5, `c59b8e5`):** una sola fuente de eventos en la SQLite del banco, proyección derivada en cada lectura; los 4 oráculos sobre USD 200 dan exacto (+0.10 → 200.10; −0.07 → 199.93; +0.59 → 200.59; −0.41 → 199.59); repetición, reinicio, cierre parcial, inversión de signo, concurrencia, migración y fallo entre escrituras cubiertos. 24 tests; **8/8 mutaciones detectadas**. Suite de research **376 OK**. Todavía **no** conectado a ningún motor: el M5 real no escribe eventos. |
 | C2 — política única de riesgo (opción A corregida) | **PASS — nivel componente local** | `risk_policy.py` (`deaca89`): unidad = min(USD 2, 1 % del capital simulado) truncada al centavo; habitual = media unidad; tope por operación y por tesis = 1 unidad; abierto y diario = 3 unidades (nunca > USD 6); pausas USD 12 semanal y USD 20 del experimento. `risk_guard` y `bank_batch_review` llaman a la misma función. `REFERENCE_UNIT` sigue en 2; no se fijó 6. 13 pruebas propias. |
 | C2 — admisión previa, reserva, fill y evento contable | **PASS — nivel componente local** | `c6cb010`: `admit_proposal` decide y reserva en una sola transacción contra el estado compartido de todos los orígenes; el fill cita la admisión y consume su riesgo admitido **acumulado** (los fills parciales de una cotización no reservan dos veces); períodos por fecha del hecho en America/Los_Angeles; un fill sin admisión, con admisión rechazada/retirada o por encima de lo admitido **se registra** con incumplimiento. Replay almacenado validado fila por fila (`4985afa`). 39 pruebas nuevas; 13 mutaciones de regla detectadas. |
-| C2 — ruta M5 en research (cohorte `m5-research-rest-v1`) | **PASS — nivel componente local** | `f2397e8`, por decisión del propietario («Simular M5 en research»). Captura → review estricto de M1 → candidata (`compute_quote`) → `admit_proposal` → `activate_admission` → fill **solo** en observaciones posteriores (`record_quote_observation`, atómico) → evento contable. 41 pruebas de aceptación (lista del CTO completa, más controles); 15 de 16 mutaciones detectadas. Flag `BOTKALSHI_M5_RESEARCH_ENABLED` **apagado por defecto**. Sin productor de fair en el droplet → el estado real sería `BLOCKED_NO_FAIR`. |
-| C2 — M1 en el presupuesto común | **PENDING** | M1 sigue en research con su atribución (review por ciclo), pero todavía **no** llama a `admit_proposal`: no emite propuestas con riesgo, solo diagnóstico. |
-| C2 — Radar | **NOT_CONNECTED** | No hay productor en el código. No se sustituye por señales inventadas. |
-| C2 — M2 referencia, M3 salidas simuladas, reporte único | **PENDING** | No abordado. |
+| C2 — **M5 local probado** (cohorte `m5-research-rest-v1`) | **PASS — nivel componente local** | `f2397e8` + **`b13d1c5`**. `b13d1c5` corrige las tres regresiones de la revisión de `3712749`: repetir `run_cycle` tras un fill y un reinicio; replay de activación después de liberar la reserva fuera de banda; y fee vencida o cambiada durante la cotización. Además, el tope acumulado por lado pasa a ser invariante del banco. Captura → review estricto de M1 → candidata → admisión y reserva → activación → fill **solo** en observaciones posteriores → evento contable. 54 pruebas de aceptación. Flag **apagado por defecto**. |
+| C2 — **M1 observador** | **OBSERVER** | M1 sigue en research con su atribución (review del libro por ciclo); **no** llama a `admit_proposal` ni propone riesgo. |
+| C2 — **Radar** | **NOT_CONNECTED** | No hay productor en el código. No se sustituye por señales inventadas. |
+| C2 — **salidas y liquidaciones simuladas** | **PENDING** | Las posiciones M5 quedan `UNKNOWN_NO_MARK`. No hay salidas M3 simuladas ni liquidación de posiciones M5 en research. |
+| C3 — **candidato preparado** | **READY — no desplegado** | `25357bc` (núcleo puro del fair de M2, importable sin venv) + `ec00e48` (productor de entradas, `init_sim_bank.py`, `m5_c3_report.py`, historial acotado). Suite research **523 OK también bajo `python3 -S`** (lo que corre `install.sh`). |
+| C3 — **M5 público verificado** | **NOT_STARTED** | Requiere acceso autorizado al droplet (ver runbook). Nada público verificado todavía. |
 | C3 — acceso, respaldo y rollback | **BLOCKED** | Esta sesión es un contenedor efímero en la nube sin acceso SSH ni consola al droplet `botkalshi-research-sfo3`. No se intentó ni se simuló. |
 | C3 — SHA desplegado y diez ciclos públicos | **BLOCKED** | Misma causa. Sin lectura nueva del host, el release `435d1d9b` sigue siendo referencia histórica, no estado actual. |
 | C3 — reinicio preserva estado | **BLOCKED** | Misma causa. |
@@ -108,6 +110,14 @@ cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue sie
 | 22-sep, 6ª iteración, `f2397e8` | idem | importa (también `m5_research_sim`); fijado por test |
 | 22-sep, 6ª iteración, `f2397e8` | 16 mutaciones (banco: misma observación, observación anterior, plano libera pendiente, activa con reserva liberada, retirada sigue llenando, observación re-evaluada; adaptador: riesgo bilateral sumado, precisión incompatible, fair vencido, sin TTL, sin barrido, replay reactiva, re-cotiza en el ciclo del retiro, evalúa la generadora, brecha sin incertidumbre, fee inventada) | **15/16 detectadas**. Sobrevive «replay reactiva» del adaptador: el banco la rechaza igual (`WITHDRAWN`); es una defensa redundante, no un hueco |
 | 22-sep, 6ª iteración, `f2397e8` | ruff `infra/` | **63 = 63** vs base; archivos nuevos limpios y formateados |
+| 22-sep, 7ª iteración, `3712749` | los 3 casos de la revisión, reproducidos con un script | **los 3 reproducidos**. (1) `run_cycle` repetido tras un fill y un reinicio → conflicto, sin recuperar lo guardado. (2) Replay de activación tras liberar la reserva fuera de banda → `active: True`, y el ciclo siguiente llenaba sin respaldo. (3) Fee ausente o cambiada → fill asentado con la fee original |
+| 22-sep, 7ª iteración | tests nuevos de regresión contra el código de `3712749` | **10 fallan** (6 fallas + 4 errores); pasan con `b13d1c5` |
+| 22-sep, 7ª iteración, `b13d1c5` | 15 mutaciones de las correcciones | **15/15 detectadas**, 3 de ellas después de agregar el test que las aísla. **Corrección:** el mensaje de commit de `b13d1c5` dice «18 mutaciones»; fueron 15 distintas |
+| 22-sep, 7ª iteración, `25357bc` | `pytest tests/strategies/motor_2_consensus tests/strategies/test_fair_value_book.py` antes y después de extraer el núcleo | **276 = 276 passed**, sin tocar esos tests |
+| 22-sep, 7ª iteración, `ec00e48` | `unittest tests.test_m5_inputs` + `pytest tests/strategies/motor_5_mm/test_fee_research_parity.py` | **34 OK** + **8 passed** (paridad con `fee_policy.py`) |
+| 22-sep, 7ª iteración, `ec00e48` | 16 mutaciones del productor (crédito no persistido antes de la llamada, presupuesto excedible, clave legible, presupuesto > 10, env reabre el ledger, costo inesperado, fair fechado por la descarga, sin frescura, línea futura, cambios de otra serie, override parcial, override que prueba el pasado, refetch en cada ciclo, evidencia sin vencer, …) | **16/16 detectadas** |
+| 22-sep, 7ª iteración, `ec00e48` | `unittest discover -s tests` (venv) y `env -i /usr/bin/python3 -S -m unittest discover -s tests` | **523 OK** en ambos |
+| 22-sep, 7ª iteración, `ec00e48` | `unittest test_collector` / `pytest -q` / ruff `src tests` / ruff `infra/` | **6 OK** / **1.702 passed** / limpio / **63 = 63** |
 
 Entorno de todas las filas: Linux x86_64, Python 3.12.3, venv del repo, sockets bloqueados en
 los tests de research. Nivel acreditado: **componente probado localmente**. No hay prueba de
@@ -145,16 +155,36 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 
 ## Lo que falta, con la intervención exacta
 
-1. **M5 research en el droplet (C3, requiere acceso autorizado).** Tres pasos del operador,
-   en este orden, y ninguno es automático:
-   (a) crear el banco ficticio con capital explícito
-   (`simulation_bank.init_bank(ruta, initial_capital_usd="200.00")`). El runner **nunca** lo
-   crea, y sin banco reporta `BLOCKED_NO_BANK`;
-   (b) proveer `m5/inputs.json` (`botkalshi-m5-research-inputs-v1`) con el fair y la fee de
-   cada evento, más su fuente y su fecha. Hoy **no hay productor**: sin él todo queda en
-   `BLOCKED_NO_FAIR`. Producirlo con The Odds API sería un gasto nuevo y está fuera de
-   alcance;
-   (c) `BOTKALSHI_M5_RESEARCH_ENABLED=true`.
+1. **C3 — runbook para una sesión con acceso autorizado al droplet** (esta sesión no lo
+   tiene; nada de esto se ejecutó). Todo en simulación: sin dinero real, sin órdenes.
+   1. Respaldo del directorio de datos y del release actual (rollback = volver al release
+      anterior con `install.sh <SHA_anterior>`; `install.sh` nunca borra datos ni releases).
+   2. `bash install.sh <SHA completo del candidato> --dedicated-research-host`. Ese paso
+      corre la suite de research con el python3 del sistema: antes de `f2397e8` fallaba al
+      importar `src`.
+   3. Como usuario `botkalshi`: `python3 init_sim_bank.py --data /var/lib/botkalshi-research
+      --initial-capital-usd 200.00` (capital **ficticio**, explícito, idempotente).
+   4. En `/etc/botkalshi-research.env`: `BOTKALSHI_M5_RESEARCH_ENABLED=true` y
+      `BOTKALSHI_M5_INPUTS_ENABLED=true` (lecturas públicas de fee en Kalshi). Aplicar y
+      **verificar con `env` en el proceso**, no por el mensaje del editor.
+   5. Antes de reiniciar: `python3 m5_c3_report.py --data … --save-restart-mark /tmp/mark.json`.
+      Después: `--check-restart-mark /tmp/mark.json` → debe decir `PRESERVED`.
+   6. Tras ≥10 ciclos: `python3 m5_c3_report.py --data … --cycles 10`. **Diez ciclos
+      públicos no exigen diez fills**; sin piloto de fair, lo honesto es `BLOCKED_NO_FAIR`.
+   7. Mirar `producer.fee` en `m5/latest.json`: si `/series/fee_changes` no tiene el shape
+      documentado, sale `FEE_CHANGES_UNREADABLE`, y ese es el primer dato público que falta.
+2. **Piloto de fair con The Odds API — requiere habilitación del propietario.** El plan
+   **Starter** del proveedor es **gratuito, con 500 créditos por mes**. Usar este proveedor
+   no exige necesariamente un plan pago. El piloto propuesto usa **hasta 10 créditos**:
+   MLB, `markets=h2h`, `regions=us` (1 crédito por llamada según la regla publicada
+   mercados × regiones; se confirma con `x-requests-last` en la primera llamada) y una
+   llamada cada ≥ 30 min. **Requisito exacto, no cubierto:** que el propietario cree él
+   mismo la cuenta Starter, autorice su uso y deje la clave en un **archivo** propiedad de
+   `botkalshi` con permisos 0600 (por ejemplo `/etc/botkalshi-research/odds-pilot.key`),
+   con `BOTKALSHI_ODDS_PILOT_ENABLED=true`, `BOTKALSHI_ODDS_PILOT_KEY_FILE=<ruta>`,
+   `BOTKALSHI_ODDS_PILOT_BUDGET=10`. **Nunca** `ODDS_API_KEY`: con esa variable el
+   collector sondea h2h+totals cada 300 s (~576 créditos por día). Esta sesión no creó
+   cuentas, no usó claves y no leyó ninguna.
 2. **M1 al presupuesto común**: hoy M1 solo diagnostica y no propone riesgo. Conectarlo
    requiere definir qué sería una propuesta de M1 (tamaño y tesis) — no se inventa.
 2b. **Camino legacy** `reserve()` + `reservation_key`: sigue existiendo y no pasa por la
