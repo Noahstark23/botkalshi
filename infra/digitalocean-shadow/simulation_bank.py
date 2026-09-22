@@ -33,7 +33,18 @@ Contract:
   - `release` is idempotent by `idempotency_key`; it frees a reservation and never
     manufactures balance. Releasing an unknown key is a fail-closed error, not a no-op.
   - `revision` increments once per real state change (init, a new reservation, a first
-    release) and never for an idempotent replay.
+    release, a new accounting event) and never for an idempotent replay.
+  - `record_fill` / `record_settlement` (C1/6.4, 2026-09-22) append SIMULATED accounting
+    events to `simulation_events`, the ONE source of truth for positions and realized
+    P&L. The projection is derived on every read, never stored. Policy in
+    `ACCOUNTING_POLICY`: FIFO price lots per (origin, position_key), fees expensed once
+    when paid, settlement at 0/100 per YES. Linked reservations are released only when
+    the position is flat or settled, in the same transaction as the closing event.
+    Snapshots add `realized_pnl_usd`, `capital_usd` (= initial + realized),
+    `available_usd` (= capital − reserved) and `positions`; an open position's
+    `valuation` is `UNKNOWN_NO_MARK`, never a guessed price.
+  - A reservation is an earmark, not a close and not a gain: releasing one never
+    changes realized P&L.
 """
 from __future__ import annotations
 
@@ -71,6 +82,11 @@ class SimulationBankInsufficientFundsError(SimulationBankError):
 
 class SimulationBankNotInitializedError(SimulationBankError):
     """No bank row exists yet; call init_bank first."""
+
+
+class SimulationBankIntegrityError(SimulationBankError):
+    """Stored accounting events do not replay into a valid state. Fail closed: a
+    corrupted history is never silently skipped or partially folded."""
 
 
 class SimulationBankNotFoundError(SimulationBankError):
@@ -154,6 +170,26 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
       created_at TEXT NOT NULL,
       released_at TEXT
     );
+    -- C1/6.4 (2026-09-22): the ONE source of simulated accounting events. Positions,
+    -- realized P&L and capital are DERIVED from these rows on every read (folded in
+    -- seq order) and never stored, so there is no second book that can diverge and a
+    -- restart is just a re-read. Added with IF NOT EXISTS: an existing bank file gains
+    -- the table in place and keeps every prior row.
+    CREATE TABLE IF NOT EXISTS simulation_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_key TEXT NOT NULL UNIQUE,
+      origin TEXT NOT NULL,
+      position_key TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('FILL', 'SETTLEMENT')),
+      side TEXT CHECK (side IN ('buy', 'sell')),
+      price_cents INTEGER,
+      count INTEGER,
+      fee_cents INTEGER,
+      payout_cents INTEGER,
+      reservation_key TEXT,
+      evidence_json TEXT,
+      created_at TEXT NOT NULL
+    );
     """)
     columns = {row[1] for row in con.execute("PRAGMA table_info(simulation_reservations)").fetchall()}
     if "evidence_json" not in columns:
@@ -180,6 +216,130 @@ def _connect(db_path: Path):
         yield con
     finally:
         con.close()
+
+
+# --------------------------------------------------------------------------------------
+# Accounting (C1/6.4). Policy, versioned and explicit — changing any rule below means a new
+# ACCOUNTING_POLICY value, never a silent reinterpretation of stored events:
+#   - Lots are FIFO by price, per (origin, position_key). A position never nets against
+#     another motor's position on the same market: origin is part of the identity.
+#   - A fill that opposes the open lots closes them first (FIFO); any remainder opens a
+#     lot on the other side (sign reversal). Realized gain per closed contract is
+#     (fill_price - lot_price) * lot_sign, in integer cents.
+#   - Fees are recognized as realized expense ONCE, when paid, in integer cents. This
+#     avoids any fractional allocation of an entry fee across partial exits.
+#   - A SETTLEMENT pays 0 or 100 cents per YES contract and closes every open lot.
+#   - Reservations linked to a position's fills are released only when the position is
+#     flat or settled, in the SAME transaction that records the closing event. A partial
+#     close keeps them (conservative: never frees capital before the exit is complete).
+#   - Releasing a reservation changes availability, never realized P&L. An open position
+#     has no stored mark here, so its valuation is UNKNOWN — never marked at 50 or at a
+#     guessed price, and never counted as a gain.
+# --------------------------------------------------------------------------------------
+
+ACCOUNTING_POLICY = "FIFO_PRICE_LOTS_FEES_EXPENSED_WHEN_PAID_V1"
+_SIDES = ("buy", "sell")
+_SETTLEMENT_PAYOUTS = (0, 100)
+_MIN_PRICE_CENTS = 1
+_MAX_PRICE_CENTS = 99
+_MAX_COUNT = 1_000_000
+_MAX_FEE_CENTS = 100_000_000
+
+
+class _Position:
+    __slots__ = ("lots", "settled", "realized_cents", "reservation_keys")
+
+    def __init__(self) -> None:
+        self.lots: list[list[int]] = []  # [sign (+1 long YES / -1 short YES), price, qty]
+        self.settled = False
+        self.realized_cents = 0
+        self.reservation_keys: list[str] = []
+
+    def net(self) -> int:
+        return sum(sign * qty for sign, _price, qty in self.lots)
+
+
+def _apply_fill(pos: _Position, *, side: str, price: int, count: int, fee: int) -> None:
+    if pos.settled:
+        raise SimulationBankValidationError("POSITION_SETTLED: no fill after settlement")
+    sign = 1 if side == "buy" else -1
+    remaining = count
+    while remaining and pos.lots and pos.lots[0][0] == -sign:
+        lot = pos.lots[0]
+        closed = min(remaining, lot[2])
+        pos.realized_cents += (price - lot[1]) * closed * lot[0]
+        lot[2] -= closed
+        remaining -= closed
+        if lot[2] == 0:
+            pos.lots.pop(0)
+    if remaining:
+        pos.lots.append([sign, price, remaining])
+    pos.realized_cents -= fee
+
+
+def _apply_settlement(pos: _Position, *, payout: int) -> None:
+    if pos.settled:
+        raise SimulationBankValidationError("POSITION_SETTLED: already settled")
+    if not pos.lots:
+        raise SimulationBankValidationError("NOTHING_TO_SETTLE: settlement without an open position")
+    for sign, price, qty in pos.lots:
+        pos.realized_cents += (payout - price) * qty * sign
+    pos.lots = []
+    pos.settled = True
+
+
+_EVENT_COLUMNS = (
+    "origin, position_key, kind, side, price_cents, count, fee_cents, payout_cents, "
+    "reservation_key, evidence_json"
+)
+
+
+def _apply_row(pos: _Position, kind: str, side, price, count, fee, payout, reservation_key) -> None:
+    if kind == "FILL":
+        _apply_fill(pos, side=side, price=price, count=count, fee=fee)
+        if reservation_key is not None:
+            pos.reservation_keys.append(reservation_key)
+    else:
+        _apply_settlement(pos, payout=payout)
+
+
+def _fold(con: sqlite3.Connection) -> dict[tuple[str, str], _Position]:
+    """Replay every stored event in seq order. Deterministic; raises on a history that
+    does not replay (a corrupted row is never skipped)."""
+    positions: dict[tuple[str, str], _Position] = {}
+    rows = con.execute(
+        "SELECT seq, origin, position_key, kind, side, price_cents, count, fee_cents, "
+        "payout_cents, reservation_key FROM simulation_events ORDER BY seq"
+    ).fetchall()
+    for seq, origin, position_key, kind, side, price, count, fee, payout, reservation_key in rows:
+        pos = positions.setdefault((origin, position_key), _Position())
+        try:
+            _apply_row(pos, kind, side, price, count, fee, payout, reservation_key)
+        except (SimulationBankValidationError, TypeError) as exc:
+            raise SimulationBankIntegrityError(
+                f"stored event seq={seq} does not replay: {exc}"
+            ) from exc
+    return positions
+
+
+def _realized_cents(positions: dict[tuple[str, str], _Position]) -> int:
+    return sum(pos.realized_cents for pos in positions.values())
+
+
+def _position_view(key: tuple[str, str], pos: _Position) -> dict[str, Any]:
+    return {
+        "origin": key[0],
+        "position_key": key[1],
+        "net_contracts": pos.net(),
+        "open_lots": [
+            {"side": "long_yes" if sign > 0 else "short_yes", "price_cents": price, "count": qty}
+            for sign, price, qty in pos.lots
+        ],
+        "settled": pos.settled,
+        "realized_pnl_usd": _usd(pos.realized_cents),
+        # No mark is stored here: an open position's value is unknown, not 50 and not 0.
+        "valuation": "CLOSED" if not pos.lots else "UNKNOWN_NO_MARK",
+    }
 
 
 def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
@@ -210,6 +370,11 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
             # rows that predate the evidence_json migration on this file).
             "evidence": json.loads(evidence_json) if evidence_json is not None else None,
         })
+    positions = _fold(con)
+    realized_cents = _realized_cents(positions)
+    # capital = initial fictional capital + realized P&L. Reserved is an earmark on it,
+    # not a loss. With no events this is exactly the pre-accounting snapshot.
+    capital_now_cents = capital_cents + realized_cents
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "SIMULATION_ONLY",
@@ -218,12 +383,16 @@ def _snapshot(con: sqlite3.Connection) -> dict[str, Any]:
         "order_capability_present": False,
         "real_entry_eligible": False,
         "initial_capital_usd": _usd(capital_cents),
+        "realized_pnl_usd": _usd(realized_cents),
+        "capital_usd": _usd(capital_now_cents),
         "reserved_usd": _usd(reserved_cents),
-        "available_usd": _usd(capital_cents - reserved_cents),
+        "available_usd": _usd(capital_now_cents - reserved_cents),
+        "accounting_policy": ACCOUNTING_POLICY,
         "revision": revision,
         "created_at": created_at,
         "updated_at": updated_at,
         "active_reservations": active_reservations,
+        "positions": [_position_view(key, positions[key]) for key in sorted(positions)],
     }
 
 
@@ -308,6 +477,10 @@ def _reserve_locked(
         "SELECT COALESCE(SUM(amount_cents), 0) FROM simulation_reservations "
         "WHERE status = 'ACTIVE'"
     ).fetchone()[0]
+    # Admission sees capital AFTER realized P&L: a realized loss must shrink what can
+    # still be reserved, or it would be invisible to the next risk. No events → the
+    # original check exactly.
+    capital_cents += _realized_cents(_fold(con))
     if amount_cents > capital_cents - reserved_cents:
         raise SimulationBankInsufficientFundsError(
             "reservation would exceed available capital"
@@ -506,6 +679,198 @@ def release(db_path: str | Path, *, idempotency_key: str) -> dict[str, Any]:
         except Exception:
             con.execute("ROLLBACK")
             raise
+
+
+# --------------------------------------------------------------------------------------
+# Recording accounting events (C1/6.4). See ACCOUNTING_POLICY above.
+# --------------------------------------------------------------------------------------
+
+
+def _parse_int(value: Any, *, field: str, lo: int, hi: int) -> int:
+    # type() is int, not isinstance: bool is an int subclass and must never pass.
+    if type(value) is not int or not lo <= value <= hi:
+        raise SimulationBankValidationError(f"{field} must be an integer in [{lo}, {hi}]")
+    return value
+
+
+def _release_linked_locked(con: sqlite3.Connection, keys: list[str], now: str) -> int:
+    """Release the still-ACTIVE reservations among `keys`. Caller holds BEGIN IMMEDIATE
+    and owns the revision bump. Already-RELEASED keys are left alone."""
+    released = 0
+    for key in keys:
+        cur = con.execute(
+            "UPDATE simulation_reservations SET status = 'RELEASED', released_at = ? "
+            "WHERE idempotency_key = ? AND status = 'ACTIVE'",
+            (now, key),
+        )
+        released += cur.rowcount
+    return released
+
+
+def _check_reservation_link(con: sqlite3.Connection, key: str, origin: str) -> None:
+    row = con.execute(
+        "SELECT origin, status FROM simulation_reservations WHERE idempotency_key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        raise SimulationBankValidationError("UNKNOWN_RESERVATION: fill cites a reservation that does not exist")
+    if row[0] != origin:
+        # A motor's fill can never be backed by another motor's reservation.
+        raise SimulationBankValidationError("RESERVATION_ORIGIN_MISMATCH")
+    if row[1] != "ACTIVE":
+        raise SimulationBankValidationError("RESERVATION_NOT_ACTIVE: fill cites a released reservation")
+    linked = con.execute(
+        "SELECT 1 FROM simulation_events WHERE reservation_key = ? LIMIT 1", (key,)
+    ).fetchone()
+    if linked is not None:
+        raise SimulationBankValidationError("RESERVATION_ALREADY_LINKED: one reservation backs one fill")
+
+
+def _record_event(db_path: str | Path, event: dict[str, Any]) -> dict[str, Any]:
+    path = Path(db_path)
+    payload = tuple(event[col.strip()] for col in _EVENT_COLUMNS.split(","))
+    with _connect(path) as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            if con.execute("SELECT 1 FROM simulation_bank WHERE id = 1").fetchone() is None:
+                raise SimulationBankNotInitializedError("bank has not been initialized")
+            existing = con.execute(
+                f"SELECT {_EVENT_COLUMNS} FROM simulation_events WHERE event_key = ?",
+                (event["event_key"],),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != payload:
+                    raise SimulationBankConflictError(
+                        "event_key already used with a different event payload"
+                    )
+                # Identical replay: no new event, no reservation change, no revision bump.
+                positions = _fold(con)
+                key = (event["origin"], event["position_key"])
+                result = {
+                    "outcome": "REPLAY",
+                    "position": _position_view(key, positions[key]),
+                    "snapshot": _snapshot(con),
+                }
+                con.execute("COMMIT")
+                return result
+            if event["kind"] == "FILL" and event["reservation_key"] is not None:
+                _check_reservation_link(con, event["reservation_key"], event["origin"])
+            # Validate against the CURRENT derived state before writing anything.
+            positions = _fold(con)
+            key = (event["origin"], event["position_key"])
+            if event["kind"] == "SETTLEMENT" and key not in positions:
+                raise SimulationBankValidationError("NOTHING_TO_SETTLE: no such position")
+            pos = positions.setdefault(key, _Position())
+            _apply_row(
+                pos,
+                event["kind"],
+                event["side"],
+                event["price_cents"],
+                event["count"],
+                event["fee_cents"],
+                event["payout_cents"],
+                event["reservation_key"],
+            )
+            now = _now()
+            con.execute(
+                f"INSERT INTO simulation_events (event_key, {_EVENT_COLUMNS}, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event["event_key"], *payload, now),
+            )
+            if not pos.lots:
+                # Flat or settled: the risk earmark ends in the SAME transaction as the
+                # closing event. A crash between them cannot leave freed capital with
+                # no recorded close, nor a recorded close with its capital still held.
+                _release_linked_locked(con, pos.reservation_keys, now)
+            con.execute(
+                "UPDATE simulation_bank SET revision = revision + 1, updated_at = ? WHERE id = 1",
+                (now,),
+            )
+            result = {
+                "outcome": "RECORDED",
+                "position": _position_view(key, pos),
+                "snapshot": _snapshot(con),
+            }
+            con.execute("COMMIT")
+            return result
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+
+
+def record_fill(
+    db_path: str | Path,
+    *,
+    event_key: str,
+    origin: str,
+    position_key: str,
+    side: str,
+    price_cents: int,
+    count: int,
+    fee_cents: int,
+    reservation_key: str | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Record one SIMULATED fill. Idempotent by `event_key`.
+
+    `fee_cents` is the fee of THIS fill as given by the caller — this ledger does not
+    recompute tariffs (that is the fill reviewer's job). `reservation_key`, if given,
+    must be an ACTIVE reservation of the same origin not already backing another fill;
+    it is released when the position becomes flat or settles.
+
+    Returns {"outcome": "RECORDED" | "REPLAY", "position": ..., "snapshot": ...}. Any
+    invalid input or state raises before anything is written.
+    """
+    if side not in _SIDES:
+        raise SimulationBankValidationError("side must be 'buy' or 'sell'")
+    event = {
+        "event_key": _parse_id(event_key, field="event_key"),
+        "origin": _parse_id(origin, field="origin"),
+        "position_key": _parse_id(position_key, field="position_key"),
+        "kind": "FILL",
+        "side": side,
+        "price_cents": _parse_int(price_cents, field="price_cents", lo=_MIN_PRICE_CENTS, hi=_MAX_PRICE_CENTS),
+        "count": _parse_int(count, field="count", lo=1, hi=_MAX_COUNT),
+        "fee_cents": _parse_int(fee_cents, field="fee_cents", lo=0, hi=_MAX_FEE_CENTS),
+        "payout_cents": None,
+        "reservation_key": (
+            None if reservation_key is None else _parse_id(reservation_key, field="reservation_key")
+        ),
+        "evidence_json": None if evidence is None else _canonical_evidence_json(evidence),
+    }
+    return _record_event(db_path, event)
+
+
+def record_settlement(
+    db_path: str | Path,
+    *,
+    event_key: str,
+    origin: str,
+    position_key: str,
+    payout_cents: int,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Record the resolution of a position: 0 or 100 cents per YES contract.
+
+    Closes every open lot and releases the position's linked reservations in the same
+    transaction. A settlement of a position with no open lot, a second settlement, or
+    a payout other than 0/100 is rejected before anything is written.
+    """
+    if type(payout_cents) is not int or payout_cents not in _SETTLEMENT_PAYOUTS:
+        raise SimulationBankValidationError("payout_cents must be 0 or 100")
+    event = {
+        "event_key": _parse_id(event_key, field="event_key"),
+        "origin": _parse_id(origin, field="origin"),
+        "position_key": _parse_id(position_key, field="position_key"),
+        "kind": "SETTLEMENT",
+        "side": None,
+        "price_cents": None,
+        "count": None,
+        "fee_cents": None,
+        "payout_cents": payout_cents,
+        "reservation_key": None,
+        "evidence_json": None if evidence is None else _canonical_evidence_json(evidence),
+    }
+    return _record_event(db_path, event)
 
 
 def get_snapshot(db_path: str | Path) -> dict[str, Any]:
