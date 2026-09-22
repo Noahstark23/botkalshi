@@ -14,9 +14,10 @@ pudo alcanzar** figura como BLOCKED con su causa, no como pendiente genérico.
 |---|---|---|
 | C1 — fila M5, comisión y estado de reserva verificados | **PASS — nivel componente local** | Candidato recibido como texto del operador (SHA-256 `77d850fc…dbdf4`, idéntico al consignado), incorporado **verbatim** (`52e5e8f`), pasada mecánica de ruff con AST verificado idéntico (`9bdff14`), y arreglo (`3f2c401`). 21 pruebas del bridge + 8 del banco: **17 de 21 pasaban con el candidato intacto; las 4 que fallaban reproducían 6.2** (liberada reportada como `RESERVED`, repetición activa indistinguible, banco inexistente creado en un rechazo). Suite de research **352 OK**. Acredita un componente probado localmente con fixtures, **no** el productor ni el circuito. |
 | C1 — cierre contable y recuperación | **PASS — nivel componente local** | **Recuperación (6.3):** comisión grabada reproducida y validada; 12 casos; suite principal **1.687 passed**. **Cierre contable (6.4/6.5, `c59b8e5`):** una sola fuente de eventos en la SQLite del banco, proyección derivada en cada lectura; los 4 oráculos sobre USD 200 dan exacto (+0.10 → 200.10; −0.07 → 199.93; +0.59 → 200.59; −0.41 → 199.59); repetición, reinicio, cierre parcial, inversión de signo, concurrencia, migración y fallo entre escrituras cubiertos. 24 tests; **8/8 mutaciones detectadas**. Suite de research **376 OK**. Todavía **no** conectado a ningún motor: el M5 real no escribe eventos. |
-| C2 — M1 conectado y alcance explícito | **PENDING** | No abordado. |
-| C2 — M2, M5, M3 y Radar conectados | **PENDING** | No abordado. |
-| C2 — capital común, resultados y reporte | **PENDING** | No abordado. |
+| C2 — política única de riesgo (opción A corregida) | **PASS — nivel componente local** | `risk_policy.py` (`deaca89`): unidad = min(USD 2, 1 % del capital simulado) truncada al centavo; habitual = media unidad; tope por operación y por tesis = 1 unidad; abierto y diario = 3 unidades (nunca > USD 6); pausas USD 12 semanal y USD 20 del experimento. `risk_guard` y `bank_batch_review` llaman a la misma función. `REFERENCE_UNIT` sigue en 2; no se fijó 6. 13 pruebas propias. |
+| C2 — admisión previa, reserva, fill y evento contable | **PASS — nivel componente local** | `c6cb010`: `admit_proposal` decide y reserva en una sola transacción contra el estado compartido de todos los orígenes; el fill cita la admisión y consume su riesgo admitido **acumulado** (los fills parciales de una cotización no reservan dos veces); períodos por fecha del hecho en America/Los_Angeles; un fill sin admisión, con admisión rechazada/retirada o por encima de lo admitido **se registra** con incumplimiento. Replay almacenado validado fila por fila (`4985afa`). 39 pruebas nuevas; 13 mutaciones de regla detectadas. |
+| C2 — M1, M5 y Radar conectados al presupuesto común | **PENDING — decisión de arquitectura** | Ningún motor llama todavía a `admit_proposal`. `research_runner.py` y `m1_observation.py` no tocan el banco; no existe productor de Radar en el código (solo el origen declarado en `bank_batch_review`); el cotizador de M5 vive en el bot principal (`src/`), no en el servicio de research. |
+| C2 — M2 referencia, M3 salidas simuladas, reporte único | **PENDING** | No abordado. |
 | C3 — acceso, respaldo y rollback | **BLOCKED** | Esta sesión es un contenedor efímero en la nube sin acceso SSH ni consola al droplet `botkalshi-research-sfo3`. No se intentó ni se simuló. |
 | C3 — SHA desplegado y diez ciclos públicos | **BLOCKED** | Misma causa. Sin lectura nueva del host, el release `435d1d9b` sigue siendo referencia histórica, no estado actual. |
 | C3 — reinicio preserva estado | **BLOCKED** | Misma causa. |
@@ -90,6 +91,14 @@ cohorte **entera** antes de aplicar una sola fila. El cero documentado sigue sie
 | 22-sep, 4ª iteración, `c59b8e5` | `unittest discover -s tests` en `infra/digitalocean-shadow/` | **376 OK** (= 352 + 24) |
 | 22-sep, 4ª iteración, `c59b8e5` | `unittest test_collector` | **6 OK** |
 | 22-sep, 4ª iteración | ruff `infra/` base vs HEAD | 58 = 58; test nuevo limpio |
+| 22-sep, 5ª iteración, `4985afa` | `unittest discover -s tests` en `infra/digitalocean-shadow/` (re-medido en worktree del commit) | **379 OK** |
+| 22-sep, 5ª iteración, `deaca89` | idem | **393 OK** |
+| 22-sep, 5ª iteración, `c6cb010` | idem | **432 OK** (39 de `test_simulation_admission`) |
+| 22-sep, 5ª iteración, `c6cb010` | `unittest test_collector` | **6 OK** |
+| 22-sep, 5ª iteración, `c6cb010` | 14 mutaciones de la admisión (habitual→unidad, sin tope de tesis, tesis ignorada, semana desde domingo, días UTC, exceso fuera del diario, cobertura no acumulada, reserva liberada que cubre, propuesta vieja aceptada, exposición sin reserva ignorada, sin tope diario, sin pausa semanal, techo del experimento sin riesgo abierto) | **13/13 reales rompen tests**; la 14ª no aplicó (patrón inexistente) y no se cuenta |
+| 22-sep, 5ª iteración, `c6cb010` | `pytest -q` (suite principal) | **1.689 passed** (+2 de `test_dependencias_espejadas`, `10911ac`) |
+| 22-sep, 5ª iteración, `c6cb010` | `ruff check src tests` + `ruff format --check src tests` | limpio |
+| 22-sep, 5ª iteración, `c6cb010` | ruff `infra/` base `21088dc9` vs HEAD, mismo comando | **63 = 63**. El 58 de la fila anterior no se reprodujo con este comando; lo que se compara es base contra HEAD. `simulation_bank.py` ya estaba sin formato en la base: no se reformateó (sin formato masivo) |
 
 Entorno de todas las filas: Linux x86_64, Python 3.12.3, venv del repo, sockets bloqueados en
 los tests de research. Nivel acreditado: **componente probado localmente**. No hay prueba de
@@ -127,14 +136,17 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 
 ## Lo que falta, con la intervención exacta
 
-1. **C2/7.1 — la ruta vertical M5**: hoy el bridge reserva y el ledger contabiliza, pero nada
-   une las dos cosas. Falta que un fill M5 verificado se registre como evento con su reserva,
-   de punta a punta con fixtures identificadas, antes de extender a M1 y Radar.
-2. **C2/7.2 — admisión previa**: la reserva de hoy ocurre DESPUÉS de observar el fill
-   hipotético. Eso es observación contable, no prueba de que la cotización se podía financiar.
-3. **C2/7.3 — política única**: `risk_guard.py` fija `REFERENCE_UNIT = 2.00` y deriva
-   6.00 de riesgo abierto y diario; la especificación del encargo dice riesgo habitual USD 1 y
-   máximo USD 2 por operación. Discrepancia documentada, no resuelta, y sin ampliar límites.
+1. **C2 — conectar los motores al presupuesto común (decisión pendiente).** El banco ya tiene
+   la cadena entera admisión → reserva → fill → evento contable, pero ningún motor la usa.
+   Para M5 hay dos caminos y la elección no es técnica: (a) el bot principal (`src/`, Coolify)
+   llama al banco de research antes de cada cotización, o (b) el servicio de research simula
+   la cotización M5 reutilizando el cotizador de `src/` y el bot principal no participa.
+   M1 se puede conectar desde `research_runner` en cualquiera de los dos; Radar no tiene
+   productor en el código.
+2. **Camino legacy** `reserve()` + `reservation_key`: sigue existiendo y no pasa por la
+   política. `m5_ledger_bridge` reserva al observar el fill (C1); con C2 eso equivale a un fill
+   sin admisión previa. Se retira o se reetiqueta cuando se conecte el productor, no antes.
+3. **C2/7.3 — resuelto** por decisión del propietario (opción A corregida, `deaca89`).
 4. **`fee_model` sin contrastar** en la recuperación de 6.3 (limitación abierta de #264).
 5. **C3 completo** — requiere una sesión con acceso al droplet. Esta no lo tiene y no hay
    forma autorizada de obtenerlo desde acá.
