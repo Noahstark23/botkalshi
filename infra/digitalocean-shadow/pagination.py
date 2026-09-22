@@ -21,6 +21,36 @@ class PaginationError(RuntimeError):
     """Provider data cannot be trusted enough to continue this cycle."""
 
 
+def strict_m1_book(raw_orderbook_fp: object) -> dict | None:
+    """Capture yes_dollars/no_dollars exactly as Kalshi returned them, for M1 only.
+
+    Fails closed (returns None) on a missing side, a wrong row shape, or a
+    non-string price/quantity, instead of dropping the bad row and silently
+    certifying whatever remains as a complete book. `sanitize_levels`
+    (`collector.numeric_levels`) makes that drop-and-stringify trade-off on
+    purpose for general research dashboards; M1 review must never receive a
+    partially invalid raw book disguised as a complete one, and must never
+    see a value coerced away from the exact string Kalshi sent.
+    """
+    if not isinstance(raw_orderbook_fp, dict):
+        return None
+    sides: dict[str, list[list[str]]] = {}
+    for key in ("yes_dollars", "no_dollars"):
+        rows = raw_orderbook_fp.get(key)
+        if not isinstance(rows, list):
+            return None
+        clean: list[list[str]] = []
+        for row in rows:
+            if type(row) is not list or len(row) != 2:
+                return None
+            price, qty = row
+            if type(price) is not str or type(qty) is not str:
+                return None
+            clean.append([price, qty])
+        sides[key] = clean
+    return {"yes_bids": sides["yes_dollars"], "no_bids": sides["no_dollars"]}
+
+
 def _parse_utc(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -121,15 +151,22 @@ def collect_paginated(
     result: list[dict] = []
     for close_at, ticker, market in selected:
         ob = reader.get_json(origin, f"/markets/{ticker}/orderbook", {"depth": orderbook_depth})
+        # Own clock read at the instant this book's fetch returned — never
+        # coverage.generated_at/packet.generated_at (cycle-start) nor a later
+        # report time, so a caller cannot mistake a stale book for a fresh one.
+        book_observed_at = datetime.now(UTC)
         if not isinstance(ob, dict):
             raise PaginationError("unexpected Kalshi orderbook response")
+        raw_fp = ob.get("orderbook_fp")
         book = ob.get("orderbook_fp", ob.get("orderbook", {}))
         result.append({
             "ticker": ticker,
             "event_ticker": market.get("event_ticker") if isinstance(market.get("event_ticker"), str) else None,
             "status": market.get("status") if isinstance(market.get("status"), str) else None,
             "close_time": close_at.isoformat(),
+            "book_observed_at": book_observed_at.isoformat(),
             "levels": sanitize_levels(book),
+            "m1_book": strict_m1_book(raw_fp),
         })
 
     coverage = {
