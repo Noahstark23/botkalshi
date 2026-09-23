@@ -31,6 +31,9 @@ from src.storage.models import OperationalState, PortfolioPosition, Trade, get_s
 NOW = datetime(2026, 9, 23, 14, 0, tzinfo=UTC)
 NAIVE_NOW = NOW.replace(tzinfo=None)
 SHA = "11c215138d9c6a81322b6cc970643a9a703e27d2"
+# Synthetic PEM-looking marker for the redaction tests, assembled at runtime so no real-
+# looking key header is ever committed (tests/test_no_claves_trackeadas.py guards that).
+FAKE_PEM = "-" * 5 + "BEGIN " + "PRIVATE" + " KEY" + "-" * 5
 
 
 @pytest.fixture
@@ -250,7 +253,6 @@ class TestNeverReportsHealthyWithoutEvidence:
                 ticker="KXA-1",
                 side="yes",
                 count=1,
-                avg_price_cents=40,
                 synced_at=NAIVE_NOW - timedelta(hours=2),
             )
         )
@@ -263,7 +265,6 @@ class TestNeverReportsHealthyWithoutEvidence:
                 ticker="KXA-1",
                 side="yes",
                 count=1,
-                avg_price_cents=40,
                 synced_at=NAIVE_NOW - timedelta(minutes=5),
             )
         )
@@ -292,7 +293,7 @@ class TestNoSecretsReachTheSnapshot:
         extra = dict(doc, environment={"KALSHI_API_KEY_ID": "x"})
         assert any(p.startswith("TOP_KEYS") for p in snap.validate_snapshot(extra))
         leaked = json.loads(json.dumps(doc))
-        leaked["mode"]["note"] = "-----BEGIN PRIVATE KEY-----"
+        leaked["mode"]["note"] = FAKE_PEM
         assert "SECRET_PATTERN" in snap.validate_snapshot(leaked)
         lying = json.loads(json.dumps(doc))
         lying["accounting"]["realized_pnl_today"].update(status="UNKNOWN", value=0)
@@ -300,7 +301,7 @@ class TestNoSecretsReachTheSnapshot:
 
     def test_release_sha_reads_only_the_allowlisted_names(self):
         env = {
-            "KALSHI_PRIVATE_KEY": "-----BEGIN",
+            "KALSHI_PRIVATE_KEY": FAKE_PEM,
             "SOURCE_COMMIT": SHA.upper(),
             "GIT_SHA": "f" * 40,
         }
@@ -440,7 +441,7 @@ class TestRuntimeCollection:
         from src.monitoring.health import BotState
         from src.risk.manager import RiskManager
 
-        monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----")
+        monkeypatch.setenv("KALSHI_PRIVATE_KEY", FAKE_PEM)
         monkeypatch.setenv("SOURCE_COMMIT", SHA)
         monkeypatch.setattr(BotState, "last_error", "GET /x?token=zzz failed")
         monkeypatch.setattr(RiskManager, "_last_raw_balance_usd", 12.34)
@@ -453,7 +454,7 @@ class TestRuntimeCollection:
             doc = snap.collect_and_build(now=NOW)
         assert snap.validate_snapshot(doc) == []
         text = json.dumps(doc)
-        assert "BEGIN RSA" not in text and "zzz" not in text
+        assert "BEGIN" not in text and "zzz" not in text
         assert doc["release_sha"] == SHA
         assert doc["balance"]["value"] == 1234
 
