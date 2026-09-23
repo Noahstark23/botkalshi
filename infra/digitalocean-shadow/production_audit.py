@@ -206,6 +206,29 @@ def _transitions(row: dict[str, Any]) -> tuple[list[tuple[str, str | None, dict]
     return events, diags
 
 
+SCAN_COHORT = "__scan__"  # pagination cursor over NEW rows (by id)
+SWEEP_COHORT = "__sweep__"  # rotating re-verification cursor over ALL rows
+OPEN_COHORT = "__open__"  # rotating cursor over already-seen non-terminal rows
+
+
+def _cursor(con: sqlite3.Connection, name: str) -> int:
+    row = con.execute(
+        "SELECT last_id FROM audit_cursor WHERE origin = ? AND cohort = ? AND version = ?",
+        (ORIGIN, name, PROJECTION_VERSION),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _rows(src: sqlite3.Connection, where: str, params: tuple, limit: int) -> list[dict]:
+    return [
+        dict(zip(_REQUIRED_COLUMNS, r, strict=True))
+        for r in src.execute(
+            f"SELECT {', '.join(_REQUIRED_COLUMNS)} FROM trades WHERE {where} ORDER BY id LIMIT ?",
+            (*params, limit),
+        )
+    ]
+
+
 def audit_pass(
     source: str | Path,
     state: str | Path,
@@ -213,25 +236,69 @@ def audit_pass(
     now: datetime | None = None,
     max_rows: int = MAX_ROWS_PER_PASS,
 ) -> dict[str, Any]:
-    """One read-only audit pass. Returns the report; raises AuditError only when the
-    SOURCE cannot be read at all (nothing is written then either)."""
+    """One read-only, BOUNDED audit pass. Returns the report; raises AuditError when the
+    source cannot be read or the state cannot be written (nothing is committed then).
+
+    Each pass reads at most `max_rows` rows from each of three pages:
+      - NEW rows after the persisted scan cursor (id > cursor) — the cursor advances, so a
+        backlog larger than one page is consumed across passes, never re-read from row 1;
+      - already-seen rows still NON-terminal (pending/filled), which mutate over time;
+      - a rotating SWEEP over every row, so a terminal row rewritten later is eventually
+        re-verified (contradiction / regression) without scanning the whole table at once.
+    Identities are stable, so overlapping pages or a restart never duplicate events."""
+    if not (isinstance(max_rows, int) and max_rows >= 1):
+        raise AuditError("max_rows must be a positive integer")
     now = (now or _now()).astimezone(UTC)
     stamp = now.isoformat()
-    src = _open_source(Path(source))
+    state_path = Path(state)
+    con = sqlite3.connect(state_path, timeout=15, isolation_level=None)
     try:
-        rows = [
-            dict(zip(_REQUIRED_COLUMNS, r, strict=True))
-            for r in src.execute(
-                f"SELECT {', '.join(_REQUIRED_COLUMNS)} FROM trades ORDER BY id LIMIT ?",
-                (max_rows + 1,),
+        con.execute("PRAGMA journal_mode=WAL")
+        _state_schema(con)
+        scan, sweep, open_cursor = (
+            _cursor(con, SCAN_COHORT),
+            _cursor(con, SWEEP_COHORT),
+            _cursor(con, OPEN_COHORT),
+        )
+        open_ids = [
+            r[0]
+            for r in con.execute(
+                "SELECT trade_id FROM audit_trade_state WHERE last_status NOT IN "
+                "('settled','cancelled','error') AND trade_id > ? ORDER BY trade_id LIMIT ?",
+                (open_cursor, max_rows + 1),
             )
         ]
+    finally:
+        con.close()
+    open_more = len(open_ids) > max_rows
+    open_ids = open_ids[:max_rows]
+
+    src = _open_source(Path(source))
+    try:
+        new_rows = _rows(src, "id > ?", (scan,), max_rows + 1)
+        partial = len(new_rows) > max_rows
+        new_rows = new_rows[:max_rows]
+        open_rows = (
+            _rows(src, f"id IN ({','.join('?' for _ in open_ids)})", tuple(open_ids), max_rows)
+            if open_ids
+            else []
+        )
+        sweep_rows = _rows(src, "id > ?", (sweep,), max_rows)
+        backlog = (
+            src.execute(
+                "SELECT COUNT(*) FROM trades WHERE id > ?", (new_rows[-1]["id"],)
+            ).fetchone()[0]
+            if partial
+            else 0
+        )
         source_sums = dict(
             src.execute(
                 "SELECT strategy, COALESCE(SUM(pnl_cents), 0) FROM trades "
                 "WHERE status = 'settled' GROUP BY strategy"
             ).fetchall()
         )
+        source_max = dict(src.execute("SELECT strategy, MAX(id) FROM trades GROUP BY strategy"))
+        source_max_id = src.execute("SELECT COALESCE(MAX(id), 0) FROM trades").fetchone()[0]
         first_coid = src.execute(
             "SELECT client_order_id FROM trades ORDER BY id LIMIT 1"
         ).fetchone()
@@ -239,18 +306,17 @@ def audit_pass(
         raise AuditError(f"SOURCE_UNREADABLE:{type(exc).__name__}") from exc
     finally:
         src.close()
-    partial = len(rows) > max_rows
-    rows = rows[:max_rows]
 
     diagnostics: list[tuple[str, str, str | None, dict]] = []  # (kind, key, cohort, detail)
-    ids = [r["id"] for r in rows]
+    ids = [r["id"] for r in new_rows]
     if ids:
-        missing = sorted(set(range(ids[0], ids[-1] + 1)) - set(ids))
+        expected_from = scan + 1 if scan else ids[0]
+        missing = sorted(set(range(expected_from, ids[-1] + 1)) - set(ids))
         if missing:
             diagnostics.append(
                 (
                     "ID_GAP",
-                    "ids",
+                    f"ids>{scan}",
                     None,
                     {
                         "missing_count": len(missing),
@@ -258,28 +324,64 @@ def audit_pass(
                     },
                 )
             )
+    if scan > source_max_id:
+        diagnostics.append(
+            (
+                "CURSOR_AHEAD_OF_SOURCE",
+                SCAN_COHORT,
+                None,
+                {
+                    "cursor": scan,
+                    "source_max": source_max_id,
+                },
+            )
+        )
     if partial:
-        diagnostics.append(("PARTIAL_PASS", "rows", None, {"max_rows": max_rows}))
+        diagnostics.append(
+            ("PARTIAL_PASS", "rows", None, {"max_rows": max_rows, "backlog_rows": backlog})
+        )
 
-    state_path = Path(state)
+    # One row object per id: overlapping pages never project the same row twice.
+    by_id = {r["id"]: r for r in (*sweep_rows, *open_rows, *new_rows)}
+    rows = [by_id[i] for i in sorted(by_id)]
+    cursors = {
+        # The scan cursor never moves backwards (a replaced source is flagged, not reset).
+        SCAN_COHORT: max(scan, ids[-1]) if ids else scan,
+        SWEEP_COHORT: sweep_rows[-1]["id"] if len(sweep_rows) == max_rows else 0,
+        OPEN_COHORT: open_ids[-1] if open_more else 0,
+    }
     con = sqlite3.connect(state_path, timeout=15, isolation_level=None)
     try:
-        con.execute("PRAGMA journal_mode=WAL")
-        _state_schema(con)
         con.execute("BEGIN IMMEDIATE")
         try:
-            report = _apply(con, rows, source_sums, first_coid, diagnostics, stamp)
+            report = _apply(
+                con, rows, source_sums, source_max, first_coid, diagnostics, stamp, backlog=partial
+            )
+            for name, value in cursors.items():
+                con.execute(
+                    "INSERT INTO audit_cursor VALUES (?,?,?,?,?) ON CONFLICT(origin, cohort, version) "
+                    "DO UPDATE SET last_id=excluded.last_id, updated_at=excluded.updated_at",
+                    (ORIGIN, name, PROJECTION_VERSION, value, stamp),
+                )
             con.execute("COMMIT")
         except Exception as exc:
             con.execute("ROLLBACK")
             raise AuditError(f"STATE_WRITE_FAILED:{type(exc).__name__}") from exc
     finally:
         con.close()
-    report.update(partial=partial, source_rows=len(rows))
+    report.update(
+        partial=partial,
+        backlog_rows=backlog,
+        source_rows=len(rows),
+        scan_cursor=cursors[SCAN_COHORT],
+        sweep_cursor=cursors[SWEEP_COHORT],
+    )
     return report
 
 
-def _apply(con, rows, source_sums, first_coid, diagnostics, stamp) -> dict[str, Any]:
+def _apply(
+    con, rows, source_sums, source_max, first_coid, diagnostics, stamp, *, backlog: bool
+) -> dict[str, Any]:
     meta = dict(con.execute("SELECT key, value FROM audit_meta"))
     identity = first_coid[0] if first_coid else ""
     if meta.get("source_identity") not in (None, identity):
@@ -384,12 +486,16 @@ def _apply(con, rows, source_sums, first_coid, diagnostics, stamp) -> dict[str, 
             (row["client_order_id"], cohort, row["id"], str(row["status"]), row_fp, stamp),
         )
 
-    cohorts = sorted(set(cursors) | set(max_by_cohort))
+    special = (SCAN_COHORT, SWEEP_COHORT, OPEN_COHORT)
+    cohorts = sorted((set(cursors) | set(max_by_cohort)) - set(special))
     cohort_report = {}
     for cohort in cohorts:
-        previous = cursors.get(cohort)
-        seen_max = max_by_cohort.get(cohort)
-        if previous is not None and (seen_max is None or seen_max < previous):
+        previous = cursors.get(cohort, 0)
+        # Highest id ever projected for this cohort: a pass that only revisits old rows
+        # does not move it back. Ahead of the SOURCE's own max ⇒ the source moved under us.
+        cursor = max(previous, max_by_cohort.get(cohort, 0))
+        src_max = source_max.get(cohort)
+        if previous and (src_max is None or src_max < previous):
             diagnostics.append(
                 (
                     "CURSOR_AHEAD_OF_SOURCE",
@@ -397,18 +503,15 @@ def _apply(con, rows, source_sums, first_coid, diagnostics, stamp) -> dict[str, 
                     cohort,
                     {
                         "cursor": previous,
-                        "source_max": seen_max,
+                        "source_max": src_max,
                     },
                 )
             )
-            cursor = previous  # kept, never reset: the source moved under us
-        else:
-            cursor = seen_max or 0
-            con.execute(
-                "INSERT INTO audit_cursor VALUES (?,?,?,?,?) ON CONFLICT(origin, cohort, version) "
-                "DO UPDATE SET last_id=excluded.last_id, updated_at=excluded.updated_at",
-                (ORIGIN, cohort, PROJECTION_VERSION, cursor, stamp),
-            )
+        con.execute(
+            "INSERT INTO audit_cursor VALUES (?,?,?,?,?) ON CONFLICT(origin, cohort, version) "
+            "DO UPDATE SET last_id=excluded.last_id, updated_at=excluded.updated_at",
+            (ORIGIN, cohort, PROJECTION_VERSION, cursor, stamp),
+        )
         audit_sum, settled = con.execute(
             "SELECT COALESCE(SUM(json_extract(payload_json, '$.pnl_cents')), 0), COUNT(*) "
             "FROM audit_events WHERE cohort = ? AND transition = 'SETTLED' AND version = ?",
@@ -416,9 +519,11 @@ def _apply(con, rows, source_sums, first_coid, diagnostics, stamp) -> dict[str, 
         ).fetchone()
         src_sum = int(source_sums.get(cohort, 0) or 0)
         if audit_sum != src_sum:
+            # With rows still unread the difference is expected, not a contradiction.
+            kind = "SUM_PENDING_BACKLOG" if backlog else "SUM_MISMATCH"
             diagnostics.append(
                 (
-                    "SUM_MISMATCH",
+                    kind,
                     cohort,
                     cohort,
                     {

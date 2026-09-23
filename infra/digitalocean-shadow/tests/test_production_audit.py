@@ -188,6 +188,110 @@ class ReplayAndRestartTests(AuditTestCase):
         self.assertEqual(report["cohorts"]["motor_5_mm"]["realized_pnl_cents_audit"], -2)
 
 
+class PaginationTests(AuditTestCase):
+    """Review of 130bb6b: every pass used to re-read the FIRST page, so the tail beyond
+    max_rows was never projected and PARTIAL_PASS stayed forever."""
+
+    def settle_rows(self, n, start=1):
+        for i in range(start, start + n):
+            self.add(f"t{i}", status="settled", pnl=10, settled="2026-09-23 13:30:00")
+
+    def distinct_events(self):
+        return len({(c, t) for c, t, _ in self.events()})
+
+    def test_backlog_is_consumed_across_pages_without_losing_the_tail(self):
+        self.settle_rows(7)
+        first = self.run_pass(max_rows=3)
+        self.assertEqual(
+            (first["partial"], first["backlog_rows"], first["scan_cursor"]), (True, 4, 3)
+        )
+        self.assertEqual(first["diagnostics"].get("SUM_PENDING_BACKLOG"), 1)
+        self.assertNotIn("SUM_MISMATCH", first["diagnostics"])
+        second = self.run_pass(max_rows=3)
+        self.assertEqual(
+            (second["partial"], second["backlog_rows"], second["scan_cursor"]), (True, 1, 6)
+        )
+        third = self.run_pass(max_rows=3)
+        self.assertEqual(
+            (third["partial"], third["backlog_rows"], third["scan_cursor"]), (False, 0, 7)
+        )
+        cohort = third["cohorts"]["motor_1_arbitrage"]
+        self.assertEqual(
+            (cohort["realized_pnl_cents_audit"], cohort["realized_pnl_cents_source"]), (70, 70)
+        )
+        self.assertEqual(third["status"], "CLEAN", third["diagnostics"])
+        self.assertEqual(len(self.events()), 21)  # 7 trades × PLACED/FILLED/SETTLED
+        self.assertEqual(self.distinct_events(), 21)  # no duplicate identity
+
+    def test_restart_mid_backlog_equals_an_uninterrupted_run(self):
+        self.settle_rows(7)
+        self.run_pass(max_rows=3)
+        import importlib
+
+        importlib.reload(audit)  # restart between pages
+        for _ in range(3):
+            last = audit.audit_pass(self.source, self.state, now=NOW, max_rows=3)
+        interrupted = self.events()
+        # Same source audited in one uninterrupted, unpaged pass into a fresh state.
+        fresh = self.dir / "fresh.sqlite3"
+        whole = audit.audit_pass(self.source, fresh, now=NOW, max_rows=100)
+        with sqlite3.connect(fresh) as con:
+            uninterrupted = con.execute(
+                "SELECT client_order_id, transition, payload_json FROM audit_events ORDER BY 1, 2"
+            ).fetchall()
+        self.assertEqual(interrupted, uninterrupted)
+        self.assertEqual(last["cohorts"], whole["cohorts"])
+
+    def test_rows_appended_after_the_limit_are_projected(self):
+        self.settle_rows(3)
+        self.run_pass(max_rows=3)
+        self.settle_rows(2, start=4)
+        report = self.run_pass(max_rows=3)
+        self.assertEqual(report["scan_cursor"], 5)
+        self.assertEqual(report["cohorts"]["motor_1_arbitrage"]["realized_pnl_cents_audit"], 50)
+
+    def test_open_rows_are_revisited_while_a_backlog_is_pending(self):
+        self.add("p1", status="pending", fill=None, fee=None)
+        self.settle_rows(6, start=2)
+        self.run_pass(max_rows=3)  # sees p1 pending + t2, t3
+        self.update(
+            "p1",
+            status="settled",
+            fill_price_cents=45,
+            fees_cents=1,
+            pnl_cents=5,
+            settled_at="2026-09-23 13:40:00",
+        )
+        self.run_pass(max_rows=3)  # scan moves on; p1 comes back through the open page
+        settled = {c for c, t, _ in self.events() if t == "SETTLED"}
+        self.assertIn("p1", settled)
+
+    def test_sweep_eventually_reverifies_terminal_rows(self):
+        self.settle_rows(6)
+        for _ in range(2):
+            self.run_pass(max_rows=3)  # backlog consumed; t1 was projected long ago
+        # A terminal row on the SECOND page, rewritten behind the scan cursor: only a sweep
+        # that rotates past page 1 can ever come back to it.
+        self.update("t5", pnl_cents=999)
+        seen = []
+        for _ in range(3):  # at most ceil(6/3)+1 passes for the sweep to come around
+            seen.append(self.run_pass(max_rows=3)["diagnostics"].get("CONTRADICTION", 0))
+        self.assertGreaterEqual(sum(seen), 1)
+        [(_, _, payload)] = [e for e in self.events() if e[0] == "t5" and e[1] == "SETTLED"]
+        self.assertIn('"pnl_cents": 10', payload)  # first observation kept
+
+    def test_lost_cursor_mid_backlog_rebuilds_without_duplicates(self):
+        self.settle_rows(7)
+        self.run_pass(max_rows=3)
+        with sqlite3.connect(self.state) as con:
+            con.execute("DELETE FROM audit_cursor")
+        for _ in range(4):
+            report = self.run_pass(max_rows=3)
+        self.assertEqual(self.distinct_events(), len(self.events()))
+        self.assertEqual(len(self.events()), 21)
+        self.assertEqual(report["cohorts"]["motor_1_arbitrage"]["realized_pnl_cents_audit"], 70)
+
+
 class DiagnosticsTests(AuditTestCase):
     def test_unknown_fee_is_explicit_and_never_recomputed(self):
         self.add("a", status="filled", fee=None)
@@ -244,7 +348,8 @@ class DiagnosticsTests(AuditTestCase):
         self.add("z", id=1)
         report = self.run_pass()
         self.assertEqual(report["diagnostics"].get("SOURCE_CHANGED"), 1)
-        self.assertEqual(report["diagnostics"].get("CURSOR_AHEAD_OF_SOURCE"), 1)
+        # Two distinct facts: the global scan cursor AND the cohort cursor are ahead.
+        self.assertEqual(report["diagnostics"].get("CURSOR_AHEAD_OF_SOURCE"), 2)
         self.assertEqual(report["cohorts"]["motor_1_arbitrage"]["cursor_last_id"], 4)
 
     def test_partial_pass_is_explicit(self):
