@@ -964,6 +964,31 @@ class Settings(BaseSettings):
     # nadie miraba el disco real y el WAL a ~8MB/s llenó el 96% sin que el bot se enterara
     # (incidente 2026-07-10). WARN → alerta Telegram + poda inmediata; CRITICAL → además se
     # descarta telemetría (orderbook_events/market_snapshots). Trading state JAMÁS se gatea.
+    # === Supervisión read-only (encargo ASTRA-SUPERVISION-20260923, S1) ===
+    # Snapshot sanitizado del runtime a un archivo PRIVADO (0600, dir 0700) para que un
+    # supervisor externo lo lea por su canal ya aprobado. No abre puertos, no crea
+    # endpoints y no contiene ninguna acción. Default OFF: se enciende a propósito.
+    SUPERVISION_SNAPSHOT_ENABLED: bool = Field(
+        default=False,
+        description="Escribe el snapshot de supervisión read-only (latest.json + historial acotado).",
+    )
+    SUPERVISION_SNAPSHOT_DIR: str = Field(
+        default="/app/data/supervision",
+        description="Directorio privado del snapshot (se crea 0700; archivos 0600).",
+    )
+    SUPERVISION_SNAPSHOT_INTERVAL_SEC: int = Field(
+        default=60,
+        ge=15,
+        le=3600,
+        description="Cada cuántos segundos se reescribe el snapshot.",
+    )
+    SUPERVISION_SNAPSHOT_HISTORY_MAX: int = Field(
+        default=1440,
+        ge=1,
+        le=20000,
+        description="Líneas máximas de history.jsonl (1440 × 60 s ≈ 1 día). Nada sin tope.",
+    )
+
     DISK_GUARD_ENABLED: bool = Field(
         default=True,
         description="Monitorea disco libre del mount de la DB y hace backpressure de telemetría.",
