@@ -88,6 +88,11 @@ def _reason(value: object) -> str | None:
     return "[REDACTED]" if _SECRET_RE.search(text) else text
 
 
+def contains_secret(text: str) -> bool:
+    """Public form of the secret detector, shared by every consumer (alerts, reports)."""
+    return bool(_SECRET_RE.search(text))
+
+
 def release_sha(env: dict[str, str] | os._Environ[str] | None = None) -> str:
     env = os.environ if env is None else env
     for name in RELEASE_ENV_NAMES:

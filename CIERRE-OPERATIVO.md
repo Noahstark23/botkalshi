@@ -208,6 +208,31 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
    `maker_fee_multiplier_for_ticker` (`src/math/fees.py`) codifica un corte fijo al
    2026-08-07: consistente con el 0.5 actual para la serie, pero no mira overrides por evento.
 
+## Supervisión read-only del bot productivo — ASTRA-SUPERVISION-20260923
+
+**Procedencia, sin mezclar fuentes:**
+- Esta sesión **no tiene acceso remoto** y no vio ningún despliegue.
+- Según la lectura SSH del supervisor (Astra) a 2026-09-23T13:19:26Z, `botkalshi-research` estaba activo con `11c2151` y `botkalshi-live` inactivo, con PID 0. La instalación principal preparada usa `src.runner` sobre `a66cf62`.
+- **No hay prueba de autenticación ni de ejecución live actual.** No se declara LIVE_ACTIVE, SUPERVISION_CONNECTED ni FINISHED.
+
+| Unidad | Estado | Evidencia |
+|---|---|---|
+| S1 — snapshot de solo lectura del runtime | **PASS, componente local** | `1cc8ea7` (+ el guard de claves corregido en `a4d7b7a`). Contrato `botkalshi-production-snapshot-v1`: allowlist, `UNKNOWN` ante ausencia, salud falsable, DB en `mode=ro`, export atómico 0600/0700 acotado. Flag `SUPERVISION_SNAPSHOT_ENABLED=false`. 29 tests, 11/11 mutaciones |
+| S2 — auditor del historial real | **PASS, componente local** | `a4d7b7a`, `production_audit.py`. Identidades estables, cursores por origen/cohorte/versión, diagnósticos sin corrección silenciosa, fixture = DDL real con test de desvío. 18 tests, 10/10 mutaciones |
+| S3 — consumidor y alertas técnicas | **PASS, componente local** | `supervision_reader.py` + `assistant_bridge.py production-status`. Contrato único (el `validate_snapshot` del productor), dedup/backoff persistido, recuperación solo con evidencia nueva, redacción, adaptador SSH no ejecutado. 18 tests, 9/9 mutaciones |
+| Productor real → snapshot real → auditor → reporte | **NOT_CONNECTED** | Requiere encender el flag en el runtime productivo y leer por el canal aprobado; ambas cosas son decisión del propietario |
+
+**Verificación de SOLO LECTURA para el operador.** Nada de esto activa trading ni cambia límites o controles.
+1. En el host donde corre research, con el repo en el SHA a verificar, correr `python3 -m unittest discover -s tests -p 'test_*.py'` dentro de `infra/digitalocean-shadow/` con el python del sistema. Esperado: todos OK.
+2. **Solo si el propietario decide encender el snapshot en el runtime productivo** (flag apagado por defecto; es una decisión suya):
+   - comprobar que `latest.json` tenga permisos `600` y su directorio `700`;
+   - traer una copia por el canal ya aprobado;
+   - leerla con `python3 assistant_bridge.py --data <dir research> production-status --snapshot <copia>`.
+
+   Esperado: `view_state`, `alert_conditions`, `authority: NONE` y `commands_executed: []`. Un `view_state` distinto de `OK` es la respuesta, no un error del lector.
+3. Auditoría: `python3 production_audit.py --source <copia de trades.db> --state <archivo propio del auditor>`. La fuente se abre en `mode=ro`. Esperado: `authority: NONE`; los diagnósticos que aparezcan se leen, no se corrigen.
+4. Nunca: `set_pause`, `/admin/resume`, `clear_kill_switch.py`, scripts de activación, ni `StrictHostKeyChecking=no`.
+
 ## Historial operativo, ajeno a este encargo — NO es estado actual
 
 Última observación que tuvo esta sesión, **21-ago-2026**: el container de producción en

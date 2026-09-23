@@ -669,6 +669,36 @@ def assess(
         )
 
 
+def production_status(
+    snapshot_path: Path,
+    *,
+    audit_path: Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """READ-ONLY view of the PRODUCTION runtime snapshot (S1) as an explicit source.
+
+    ASTRA-SUPERVISION-20260923 (S3): this path never calls set_pause, never writes the
+    assistant control state, never runs `_assess_locked` and never sends anything. It
+    reports the snapshot's state and the technical alert conditions; the decision stays
+    with the human."""
+    import supervision_reader
+
+    view = supervision_reader.read_snapshot(snapshot_path, now=now or datetime.now(UTC))
+    audit = _read_optional(audit_path) if audit_path is not None else None
+    return {
+        "schema_version": "botkalshi-assistant-production-status-v1",
+        "view_state": view["state"],
+        "problems": view["problems"],
+        "alert_conditions": supervision_reader.conditions(view, audit),
+        "snapshot_id": (view["snapshot"] or {}).get("snapshot_id"),
+        "captured_at": (view["snapshot"] or {}).get("captured_at"),
+        "release_sha": (view["snapshot"] or {}).get("release_sha"),
+        "authority": "NONE",
+        "commands_executed": [],
+        "execution_authorized": False,
+    }
+
+
 def _print(value: dict[str, Any]) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
 
@@ -688,6 +718,9 @@ def main() -> int:
     sub.add_parser("status")
     sub.add_parser("snapshot")
     sub.add_parser("latest-assessment")
+    prod = sub.add_parser("production-status")
+    prod.add_argument("--snapshot", type=Path, required=True)
+    prod.add_argument("--audit", type=Path)
     pause = sub.add_parser("pause")
     pause.add_argument("--reason", required=True)
     resume = sub.add_parser("resume-simulation")
@@ -701,6 +734,8 @@ def main() -> int:
             result = build_status(args.data, state_data_dir=args.state_data)
         elif args.command == "snapshot":
             result = build_snapshot(args.data)
+        elif args.command == "production-status":
+            result = production_status(args.snapshot, audit_path=args.audit)
         elif args.command == "latest-assessment":
             result = latest_assessment(args.data, state_data_dir=args.state_data)
         elif args.command == "pause":
