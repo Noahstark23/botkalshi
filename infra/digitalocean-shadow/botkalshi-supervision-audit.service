@@ -1,0 +1,47 @@
+# ASTRA-DEPLOY-SUPERVISION-20260924 — read-only audit of the production trade history.
+# Installed by install-supervision.sh; its timer is NOT enabled automatically.
+# No trading authority: it never starts/stops/pauses the bot, never writes the live DB.
+[Unit]
+Description=botkalshi read-only production audit (no trading authority)
+
+[Service]
+Type=oneshot
+User=botkalshi-supervisor
+Group=botkalshi-supervisor
+WorkingDirectory=/opt/botkalshi/infra/digitalocean-shadow
+Environment=PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=KALSHI_API_KEY_ID KALSHI_PRIVATE_KEY KALSHI_PRIVATE_KEY_PATH TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID ODDS_API_KEY OPENAI_API_KEY PYTHONPATH PYTHONHOME PYTHONINSPECT PYTHONOPTIMIZE
+# Root pre-step: copies ONLY the trades table (source opened mode=ro) into the inbox.
+ExecStartPre=+/usr/bin/python3 -I /opt/botkalshi/infra/digitalocean-shadow/supervision_collect.py --env /etc/botkalshi-supervision.env --inbox /var/lib/botkalshi-supervision/inbox --owner botkalshi-supervisor
+ExecStart=/usr/bin/python3 /opt/botkalshi/infra/digitalocean-shadow/production_audit.py --source /var/lib/botkalshi-supervision/inbox/trades.db --state /var/lib/botkalshi-supervision/audit/audit.sqlite3 --report /var/lib/botkalshi-supervision/audit/latest.json
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/botkalshi-supervision
+InaccessiblePaths=-/etc/botkalshi-research.env -/etc/botkalshi-assistant -/etc/botkalshi-telegram
+UMask=0077
+LimitCORE=0
+MemoryMax=256M
+CPUQuota=25%
+TasksMax=16
+TimeoutStartSec=120
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=50

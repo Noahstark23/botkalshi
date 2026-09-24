@@ -76,6 +76,9 @@ class BatchReviewTests(unittest.TestCase):
         allowed = {
             "__future__", "argparse", "datetime", "hashlib", "json", "os",
             "pathlib", "re", "stat", "typing", "zoneinfo", "risk_guard",
+            # 2026-09-22: the shared policy formula. Pure, and itself imports nothing
+            # (pinned in test_risk_policy.test_policy_module_imports_nothing).
+            "risk_policy",
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -151,6 +154,21 @@ class BatchReviewTests(unittest.TestCase):
         self.data["risk"]["capital_reconciled_usd"] = "400"
         self.data["unit_ceiling_usd"] = "1.80"
         self.assertEqual(self.run_review()["unit_usd"], "1.800000")
+
+    def test_habitual_comes_from_the_shared_policy_and_shrinks_with_capital(self):
+        """2026-09-22: one formula (risk_policy) for both callers; habitual = half unit."""
+        import risk_policy
+
+        for capital, unit, habitual in (("200", "2.000000", "1.000000"),
+                                        ("195", "1.950000", "0.970000"),
+                                        ("180", "1.800000", "0.900000")):
+            with self.subTest(capital=capital):
+                self.data["risk"]["capital_reconciled_usd"] = capital
+                self.data["cash_available_usd"] = capital
+                result = self.run_review()
+                self.assertEqual(result["unit_usd"], unit)
+                self.assertEqual(result["habitual_risk_usd"], habitual)
+                self.assertEqual(result["risk_policy_version"], risk_policy.POLICY_VERSION)
 
     def test_unit_reduces_on_capital_drop(self):
         self.data["risk"]["capital_reconciled_usd"] = "180"

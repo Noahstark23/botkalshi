@@ -493,6 +493,15 @@ def test_run_limpio_y_run_invalido_son_durables():
 
 
 def test_rehidrata_inventario_de_la_misma_cohorte():
+    """⚠️ CAMBIO SEMÁNTICO DELIBERADO (encargo 22-sep, C1/6.3).
+
+    Antes la fila se persistía SIN `fee_effective_cents` y el test solo miraba
+    `net_contracts`, así que pasaba mientras la rehidratación recalculaba la comisión con
+    el modo vivo del engine — y una cohorte taker rehidratada en modo maker cambiaba de
+    caja al reiniciar (2¢ reales reconstruidos como 1¢). Ahora la comisión GRABADA manda y
+    su ausencia bloquea: la fila lleva el `fee_effective_cents` que el productor escribe de
+    verdad (`_persist_fill`), y se afirma también la comisión. El detalle completo, en
+    tests/strategies/motor_5_mm/test_rehidratacion_comision.py."""
     eng = Motor5Engine(
         experiment_label="rehydrate",
         fees_as_maker=True,
@@ -511,6 +520,8 @@ def test_rehidrata_inventario_de_la_misma_cohorte():
                 metric_version=eng.F1_METRIC_VERSION,
                 experiment_id=eng._experiment_id,
                 fee_multiplier=0.5,
+                fee_model="maker",
+                fee_effective_cents=3,
             )
         )
         s.commit()
@@ -518,6 +529,7 @@ def test_rehidrata_inventario_de_la_misma_cohorte():
     eng._rehidratar_inventory()
 
     assert eng._inventory.net("KXMLBGAME-E1-YES") == 1
+    assert eng._inventory.positions["KXMLBGAME-E1-YES"].fees_cents == 3
 
 
 @pytest.mark.asyncio

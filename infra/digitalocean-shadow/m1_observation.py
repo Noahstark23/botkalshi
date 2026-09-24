@@ -25,6 +25,8 @@ from datetime import UTC, datetime
 from fractions import Fraction
 from typing import NamedTuple
 
+import repo_root  # noqa: F401 — puts the repo root on sys.path (system python3)
+
 from src.math.arbitrage import detect_binary_arb
 
 SCHEMA_VERSION_INPUT = "botkalshi-m1-book-input-v1"

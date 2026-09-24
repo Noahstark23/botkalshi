@@ -1,0 +1,14 @@
+# Not enabled by the installer: enabling it is an explicit operator decision.
+[Unit]
+Description=Periodic botkalshi read-only production supervision
+
+[Timer]
+OnActiveSec=2min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15
+AccuracySec=10s
+Persistent=false
+Unit=botkalshi-supervision-reader.service
+
+[Install]
+WantedBy=timers.target

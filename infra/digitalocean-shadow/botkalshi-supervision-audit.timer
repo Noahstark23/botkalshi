@@ -1,0 +1,14 @@
+# Not enabled by the installer: enabling it is an explicit operator decision.
+[Unit]
+Description=Periodic botkalshi read-only production audit
+
+[Timer]
+OnActiveSec=5min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=60
+AccuracySec=30s
+Persistent=false
+Unit=botkalshi-supervision-audit.service
+
+[Install]
+WantedBy=timers.target

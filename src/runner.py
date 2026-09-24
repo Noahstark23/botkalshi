@@ -603,6 +603,35 @@ class ProductionRunner:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
 
+    async def _run_supervision_snapshot(self) -> None:
+        """
+        Snapshot de supervisión READ-ONLY (S1, gateado por SUPERVISION_SNAPSHOT_ENABLED,
+        default off). Lee estado (BotState, caché del RiskManager, DB en mode=ro) y escribe
+        un JSON privado. NUNCA decide, pausa ni ordena. Best-effort ABSOLUTO: esta task
+        corre bajo asyncio.wait(FIRST_EXCEPTION) — si una excepción escapara, tiraría el
+        bot; por eso todo se captura, se registra (Lección 7) y el loop sigue.
+        """
+        if not self.settings.SUPERVISION_SNAPSHOT_ENABLED:
+            return
+        from pathlib import Path
+
+        from src.monitoring.supervision_snapshot import collect_and_build, export_snapshot
+
+        directory = Path(self.settings.SUPERVISION_SNAPSHOT_DIR)
+        interval = self.settings.SUPERVISION_SNAPSHOT_INTERVAL_SEC
+        history_max = self.settings.SUPERVISION_SNAPSHOT_HISTORY_MAX
+        await asyncio.sleep(15)  # dejar que el boot pueble BotState
+        while not self._stop_event.is_set():
+            try:
+                doc = await asyncio.to_thread(collect_and_build)
+                await asyncio.to_thread(export_snapshot, doc, directory, history_max=history_max)
+            except Exception as e:
+                msg = f"supervision_snapshot: {type(e).__name__}: {e}"
+                logger.warning(msg)
+                BotState.record_error(msg[:200])
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+
     async def _run_disk_guard(self) -> None:
         """
         DiskGuard — lazo CERRADO de presión de disco (incidente 2026-07-10: el WAL a ~8MB/s
@@ -763,6 +792,12 @@ class ProductionRunner:
                 asyncio.create_task(self._run_db_maintenance(), name="db_maintenance"),
                 asyncio.create_task(self._run_disk_guard(), name="disk_guard"),
             ]
+            if self.settings.SUPERVISION_SNAPSHOT_ENABLED:
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_supervision_snapshot(), name="supervision_snapshot"
+                    )
+                )
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
             if self.settings.DAILY_PNL_REPORT_ENABLED:

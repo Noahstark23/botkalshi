@@ -7,13 +7,14 @@ Missing or invalid reconciliation means no real-money entry is eligible.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 from cycle_contract import RISK_SCHEMA
+import risk_policy
 
 CENT = Decimal("0.01")
 REFERENCE_BANK = Decimal("200.00")
@@ -41,6 +42,17 @@ def _money(value: Any, *, field: str, allow_negative: bool = False) -> Decimal:
     if not allow_negative and amount < 0:
         raise RiskInputError(f"{field} must be non-negative")
     return amount.quantize(CENT)
+
+
+def _to_micros(value: Decimal) -> int:
+    micros = value * risk_policy.MICRO
+    if micros != micros.to_integral_value():
+        raise RiskInputError("amount has more precision than microdollars")
+    return int(micros)
+
+
+def _from_micros(value: int) -> Decimal:
+    return (Decimal(value) / risk_policy.MICRO).quantize(CENT)
 
 
 def _fmt(value: Decimal | None) -> str | None:
@@ -108,6 +120,9 @@ def build_status(
             "capital_reconciled_at": None,
             "source": None,
             "unit_usd": _fmt(REFERENCE_UNIT),
+            "habitual_risk_usd": _fmt(REFERENCE_UNIT / 2),
+            "max_per_operation_usd": _fmt(REFERENCE_UNIT),
+            "risk_policy_version": risk_policy.POLICY_VERSION,
             "max_open_risk_usd": _fmt(REFERENCE_UNIT * 3),
             "max_new_daily_risk_usd": _fmt(REFERENCE_UNIT * 3),
             "open_risk_usd": None,
@@ -143,9 +158,14 @@ def build_status(
         if field in raw and raw[field] is not False:
             raise RiskInputError(f"{field} cannot grant authority")
 
-    unit = min(REFERENCE_UNIT, (capital * Decimal("0.01")).quantize(CENT, rounding=ROUND_DOWN))
-    max_open = (unit * 3).quantize(CENT)
-    max_daily = (unit * 3).quantize(CENT)
+    # The ONE policy formula (risk_policy), not a local copy: unit, habitual size and
+    # aggregate caps all shrink with capital. Values are identical to the previous
+    # inline formula; habitual is new and is what a proposal is sized FROM.
+    limits = risk_policy.policy_limits(_to_micros(capital))
+    unit = _from_micros(limits["unit"])
+    habitual = _from_micros(limits["habitual"])
+    max_open = _from_micros(limits["max_open"])
+    max_daily = _from_micros(limits["max_daily"])
     open_headroom = max(Decimal("0.00"), max_open - open_risk)
     daily_headroom = max(Decimal("0.00"), max_daily - today_new)
     loss_room_before_experiment_pause = max(Decimal("0.00"), EXPERIMENT_STOP + cumulative_pnl)
@@ -186,6 +206,9 @@ def build_status(
         "capital_reconciled_at": reconciled_at.isoformat(),
         "source": source,
         "unit_usd": _fmt(unit),
+        "habitual_risk_usd": _fmt(habitual),
+        "max_per_operation_usd": _fmt(unit),
+        "risk_policy_version": risk_policy.POLICY_VERSION,
         "max_open_risk_usd": _fmt(max_open),
         "max_new_daily_risk_usd": _fmt(max_daily),
         "open_risk_usd": _fmt(open_risk),

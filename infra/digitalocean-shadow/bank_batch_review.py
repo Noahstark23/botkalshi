@@ -19,6 +19,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from risk_guard import EXPERIMENT_STOP, REFERENCE_UNIT, WEEKLY_STOP, build_status
+import risk_policy
 
 INPUT_SCHEMA = "botkalshi-bank-batch-input-v1"
 OUTPUT_SCHEMA = "botkalshi-bank-batch-review-v1"
@@ -202,8 +203,13 @@ def review_batch(raw: Any, *, now: datetime | None = None) -> dict[str, Any]:
             else:
                 unique[key] = normalized
 
-        unit = min(ceiling, (capital // 100 // CENT_MICRO) * CENT_MICRO)
-        open_cap = daily_cap = 3 * unit
+        # The ONE policy formula (risk_policy) — this module used to keep its own copy.
+        # Same values as before (ceiling is whole cents, so floor/min commute).
+        limits = risk_policy.policy_limits(capital, unit_ceiling=ceiling)
+        unit = limits["unit"]
+        habitual = limits["habitual"]
+        open_cap = limits["max_open"]
+        daily_cap = limits["max_daily"]
         stop = _amount(format(EXPERIMENT_STOP, "f"))
         paused = data["paused"] or weekly <= -_amount(format(WEEKLY_STOP, "f")) or cumulative <= -stop
         total = 0
@@ -240,6 +246,8 @@ def review_batch(raw: Any, *, now: datetime | None = None) -> dict[str, Any]:
             "declared_snapshot_at": stamp.isoformat(),
             "input_mode": risk["mode"],
             "unit_usd": _usd(unit),
+            "habitual_risk_usd": _usd(habitual),
+            "risk_policy_version": risk_policy.POLICY_VERSION,
             "max_open_risk_usd": _usd(open_cap),
             "policy_paused": paused,
             "duplicates_ignored": duplicates,

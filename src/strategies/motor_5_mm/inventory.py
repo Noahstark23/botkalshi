@@ -27,6 +27,35 @@ from src.math.fees import (
 from src.strategies.motor_5_mm.shadow_fill import ShadowFill
 
 
+def validar_fee_registrada(valor: object) -> int:
+    """Una comisión GRABADA en `mm_shadow_fills` es válida solo si es un entero ≥ 0.
+
+    ALCANCE: este es el contrato del esquema LEGACY de esta tabla (`fee_effective_cents`
+    INTEGER, en centavos). NO es el formato general de Kalshi, que publica comisiones en
+    dólares con precisión de seis decimales; un adaptador futuro para ese formato se
+    versiona aparte, sin truncar a centavos.
+
+    Reproducir un dato histórico no es aceptar cualquier valor: la comisión neta de Kalshi
+    es no negativa, y SQLite tiene tipado dinámico — una columna INTEGER guarda un REAL o
+    un TEXT sin quejarse y el driver los devuelve con su tipo nativo. El cero documentado
+    es válido; un dato ausente (None) es otro hecho y lo resuelve quien llama.
+
+    ⚠️ `bool` se excluye ANTES del chequeo de `int`: en Python `isinstance(True, int)` es
+    True, así que sin esto `True` entraría como 1¢ sin que nadie lo note.
+    """
+    if isinstance(valor, bool) or not isinstance(valor, int):
+        raise ValueError(
+            f"comisión registrada fuera de contrato: tipo {type(valor).__name__} "
+            "(se espera un entero ≥ 0 en centavos)"
+        )
+    if valor < 0:
+        raise ValueError(
+            f"comisión registrada fuera de contrato: {valor}¢ es negativa "
+            "(la comisión neta de Kalshi es no negativa)"
+        )
+    return valor
+
+
 @dataclass(slots=True)
 class TickerInventory:
     net_contracts: int = 0
@@ -53,14 +82,37 @@ class InventoryBook:
         self._fees_as_maker = fees_as_maker
 
     def apply_fill(
-        self, fill: ShadowFill, *, fee_multiplier: int | float | str = 1
+        self,
+        fill: ShadowFill,
+        *,
+        fee_multiplier: int | float | str = 1,
+        fee_cents_recorded: int | None = None,
     ) -> TickerInventory:
+        """Aplica un fill. `fee_cents_recorded` REPRODUCE una comisión ya cobrada.
+
+        La recuperación de una cohorte (engine._rehidratar_inventory) pasa el
+        `fee_effective_cents` de la fila: el hecho histórico manda sobre cualquier
+        recálculo. Recalcular en cada arranque hace que la comisión dependa del modo
+        VIVO del engine (`_fees_as_maker`) y del multiplicador vigente, así que una
+        cohorte grabada como taker rehidratada en modo maker cambiaba de caja al
+        reiniciar — medido: 2¢ reales reconstruidos como 1¢. Y la tarifa se mueve: la
+        API de la serie KXMLBGAME publica hoy `fee_multiplier: 0.5`, pero eso no dice qué
+        regía en cada fecha pasada, y Kalshi documenta overrides por EVENTO. La tarifa de
+        hoy no puede reescribir el pasado.
+
+        Reproducir fielmente NO es aceptar cualquier valor: se valida contra el contrato
+        (entero ≥ 0) ANTES de tocar `positions` — el `setdefault` va después a propósito,
+        para que un rechazo no deje una entrada vacía de un ticker que nunca operó.
+        """
+        if fee_cents_recorded is not None:
+            fee = validar_fee_registrada(fee_cents_recorded)
+        else:
+            fee = (
+                kalshi_maker_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
+                if self._fees_as_maker
+                else kalshi_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
+            )
         inv = self.positions.setdefault(fill.ticker, TickerInventory())
-        fee = (
-            kalshi_maker_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
-            if self._fees_as_maker
-            else kalshi_fee_cents(fill.count, fill.price_cents, fee_multiplier=fee_multiplier)
-        )
         if fill.side == "buy":
             inv.net_contracts += fill.count
             inv.cash_cents -= fill.price_cents * fill.count
