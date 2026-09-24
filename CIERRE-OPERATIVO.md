@@ -233,6 +233,32 @@ también la comisión. No se redujo el alcance de ninguna prueba para hacerla pa
 3. Auditoría: `python3 production_audit.py --source <copia de trades.db> --state <archivo propio del auditor>`. La fuente se abre en `mode=ro`. Esperado: `authority: NONE`; los diagnósticos que aparezcan se leen, no se corrigen.
 4. Nunca: `set_pause`, `/admin/resume`, `clear_kill_switch.py`, scripts de activación, ni `StrictHostKeyChecking=no`.
 
+## Despliegue seguro de la supervisión — ASTRA-DEPLOY-SUPERVISION-20260924
+
+**Diseño: todo en el mismo host y de solo lectura.**
+- **Productor:** el runtime live escribe su snapshot privado (S1).
+- **Recolección:** un paso root (`ExecStartPre=+`, `supervision_collect.py`) copia a `/var/lib/botkalshi-supervision/inbox` solo dos cosas:
+  - el snapshot, si es un archivo regular de tamaño acotado;
+  - la tabla `trades`, leída con la fuente en `mode=ro`.
+
+  Nunca modifica permisos ni datos del lado live. Las rutas vienen de `/etc/botkalshi-supervision.env`, propiedad de root, que solo admite `BOTKALSHI_LIVE_DB` y `BOTKALSHI_LIVE_SNAPSHOT`. Si la copia falla, borra las copias viejas: el lector reporta `MISSING`/`SERVICE_DOWN`, no un estado viejo.
+- **Consumo:** `botkalshi-supervision-audit.service` (S2) y `botkalshi-supervision-reader.service` (S3) corren como `botkalshi-supervisor`, sin red (`PrivateNetwork`, `AF_UNIX`) y escribiendo solo en `/var/lib/botkalshi-supervision`. Las alertas van a un outbox local 0600, sin credenciales. No hay SSH loopback ni endpoint.
+- **Arranque:** los timers **no** se habilitan al instalar.
+
+**Comandos exactos**, en el droplet dedicado, como root y desde la release ya instalada por `install.sh`:
+1. **Prueba sin cambios:** `bash /opt/botkalshi-research/releases/<SHA>/infra/digitalocean-shadow/install-supervision.sh install <SHA> --dedicated-research-host --dry-run`
+2. **Instalación:** el mismo comando sin `--dry-run`. Verifica la release (HEAD exacto, árbol limpio) y corre los tests focales con `/usr/bin/python3`; si fallan, no instala nada. Crea el usuario y el estado 0700, respalda el estado y las units previas en `/var/backups/botkalshi-supervision/*.tar.gz` (0600), escribe la **plantilla** del env solo si no existe, registra `RELEASE`/`RELEASE.previous` y hace `daemon-reload`.
+3. **Verificación de solo lectura:** `… install-supervision.sh verify`. Esperado: `ok: true`, `units_sha` igual al SHA registrado y timers `disabled`.
+4. **Rollback:** `… install-supervision.sh rollback --dedicated-research-host`. Re-renderiza las units desde `RELEASE.previous` y preserva el estado. Para restaurar el estado de un respaldo, extraer el `.tar.gz` correspondiente con el servicio detenido.
+
+**Sigue requiriendo intervención del dueño** (nada de esto lo hace el instalador):
+- (a) Encender `SUPERVISION_SNAPSHOT_ENABLED` en el runtime live y conocer su `SUPERVISION_SNAPSHOT_DIR`.
+- (b) Completar `/etc/botkalshi-supervision.env` con las dos rutas reales.
+- (c) Habilitar los timers: `systemctl enable --now botkalshi-supervision-audit.timer botkalshi-supervision-reader.timer`.
+- (d) Cualquier transporte externo de alertas; hoy es solo el outbox local.
+
+**Límite conocido:** la unit `botkalshi-live` **no está en el repo**. Su usuario y sus rutas no se pudieron verificar desde esta sesión.
+
 ## Historial operativo, ajeno a este encargo — NO es estado actual
 
 Última observación que tuvo esta sesión, **21-ago-2026**: el container de producción en

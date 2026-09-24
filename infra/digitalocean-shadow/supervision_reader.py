@@ -239,6 +239,29 @@ class FakeTransport:
         return True
 
 
+class OutboxTransport:
+    """Default in deployment: 'delivers' to a bounded local JSONL outbox (0600) that the
+    operator reads. No network, no credentials — alerts are never lost, never sent out."""
+
+    def __init__(self, path: Path, *, max_lines: int = 500) -> None:
+        self.path = path
+        self.max_lines = max_lines
+
+    def send(self, text: str) -> bool:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lines = self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
+        entry = json.dumps({"at": datetime.now(UTC).isoformat(), "text": text})
+        lines = [*lines[-(self.max_lines - 1) :], entry]
+        tmp = self.path.with_name(f".{self.path.name}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.path)
+        return True
+
+
 class TelegramTransport:
     """Production adapter over the existing research notifier's credential mechanism
     (systemd credentials; never arguments). Not exercised by tests."""
@@ -347,3 +370,59 @@ def process_alerts(
         outcome["resolved"].append(code)
     _save_state(state_path, state)
     return outcome
+
+
+def main(argv: list[str] | None = None) -> int:
+    """One read-only supervision run: read the snapshot (and the audit report), evaluate
+    alerts with dedup/backoff, deliver to the LOCAL outbox, write a bounded report."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="read-only production supervision run")
+    parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument("--audit", type=Path)
+    parser.add_argument("--state", required=True, type=Path)
+    parser.add_argument("--outbox", required=True, type=Path)
+    parser.add_argument("--report", required=True, type=Path)
+    args = parser.parse_args(argv)
+    now = datetime.now(UTC)
+    view = read_snapshot(args.snapshot, now=now)
+    audit = None
+    if args.audit is not None:
+        try:
+            audit = json.loads(args.audit.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            audit = {"status": "DIAGNOSTICS", "diagnostics": {"AUDIT_REPORT_UNREADABLE": 1}}
+    outcome = process_alerts(
+        view,
+        state_path=args.state,
+        transport=OutboxTransport(args.outbox),
+        now=now,
+        audit_report=audit,
+    )
+    doc = view.get("snapshot") or {}
+    report = {
+        "schema_version": SCHEMA_VIEW + "+run",
+        "read_at": view["read_at"],
+        "view_state": view["state"],
+        "problems": view["problems"],
+        "snapshot_id": doc.get("snapshot_id"),
+        "release_sha": doc.get("release_sha"),
+        "alert_conditions": conditions(view, audit),
+        "alerts": outcome,
+        "authority": "NONE",
+        "commands_executed": [],
+    }
+    args.report.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = args.report.with_name(f".{args.report.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, args.report)
+    print(json.dumps({k: report[k] for k in ("view_state", "alert_conditions")}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

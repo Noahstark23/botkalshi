@@ -251,8 +251,11 @@ def audit_pass(
     now = (now or _now()).astimezone(UTC)
     stamp = now.isoformat()
     state_path = Path(state)
+    state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     con = sqlite3.connect(state_path, timeout=15, isolation_level=None)
     try:
+        # The auditor's own state is private whatever the caller's umask (0600).
+        state_path.chmod(0o600)
         con.execute("PRAGMA journal_mode=WAL")
         _state_schema(con)
         scan, sweep, open_cursor = (
@@ -564,18 +567,44 @@ def _apply(
     }
 
 
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    """Atomic 0600 write of the audit report (the supervisor's own directory)."""
+    import os
+
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--source", required=True, type=Path, help="trades.db (opened mode=ro)")
     parser.add_argument("--state", required=True, type=Path, help="the auditor's own SQLite")
+    parser.add_argument("--report", type=Path, help="write the report here too (0600, atomic)")
+    parser.add_argument("--max-rows", type=int, default=MAX_ROWS_PER_PASS)
     args = parser.parse_args(argv)
     try:
-        report = audit_pass(args.source, args.state)
+        report = audit_pass(args.source, args.state, max_rows=args.max_rows)
+        code = 0
     except AuditError as exc:
-        print(json.dumps({"schema_version": SCHEMA_REPORT, "status": "ERROR", "error": str(exc)}))
-        return 2
+        report = {
+            "schema_version": SCHEMA_REPORT,
+            "status": "ERROR",
+            "error": str(exc),
+            "authority": "NONE",
+            "audited_at": _now().isoformat(),
+        }
+        code = 2
+    if args.report is not None:
+        write_report(args.report, report)
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return code
 
 
 if __name__ == "__main__":
