@@ -253,7 +253,8 @@ class Deployer:
             self.say("env file kept as is (never overwritten)")
             return
         self.write(self.env_file, ENV_TEMPLATE.encode(), 0o600)
-        self.say("env TEMPLATE written; the units block until the owner fills it")
+        if not self.dry_run:
+            self.say("env TEMPLATE written; the units block until the owner fills it")
 
     def render_units(self, release: Path) -> None:
         for unit in UNITS:
@@ -283,7 +284,11 @@ class Deployer:
         self.render_units(release)
         self.record(sha, previous)
         self.run(["systemctl", "daemon-reload"], mutating=True)
-        self.say("installed; timers NOT enabled. Enabling them is an owner decision.")
+        self.say(
+            "DRY-RUN complete: nothing was written or run"
+            if self.dry_run
+            else "installed; timers NOT enabled. Enabling them is an owner decision."
+        )
         return {
             "installed": sha,
             "previous": (previous or {}).get("sha"),

@@ -310,6 +310,9 @@ class InstallTests(DeployTestCase):
         mutating = [c for c in runner.calls if c[0] in ("useradd", "systemctl")]
         self.assertEqual(mutating, [])
         self.assertTrue(any("DRY-RUN would run: systemctl daemon-reload" in s for s in d.plan))
+        # A dry run never claims to have done something.
+        self.assertFalse(any(s.startswith(("installed", "env TEMPLATE written")) for s in d.plan))
+        self.assertEqual(d.plan[-1], "DRY-RUN complete: nothing was written or run")
 
     def test_verify_is_read_only_and_catches_loose_permissions(self):
         d, runner = self.deployer()
