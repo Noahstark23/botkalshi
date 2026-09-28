@@ -207,6 +207,28 @@ class Settings(BaseSettings):
     # 0.0 = sin setear → el dashboard usa DailyPnL.starting_capital si existe, o lo omite.
     KALSHI_INITIAL_BANKROLL: float = Field(0.0, ge=0)
 
+    # === Experimento REAL bank USD 200 ===
+    # Capa adicional, opt-in y fail-closed. No habilita ejecución por sí sola.
+    # Cuando está activa, RiskManager exige balance REAL fresco antes de cada entrada
+    # y aplica la política acordada: unidad=min($2,1% capital), $6 máx abierto/día,
+    # pausa semanal -$12 y experimental -$20.
+    EXPERIMENT_BANK200_ENABLED: bool = False
+    EXPERIMENT_START_AT: str = Field(
+        default="",
+        description="ISO-8601 con timezone del inicio REAL confirmado; obligatorio al armar trading.",
+    )
+    EXPERIMENT_BALANCE_MAX_AGE_SEC: int = Field(
+        default=600,
+        ge=30,
+        le=3600,
+        description="Edad máxima del balance Kalshi para permitir nuevas entradas.",
+    )
+    EXPERIMENT_BANK_CONFIRMED_USD: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Ack explícito del capital separado para la prueba; no es un saldo del exchange.",
+    )
+
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
@@ -1097,6 +1119,54 @@ class Settings(BaseSettings):
                     f"ACTIVE_CAPITAL_USD={self.ACTIVE_CAPITAL_USD} excede límite de seguridad ($5k). "
                     "Si quieres operar con más capital, modifica este check explícitamente."
                 )
+
+            if self.EXPERIMENT_BANK200_ENABLED:
+                problems: list[str] = []
+                if self.ACTIVE_CAPITAL_USD != 200.0:
+                    problems.append("ACTIVE_CAPITAL_USD=200")
+                if not self.DYNAMIC_CAPITAL_ENABLED:
+                    problems.append("DYNAMIC_CAPITAL_ENABLED=true")
+                if self.CAPITAL_CAP_USD != 200.0:
+                    problems.append("CAPITAL_CAP_USD=200")
+                if self.CAPITAL_FLOOR_USD != 180.0:
+                    problems.append("CAPITAL_FLOOR_USD=180")
+                if self.CAPITAL_SMOOTHING_PCT != 0.0:
+                    problems.append("CAPITAL_SMOOTHING_PCT=0")
+                if self.MAX_TRADE_SIZE_USD > 2.0:
+                    problems.append("MAX_TRADE_SIZE_USD<=2")
+                if self.MAX_TRADE_SIZE_PCT > 1.0:
+                    problems.append("MAX_TRADE_SIZE_PCT<=1")
+                if self.MAX_SIMULTANEOUS_EXPOSURE_PCT > 3.0:
+                    problems.append("MAX_SIMULTANEOUS_EXPOSURE_PCT<=3")
+                if self.MAX_EVENT_DIRECTIONAL_EXPOSURE_USD > 2.0:
+                    problems.append("MAX_EVENT_DIRECTIONAL_EXPOSURE_USD<=2")
+                if any(
+                    [
+                        self.MOTOR_2_ENTRY_EXECUTION_ENABLED,
+                        self.MOTOR_REST_EXECUTION_ENABLED,
+                        self.MOTOR_MM_EXECUTION_ENABLED,
+                    ]
+                ):
+                    problems.append("solo M1 puede abrir entradas en la fase inicial")
+                if self.TRADING_ENABLED:
+                    if self.EXPERIMENT_BANK_CONFIRMED_USD != 200.0:
+                        problems.append("EXPERIMENT_BANK_CONFIRMED_USD=200 (ack explícito)")
+                    try:
+                        from datetime import datetime
+
+                        started = datetime.fromisoformat(
+                            self.EXPERIMENT_START_AT.replace("Z", "+00:00")
+                        )
+                        if started.tzinfo is None:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        problems.append("EXPERIMENT_START_AT ISO-8601 con timezone")
+                if problems:
+                    raise ValueError(
+                        "EXPERIMENT_BANK200_ENABLED no cumple el perfil fail-closed: "
+                        + "; ".join(problems)
+                    )
+
             # Solo los flags que ARRANCAN un motor cuentan (deuda auditoría 2026-07-01:
             # los *_EXECUTION_ENABLED no arrancan nada por sí solos — contaban como
             # "motor habilitado" y el boot pasaba la validación sin ningún motor corriendo).

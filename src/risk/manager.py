@@ -8,6 +8,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 from sqlmodel import col, select
@@ -16,6 +17,7 @@ from src.math.arbitrage import ArbOpportunity
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
+from src.risk.experiment_policy import limits_for_capital
 from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
 from src.strategies.motor_rest_arb.settlement import arb_group_key
 from src.utils.config import get_settings
@@ -79,6 +81,10 @@ class RiskManager:
 
     def __init__(self) -> None:
         self.settings = get_settings()
+
+    def _experiment_enabled(self) -> bool:
+        """Solo un bool True explícito activa el guard; mocks/ausencia nunca lo arman."""
+        return getattr(self.settings, "EXPERIMENT_BANK200_ENABLED", False) is True
 
     # =========================================================
     # C-01 — Capital base efectivo (balance real de Kalshi)
@@ -145,6 +151,16 @@ class RiskManager:
         bajo CAPITAL_FLOOR_USD → se pausan las entradas, pero la GESTIÓN/CIERRE de posiciones
         abiertas sigue (Motor 3 no pasa por este gate). En modo estático o sin balance real
         todavía, NO bloquea (el sizing/exposición ya protegen)."""
+        if self._experiment_enabled():
+            cached = RiskManager._cached_capital_usd
+            last = RiskManager._last_balance_at
+            if cached is None or last is None:
+                return False
+            now = datetime.now(UTC).replace(tzinfo=None)
+            age_sec = max(0.0, (now - last).total_seconds())
+            if age_sec > self.settings.EXPERIMENT_BALANCE_MAX_AGE_SEC:
+                return False
+
         if not self.settings.DYNAMIC_CAPITAL_ENABLED:
             return True
         cached = RiskManager._cached_capital_usd
@@ -298,6 +314,107 @@ class RiskManager:
         except Exception as exc:
             logger.warning(f"risk.capital.drift: chequeo falló ({type(exc).__name__}: {exc})")
 
+    @staticmethod
+    def _as_utc_naive(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def _experiment_start_utc_naive(self) -> datetime | None:
+        raw = self.settings.EXPERIMENT_START_AT.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC).replace(tzinfo=None)
+
+    def _experiment_accounting_snapshot(self) -> dict:
+        """Ledger derivado para el bank-200; no hace red y no muta estado."""
+        if not self._experiment_enabled():
+            return {}
+
+        start = self._experiment_start_utc_naive()
+        if start is None:
+            return {"valid": False, "reason": "EXPERIMENT_START_AT inválido o ausente"}
+
+        now_utc = datetime.now(UTC)
+        la = ZoneInfo("America/Los_Angeles")
+        now_la = now_utc.astimezone(la)
+        day_start_la = datetime.combine(now_la.date(), time.min, tzinfo=la)
+        week_date = now_la.date() - timedelta(days=now_la.weekday())
+        week_start_la = datetime.combine(week_date, time.min, tzinfo=la)
+        day_start = day_start_la.astimezone(UTC).replace(tzinfo=None)
+        week_start = week_start_la.astimezone(UTC).replace(tzinfo=None)
+
+        with get_session() as s:
+            buys = list(s.exec(select(Trade).where(Trade.action == "buy")))
+            settled = list(s.exec(select(Trade).where(Trade.status == "settled")))
+
+        committed_cents = 0
+        committed_statuses = {"pending", "filled", "settled", "cancelled"}
+        for trade in buys:
+            placed = self._as_utc_naive(trade.placed_at)
+            if placed < start or placed < day_start or trade.status not in committed_statuses:
+                continue
+            fee_cents = (
+                trade.fees_cents
+                if trade.fees_cents is not None
+                else kalshi_fee_cents(trade.count, trade.price_cents)
+            )
+            committed_cents += trade.price_cents * trade.count + fee_cents
+
+        weekly_cents = 0
+        cumulative_cents = 0
+        for trade in settled:
+            if trade.settled_at is None:
+                continue
+            settled_at = self._as_utc_naive(trade.settled_at)
+            if settled_at < start:
+                continue
+            pnl = trade.pnl_cents or 0
+            cumulative_cents += pnl
+            if settled_at >= week_start:
+                weekly_cents += pnl
+
+        limits = limits_for_capital(self._get_effective_capital_usd())
+        return {
+            "valid": True,
+            "start_utc": start.isoformat(),
+            "daily_new_risk_usd": committed_cents / 100.0,
+            "weekly_pnl_usd": weekly_cents / 100.0,
+            "cumulative_pnl_usd": cumulative_cents / 100.0,
+            "limits": limits,
+        }
+
+    async def _check_experiment_stops(self) -> str | None:
+        if not self._experiment_enabled():
+            return None
+        snap = self._experiment_accounting_snapshot()
+        if not snap.get("valid"):
+            return str(snap.get("reason") or "experiment ledger inválido")
+
+        weekly = float(snap["weekly_pnl_usd"])
+        cumulative = float(snap["cumulative_pnl_usd"])
+        if cumulative <= -20.0:
+            reason = f"Experimento bank-200 alcanzó pérdida acumulada ${cumulative:.2f} <= -$20.00"
+            await self._trigger_kill_switch(reason)
+            return reason
+        if weekly <= -12.0:
+            reason = f"Experimento bank-200 alcanzó pérdida semanal ${weekly:.2f} <= -$12.00"
+            await self._trigger_kill_switch(reason)
+            return reason
+
+        limits = snap["limits"]
+        daily = float(snap["daily_new_risk_usd"])
+        daily_cap = float(limits.max_daily_new_risk_usd)
+        if daily >= daily_cap:
+            return f"Presupuesto diario bank-200 consumido: ${daily:.2f} / ${daily_cap:.2f}"
+        return None
+
     async def check_pre_trade(self, opp: ArbOpportunity) -> TradeDecision:
         """Gatekeeper crítico. Debe llamarse con await desde el executor.
 
@@ -337,6 +454,10 @@ class RiskManager:
             reason = BotState.pause_reason or "Razón desconocida"
             return TradeDecision(False, f"BotState.is_paused activo: {reason}", 0)
 
+        experiment_block = await self._check_experiment_stops()
+        if experiment_block:
+            return TradeDecision(False, experiment_block, 0)
+
         breached_period = await self._check_timeframe_stop_losses()
         if breached_period:
             return TradeDecision(
@@ -349,12 +470,17 @@ class RiskManager:
         # (la gestión/cierre de lo abierto NO pasa por este gate — Motor 3 no llama check_pre_trade).
         # Gate NUEVO e independiente: no toca el stop-loss ni el kill-switch.
         if not self.can_open_new_positions():
-            return TradeDecision(
-                False,
-                f"Capital bajo el piso (${self.settings.CAPITAL_FLOOR_USD:.2f}): "
-                "nuevas entradas en pausa",
-                0,
-            )
+            if self._experiment_enabled():
+                reason = (
+                    "Bank-200 sin balance Kalshi fresco o capital bajo el piso: "
+                    "nuevas entradas en pausa"
+                )
+            else:
+                reason = (
+                    f"Capital bajo el piso (${self.settings.CAPITAL_FLOOR_USD:.2f}): "
+                    "nuevas entradas en pausa"
+                )
+            return TradeDecision(False, reason, 0)
 
         # Gate SOFT de pérdida latente (MTM) — solo con UNREALIZED_STOP_ENABLED (default
         # off: cambia la semántica realized-only, decisión del owner). Rechaza entradas
@@ -367,6 +493,24 @@ class RiskManager:
         capital_usd = self._get_effective_capital_usd()
         current_exposure_usd = self._get_current_exposure_usd()
         max_total_exposure_usd = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
+        daily_remaining_usd = float("inf")
+        experiment_limits = None
+        if self._experiment_enabled():
+            experiment_limits = limits_for_capital(capital_usd)
+            max_total_exposure_usd = min(
+                max_total_exposure_usd,
+                float(experiment_limits.max_open_usd),
+            )
+            snap = self._experiment_accounting_snapshot()
+            if not snap.get("valid"):
+                return TradeDecision(
+                    False, str(snap.get("reason") or "experiment ledger inválido"), 0
+                )
+            daily_remaining_usd = max(
+                0.0,
+                float(experiment_limits.max_daily_new_risk_usd) - float(snap["daily_new_risk_usd"]),
+            )
+
         remaining_exposure_usd = max_total_exposure_usd - current_exposure_usd
         if remaining_exposure_usd <= 0:
             return TradeDecision(
@@ -377,11 +521,17 @@ class RiskManager:
             )
 
         max_trade_usd = capital_usd * (self.settings.MAX_TRADE_SIZE_PCT / 100.0)
-        # Cap ABSOLUTO anti-slippage: el USD comprometido por orden nunca supera
-        # MAX_TRADE_SIZE_USD ($200), sin importar % ni capital. Combinado con
-        # remaining_exposure y opp.count (liquidez real del book) abajo, el size final es
-        # min(liquidez_book, kelly/%, $200).
-        usable_usd = min(max_trade_usd, remaining_exposure_usd, self.settings.MAX_TRADE_SIZE_USD)
+        if experiment_limits is not None:
+            max_trade_usd = min(max_trade_usd, float(experiment_limits.max_per_operation_usd))
+
+        # Cap ABSOLUTO anti-slippage + exposición + presupuesto de riesgo nuevo del día.
+        # En bank-200, daily_remaining NO se repone por cierres/ganancias del mismo día.
+        usable_usd = min(
+            max_trade_usd,
+            remaining_exposure_usd,
+            self.settings.MAX_TRADE_SIZE_USD,
+            daily_remaining_usd,
+        )
 
         total_cost_per_unit_cents = sum(leg.price_cents for leg in opp.legs)
         if total_cost_per_unit_cents <= 0:
@@ -415,6 +565,8 @@ class RiskManager:
         headroom (su fila pending reserva el capital para los demás motores)."""
         capital_usd = self._get_effective_capital_usd()
         max_total = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
+        if self._experiment_enabled():
+            max_total = min(max_total, float(limits_for_capital(capital_usd).max_open_usd))
         return max_total - self._get_current_exposure_usd()
 
     def _get_current_exposure_usd(self) -> float:
