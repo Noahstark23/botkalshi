@@ -1,0 +1,8 @@
+# Opt-in, one-shot public diagnostics. No keys, account access or legacy motors.
+# bridge enables outbound networking; this is NOT an OS-level domain firewall.
+services:
+  lab:
+    network_mode: bridge
+    command: ["public-once", "--allow-public-data", "--data", "/data"]
+    healthcheck:
+      disable: true
