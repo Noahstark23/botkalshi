@@ -9,9 +9,13 @@ El prechequeo de la unidad rechaza flags de ejecucion o estudios encendidos.
 
 - Revisar el SHA exacto y la configuracion. Crear usuario de sistema dedicado
   `botkalshi-runtime`, sin login. No reutilizar el usuario ni la DB del colector.
-- Preparar el release en `/opt/botkalshi-runtime/releases/<SHA>` y su `.venv`
-  con `python3.12 -m venv .venv` y `.venv/bin/pip install .`. Conservar versiones
-  resueltas para reproducibilidad. `current` debe apuntar a ese release revisado.
+- Preparar el release completo en `/opt/botkalshi-runtime/releases/<SHA>` y crear
+  su `.venv` **en Ubuntu**, con `python3.12 -m venv .venv`; no copiar la de macOS.
+  Instalar dependencias con `.venv/bin/pip install --require-hashes -r
+  infra/digitalocean-runtime/requirements.lock` y verificar `.venv/bin/pip check`.
+  El runner importa `src` desde el release mediante WorkingDirectory/PYTHONPATH;
+  conservar tambien `scripts/`. El lock fija la resolucion para Linux x86_64 y
+  Python 3.12. `current` debe apuntar a ese release revisado.
 - Guardar `runtime.env` en `/etc/botkalshi-runtime/`, propiedad de root y modo
   `0600`. Entregar el ID real fuera del repositorio. Guardar el PEM privado como
   `kalshi_private_key.pem`, legible solo por root y el grupo del servicio (`0640`).
