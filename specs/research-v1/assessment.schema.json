@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResearchAssessmentV1 — advisory only",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "packet_id",
+    "packet_sha256",
+    "mode",
+    "decision",
+    "market_ticker",
+    "generated_at",
+    "summary",
+    "evidence_ids",
+    "counter_evidence_ids",
+    "missing_fields",
+    "execution_authorized"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "research-assessment-v1"
+    },
+    "packet_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "packet_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "mode": {
+      "enum": [
+        "OFFLINE",
+        "SHADOW_READONLY"
+      ]
+    },
+    "decision": {
+      "enum": [
+        "WAIT",
+        "REJECT",
+        "REVIEW"
+      ]
+    },
+    "market_ticker": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1500
+    },
+    "evidence_ids": {
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    },
+    "counter_evidence_ids": {
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    },
+    "missing_fields": {
+      "type": "array",
+      "maxItems": 30,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    },
+    "execution_authorized": {
+      "const": false
+    }
+  }
+}
