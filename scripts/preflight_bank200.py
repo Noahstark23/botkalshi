@@ -8,46 +8,107 @@ sale NO-GO.
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.utils.config import get_settings
 
+_PAGE_LIMIT = 100
+_MAX_POSITION_PAGES = 1000
 
-def _position_count(row: dict) -> int:
-    raw = row.get("position_fp", row.get("position"))
+
+def _finite_decimal(raw: object, field: str) -> Decimal:
+    # Un dato desconocido nunca demuestra ausencia de exposición ni cash suficiente.
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float, Decimal)):
+        raise ValueError(f"{field}: número ausente o inválido")
     try:
-        return int(round(float(raw))) if raw is not None else 0
-    except (TypeError, ValueError):
-        return 0
+        value = Decimal(str(raw))
+    except InvalidOperation as exc:
+        raise ValueError(f"{field}: número inválido") from exc
+    if not value.is_finite():
+        raise ValueError(f"{field}: número no finito")
+    return value
+
+
+def _position_count(row: dict) -> Decimal:
+    if not isinstance(row, dict):
+        raise ValueError("posición: estructura inválida")
+    # Conservar fracciones: redondear 0.1 a cero ocultaba una posición real.
+    return _finite_decimal(row.get("position_fp", row.get("position")), "posición")
+
+
+def _page_rows(page: object, *fields: str) -> list[dict]:
+    if not isinstance(page, dict):
+        raise ValueError("respuesta: estructura inválida")
+    for field in fields:
+        if field in page:
+            rows = page[field]
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError(f"{field}: lista inválida")
+            return rows
+    raise ValueError("respuesta: falta colección esperada")
+
+
+def _page_cursor(page: dict) -> str | None:
+    cursor = page.get("cursor")
+    if cursor is None or cursor == "":
+        return None
+    if not isinstance(cursor, str) or not cursor.strip():
+        raise ValueError("cursor inválido")
+    return cursor
 
 
 async def _read_account() -> dict:
     positions: list[dict] = []
     async with KalshiRestClient() as client:
         balance = await client.get_balance()
+        if not isinstance(balance, dict):
+            raise ValueError("balance: estructura inválida")
+        cents = _finite_decimal(balance.get("balance"), "balance")
+        if cents < 0 or cents != cents.to_integral_value():
+            raise ValueError("balance: se requieren centavos enteros no negativos")
+
         cursor: str | None = None
-        while True:
-            page = await client.get_positions(limit=100, cursor=cursor)
-            positions.extend(page.get("market_positions", page.get("positions", [])))
-            cursor = page.get("cursor")
-            if not cursor:
+        seen_cursors: set[str] = set()
+        for _ in range(_MAX_POSITION_PAGES):
+            page = await client.get_positions(limit=_PAGE_LIMIT, cursor=cursor)
+            rows = _page_rows(page, "market_positions", "positions")
+            positions.extend(p for p in rows if _position_count(p) != 0)
+            cursor = _page_cursor(page)
+            if cursor is None:
+                if "cursor" not in page and len(rows) >= _PAGE_LIMIT:
+                    raise ValueError("posiciones: exhaustividad no demostrada")
                 break
+            if cursor in seen_cursors:
+                raise ValueError("posiciones: cursor repetido")
+            seen_cursors.add(cursor)
+        else:
+            raise ValueError("posiciones: límite de páginas; exhaustividad no demostrada")
 
-        orders_page = await client.get_orders(limit=100)
+        orders_page = await client.get_orders(limit=_PAGE_LIMIT)
+        orders = _page_rows(orders_page, "orders")
+        # El cliente actual no pagina órdenes: una página parcial jamás es un GO.
+        if _page_cursor(orders_page) is not None or len(orders) >= _PAGE_LIMIT:
+            raise ValueError("órdenes: exhaustividad no demostrada")
 
-    cents = balance.get("balance") if isinstance(balance, dict) else None
-    if cents is None:
-        raise ValueError("balance response sin campo balance")
     return {
-        "cash_usd": float(cents) / 100.0,
-        "positions": [p for p in positions if _position_count(p) != 0],
-        "orders": orders_page.get("orders", []),
+        "cash_usd": cents / Decimal(100),
+        "positions": positions,
+        "orders": orders,
     }
 
 
 def _open_orders(rows: list[dict]) -> list[dict]:
     open_states = {"resting", "pending", "open"}
-    return [row for row in rows if str(row.get("status", "")).lower() in open_states]
+    closed_states = {"executed", "canceled"}
+    opened = []
+    for row in rows:
+        status = row.get("status")
+        if not isinstance(status, str) or status.lower() not in open_states | closed_states:
+            raise ValueError("orden: estado ausente o desconocido")
+        if status.lower() in open_states:
+            opened.append(row)
+    return opened
 
 
 async def main() -> int:
@@ -81,14 +142,13 @@ async def main() -> int:
 
     try:
         account = await _read_account()
+        opened = _open_orders(account["orders"])
     except Exception as exc:  # noqa: BLE001 - fail-closed
         print(f"NO-GO: lectura autenticada falló ({type(exc).__name__})")
         return 2
 
     cash = account["cash_usd"]
     positions = account["positions"]
-    orders = account["orders"]
-    opened = _open_orders(orders)
 
     if cash < 200.0:
         blockers.append(f"cash Kalshi ${cash:.2f} < $200 separados")
@@ -96,8 +156,6 @@ async def main() -> int:
         blockers.append(f"{len(positions)} posición(es) abierta(s) sin conciliar")
     if opened:
         blockers.append(f"{len(opened)} orden(es) abierta(s) sin conciliar")
-    if len(orders) >= 100:
-        blockers.append("lista de órdenes alcanzó limit=100; exhaustividad no demostrada")
 
     print("BANK200 PREFLIGHT — READ ONLY")
     print(f"cash_exchange=${cash:.2f}")

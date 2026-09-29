@@ -1,0 +1,55 @@
+[Unit]
+Description=Botkalshi - servicio tecnico de produccion sin ordenes
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/botkalshi-runtime/runtime.env
+ConditionPathExists=/etc/botkalshi-runtime/kalshi_private_key.pem
+ConditionPathExists=/etc/botkalshi-runtime/STANDBY_REVIEWED
+ConditionPathIsDirectory=/opt/botkalshi-runtime/current
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=botkalshi-runtime
+Group=botkalshi-runtime
+WorkingDirectory=/opt/botkalshi-runtime/current
+EnvironmentFile=/etc/botkalshi-runtime/runtime.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/botkalshi-runtime/current
+StateDirectory=botkalshi-runtime
+StateDirectoryMode=0700
+LogsDirectory=botkalshi-runtime
+LogsDirectoryMode=0700
+# El montaje solo existe en el namespace de la unidad; no reemplaza /app del host.
+BindPaths=/var/log/botkalshi-runtime:/app/logs
+ReadWritePaths=/var/lib/botkalshi-runtime /var/log/botkalshi-runtime /app/logs
+# Esta unidad es SOLO standby: rechazar drift de flags antes de abrir conexiones.
+ExecStartPre=/opt/botkalshi-runtime/current/.venv/bin/python -c "import sys; from src.utils.config import get_settings; s=get_settings(); flags=('TRADING_ENABLED','MOTOR_1_EXECUTION_ENABLED','MOTOR_2_ENTRY_EXECUTION_ENABLED','MOTOR_2_EXECUTION_ENABLED','MOTOR_3_EXECUTION_ENABLED','MOTOR_REST_EXECUTION_ENABLED','MOTOR_MM_EXECUTION_ENABLED','MOTOR_1_ARBITRAGE_ENABLED','MOTOR_2_SPORTSBOOK_ENABLED','MOTOR_3_CLV_ENABLED','MOTOR_REST_ENABLED','MOTOR_MM_ENABLED','MOTOR_6_LINEMOVE_ENABLED','MOTOR_8_OFI_ENABLED','MOTOR_9_SPILLOVER_ENABLED','ANALYST_LOOP_ENABLED','DAILY_PNL_REPORT_ENABLED','TELEGRAM_DASHBOARD_ENABLED'); blocked=[n for n in flags if getattr(s,n)]; sys.exit('Unidad standby: flags no permitidos '+','.join(blocked)) if blocked else None; sys.exit('Se requieren datos de produccion') if s.KALSHI_ENV != 'production' else None; sys.exit('Health debe ser loopback:18080') if s.HEALTH_HOST != '127.0.0.1' or s.HEALTH_PORT != 18080 else None; sys.exit('APIs adicionales no autorizadas en standby') if s.ODDS_API_KEY or s.telegram_configured else None"
+ExecStart=/opt/botkalshi-runtime/current/.venv/bin/python -m src.runner
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryAccounting=true
+MemoryHigh=500M
+MemoryMax=650M
+MemorySwapMax=256M
+CPUQuota=80%
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botkalshi-runtime
+
+[Install]
+WantedBy=multi-user.target
