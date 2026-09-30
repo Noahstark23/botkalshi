@@ -1,0 +1,36 @@
+[Unit]
+Description=Botkalshi - exportacion financiera readonly
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/botkalshi-runtime/runtime.env
+ConditionPathExists=/etc/botkalshi-runtime/OPERATOR_REPORT_REVIEWED
+ConditionPathIsDirectory=/opt/botkalshi-operator-report/current
+
+[Service]
+Type=oneshot
+User=botkalshi-runtime
+Group=botkalshi-runtime
+WorkingDirectory=/opt/botkalshi-operator-report/current
+EnvironmentFile=/etc/botkalshi-runtime/runtime.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/botkalshi-operator-report/current
+StateDirectory=botkalshi-operator-report
+StateDirectoryMode=0700
+ExecStart=/opt/botkalshi-runtime/current/.venv/bin/python -B -m scripts.export_operator_report --output /var/lib/botkalshi-operator-report/report.json --subaccount 0
+TimeoutStartSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/botkalshi-operator-report
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=200M
+MemorySwapMax=0
+CPUQuota=25%
+TasksMax=32
+StandardOutput=journal
+StandardError=journal

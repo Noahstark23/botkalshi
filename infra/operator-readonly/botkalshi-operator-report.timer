@@ -1,0 +1,12 @@
+[Unit]
+Description=Botkalshi - refresco del reporte financiero readonly
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=300
+AccuracySec=15
+Persistent=false
+Unit=botkalshi-operator-report.service
+
+[Install]
+WantedBy=timers.target
