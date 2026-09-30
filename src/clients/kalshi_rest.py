@@ -350,9 +350,11 @@ class KalshiRestClient:
     # =====================================================
     # Account
     # =====================================================
-    async def get_balance(self) -> dict:
+    async def get_balance(self, *, subaccount: int | None = None) -> dict:
         """Balance de la cuenta. Retorna `{'balance': cents}`."""
-        return await self._request("GET", "/portfolio/balance")
+        if subaccount is None:
+            return await self._request("GET", "/portfolio/balance")
+        return await self._request("GET", "/portfolio/balance", params={"subaccount": subaccount})
 
     async def get_available_balance_usd(self) -> float:
         """Cash disponible en USD (Bug 1, incidente 2026-07-07: pre-check antes de colocar
@@ -364,18 +366,39 @@ class KalshiRestClient:
             raise ValueError(f"get_balance sin campo 'balance': {data!r}")
         return float(cents) / 100.0
 
-    async def get_positions(self, *, limit: int = 100, cursor: str | None = None) -> dict:
+    async def get_positions(
+        self, *, limit: int = 100, cursor: str | None = None, subaccount: int | None = None
+    ) -> dict:
         """Posiciones abiertas, paginadas."""
         params: dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/positions", params=params)
 
-    async def get_fills(self, *, limit: int = 100, ticker: str | None = None) -> dict:
+    async def get_fills(
+        self,
+        *,
+        limit: int = 100,
+        ticker: str | None = None,
+        cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+        subaccount: int | None = None,
+    ) -> dict:
         """Fills recientes (trades ejecutados de tu cuenta)."""
         params: dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/fills", params=params)
 
     async def get_settlements(
@@ -385,6 +408,7 @@ class KalshiRestClient:
         cursor: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,
+        subaccount: int | None = None,
     ) -> dict:
         """
         Posiciones resueltas por el exchange. `revenue` (¢) = lo recibido al settlement.
@@ -397,6 +421,8 @@ class KalshiRestClient:
             params["min_ts"] = min_ts
         if max_ts is not None:
             params["max_ts"] = max_ts
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/settlements", params=params)
 
     # =====================================================
@@ -600,6 +626,8 @@ class KalshiRestClient:
         ticker: str | None = None,
         status: str | None = None,
         limit: int = 100,
+        cursor: str | None = None,
+        subaccount: int | None = None,
     ) -> dict:
         """Lista de órdenes."""
         params: dict[str, Any] = {"limit": limit}
@@ -607,4 +635,8 @@ class KalshiRestClient:
             params["ticker"] = ticker
         if status:
             params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/orders", params=params)
