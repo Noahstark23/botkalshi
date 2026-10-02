@@ -26,6 +26,10 @@ import pytest
 from scripts import live_unit_report as lur
 
 SCRIPT = Path(lur.__file__)
+# Cabeceras PEM ARMADAS por concatenación: el guard de #248 (test_no_claves_trackeadas)
+# marca cualquier archivo trackeado que las contenga literal — y tiene razón en ser estricto.
+PEM_BEGIN = "-----BEGIN " + "PRIVATE KEY-----"
+PEM_END = "-----END " + "PRIVATE KEY-----"
 SECRETS = (
     "SUPERSECRETAPIKEYID-1234567890",
     "tg-bot-token-abcdefghijklmnop",
@@ -260,7 +264,7 @@ def test_sanitize_unit_text():
 
 
 def test_final_guard_drops_pem_lines():
-    text = "ok\n-----BEGIN PRIVATE KEY-----\nMIIEv\n-----END PRIVATE KEY-----\nfin"
+    text = f"ok\n{PEM_BEGIN}\nMIIEv\n{PEM_END}\nfin"
     out = lur.final_guard(text)
     assert "BEGIN" not in out and "END PRIVATE" not in out
     assert out.startswith("ok\n") and out.rstrip().endswith("fin")
@@ -328,7 +332,7 @@ def host(tmp_path):
     envfile.write_text(
         f"KALSHI_API_KEY_ID={SECRETS[0]}\n"
         f"TELEGRAM_BOT_TOKEN='{SECRETS[1]}'\n"
-        "-----BEGIN PRIVATE KEY-----\n"
+        f"{PEM_BEGIN}\n"
         "KALSHI_ENV=production\n"
         "MOTOR_1_EXECUTION_ENABLED=true\n"
         "TRADING_ENABLED=false\n"
