@@ -2,8 +2,10 @@
 
 Este paquete está separado de los motores y no los activa. Se instala solamente
 tras revisión y autorización de Noel. No modifica la whitelist SSH existente.
-Los archivos systemd son plantillas; todavía no se verificaron en Ubuntu ni se
-instalaron. El acceso completo sigue siendo exclusivo de Noel.
+Los archivos systemd son plantillas. El 5/10 pasaron validación estática con
+systemd 255 en Ubuntu 24.04 AMD64 emulado localmente, sin iniciar unidades.
+No están instalados ni probados con credenciales y permisos del droplet.
+El acceso completo sigue siendo exclusivo de Noel.
 
 ## Qué aporta
 

@@ -5,6 +5,7 @@ indicó una pérdida máxima diaria de US$200. Con ese capital, ese máximo perm
 perder la asignación entera en un día: no es un objetivo de consumo ni motivo para
 elevar los stops existentes. El depósito y la habilitación de la cuenta no se han
 verificado. Este candidato local mantiene apagadas todas las órdenes.
+El 5/10 Noel confirmó expresamente que todavía no ha hecho el depósito.
 
 ## Entrega técnica actual
 
@@ -31,6 +32,14 @@ verificado. Este candidato local mantiene apagadas todas las órdenes.
 - M5 detiene nuevas cotizaciones y registra un incidente persistente si falla la
   lectura de fills. Un fill sin cantidad ejecutada válida ya no se sustituye por
   la cantidad solicitada; sólo se marca procesado después de aplicar inventario.
+- En el arranque de ejecución, M5 no carga inventario ni mediciones de fills
+  simulados. Se reprodujo la contaminación de 6 contratos confirmados con 9
+  simulados, que daban un neto incorrecto de 15. Las cohortes de ejecución tienen
+  identidad separada; la identidad histórica shadow se conserva.
+- Se verificó localmente la recuperación de compras y ventas de cantidad entera
+  tras reiniciar, sin duplicación. Una ejecución parcial resting de 2 contratos
+  seguida de otro fill durante el cancel recupera 3, conserva el incidente y
+  requiere revisión; nunca se transforma automáticamente en permiso de cotizar.
 - Se integró el reporte de lectura de `b176507`: saldo antes/después, órdenes,
   posiciones, fills y liquidaciones con subcuenta explícita y paginación acotada.
   También conserva la separación de depósitos y beneficio en la medición.
@@ -46,8 +55,19 @@ oportunidades rentables. La captura de ambos deportes no valida ninguna estrateg
 
 ## Verificación del candidato
 
-- macOS, Python 3.12.14: **2.270 pruebas aprobadas**, 31 advertencias.
-- Contenedor Linux ARM64 sin red, con el código montado en sólo lectura:
+- macOS, Python 3.12.14: **2.275 pruebas aprobadas**, 31 advertencias
+  (`macos-restart-suite.log`). El grupo M5 aprobó 273 pruebas.
+- Ubuntu 24.04.5 AMD64, Python 3.12.3, emulado localmente: **2.273 aprobadas,
+  2 omitidas**, 31 advertencias (`ubuntu-amd64-suite.log`). Dependencias de
+  `infra/digitalocean-runtime/requirements.lock` instaladas con verificación de
+  hashes; todas sus versiones contrastadas tras instalar las herramientas de QA.
+  La ejecución de tests no tuvo red ni credenciales. Las dos pruebas omitidas
+  requieren Git y aprobaron en macOS. Imagen de QA `7b06d970af41`.
+- La validación estática de servicio y timer del lector pasó con systemd 255 de
+  Ubuntu, sin iniciar unidades. No acredita permisos, credenciales, recursos ni
+  funcionamiento de esos servicios en el droplet.
+- La versión anterior `01b84b1`, en contenedor Linux ARM64 sin red, con el código
+  montado en sólo lectura:
   **2.268 aprobadas, 2 omitidas**, 31 advertencias. Las dos omitidas comprueban
   secretos versionados mediante Git, que no está disponible dentro de la imagen;
   esas mismas pruebas sí aprobaron en macOS.
@@ -84,11 +104,20 @@ antes de cualquier uso financiero.
 1. Confirmar el depósito acreditado y conciliar la cuenta mediante el lector.
    El titular debe habilitar el reporte autorizado o aportar la exportación de
    Kalshi. No se necesita compartir contraseñas ni llaves privadas por chat.
-2. Verificar la versión destinada al servidor y las pruebas en Ubuntu AMD64. La suite
+2. Verificar e instalar la versión destinada al servidor. La compatibilidad local
+   con Ubuntu AMD64 y el lock ya se comprobó; falta probar el host real. La suite
    local usa transporte simulado y SQLite temporal; no equivale a aceptación de
    órdenes, ejecución demo, producción ni rentabilidad.
-3. Cerrar el inventario M5 durante fills parciales, su recuperación después de
-   una interrupción y el aislamiento de exposición por cuenta. Los parsers legacy
+3. Adaptar el ledger M5 a ejecuciones fraccionarias y conciliar la exposición de
+   la cuenta. El reinicio para cantidades enteras y el fill durante cancelación
+   ya se verificaron. El lector admite fracciones, pero el ledger de ejecución
+   todavía sólo representa enteros y los casos fraccionarios quedan bloqueados.
+   La [guía vigente de Kalshi](https://docs.kalshi.com/getting_started/fixed_point_migration)
+   confirma que los fills pueden ser fraccionarios aunque la orden use contratos
+   enteros. La consulta pública del 5/10 encontró 14 mercados MLB y 32 NFL;
+   ninguno incluyó `fractional_trading_enabled`, cuya ausencia no prueba que las
+   fracciones estén desactivadas. Se conserva `public-market-capabilities.json`.
+   Los parsers legacy
    de otros motores todavía requieren revisión; el perfil mantiene sus órdenes
    apagadas. La guarda reduce_only limita la orden en el exchange, no convierte
    una conciliación incompleta en una cartera correcta.

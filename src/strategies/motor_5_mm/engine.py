@@ -210,6 +210,10 @@ class Motor5Engine:
             "fair_cache_ttl_sec": self._fair_cache_ttl_sec,
             "fair_method_version": FAIR_METHOD_VERSION,
         }
+        # La misma etiqueta/config antes mezclaba la custodia shadow y ejecución.
+        # Conservar el hash F1 para recuperar sus cohortes; ejecución tiene otro id.
+        if trading_enabled:
+            experiment_config["execution_mode"] = "exchange"
         config_hash = hashlib.sha256(
             json.dumps(experiment_config, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:12]
@@ -432,8 +436,11 @@ class Motor5Engine:
         )
         self._begin_experiment_run()
         try:
-            self._rehidratar_markouts()
-            self._rehidratar_inventory()
+            # Los fills hipotéticos jamás son posiciones reales, aunque un registro
+            # histórico comparta experiment_id. Trade se recupera tras reconciliar.
+            if not self._trading_enabled:
+                self._rehidratar_markouts()
+                self._rehidratar_inventory()
             async with self._client_factory() as client:
                 self._client = client
                 self._fee_policy = SeriesFeePolicy(client)
