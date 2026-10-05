@@ -5,20 +5,31 @@ Motor de Gestión de Riesgo (Fase 2 Motor 1).
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from loguru import logger
-from sqlmodel import col, select
+from sqlmodel import col, or_, select
 
-from src.math.arbitrage import ArbOpportunity
+from src.math.arbitrage import ArbLeg, ArbOpportunity
+from src.math.balance import available_cash_usd
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
 from src.risk.experiment_policy import limits_for_capital
+from src.risk.exposure import (
+    MM_STRATEGY,
+    UnknownExposureError,
+    committed_risk_cents,
+    contract_risk_cents,
+    exposure_count,
+    open_risk_cents,
+)
 from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
+from src.strategies.motor_5_mm.incidents import incident_status
 from src.strategies.motor_rest_arb.settlement import arb_group_key
 from src.utils.config import get_settings
 
@@ -86,6 +97,26 @@ class RiskManager:
         """Solo un bool True explícito activa el guard; mocks/ausencia nunca lo arman."""
         return getattr(self.settings, "EXPERIMENT_BANK200_ENABLED", False) is True
 
+    def _requires_confirmed_cash(self) -> bool:
+        return self.settings.KALSHI_ENV == "production" or self._experiment_enabled()
+
+    def _fresh_cash_usd(self) -> float | None:
+        """La última lectura cruda limita el suavizado; un retiro no aumenta el margen."""
+        cached = RiskManager._cached_capital_usd
+        raw = RiskManager._last_raw_balance_usd
+        last = RiskManager._last_balance_at
+        if cached is None or raw is None or last is None:
+            return None
+        if not all(math.isfinite(v) and v > 0 for v in (cached, raw)):
+            return None
+        age = (datetime.now(UTC).replace(tzinfo=None) - self._as_utc_naive(last)).total_seconds()
+        ttl = self.settings.BALANCE_MAX_AGE_SECONDS
+        if self._experiment_enabled():
+            ttl = min(ttl, self.settings.EXPERIMENT_BALANCE_MAX_AGE_SEC)
+        if age < 0 or age > ttl:
+            return None
+        return min(cached, raw)
+
     # =========================================================
     # C-01 — Capital base efectivo (balance real de Kalshi)
     # =========================================================
@@ -106,15 +137,15 @@ class RiskManager:
 
         Fallback (C-01): si NUNCA se obtuvo balance (refresh no corrió o la API falla desde el
         arranque), cae a `settings.ACTIVE_CAPITAL_USD` SIN factorizar — ese valor ya es un piso
-        de seguridad conservador. Loguea WARNING una vez. NUNCA devuelve 0 por un fallo de red.
+        diagnóstico. Loguea WARNING una vez; este fallback no habilita entradas live.
 
-        Capital dinámico: DYNAMIC_CAPITAL_ENABLED=False fuerza el estático ACTIVE_CAPITAL_USD
-        (escudo / dry-run). Sobre el cash real se aplica techo configurable (CAPITAL_CAP_USD) y
+        Capital dinámico: DYNAMIC_CAPITAL_ENABLED=False usa capital estático en demo;
+        en producción lo limita además al cash confirmado. Sobre el cash se aplica techo (CAPITAL_CAP_USD) y
         piso (CAPITAL_FLOOR_USD) — el efectivo nunca baja del piso para no romper la matemática
         de riesgo; la PAUSA de nuevas entradas la decide can_open_new_positions().
         """
-        # Toggle maestro: dynamic off → capital estático (ignora el cash real).
-        if not self.settings.DYNAMIC_CAPITAL_ENABLED:
+        # Sólo demo sin experimento puede usar capital estático sin observar cash.
+        if not self.settings.DYNAMIC_CAPITAL_ENABLED and not self._requires_confirmed_cash():
             return self.settings.ACTIVE_CAPITAL_USD
 
         cached = RiskManager._cached_capital_usd
@@ -123,14 +154,21 @@ class RiskManager:
                 RiskManager._capital_fallback_warned = True
                 logger.warning(
                     "risk.capital: sin balance real de Kalshi todavía → fallback a "
-                    f"ACTIVE_CAPITAL_USD=${self.settings.ACTIVE_CAPITAL_USD:.2f} (piso de seguridad)"
+                    f"ACTIVE_CAPITAL_USD=${self.settings.ACTIVE_CAPITAL_USD:.2f} (diagnóstico; no habilita entradas live)"
                 )
             base = self.settings.ACTIVE_CAPITAL_USD
         else:
+            if self._requires_confirmed_cash():
+                raw = RiskManager._last_raw_balance_usd
+                if raw is not None and math.isfinite(raw) and raw >= 0:
+                    cached = min(cached, raw)
             # C-02: cash real × factor de seguridad, con techo y piso configurables.
             base = cached * (self.settings.CAPITAL_SAFETY_FACTOR_PCT / 100.0)
             base = min(base, self.settings.CAPITAL_CAP_USD)
             base = max(base, self.settings.CAPITAL_FLOOR_USD)
+
+        if not self.settings.DYNAMIC_CAPITAL_ENABLED:
+            base = min(base, self.settings.ACTIVE_CAPITAL_USD)
 
         # C-02: clamp ÚNICO al hard cap en producción — cubre AMBOS paths (cash real Y
         # fallback). Hoy el fallback ya respeta el techo vía el validator de config, pero
@@ -147,19 +185,22 @@ class RiskManager:
         return self._get_effective_capital_usd()
 
     def can_open_new_positions(self) -> bool:
-        """True si se permiten NUEVAS entradas. False = capital (cash real × factor, pre-piso)
-        bajo CAPITAL_FLOOR_USD → se pausan las entradas, pero la GESTIÓN/CIERRE de posiciones
-        abiertas sigue (Motor 3 no pasa por este gate). En modo estático o sin balance real
-        todavía, NO bloquea (el sizing/exposición ya protegen)."""
-        if self._experiment_enabled():
-            cached = RiskManager._cached_capital_usd
-            last = RiskManager._last_balance_at
-            if cached is None or last is None:
+        """Producción exige cash fresco incluso en modo estático. No bloquea salidas.
+
+        El fallback sigue disponible para diagnóstico, nunca autoriza entradas live.
+        Demo fuera del perfil Bank200 conserva su simulación con capital estático.
+        """
+        if self._requires_confirmed_cash():
+            cash = self._fresh_cash_usd()
+            if cash is None:
                 return False
-            now = datetime.now(UTC).replace(tzinfo=None)
-            age_sec = max(0.0, (now - last).total_seconds())
-            if age_sec > self.settings.EXPERIMENT_BALANCE_MAX_AGE_SEC:
-                return False
+            usable = min(
+                cash * self.settings.CAPITAL_SAFETY_FACTOR_PCT / 100.0,
+                self.settings.CAPITAL_CAP_USD,
+            )
+            if not self.settings.DYNAMIC_CAPITAL_ENABLED:
+                usable = min(usable, self.settings.ACTIVE_CAPITAL_USD)
+            return usable >= self.settings.CAPITAL_FLOOR_USD
 
         if not self.settings.DYNAMIC_CAPITAL_ENABLED:
             return True
@@ -190,7 +231,7 @@ class RiskManager:
                 "mode": "unknown",
                 "raw_balance_usd": cls._last_raw_balance_usd,
                 "effective_usd": None,
-                "is_paused": False,
+                "is_paused": True,
             }
 
     @classmethod
@@ -207,18 +248,15 @@ class RiskManager:
         """
         from src.clients.kalshi_rest import KalshiRestClient
 
-        # Capital estático: no consultamos la API (dry-run / escudo). El check usa ACTIVE_CAPITAL_USD.
-        if not get_settings().DYNAMIC_CAPITAL_ENABLED:
+        # Demo estático evita red; producción siempre necesita observar fondos.
+        if not get_settings().DYNAMIC_CAPITAL_ENABLED and not cls()._requires_confirmed_cash():
             return cls._cached_capital_usd
 
         factory = client_factory or KalshiRestClient
         try:
             async with factory() as client:  # type: ignore[operator]
                 data = await client.get_balance()
-            cents = data.get("balance") if isinstance(data, dict) else None
-            if cents is None:
-                raise ValueError(f"get_balance sin campo 'balance': {data!r}")
-            usd = int(round(float(cents))) / 100.0  # {'balance': cents:int} → USD
+            usd = float(available_cash_usd(data))
             cls._last_raw_balance_usd = usd  # crudo, siempre (para /status)
             # Suavizado anti-churn: ignorar cambios menores al umbral (no actualizar la caché de
             # riesgo). Primer balance (prev None) o prev<=0 siempre actualiza.
@@ -250,7 +288,7 @@ class RiskManager:
             else:
                 logger.warning(
                     f"risk.capital: get_balance falló ({type(exc).__name__}: {exc}) y no hay "
-                    "balance previo → los checks usarán ACTIVE_CAPITAL_USD (piso de seguridad)"
+                    "balance previo → producción mantiene nuevas entradas bloqueadas"
                 )
             return last
 
@@ -351,21 +389,35 @@ class RiskManager:
         week_start = week_start_la.astimezone(UTC).replace(tzinfo=None)
 
         with get_session() as s:
-            buys = list(s.exec(select(Trade).where(Trade.action == "buy")))
+            entries = list(
+                s.exec(
+                    select(Trade).where(or_(Trade.action == "buy", Trade.strategy == MM_STRATEGY))
+                )
+            )
             settled = list(s.exec(select(Trade).where(Trade.status == "settled")))
 
         committed_cents = 0
         committed_statuses = {"pending", "filled", "settled", "cancelled"}
-        for trade in buys:
+        for trade in entries:
             placed = self._as_utc_naive(trade.placed_at)
-            if placed < start or placed < day_start or trade.status not in committed_statuses:
+            if placed < start or placed < day_start:
                 continue
+            if trade.status not in committed_statuses:
+                if trade.strategy == MM_STRATEGY:
+                    return {"valid": False, "reason": "M5 con estado de compromiso desconocido"}
+                continue
+            try:
+                committed = committed_risk_cents(trade)
+            except UnknownExposureError as exc:
+                return {"valid": False, "reason": f"Compromiso de riesgo inválido: {exc}"}
             fee_cents = (
                 trade.fees_cents
                 if trade.fees_cents is not None
                 else kalshi_fee_cents(trade.count, trade.price_cents)
             )
-            committed_cents += trade.price_cents * trade.count + fee_cents
+            if type(fee_cents) is not int or fee_cents < 0:
+                return {"valid": False, "reason": "Comisión de riesgo desconocida"}
+            committed_cents += committed + fee_cents
 
         weekly_cents = 0
         cumulative_cents = 0
@@ -424,6 +476,18 @@ class RiskManager:
         async with RiskManager._check_lock:
             return await self._check_pre_trade_locked(opp)
 
+    @staticmethod
+    def _shared_incident_block() -> TradeDecision | None:
+        """Una phantom M5 sin fila también compromete el capital de otros motores.
+
+        El latch bloquea sólo gates de entrada: no inventa exposición numérica ni
+        modifica las rutas de cancelación/gestión. Una lectura fallida bloquea.
+        """
+        blocked, reason = incident_status()
+        if blocked:
+            return TradeDecision(False, f"Exposición M5 incierta: {reason}", 0)
+        return None
+
     async def check_and_reserve(
         self, opp: ArbOpportunity, persist_intent: Callable[[TradeDecision], bool]
     ) -> TradeDecision:
@@ -444,15 +508,115 @@ class RiskManager:
             decision = await self._check_pre_trade_locked(opp)
             if not decision.approved:
                 return decision
+            incident_block = self._shared_incident_block()
+            if incident_block is not None:
+                return incident_block
             if not persist_intent(decision):
                 return TradeDecision(False, "persist_intent_failed", 0)
             return decision
 
-    async def _check_pre_trade_locked(self, opp: ArbOpportunity) -> TradeDecision:
+    def _confirmed_quote_capital_usd(self) -> float | None:
+        """M5 sólo abre contra cash observado fresco, nunca contra piso/fallback.
+
+        El valor crudo también limita el suavizado: un retiro pequeño no puede
+        conservar capacidad ficticia. Esto no cambia los clamps de otros motores.
+        """
+        cash = self._fresh_cash_usd()
+        if cash is None:
+            return None
+        confirmed = cash * self.settings.CAPITAL_SAFETY_FACTOR_PCT / 100.0
+        confirmed = min(confirmed, self.settings.CAPITAL_CAP_USD)
+        if confirmed < self.settings.CAPITAL_FLOOR_USD:
+            return None
+        return min(confirmed, self._get_effective_capital_usd())
+
+    async def check_quote_and_reserve(
+        self,
+        trade: Trade,
+        persist_intent: Callable[[], bool],
+        *,
+        max_exposure_usd: float | None = None,
+    ) -> TradeDecision:
+        """M5: gate + canary + INSERT bajo el lock compartido, antes de la red.
+
+        La quote se acepta completa o se rechaza. El lock cubre un proceso; los
+        motores con check_pre_trade e INSERT separado aún requieren migración.
+        """
+        async with RiskManager._check_lock:
+            try:
+                if trade.strategy != MM_STRATEGY or trade.status != "pending":
+                    return TradeDecision(False, "Intent M5 inválido", 0)
+                risk_cents = open_risk_cents(trade)
+                capital = self._confirmed_quote_capital_usd()
+                if capital is None:
+                    return TradeDecision(False, "M5 sin capital confirmado fresco sobre el piso", 0)
+                unit_risk = contract_risk_cents(
+                    action=trade.action, side=trade.side, price_cents=trade.price_cents
+                )
+                risk_side = (
+                    trade.side
+                    if trade.action == "buy"
+                    else ("no" if trade.side == "yes" else "yes")
+                )
+                # El gate existente recibe el BUY equivalente; incluye sus mismos
+                # stops, exposición, sizing y fees, sin permitir count parcial.
+                opp = ArbOpportunity(
+                    legs=(ArbLeg(trade.ticker, risk_side, unit_risk, trade.count, trade.count),),
+                    count=trade.count,
+                    gross_profit_cents=0,
+                    fees_cents=0,
+                    net_profit_cents=0,
+                    edge_pct=0.0,
+                )
+                decision = await self._check_pre_trade_locked(opp, capital_usd=capital)
+                if not decision.approved:
+                    return decision
+                # Los stops pueden esperar I/O de alertas. Una pausa/retiro en esa
+                # espera invalida el permiso antes de persistir la nueva reserva.
+                current_capital = self._confirmed_quote_capital_usd()
+                if BotState.is_paused or current_capital is None or current_capital < capital:
+                    return TradeDecision(False, "M5 capital/pausa cambió durante el check", 0)
+                if decision.max_allowed_count < trade.count:
+                    return TradeDecision(False, "M5 quote completa excede sizing disponible", 0)
+                if max_exposure_usd is not None:
+                    if not math.isfinite(max_exposure_usd) or max_exposure_usd < 0:
+                        return TradeDecision(False, "M5 canary cap inválido", 0)
+                    with get_session() as session:
+                        rows = list(
+                            session.exec(
+                                select(Trade).where(
+                                    Trade.strategy == MM_STRATEGY,
+                                    col(Trade.status).notin_(["settled", "cancelled"]),
+                                )
+                            )
+                        )
+                    if sum(open_risk_cents(row) for row in rows) + risk_cents > int(
+                        max_exposure_usd * 100
+                    ):
+                        return TradeDecision(False, "M5 canary cap alcanzado", 0)
+            except Exception:
+                logger.exception("risk.quote_check_failed → no se autoriza riesgo nuevo")
+                return TradeDecision(False, "M5 riesgo/capital desconocido", 0)
+            # El callback debe persistir o devolver False. Sus errores de latch no
+            # se silencian acá: el executor/supervisor deben ver el fallo durable.
+            incident_block = self._shared_incident_block()
+            if incident_block is not None:
+                return incident_block
+            if not persist_intent():
+                return TradeDecision(False, "persist_intent_failed", 0)
+            return decision
+
+    async def _check_pre_trade_locked(
+        self, opp: ArbOpportunity, *, capital_usd: float | None = None
+    ) -> TradeDecision:
         """Cuerpo del check (bajo lock). Lógica idéntica a la versión histórica."""
         if BotState.is_paused:
             reason = BotState.pause_reason or "Razón desconocida"
             return TradeDecision(False, f"BotState.is_paused activo: {reason}", 0)
+
+        incident_block = self._shared_incident_block()
+        if incident_block is not None:
+            return incident_block
 
         experiment_block = await self._check_experiment_stops()
         if experiment_block:
@@ -470,10 +634,9 @@ class RiskManager:
         # (la gestión/cierre de lo abierto NO pasa por este gate — Motor 3 no llama check_pre_trade).
         # Gate NUEVO e independiente: no toca el stop-loss ni el kill-switch.
         if not self.can_open_new_positions():
-            if self._experiment_enabled():
+            if self._requires_confirmed_cash():
                 reason = (
-                    "Bank-200 sin balance Kalshi fresco o capital bajo el piso: "
-                    "nuevas entradas en pausa"
+                    "Sin balance Kalshi fresco o capital bajo el piso: nuevas entradas en pausa"
                 )
             else:
                 reason = (
@@ -490,7 +653,12 @@ class RiskManager:
             return TradeDecision(False, unrealized_reason, 0)
 
         # C-01: capital base = balance REAL de Kalshi (no el ACTIVE_CAPITAL_USD estático).
-        capital_usd = self._get_effective_capital_usd()
+        if capital_usd is None:
+            capital_usd = self._get_effective_capital_usd()
+        elif self._requires_confirmed_cash():
+            if not math.isfinite(capital_usd) or capital_usd <= 0:
+                return TradeDecision(False, "Capital propuesto inválido", 0)
+            capital_usd = min(capital_usd, self._get_effective_capital_usd())
         current_exposure_usd = self._get_current_exposure_usd()
         max_total_exposure_usd = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
         daily_remaining_usd = float("inf")
@@ -556,6 +724,11 @@ class RiskManager:
                 0,
             )
 
+        # Los stops de arriba pueden esperar alertas. El incidente compartido se
+        # vuelve a consultar después de todos los awaits, justo antes de aprobar.
+        incident_block = self._shared_incident_block()
+        if incident_block is not None:
+            return incident_block
         return TradeDecision(True, "Aprobado", allowed_count)
 
     def exposure_headroom_usd(self) -> float:
@@ -581,28 +754,33 @@ class RiskManager:
         arb_id de A.1, status='filled'); pending y patas sueltas cuentan completo —
         ante la duda, sobrestimar (frena antes, nunca después).
         """
-        with get_session() as s:
-            stmt = select(Trade).where(col(Trade.status).in_(["pending", "filled"]))
-            active_trades = list(s.exec(stmt))
+        try:
+            with get_session() as s:
+                stmt = select(Trade).where(
+                    or_(
+                        col(Trade.status).in_(["pending", "filled"]),
+                        (Trade.strategy == MM_STRATEGY)
+                        & col(Trade.status).notin_(["settled", "cancelled"]),
+                    )
+                )
+                active_trades = list(s.exec(stmt))
+            total_cents = sum(open_risk_cents(trade) for trade in active_trades)
+        except Exception:
+            logger.exception("risk.exposure_unknown → bloquea riesgo adicional")
+            return float("inf")
 
         if not active_trades:
             return 0.0
 
-        # Motor 5 F2 — reservado vs expuesto: una fila 'pending' (orden RESTING) reserva
-        # su count COMPLETO (conservador: puede llenarse entera en cualquier momento);
-        # una 'filled' con filled_count (fill PARCIAL: el resto se canceló) expone SOLO
-        # lo llenado. filled_count=None = semántica legacy (count entero).
-        def _exposure_count(t: Trade) -> int:
-            if t.status == "filled" and t.filled_count is not None:
-                return t.filled_count
-            return t.count
-
-        total_cents = sum(t.price_cents * _exposure_count(t) for t in active_trades)
-
         # Descuento de arbs hedged: agrupar las FILLED con arb_id identificable.
         groups: dict[str, list[Trade]] = {}
         for t in active_trades:
-            if t.status == "filled" and "arb_id=" in (t.notes or ""):
+            if (
+                t.status == "filled"
+                and t.action == "buy"
+                and t.strategy in ("motor_1_arbitrage", "motor_rest_arb")
+                and "arb_id=" in (t.notes or "")
+            ):
                 groups.setdefault(arb_group_key(t), []).append(t)
 
         for arb_id, legs in groups.items():
@@ -611,14 +789,14 @@ class RiskManager:
             tickers = {t.ticker for t in legs}
             if yes_legs and no_legs and len(tickers) == 1:
                 # Arb BINARIO hedged (yes+no del mismo ticker): descuenta el par.
-                cnt_yes = sum(t.count for t in yes_legs)
-                cnt_no = sum(t.count for t in no_legs)
+                cnt_yes = sum(exposure_count(t) for t in yes_legs)
+                cnt_no = sum(exposure_count(t) for t in no_legs)
                 paired = min(cnt_yes, cnt_no)
                 if paired <= 0:
                     continue
                 # Costo promedio ponderado por lado × contratos emparejados.
-                cost_yes = sum(t.price_cents * t.count for t in yes_legs) / cnt_yes
-                cost_no = sum(t.price_cents * t.count for t in no_legs) / cnt_no
+                cost_yes = sum(open_risk_cents(t) for t in yes_legs) / cnt_yes
+                cost_no = sum(open_risk_cents(t) for t in no_legs) / cnt_no
                 total_cents -= int(paired * (cost_yes + cost_no))
                 continue
             total_cents -= self._multi_outcome_hedge_discount_cents(legs=legs, arb_id=arb_id)
@@ -668,11 +846,11 @@ class RiskManager:
             return 0
         if any(row.status not in ("filled", "settled") for row in siblings):
             return 0  # una pata no-fillada = set incompleto (KILL/pending) → direccional
-        paired = min(sum(t.count for t in ts) for ts in by_ticker.values())
+        paired = min(sum(exposure_count(t) for t in ts) for ts in by_ticker.values())
         if paired <= 0:
             return 0
         set_cost = sum(
-            sum(t.price_cents * t.count for t in ts) / sum(t.count for t in ts)
+            sum(open_risk_cents(t) for t in ts) / sum(exposure_count(t) for t in ts)
             for ts in by_ticker.values()
         )
         if set_cost >= 100:

@@ -88,6 +88,7 @@ async def test_asymmetric_fill_triggers_rollback():
     # El rollback fue un sell a 1¢ de la pata NO (la hard, la única llena).
     sell_call = client.place_order.await_args_list[2]
     assert sell_call.kwargs["action"] == "sell"
+    assert sell_call.kwargs["reduce_only"] is True
     assert sell_call.kwargs["no_price"] == 1
 
 
@@ -350,6 +351,7 @@ async def test_fill_plus_kill409_rolls_back_immediately_no_reconcile():
     # El rollback fue un sell a 1¢ de la pata NO (la hard, la única llena).
     sell_call = client.place_order.await_args_list[2]
     assert sell_call.kwargs["action"] == "sell"
+    assert sell_call.kwargs["reduce_only"] is True
     assert sell_call.kwargs["no_price"] == 1
 
 

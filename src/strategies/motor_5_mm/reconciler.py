@@ -1,27 +1,9 @@
-"""
-MMReconciler (F2) — la VERDAD runtime: get_orders() de Kalshi ↔ tabla Trade por
-client_order_id (+ fills por WS como fast-path, ver fill_feed.py).
+"""Reconciliación M5: solo evidencia terminal íntegra libera una intención.
 
-El gap #1 del F0 (§1.3): la reconciliación de resting orders solo existía al boot.
-Una orden cancelada por Kalshi/UI dejaba un 'pending' fantasma reservando capital para
-siempre; un fill no visto dejaba exposición invisible. Este loop cierra ambos:
-
-  Por cada fila Trade pending de strategy='motor_5_mm':
-    - orden 'resting' en la API   → OK (se refresca kalshi_order_id si faltaba)…
-      …salvo que su coid NO esté entre las quotes vivas del executor (live_coids):
-      HUÉRFANA de un proceso anterior (P0 auditoría 2026-07-07: tras un restart el
-      executor arranca con _live vacío y jamás re-adoptaba las resting del proceso
-      previo — cotizaba ENCIMA, duplicando exposición). Se CANCELA (no se adopta:
-      el engine re-cotiza al fair actual en el mismo tick, que es lo correcto para
-      un MM) y el fill parcial que haya ganado la carrera se registra del response.
-    - 'executed'                  → fila filled (+ filled_count si la API lo trae).
-    - 'canceled' con fill parcial → filled con filled_count; sin fill → cancelled.
-    - NO aparece en la API        → DISCREPANCIA → ticker corrupto.
-  Por cada orden resting de la API con prefijo m5mm- SIN fila pending nuestra:
-    - FANTASMA (la DB la perdió) → se CANCELA + ticker corrupto.
-
-Toda discrepancia marca el ticker corrupto → el executor cancela todo lo suyo y
-re-sincroniza antes de volver a cotizar (estado corrupto no opera, Lección 9).
+Todos los cursores deben terminar antes de mutar la DB. Una ausencia, un formato
+desconocido o una escritura fallida conservan pending y bloquean nuevas quotes.
+Paginar no hace atómica la lectura: identidades repetidas invalidan el barrido.
+Las órdenes históricas ausentes requieren resolución aparte.
 """
 
 from __future__ import annotations
@@ -33,11 +15,20 @@ from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.storage.models import Trade, get_session
-from src.strategies.motor_5_mm.executor import COID_PREFIX, STRATEGY, _parse_count
+from src.strategies.motor_5_mm.executor import COID_PREFIX, STRATEGY
+from src.strategies.motor_5_mm.incidents import latch_incident
+from src.strategies.motor_5_mm.order_state import (
+    COUNT_QUARANTINE_NOTE,
+    filled_count,
+    terminal_fill_count,
+    unrepresentable_fill,
+)
 
 
 @dataclass(slots=True)
 class MMReconcileReport:
+    # Un informe vacío no acredita una reconciliación terminada.
+    complete: bool = False
     pending_checked: int = 0
     resolved_filled: int = 0
     resolved_cancelled: int = 0
@@ -46,158 +37,237 @@ class MMReconcileReport:
     orphan_cancelled: int = 0
     discrepancies: int = 0
     corrupted_tickers: set[str] = field(default_factory=set)
+    terminal_coids: set[str] = field(default_factory=set)
 
 
 class MMReconciler:
     def __init__(self, client: KalshiRestClient) -> None:
         self._client = client
 
+    @staticmethod
+    def _uncertain(
+        report: MMReconcileReport, ticker: str | None = None, *, durable: bool = True
+    ) -> None:
+        report.discrepancies += 1
+        if ticker:
+            report.corrupted_tickers.add(ticker)
+        if durable:
+            latch_incident(f"reconciliación M5 incierta: {ticker or 'identidad desconocida'}")
+
     async def reconcile(self, live_coids: set[str] | None = None) -> MMReconcileReport:
-        """live_coids: quotes que el executor gestiona AHORA (executor.live_coids()).
-        None = sin información (caller legacy/diagnóstico) → no se cancelan huérfanas."""
+        """None no autoriza cancelar huérfanas; set vacío identifica un reinicio."""
         report = MMReconcileReport()
         try:
-            resp = await self._client.get_orders(limit=200)
+            orders = await self._client.get_all_orders(limit=200)
+            api_orders: dict[str, dict] = {}
+            order_ids: set[str] = set()
+            for order in orders:
+                coid, oid = order.get("client_order_id"), order.get("order_id")
+                if not isinstance(coid, str) or not coid or not isinstance(oid, str) or not oid:
+                    raise ValueError("identidad de orden incompleta")
+                if coid in api_orders or oid in order_ids:
+                    raise ValueError("identidad repetida en barrido de órdenes")
+                api_orders[coid] = order
+                order_ids.add(oid)
+            with get_session() as session:
+                pending = list(
+                    session.exec(
+                        select(Trade).where(Trade.strategy == STRATEGY, Trade.status == "pending")
+                    )
+                )
         except Exception:
-            logger.exception("motor5.reconcile.get_orders_error → tick sin reconcile")
-            report.discrepancies += 1  # sin verdad de la API, nada se des-corrompe
+            logger.exception("motor5.reconcile.snapshot_incomplete → sin nuevas quotes")
+            self._uncertain(report, durable=False)
             return report
-        api_orders = {
-            o.get("client_order_id"): o
-            for o in (resp.get("orders") or [])
-            if o.get("client_order_id")
-        }
 
-        with get_session() as s:
-            pending = list(
-                s.exec(select(Trade).where(Trade.strategy == STRATEGY, Trade.status == "pending"))
-            )
         for row in pending:
             report.pending_checked += 1
+            if COUNT_QUARANTINE_NOTE in (row.notes or ""):
+                self._uncertain(report, row.ticker)
+                continue
             order = api_orders.get(row.client_order_id)
-            if order is None:
-                # La API no la conoce (¿nunca entró? ¿purgada?) — irresoluble acá.
-                report.discrepancies += 1
-                report.corrupted_tickers.add(row.ticker)
-                logger.warning(
-                    f"motor5.reconcile.unknown_order coid={row.client_order_id[:13]}… "
-                    f"ticker={row.ticker} (pending sin orden en la API → corrupto)"
-                )
+            if order is None or not self._matches(row, order):
+                self._uncertain(report, row.ticker)
                 continue
             status = str(order.get("status", "")).lower()
-            filled = _parse_count(order.get("fill_count")) or 0
             if status == "resting":
+                observed_fill = filled_count(order)
+                if observed_fill is None or observed_fill > row.count:
+                    # El ledger entero no representa esta evidencia. El marcador se
+                    # preserva en DB: otro cancel o reinicio no la convierte en cero.
+                    if not self._update(row.client_order_id, note=COUNT_QUARANTINE_NOTE):
+                        # Sin registrar el bloqueo, no continuar hacia otros cancels.
+                        latch_incident("no se pudo persistir cuarentena de cantidad M5")
+                        raise RuntimeError("no se pudo persistir cuarentena de cantidad M5")
+                    self._uncertain(report, row.ticker)
+                    continue
+                if observed_fill < (row.filled_count or 0):
+                    self._uncertain(report, row.ticker)
+                    continue
+                if not self._update(
+                    row.client_order_id,
+                    kalshi_order_id=order["order_id"],
+                    filled_count=observed_fill,
+                ):
+                    # Volver al engine permitiría cancelar usando una DB que perdió
+                    # el fill recién observado. El supervisor debe ver un fallo fatal.
+                    latch_incident("no se pudo persistir evidencia resting M5")
+                    raise RuntimeError("no se pudo persistir evidencia resting M5")
+                row.kalshi_order_id = order["order_id"]
+                row.filled_count = observed_fill
                 if live_coids is not None and row.client_order_id not in live_coids:
-                    # HUÉRFANA: resting real que este proceso no gestiona (quedó de un
-                    # proceso anterior). Cancelar — dejarla viva duplica exposición
-                    # cuando el engine cotice el mismo ticker.
                     await self._cancel_orphan(row, order, report)
                     continue
+                # El ledger actual aplica fills solo al terminar. Un fill resting
+                # parcial no puede tratarse como inventario cero para cotizar.
+                if observed_fill != 0:
+                    self._uncertain(report, row.ticker)
+                    continue
                 report.still_resting += 1
-                if not row.kalshi_order_id and order.get("order_id"):
-                    self._update(row.client_order_id, kalshi_order_id=order["order_id"])
-            elif status == "executed":
-                report.resolved_filled += 1
-                self._update(
-                    row.client_order_id,
-                    status="filled",
-                    filled_count=filled or row.count,
-                    note="reconcile: executed",
-                )
-            elif status in ("canceled", "cancelled"):
-                if filled > 0:
-                    report.resolved_filled += 1
-                    self._update(
-                        row.client_order_id,
-                        status="filled",
-                        filled_count=filled,
-                        note="reconcile: partial_then_canceled",
-                    )
-                else:
-                    report.resolved_cancelled += 1
-                    self._update(
-                        row.client_order_id, status="cancelled", note="reconcile: canceled"
-                    )
             else:
-                report.discrepancies += 1
-                report.corrupted_tickers.add(row.ticker)
-                logger.warning(
-                    f"motor5.reconcile.status_desconocido {row.client_order_id[:13]}… "
-                    f"status={status!r} → corrupto"
-                )
+                self._resolve_terminal(row, order, report, note="reconcile: terminal")
 
-        # Fantasmas: resting en la API con nuestro prefijo, sin fila pending en DB.
         pending_coids = {row.client_order_id for row in pending}
         for coid, order in api_orders.items():
-            if not coid.startswith(COID_PREFIX) or coid in pending_coids:
+            if (
+                not coid.startswith(COID_PREFIX)
+                or coid in pending_coids
+                or str(order.get("status", "")).lower() != "resting"
+            ):
                 continue
-            if str(order.get("status", "")).lower() != "resting":
-                continue
-            oid = order.get("order_id")
-            ticker = order.get("ticker", "?")
-            report.phantom_cancelled += 1
-            report.discrepancies += 1
-            report.corrupted_tickers.add(ticker)
-            logger.warning(f"motor5.reconcile.phantom coid={coid[:13]}… ticker={ticker} → cancel")
-            if oid:
-                try:
-                    await self._client.cancel_order(oid)
-                except Exception:
-                    logger.exception(f"motor5.reconcile.phantom_cancel_error {oid}")
+            # Sin ledger no se reconstruyen exposición/fees: ni un cancel confirmado
+            # elimina la discrepancia ni autoriza nuevas quotes.
+            ticker = order.get("ticker")
+            self._uncertain(report, ticker if isinstance(ticker, str) else None)
+            try:
+                response = await self._client.cancel_order(order["order_id"])
+                terminal = response.get("order", response) if isinstance(response, dict) else None
+                if (
+                    terminal_fill_count(terminal, order_id=order["order_id"], client_order_id=coid)
+                    is not None
+                ):
+                    report.phantom_cancelled += 1
+            except Exception:
+                logger.exception("motor5.reconcile.phantom_cancel_unconfirmed")
 
-        if report.pending_checked or report.phantom_cancelled:
+        report.complete = report.discrepancies == 0
+        if report.pending_checked or report.discrepancies:
             logger.info(
-                f"motor5.reconcile pending={report.pending_checked} "
+                f"motor5.reconcile complete={report.complete} pending={report.pending_checked} "
                 f"resting={report.still_resting} filled={report.resolved_filled} "
                 f"cancelled={report.resolved_cancelled} phantom={report.phantom_cancelled} "
                 f"orphan={report.orphan_cancelled} discrep={report.discrepancies}"
             )
         return report
 
-    async def _cancel_orphan(self, row: Trade, order: dict, report: MMReconcileReport) -> None:
-        """Cancela una quote resting huérfana y resuelve su fila con la verdad del
-        cancel-response (un fill parcial pudo ganar la carrera → fila filled, y
-        _apply_settled_fills la lleva al inventario). FAIL-SAFE: si el cancel falla,
-        el ticker queda corrupto — nunca se asume 'cancelada' sin confirmación."""
-        oid = row.kalshi_order_id or order.get("order_id")
-        if not oid:
-            report.discrepancies += 1
-            report.corrupted_tickers.add(row.ticker)
-            logger.warning(
-                f"motor5.reconcile.orphan_sin_order_id coid={row.client_order_id[:13]}… "
-                f"ticker={row.ticker} → corrupto"
-            )
+    @staticmethod
+    def _matches(row: Trade, order: dict) -> bool:
+        return (
+            order.get("client_order_id") == row.client_order_id
+            and order.get("ticker") == row.ticker
+            and (not row.kalshi_order_id or order.get("order_id") == row.kalshi_order_id)
+            and order.get("action", row.action) == row.action
+            and order.get("side", row.side) == row.side
+        )
+
+    @staticmethod
+    def _observed_identity_matches(row: Trade, order: object) -> bool:
+        oid = row.kalshi_order_id or (order.get("order_id") if isinstance(order, dict) else None)
+        return (
+            isinstance(order, dict)
+            and bool(oid)
+            and order.get("order_id") == oid
+            and order.get("client_order_id", row.client_order_id) == row.client_order_id
+        )
+
+    def _quarantine_observed_count(self, row: Trade, order: object) -> bool:
+        """Evidencia imposible sólo bloquea; nunca confirma el payload de una excepción."""
+        if self._observed_identity_matches(row, order) and unrepresentable_fill(
+            order, count=row.count
+        ):
+            # Una cantidad explícita imposible no desaparece porque el siguiente
+            # cancel/reinicio diga cero. La reserva global requiere revisión manual.
+            if not self._update(row.client_order_id, note=COUNT_QUARANTINE_NOTE):
+                latch_incident("no se pudo persistir cuarentena de cantidad terminal M5")
+                raise RuntimeError("no se pudo persistir cuarentena de cantidad terminal M5")
+            row.notes = f"{COUNT_QUARANTINE_NOTE} | {row.notes or ''}"[:500]
+            return True
+        return False
+
+    def _preserve_observed_count(self, row: Trade, order: object) -> None:
+        """Guarda el piso observado antes del error sin dar por terminal la orden."""
+        if not self._observed_identity_matches(row, order):
             return
-        try:
-            resp = await self._client.cancel_order(oid)
-        except Exception:
-            report.discrepancies += 1
-            report.corrupted_tickers.add(row.ticker)
-            logger.exception(
-                f"motor5.reconcile.orphan_cancel_error coid={row.client_order_id[:13]}… "
-                f"ticker={row.ticker} → corrupto"
-            )
+        if self._quarantine_observed_count(row, order):
             return
-        report.orphan_cancelled += 1
-        cancelled = resp.get("order", resp) if isinstance(resp, dict) else {}
-        filled = _parse_count(cancelled.get("fill_count")) or 0
-        if filled > 0:
+        observed_fill = filled_count(order)
+        if observed_fill is None or observed_fill <= (row.filled_count or 0):
+            return
+        if not self._update(row.client_order_id, filled_count=observed_fill):
+            latch_incident("no se pudo persistir evidencia de cancel M5")
+            raise RuntimeError("no se pudo persistir evidencia de cancel M5")
+        # La siguiente observación de la MISMA excepción jamás rebaja este piso.
+        row.filled_count = observed_fill
+
+    def _resolve_terminal(
+        self, row: Trade, order: object, report: MMReconcileReport, *, note: str
+    ) -> bool:
+        if self._quarantine_observed_count(row, order):
+            self._uncertain(report, row.ticker)
+            return False
+        oid = row.kalshi_order_id or (order.get("order_id") if isinstance(order, dict) else None)
+        filled = terminal_fill_count(
+            order, order_id=oid, client_order_id=row.client_order_id, count=row.count
+        )
+        if filled is None or filled < (row.filled_count or 0):
+            self._uncertain(report, row.ticker)
+            return False
+        if not self._update(
+            row.client_order_id,
+            status="filled" if filled else "cancelled",
+            filled_count=filled,
+            kalshi_order_id=oid,
+            note=note,
+        ):
+            latch_incident("no se pudo persistir evidencia terminal M5")
+            raise RuntimeError("no se pudo persistir evidencia terminal M5")
+        report.terminal_coids.add(row.client_order_id)
+        if filled:
             report.resolved_filled += 1
-            self._update(
-                row.client_order_id,
-                status="filled",
-                filled_count=filled,
-                note="reconcile: orphan_partial_then_cancel",
-            )
         else:
             report.resolved_cancelled += 1
-            self._update(
-                row.client_order_id, status="cancelled", note="reconcile: orphan_resting_cancelled"
-            )
-        logger.warning(
-            f"motor5.reconcile.orphan_cancelled coid={row.client_order_id[:13]}… "
-            f"ticker={row.ticker} filled={filled}"
-        )
+        return True
+
+    async def _cancel_orphan(self, row: Trade, order: dict, report: MMReconcileReport) -> None:
+        oid = row.kalshi_order_id or order["order_id"]
+        # Identidad y mínimo fill conocido ya persistidos por la rama resting común.
+        try:
+            response = await self._client.cancel_order(oid)
+        except BaseException as exc:
+            # El cliente V2 pudo rechazar el sobre DESPUÉS de observar un conteo
+            # real. Timeout/cancelación también conservan esa evidencia sin cierre.
+            try:
+                observations = getattr(exc, "observed_orders", None)
+                if not isinstance(observations, list) or not observations:
+                    observations = [getattr(exc, "observed_order", None)]
+                for observed in observations:
+                    self._preserve_observed_count(row, observed)
+                self._uncertain(report, row.ticker)
+            except Exception:
+                if not isinstance(exc, Exception):
+                    # Un fallo secundario de DB no consume la cancelación original.
+                    logger.error("motor5.reconcile.cancel_observation_persist_failed")
+                    raise exc from None
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning("motor5.reconcile.orphan_cancel_unconfirmed")
+            return
+        terminal = response.get("order", response) if isinstance(response, dict) else None
+        if self._resolve_terminal(
+            row, terminal, report, note="reconcile: orphan_resting_cancelled"
+        ):
+            report.orphan_cancelled += 1
 
     def _update(
         self,
@@ -207,12 +277,18 @@ class MMReconciler:
         filled_count: int | None = None,
         kalshi_order_id: str | None = None,
         note: str | None = None,
-    ) -> None:
+    ) -> bool:
         try:
-            with get_session() as s:
-                row = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
-                if row is None:
-                    return
+            with get_session() as session:
+                row = session.exec(select(Trade).where(Trade.client_order_id == coid)).first()
+                if row is None or row.strategy != STRATEGY or row.status != "pending":
+                    return False
+                if status and COUNT_QUARANTINE_NOTE in (row.notes or ""):
+                    return False
+                if filled_count is not None and filled_count < (row.filled_count or 0):
+                    return False
+                if kalshi_order_id and row.kalshi_order_id not in (None, "", kalshi_order_id):
+                    return False
                 if status:
                     row.status = status
                 if filled_count is not None:
@@ -220,8 +296,14 @@ class MMReconciler:
                 if kalshi_order_id:
                     row.kalshi_order_id = kalshi_order_id
                 if note:
-                    row.notes = f"{row.notes or ''} | {note}"[:500]
-                s.add(row)
-                s.commit()
+                    row.notes = (
+                        f"{note} | {row.notes or ''}"
+                        if note == COUNT_QUARANTINE_NOTE
+                        else f"{row.notes or ''} | {note}"
+                    )[:500]
+                session.add(row)
+                session.commit()
+            return True
         except Exception:
             logger.exception(f"motor5.reconcile.update_error coid={coid}")
+            return False

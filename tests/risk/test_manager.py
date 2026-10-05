@@ -22,6 +22,13 @@ from src.storage.models import RiskEvent, Trade
 
 
 @pytest.fixture(autouse=True)
+def clean_incident_for_risk_unit_tests():
+    """Estado externo explícito; el latch real se prueba con SQLite en reservation_safety."""
+    with patch("src.risk.manager.incident_status", return_value=(False, None)):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def reset_botstate():
     """Asegurar BotState limpio entre tests."""
     BotState.is_paused = False

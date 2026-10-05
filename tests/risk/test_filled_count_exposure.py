@@ -5,6 +5,7 @@ modo quotes_paused persistente.
 
 from __future__ import annotations
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -65,10 +66,20 @@ def test_pending_resting_reserves_full_count():
     assert _rm()._get_current_exposure_usd() == pytest.approx(50.0)
 
 
-def test_legacy_none_semantics_unchanged():
-    """filled_count=None (órdenes FOK/IOC legacy) → count entero, como siempre."""
+def test_m5_missing_fill_count_is_unknown_exposure():
+    """M5 resting no hereda la inferencia de fill completo del FOK/IOC legacy."""
     with get_session() as s:
         s.add(_trade("c", "filled", 100))
+        s.commit()
+    assert math.isinf(_rm()._get_current_exposure_usd())
+
+
+def test_legacy_none_semantics_unchanged():
+    """Un motor FOK/IOC legacy sin filled_count conserva count entero."""
+    row = _trade("legacy", "filled", 100)
+    row.strategy = "motor_1_arbitrage"
+    with get_session() as s:
+        s.add(row)
         s.commit()
     assert _rm()._get_current_exposure_usd() == pytest.approx(50.0)
 

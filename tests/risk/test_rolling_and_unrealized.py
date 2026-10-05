@@ -24,6 +24,14 @@ from src.monitoring.health import BotState
 from src.risk.manager import RiskManager
 from src.storage.models import Trade
 
+
+@pytest.fixture(autouse=True)
+def clean_incident_for_stop_loss_unit_tests():
+    """Aislar stops; los fallos del latch se prueban con SQLite en reservation_safety."""
+    with patch("src.risk.manager.incident_status", return_value=(False, None)):
+        yield
+
+
 # Reloj congelado: 2026-07-17 (viernes). month_start=Jul 1, week_start=lun Jul 13,
 # rolling30_start=Jun 17. Determinístico: el repro no depende del día en que corra la suite.
 _FROZEN_NOW = datetime(2026, 7, 17, 12, 0)

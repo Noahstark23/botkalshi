@@ -43,6 +43,7 @@ from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState
+from src.risk.exposure import contract_risk_cents, exposure_count
 from src.risk.manager import RiskManager
 from src.storage.models import (
     MMExperimentRun,
@@ -63,6 +64,12 @@ from src.strategies.motor_5_mm.fee_policy import (
     UnsupportedSeriesFeeError,
 )
 from src.strategies.motor_5_mm.fill_feed import MMFillFeed
+from src.strategies.motor_5_mm.incidents import (
+    begin_execution_session,
+    finish_execution_session,
+    incident_status,
+    latch_incident,
+)
 from src.strategies.motor_5_mm.inventory import InventoryBook
 from src.strategies.motor_5_mm.quoter import QuoteSet, compute_quote
 from src.strategies.motor_5_mm.reconciler import MMReconciler
@@ -116,6 +123,7 @@ class Motor5Engine:
     # además cualquier ruta de error: contra un mark congelado no se mide.
     MARK_FRESH_MAX_SEC = 90.0  # 1.5 ticks
     SHUTDOWN_OBSERVE_TIMEOUT_SEC = 10.0
+    SHUTDOWN_CANCEL_TIMEOUT_SEC = 10.0
     F1_METRIC_VERSION = "f1-v2-bbo-depth"
     F1_OBSERVABLE_FILL_CAP = 1
 
@@ -246,6 +254,7 @@ class Motor5Engine:
         # siempre tras la primera vez. Valor = time.monotonic() del último log.
         self._book_diag_last: dict[str, float] = {}
         self._experiment_run_id: int | None = None
+        self._execution_session: str | None = None
 
     def _begin_experiment_run(self) -> None:
         """Abre una época durable antes de tocar estado shadow.
@@ -428,37 +437,59 @@ class Motor5Engine:
             async with self._client_factory() as client:
                 self._client = client
                 self._fee_policy = SeriesFeePolicy(client)
-                if self._trading_enabled:
-                    self._executor = Motor5Executor(
-                        client, risk=self._risk, max_exposure_usd=self._mm_exposure_cap_usd
-                    )
-                    self._reconciler = MMReconciler(client)
-                while not stop_event.is_set():
-                    try:
-                        await self._tick()
-                    except Motor5DataIntegrityError:
-                        raise  # fatal: supervisor/probe nunca declara verde una cohorte corrupta
-                    except Exception as exc:
-                        logger.exception("motor5.engine.tick_failed")
-                        BotState.record_error(f"motor5.engine: {type(exc).__name__}: {exc}")
-                        self._invalidate_experiment(f"tick incompleto {type(exc).__name__}: {exc}")
-                        raise Motor5DataIntegrityError(
-                            "tick M5 incompleto; trayectoria shadow no reproducible"
-                        ) from exc
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(stop_event.wait(), timeout=self.LOOP_INTERVAL_SEC)
-                if self._executor is None:
-                    await self._finalize_shadow_exposure()
-                # Shutdown limpio (auditoría 2026-07-07, P0 de F2): sin esto las quotes GTC
-                # quedaban RESTING en el book sin bot que las gestione.
-                if self._executor is not None:
-                    try:
-                        n = await self._executor.cancel_all("shutdown")
-                        logger.info(f"[MOTOR 5] shutdown → cancel_all n={n}")
-                    except Exception:
-                        logger.exception("motor5.engine.shutdown_cancel_error")
+                original: BaseException | None = None
+                try:
+                    if self._trading_enabled:
+                        self._execution_session = begin_execution_session()
+                        self._executor = Motor5Executor(
+                            client, risk=self._risk, max_exposure_usd=self._mm_exposure_cap_usd
+                        )
+                        self._reconciler = MMReconciler(client)
+                    while not stop_event.is_set():
+                        try:
+                            await self._tick()
+                        except Motor5DataIntegrityError:
+                            raise
+                        except Exception as exc:
+                            logger.exception("motor5.engine.tick_failed")
+                            BotState.record_error(f"motor5.engine: {type(exc).__name__}: {exc}")
+                            # La invalidación exterior conserva el error original,
+                            # incluso si la persistencia del diagnóstico también falla.
+                            if not self._trading_enabled:
+                                self._invalidate_experiment(
+                                    f"tick incompleto {type(exc).__name__}: {exc}"
+                                )
+                                raise Motor5DataIntegrityError(
+                                    "tick M5 incompleto; trayectoria shadow no reproducible"
+                                ) from exc
+                            raise
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                stop_event.wait(), timeout=self.LOOP_INTERVAL_SEC
+                            )
+                    if self._executor is None:
+                        await self._finalize_shadow_exposure()
+                except BaseException as exc:
+                    original = exc
+                    raise
+                finally:
+                    # El cliente sigue abierto incluso ante fatal/CancelledError.
+                    # El cleanup nunca reemplaza la excepción que originó la salida.
+                    if self._executor is not None:
+                        try:
+                            await self._shutdown_live_execution(close_session=original is None)
+                        except BaseException:
+                            if original is None:
+                                raise
+                            logger.exception("motor5.shutdown_failed_preserving_original")
             self._close_experiment_run_clean()
         except BaseException as exc:
+            if self._trading_enabled:
+                try:
+                    latch_incident(f"salida M5 incompleta {type(exc).__name__}: {exc}")
+                except Exception:
+                    # El marcador previo sigue active si no se pudo cerrar la sesión.
+                    logger.exception("motor5.shutdown_incident_write_failed")
             if not BotState.motor5_experiment_invalid:
                 try:
                     self._invalidate_experiment(f"{type(exc).__name__}: {exc}")
@@ -467,6 +498,69 @@ class Motor5Engine:
                     logger.exception("motor5.experiment_invalidation_write_failed")
             raise
         logger.info("[MOTOR 5 SHADOW] detenido (stop_event)")
+
+    async def _shutdown_live_execution(self, *, close_session: bool = True) -> None:
+        """Retiro + conciliación dentro de un único presupuesto, aun al cancelar run()."""
+
+        async def cleanup() -> None:
+            n = await self._executor.cancel_all("shutdown")
+            if self._reconciler is None:
+                raise Motor5DataIntegrityError("shutdown M5 sin reconciliador")
+            report = await self._reconciler.reconcile(live_coids=set())
+            self._executor.forget_confirmed(report.terminal_coids)
+            if not report.complete or self._executor.live_coids():
+                raise Motor5DataIntegrityError("shutdown M5 sin cierre terminal confirmado")
+            logger.info(f"[MOTOR 5] shutdown confirmado → cancel_all n={n}")
+
+        task = asyncio.create_task(cleanup(), name="motor5-shutdown")
+        deadline = asyncio.get_running_loop().time() + self.SHUTDOWN_CANCEL_TIMEOUT_SEC
+        interrupted: asyncio.CancelledError | None = None
+        try:
+            while not task.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("shutdown M5 agotó presupuesto")
+                try:
+                    await asyncio.wait({task}, timeout=remaining)
+                except asyncio.CancelledError as exc:
+                    # Cancelar el supervisor no debe cancelar el retiro de sus GTC.
+                    # Se propaga al terminar el presupuesto, sin perder la petición.
+                    interrupted = exc
+            task.result()
+            if interrupted is None and close_session:
+                if self._execution_session is None:
+                    raise Motor5DataIntegrityError("shutdown M5 sin dueño durable")
+                finish_execution_session(self._execution_session)
+        except BaseException as exc:
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait({task}, timeout=0.1)
+                except asyncio.CancelledError as cancellation:
+                    interrupted = interrupted or cancellation
+                # Recoger errores tardíos sin retener el cliente indefinidamente.
+                task.add_done_callback(self._consume_shutdown_result)
+            try:
+                latch_incident(f"shutdown M5 incierto {type(exc).__name__}: {exc}")
+            except Exception:
+                logger.exception("motor5.shutdown_incident_write_failed")
+            if interrupted is not None:
+                raise interrupted from exc
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise Motor5DataIntegrityError(
+                "shutdown M5 incierto; revisión manual requerida"
+            ) from exc
+        if interrupted is not None:
+            raise interrupted
+
+    @staticmethod
+    def _consume_shutdown_result(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                logger.exception("motor5.shutdown_task_failed_after_timeout")
 
     async def _finalize_shadow_exposure(self) -> None:
         """Observa el último intervalo de cada quote antes de declarar el run limpio.
@@ -568,9 +662,13 @@ class Motor5Engine:
         # ── Gates F2 (solo con executor) — se evalúan ANTES de cualquier quote ──────
         quotes_allowed = True
         if self._executor is not None:
+            blocked, incident_reason = incident_status()
+            if blocked:
+                quotes_allowed = False
+                logger.warning(f"[MOTOR 5] incidente: {incident_reason} → revisión manual")
             engaged, ks_reason = kill_switch_engaged()
             if engaged:
-                # Pánico: cancel-all UNA vez (<5s vía batch) y el motor queda en gestión
+                # Pánico: cancel-all UNA vez; su latencia depende de la API. Gestión
                 # mínima (reconcile) sin cotizar hasta que el humano limpie el switch.
                 if not self._kill_cancelled:
                     n = await self._executor.cancel_all(f"kill_switch: {ks_reason}")
@@ -591,12 +689,20 @@ class Motor5Engine:
                 # live_coids: lo que ESTE proceso gestiona. Tras un restart es vacío →
                 # el reconcile cancela las resting del proceso anterior (huérfanas, P0
                 # auditoría 2026-07-07) antes de que el tick cotice encima.
-                report = await self._reconciler.reconcile(live_coids=self._executor.live_coids())
-                # Verdad del reconcile: los tickers con discrepancia quedan corruptos;
-                # los que salieron limpios se des-corrompen (ya se puede cotizar).
-                self._executor.corrupted = set(report.corrupted_tickers)
+                report = await self._reconciler.reconcile(live_coids=self._executor.managed_coids())
+                # Lectura fallida o barrido vacío NO acreditan recuperación. Mantener
+                # el bloqueo hasta revisión explícita de la exposición desconocida.
+                self._executor.corrupted.update(report.corrupted_tickers)
+                if report.corrupted_tickers:
+                    latch_incident("reconciliación M5 con estado de órdenes incierto")
+                self._executor.forget_confirmed(report.terminal_coids)
+                if not report.complete or report.corrupted_tickers:
+                    quotes_allowed = False
                 if ws_fills:
                     logger.info(f"[MOTOR 5] fill_feed fast-path: {len(ws_fills)} fills")
+            else:
+                # Sin reconciliador no hay autoridad para aumentar riesgo.
+                quotes_allowed = False
             counters["fills"] += self._apply_settled_fills()
         raw_fairs = {
             ticker: fair
@@ -894,25 +1000,34 @@ class Motor5Engine:
                         select(Trade).where(Trade.strategy == STRATEGY, Trade.status == "filled")
                     )
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("motor5.engine.settled_fills_query_error")
-            return 0
+            latch_incident("lectura de inventario M5 fallida")
+            raise Motor5DataIntegrityError("inventario live M5 no verificable") from exc
         applied = 0
         for row in rows:
             if row.client_order_id in self._settled_coids:
                 continue
+            try:
+                count = exposure_count(row)
+                if count <= 0 or row.side != "yes":
+                    raise ValueError("fill M5 no representable en el inventario YES")
+                price = row.price_cents if row.fill_price_cents is None else row.fill_price_cents
+                contract_risk_cents(action=row.action, side=row.side, price_cents=price)
+                fill = ShadowFill(
+                    ticker=row.ticker,
+                    side=row.action,  # buy (bid) | sell (ask), eje YES
+                    price_cents=price,
+                    count=count,
+                    rule="real_fill",
+                )
+                inv = self._inventory.apply_fill(fill)
+            except Exception as exc:
+                latch_incident("fill confirmado M5 no aplicable al inventario")
+                raise Motor5DataIntegrityError("inventario live M5 no verificable") from exc
+            # El marcador sólo se publica tras aplicar el fill válido. Una excepción
+            # no puede convertir un fill perdido en una operación ya procesada.
             self._settled_coids.add(row.client_order_id)
-            count = row.filled_count if row.filled_count is not None else row.count
-            if count <= 0:
-                continue
-            fill = ShadowFill(
-                ticker=row.ticker,
-                side=row.action,  # buy (bid) | sell (ask), eje YES
-                price_cents=row.fill_price_cents or row.price_cents,
-                count=count,
-                rule="real_fill",
-            )
-            inv = self._inventory.apply_fill(fill)
             applied += 1
             logger.info(
                 f"[MOTOR 5 LIVE] fill {fill.side} {count}x{row.ticker} "

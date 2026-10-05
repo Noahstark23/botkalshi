@@ -185,7 +185,7 @@ def test_status_includes_capital_block(client):
     cap = resp.json()["capital"]
     assert cap["mode"] == "dynamic"
     assert cap["effective_usd"] == 300.0  # fallback a ACTIVE_CAPITAL_USD (sin cash real aún)
-    assert cap["is_paused"] is False
+    assert cap["is_paused"] is True  # producción sin saldo confirmado no admite entradas
 
 
 def test_status_reenvia_metricas_nuevas_del_manager(client):

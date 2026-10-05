@@ -192,6 +192,7 @@ async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_op
     assert sell_calls[0].kwargs["side"] == "no"
     # el sell de liquidación va IOC: jamás queda resting (auditoría 2026-07-07)
     assert sell_calls[0].kwargs["time_in_force"] == "immediate_or_cancel"
+    assert sell_calls[0].kwargs["reduce_only"] is True
 
 
 @pytest.mark.asyncio

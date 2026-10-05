@@ -165,6 +165,7 @@ async def test_place_order_allows_protective_sell_when_trading_disabled(mock_set
         ticker="KXTEST",
         side="yes",
         action="sell",
+        reduce_only=True,
         count=10,
         yes_price=1,
         time_in_force="immediate_or_cancel",
@@ -175,16 +176,8 @@ async def test_place_order_allows_protective_sell_when_trading_disabled(mock_set
 
 
 @pytest.mark.asyncio
-async def test_el_sell_pasa_con_trading_off_solo_por_el_invariante_binario(
-    mock_settings, mock_signer
-):
-    """PIN del ALCANCE del invariante (2026-08-15). La Capa C deja pasar `sell` con
-    TRADING_ENABLED=false porque en BINARIOS un sell solo puede CERRAR una posición
-    (salida protectora del rollback). Desde que Kalshi lista perpetuos apalancados
-    (3-jun-2026) eso dejó de ser cierto para el EXCHANGE: ahí un sell ABRE un corto.
-    El bot no tiene una línea de perps, así que la excepción sigue siendo segura —
-    este test existe para dejar EXPLÍCITO qué la sostiene: si alguna vez entra un
-    producto con posición corta, este comportamiento se cambia ANTES que nada."""
+async def test_salida_reduce_only_pasa_con_trading_off(mock_settings, mock_signer):
+    """La excepción al OFF exige una salida explícita limitada por el exchange."""
     mock_settings.TRADING_ENABLED = False
     client = KalshiRestClient()
     client._request = AsyncMock(return_value={"order": {"order_id": "x"}})
@@ -200,13 +193,15 @@ async def test_el_sell_pasa_con_trading_off_solo_por_el_invariante_binario(
         )
     client._request.assert_not_awaited()
 
-    # sell = SALIDA protectora → pasa. Válido SOLO mientras el universo sea binario.
+    # La salida protectora pide reduce_only y IOC, incluso con trading OFF.
     await client.place_order(
         ticker="KXTEST",
         side="yes",
         action="sell",
+        reduce_only=True,
         count=1,
         yes_price=50,
         client_order_id="c2",
+        time_in_force="immediate_or_cancel",
     )
     client._request.assert_awaited_once()

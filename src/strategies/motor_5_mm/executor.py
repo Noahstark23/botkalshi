@@ -13,9 +13,10 @@ Principios (heredados de Motor REST / Motor 3):
     vez.
   - Estado corrupto NO opera (Lección 9): un ticker corrupto primero cancela todo lo
     suyo y re-sincroniza; hasta entonces no se cotiza.
-  - Riesgo: cada orden nueva pasa por el headroom de exposición del RiskManager (la
-    fila pending ya reserva capital para TODOS los motores). Reserva bilateral
-    conservadora (decisión F2 documentada en el commit del RiskManager).
+  - Riesgo: capital confirmado fresco, stops, sizing, exposición global y canary
+    se verifican bajo el lock compartido del RiskManager; el intent se persiste
+    antes de soltarlo y antes de la red. BUY reserva P y SELL reserva 100-P, sin
+    neteo de inventario no atribuido. Quote completa o rechazo, nunca count parcial.
   - Todo se cotiza en el eje YES (como V2): bid = buy yes, ask = sell yes (que ABRE
     posición NO si llena — por eso el ask NO es un "sell protector" y el batch create
     del cliente lo gatea entero).
@@ -34,10 +35,20 @@ from sqlmodel import col, select
 from src.clients.kalshi_rest import (
     KalshiAPIError,
     KalshiClientError,
+    KalshiOrderConfirmationError,
     KalshiRestClient,
 )
+from src.risk.exposure import open_risk_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
+from src.strategies.motor_5_mm.incidents import incident_status, latch_incident
+from src.strategies.motor_5_mm.order_state import (
+    COUNT_QUARANTINE_NOTE,
+    filled_count,
+    parse_count,
+    terminal_fill_count,
+    unrepresentable_fill,
+)
 from src.strategies.motor_5_mm.quoter import QuoteSet
 
 STRATEGY = "motor_5_mm"
@@ -45,11 +56,8 @@ COID_PREFIX = "m5mm-"
 
 
 def _parse_count(value: object) -> int | None:
-    """FixedPointCount de Kalshi ("5.00") → int. None si no es parseable."""
-    try:
-        return int(float(str(value)))
-    except (TypeError, ValueError):
-        return None
+    """Compatibilidad para consumidores existentes; nunca trunca una fracción."""
+    return parse_count(value)
 
 
 @dataclass(slots=True)
@@ -74,15 +82,21 @@ class Motor5Executor:
         max_exposure_usd: float | None = None,
     ) -> None:
         self._client = client
-        self._risk = risk
+        self._risk = risk if risk is not None else RiskManager()
         # Canary cap F3 (plan §5): techo ABSOLUTO del costo abierto del MM (pending +
         # filled), independiente del headroom global. None = sin cap propio (demo).
         self._max_exposure_usd = max_exposure_usd
         self._live: dict[str, dict[str, LiveOrder]] = {}  # ticker → {action: LiveOrder}
-        self.corrupted: set[str] = set()  # tickers con estado en duda → reconcile primero
+        self.corrupted: set[str] = set()  # bloqueo local enclavado; conciliar no lo levanta
 
     def _lock(self, ticker: str) -> asyncio.Lock:
         return self._locks.setdefault(ticker, asyncio.Lock())
+
+    def _latch_corruption(self, ticker: str, reason: str) -> None:
+        self.corrupted.add(ticker)
+        # Un fallo de persistencia se propaga al supervisor; el bloqueo local ya
+        # existe y ninguna continuación del tick puede emitir el lado opuesto.
+        latch_incident(f"executor {ticker}: {reason}")
 
     def live_order_ids(self) -> list[str]:
         return [
@@ -93,10 +107,31 @@ class Motor5Executor:
         ]
 
     def live_coids(self) -> set[str]:
-        """client_order_ids de las quotes que ESTE proceso está gestionando. El
-        reconciler los usa para distinguir resting gestionadas de HUÉRFANAS (quotes de
-        un proceso anterior que nadie re-adoptó tras un restart — P0 auditoría)."""
+        """Todas las quotes cuyo seguimiento conserva este proceso, incluso inciertas."""
         return {lo.client_order_id for sides in self._live.values() for lo in sides.values()}
+
+    def managed_coids(self) -> set[str]:
+        """Quotes sanas que pueden seguir resting sin un reintento de cancelación.
+
+        Retener una quote incierta no equivale a mantenerla cotizando: excluir los
+        tickers bloqueados permite que el conciliador reintente retirarlos incluso
+        cuando kill-switch o salida del universo ya consumieron su primer intento.
+        """
+        return {
+            live.client_order_id
+            for ticker, sides in self._live.items()
+            if ticker not in self.corrupted
+            for live in sides.values()
+        }
+
+    def forget_confirmed(self, coids: set[str]) -> None:
+        """Sólo el conciliador con evidencia terminal persistida puede liberar este dueño."""
+        for ticker, sides in list(self._live.items()):
+            for action, live in list(sides.items()):
+                if live.client_order_id in coids:
+                    del sides[action]
+            if not sides:
+                del self._live[ticker]
 
     # =====================================================
     # Sync de quotes por tick
@@ -108,9 +143,8 @@ class Motor5Executor:
         ticker = quote.ticker
         async with self._lock(ticker):
             if ticker in self.corrupted:
-                # Estado en duda: NO se cotiza encima. Cancel-all del ticker; si el
-                # cancel sale limpio, el reconciler confirmará el estado real y
-                # des-corromperá (acá seguimos sin cotizar este tick — conservador).
+                # Estado en duda: NO se cotiza encima. La conciliación puede confirmar
+                # el cierre, pero no levanta automáticamente este bloqueo enclavado.
                 await self._cancel_ticker(ticker, reason="corrupted_resync")
                 return "corrupted"
             desired: dict[str, tuple[int, int] | None] = {
@@ -121,8 +155,8 @@ class Motor5Executor:
             for action, want in desired.items():
                 current = self._live.get(ticker, {}).get(action)
                 if want is None:
-                    if current is not None:
-                        await self._cancel(ticker, current)
+                    if current is not None and not await self._cancel(ticker, current):
+                        return "corrupted"
                     continue
                 price, count = want
                 if current is not None and (current.price_cents, current.count) == want:
@@ -130,11 +164,12 @@ class Motor5Executor:
                 if current is not None:
                     ok = await self._cancel(ticker, current)
                     if not ok:
-                        outcome = "corrupted"
-                        continue  # ticker quedó corrupto: no colocar encima
+                        return "corrupted"  # tampoco emitir el lado opuesto del ticker
                 placed = await self._place(ticker, action, price, count)
                 if placed is None:
                     outcome = "risk_blocked" if ticker not in self.corrupted else "corrupted"
+                    if ticker in self.corrupted:
+                        return "corrupted"
             return outcome
 
     async def retire_ticker(self, ticker: str) -> None:
@@ -147,44 +182,50 @@ class Motor5Executor:
     # =====================================================
 
     async def _place(self, ticker: str, action: str, price: int, count: int) -> LiveOrder | None:
-        cost_usd = price * count / 100.0
-        if self._risk is not None and self._risk.exposure_headroom_usd() < cost_usd:
-            logger.warning(
-                f"motor5.exec.risk_blocked {ticker} {action} {count}@{price}c "
-                f"(headroom < ${cost_usd:.2f})"
-            )
+        blocked, reason = incident_status()
+        if blocked:
+            self.corrupted.add(ticker)
+            logger.warning(f"motor5.exec.incident_blocked {ticker}: {reason}")
             return None
-        if self._max_exposure_usd is not None:
-            open_cost = self._mm_open_cost_usd()
-            if open_cost + cost_usd > self._max_exposure_usd:
-                logger.warning(
-                    f"motor5.exec.canary_cap {ticker} {action} {count}@{price}c "
-                    f"(abierto ${open_cost:.2f} + ${cost_usd:.2f} > "
-                    f"cap ${self._max_exposure_usd:.2f})"
-                )
-                return None
         coid = f"{COID_PREFIX}{uuid.uuid4()}"
-        # INTENT PRE-RED: si el proceso muere entre el INSERT y la respuesta, la fila
-        # pending existe y el reconciler la resuelve contra get_orders.
-        try:
-            with get_session() as s:
-                s.add(
-                    Trade(
-                        client_order_id=coid,
-                        ticker=ticker,
-                        side="yes",
-                        action=action,
-                        count=count,
-                        price_cents=price,
-                        strategy=STRATEGY,
-                        status="pending",
-                        notes=f"mm_quote {action} (F2 demo)",
-                    )
-                )
-                s.commit()
-        except Exception:
-            logger.exception(f"motor5.exec.intent_persist_error {ticker} → no se coloca")
-            return None  # sin intent no hay orden (el capital no quedaría contado)
+        intent = Trade(
+            client_order_id=coid,
+            ticker=ticker,
+            side="yes",
+            action=action,
+            count=count,
+            price_cents=price,
+            strategy=STRATEGY,
+            status="pending",
+            notes=f"mm_quote {action}",
+        )
+
+        def persist_intent() -> bool:
+            # El gate puede esperar el lock/stops: revalidar el latch al reservar.
+            blocked, _ = incident_status()
+            if blocked:
+                self.corrupted.add(ticker)
+                return False
+            try:
+                with get_session() as session:
+                    session.add(intent)
+                    session.commit()
+                return True
+            except Exception:
+                logger.exception(f"motor5.exec.intent_persist_error {ticker} → no se coloca")
+                self._latch_corruption(ticker, "intent_persist_failed")
+                return False
+
+        decision = await self._risk.check_quote_and_reserve(
+            intent, persist_intent, max_exposure_usd=self._max_exposure_usd
+        )
+        if not decision.approved:
+            logger.warning(f"motor5.exec.risk_blocked {ticker}: {decision.reason}")
+            return None
+        # La reserva y su dueño existen ANTES de la red, incluso si se cancela la
+        # task o la respuesta no permite conocer el id del exchange.
+        live = LiveOrder(coid, None, action, price, count)
+        self._live.setdefault(ticker, {})[action] = live
         try:
             resp = await self._client.place_order(
                 ticker=ticker,
@@ -197,84 +238,266 @@ class Motor5Executor:
                 post_only=True,
             )
         except KalshiClientError as exc:
+            if exc.status_code in (408, 409):
+                self._latch_corruption(ticker, f"place_ambiguous_http_{exc.status_code}")
+                return None
             # Rechazo DETERMINÍSTICO (4xx, p.ej. post_only cruzaría) → la orden NO existe.
             logger.info(f"motor5.exec.rejected {ticker} {action} {count}@{price}c: {exc}")
-            self._mark_row(coid, "cancelled", note=f"rejected: {exc.error_code or exc.status_code}")
+            if not self._mark_row(
+                coid, "cancelled", note=f"rejected: {exc.error_code or exc.status_code}"
+            ):
+                self._latch_corruption(ticker, "rejection_persist_failed")
+            else:
+                self.forget_confirmed({coid})
             return None
+        except asyncio.CancelledError:
+            self._latch_corruption(ticker, "place_task_cancelled")
+            raise
         except (KalshiAPIError, Exception):
             # AMBIGUO (timeout/5xx/red): la orden PUDO haber entrado. La fila queda
             # pending y el ticker corrupto → reconciler resuelve. Jamás re-colocar a ciegas.
             logger.exception(f"motor5.exec.place_ambiguous {ticker} {action} → corrupted")
-            self.corrupted.add(ticker)
+            self._latch_corruption(ticker, "place_ambiguous")
             return None
-        order = resp.get("order", resp) if isinstance(resp, dict) else {}
-        kid = order.get("order_id") or resp.get("order_id")
-        live = LiveOrder(coid, kid, action, price, count)
-        self._live.setdefault(ticker, {})[action] = live
-        self._set_kalshi_id(coid, kid)
+        order = resp.get("order", resp) if isinstance(resp, dict) else None
+        kid = order.get("order_id") if isinstance(order, dict) else None
+        if (
+            not isinstance(resp, dict)
+            or resp.get("error") is not None
+            or not isinstance(order, dict)
+            or order.get("error") is not None
+            or not isinstance(kid, str)
+            or not kid.strip()
+            or resp.get("order_id", kid) != kid
+            or order.get("client_order_id", coid) != coid
+            or resp.get("client_order_id", coid) != coid
+            or order.get("ticker", ticker) != ticker
+            or order.get("action", action) != action
+            or order.get("side", "yes") != "yes"
+        ):
+            self._latch_corruption(ticker, "place_response_invalid")
+            return None
+        live.kalshi_order_id = kid
+        if not self._set_kalshi_id(coid, kid):
+            self._latch_corruption(ticker, "order_id_persist_failed")
+            return None
         logger.info(f"motor5.exec.placed {ticker} {action} {count}@{price}c coid={coid[:13]}…")
         return live
 
     async def _cancel(self, ticker: str, live: LiveOrder) -> bool:
         """Cancela una orden viva. False = estado en duda (ticker queda corrupto)."""
-        self._live.get(ticker, {}).pop(live.action, None)
         if live.kalshi_order_id is None:
-            self.corrupted.add(ticker)  # nunca supimos su id → solo el reconciler sabe
+            self._latch_corruption(ticker, "cancel_without_order_id")
             return False
         try:
             resp = await self._client.cancel_order(live.kalshi_order_id)
+        except asyncio.CancelledError as exc:
+            try:
+                self._preserve_error_observations(ticker, live, getattr(exc, "observed_orders", []))
+                self._latch_corruption(ticker, "cancel_task_cancelled")
+            except Exception:
+                # El fallo durable ya revoca al dueño sano; no sustituir la
+                # petición de cancelación por un error secundario de persistencia.
+                logger.exception("motor5.cancel_evidence_failed_preserving_cancellation")
+            raise
+        except KalshiOrderConfirmationError as exc:
+            observations = getattr(exc, "observed_orders", [])
+            self._preserve_error_observations(
+                ticker, live, [*observations, getattr(exc, "observed_order", None)]
+            )
+            self._latch_corruption(ticker, "cancel_confirmation_missing")
+            return False
         except KalshiClientError as exc:
             # 4xx: la orden ya no está resting — pudo llenarse antes del cancel.
+            self._preserve_error_observations(ticker, live, getattr(exc, "observed_orders", []))
             logger.warning(f"motor5.exec.cancel_race {ticker} {live.action}: {exc} → reconcile")
-            self.corrupted.add(ticker)
+            self._latch_corruption(ticker, "cancel_race")
             return False
-        except Exception:
+        except Exception as exc:
+            self._preserve_error_observations(ticker, live, getattr(exc, "observed_orders", []))
             logger.exception(f"motor5.exec.cancel_ambiguous {ticker} → corrupted")
-            self.corrupted.add(ticker)
+            self._latch_corruption(ticker, "cancel_ambiguous")
             return False
-        # Fill parcial ANTES del cancel: el response trae el order con su fill_count.
-        order = resp.get("order", resp) if isinstance(resp, dict) else {}
-        filled = _parse_count(order.get("fill_count")) or 0
-        if filled > 0:
-            self._mark_row(
-                live.client_order_id, "filled", filled_count=filled, note="partial_then_cancel"
-            )
-        else:
-            self._mark_row(live.client_order_id, "cancelled", note="quote_replaced")
+        order = (
+            resp.get("order", resp) if isinstance(resp, dict) and resp.get("error") is None else {}
+        )
+        return self._confirm_cancel(ticker, live, order, note="quote_cancel")
+
+    def _confirm_cancel(self, ticker: str, live: LiveOrder, order: object, *, note: str) -> bool:
+        if self._quarantine_unrepresentable_order(ticker, live, order):
+            return False
+        filled = terminal_fill_count(
+            order,
+            order_id=live.kalshi_order_id or "",
+            client_order_id=live.client_order_id,
+            count=live.count,
+        )
+        if filled is None or not self._mark_row(
+            live.client_order_id,
+            "filled" if filled else "cancelled",
+            filled_count=filled,
+            note=note,
+        ):
+            # La reserva pending y el dueño sobreviven incluso a un HTTP 200 si
+            # falta evidencia terminal o su persistencia: no hay cancel ficticio.
+            self._latch_corruption(ticker, "cancel_unconfirmed")
+            logger.warning(f"motor5.exec.cancel_unconfirmed {ticker} → conserva seguimiento")
+            return False
+        self.forget_confirmed({live.client_order_id})
         return True
+
+    def _quarantine_unrepresentable_order(
+        self, ticker: str, live: LiveOrder, order: object
+    ) -> bool:
+        """Usar evidencia de error sólo para bloquear, nunca para confirmar cierre."""
+        if (
+            isinstance(order, dict)
+            and live.kalshi_order_id is not None
+            and order.get("order_id") == live.kalshi_order_id
+            and order.get("client_order_id", live.client_order_id) == live.client_order_id
+            and unrepresentable_fill(order, count=live.count)
+        ):
+            try:
+                with get_session() as session:
+                    row = session.exec(
+                        select(Trade).where(Trade.client_order_id == live.client_order_id)
+                    ).first()
+                    if row is None or row.strategy != STRATEGY or row.status != "pending":
+                        raise RuntimeError("no se puede conservar cuarentena terminal M5")
+                    if COUNT_QUARANTINE_NOTE not in (row.notes or ""):
+                        row.notes = f"{COUNT_QUARANTINE_NOTE} | {row.notes or ''}"[:500]
+                        session.add(row)
+                        session.commit()
+            except Exception:
+                self._latch_corruption(ticker, "terminal_quarantine_persist_failed")
+                raise  # no continuar con otra orden sin conservar esta evidencia
+            self._latch_corruption(ticker, "terminal_fill_unrepresentable")
+            return True
+        return False
+
+    def _preserve_error_observations(
+        self, ticker: str, live: LiveOrder, observations: object
+    ) -> None:
+        """Guardar fills observados antes de un fallo; nunca confirmar status desde él."""
+        if not isinstance(observations, list):
+            return
+        for order in observations:
+            if (
+                not isinstance(order, dict)
+                or order.get("order_id") != live.kalshi_order_id
+                or order.get("client_order_id", live.client_order_id) != live.client_order_id
+            ):
+                continue
+            if self._quarantine_unrepresentable_order(ticker, live, order):
+                continue
+            observed = filled_count(order)
+            if observed is None or observed == 0:
+                continue
+            try:
+                with get_session() as session:
+                    row = session.exec(
+                        select(Trade).where(Trade.client_order_id == live.client_order_id)
+                    ).first()
+                    if row is None or row.strategy != STRATEGY or row.status != "pending":
+                        raise RuntimeError("no se puede conservar fill observado M5")
+                    row.filled_count = max(row.filled_count or 0, observed)
+                    session.add(row)
+                    session.commit()
+            except Exception:
+                self._latch_corruption(ticker, "observed_fill_persist_failed")
+                raise
 
     async def _cancel_ticker(self, ticker: str, *, reason: str) -> None:
         for live in list(self._live.get(ticker, {}).values()):
             await self._cancel(ticker, live)
-        logger.info(f"motor5.exec.ticker_cleared {ticker} ({reason})")
+        remaining = len(self._live.get(ticker, {}))
+        logger.info(f"motor5.exec.ticker_cancel {ticker} remaining={remaining} ({reason})")
 
     # =====================================================
-    # Pánico: cancel-all (<5s — kill-switch / shutdown)
+    # Pánico: cancel-all (kill-switch / shutdown; latencia depende de la API)
     # =====================================================
 
     async def cancel_all(self, reason: str) -> int:
-        """Cancela TODAS las quotes vivas en 1-2 requests (batch; fallback secuencial).
-        Los desenlaces finos (fills que ganaron la carrera) los verifica el reconciler."""
-        ids = self.live_order_ids()
-        coids = [lo.client_order_id for sides in self._live.values() for lo in sides.values()]
-        tickers = list(self._live)
-        self._live.clear()
-        self.corrupted.update(tickers)  # todo queda en duda hasta el próximo reconcile
+        """Intenta cancelar todas; cuenta únicamente estados terminales persistidos.
+
+        El batch puede ser parcial: cada resultado se confirma por separado y el
+        fallback conserva toda quote cuyo desenlace siga ambiguo.
+        """
+        pending = [
+            (ticker, live) for ticker, sides in self._live.items() for live in sides.values()
+        ]
+        ids = [live.kalshi_order_id for _, live in pending if live.kalshi_order_id]
+        self.corrupted.update(ticker for ticker, _ in pending)
         if not ids:
             return 0
+        confirmed = 0
+        batch_orders: dict[str, dict] = {}
+        live_by_id = {live.kalshi_order_id: (ticker, live) for ticker, live in pending}
         try:
-            await self._client.batch_cancel_orders(ids)
-        except Exception:
+            response = await self._client.batch_cancel_orders(ids)
+        except BaseException as exc:
+            # Un lote puede observar una cantidad imposible antes de fallar en
+            # otra orden. Nunca perder esa evidencia al entrar al fallback.
+            try:
+                observations = getattr(exc, "observed_orders", [])
+                if isinstance(observations, list):
+                    for observed in observations:
+                        oid = observed.get("order_id") if isinstance(observed, dict) else None
+                        target = live_by_id.get(oid) if isinstance(oid, str) else None
+                        if target is not None:
+                            self._preserve_error_observations(*target, [observed])
+                latch_incident("cancelación batch M5 incompleta; revisar órdenes")
+            except Exception:
+                if not isinstance(exc, Exception):
+                    logger.exception("motor5.batch_evidence_failed_preserving_cancellation")
+                    raise exc from None
+                raise
+            if not isinstance(exc, Exception):
+                raise
             logger.exception("motor5.exec.batch_cancel_error → fallback secuencial")
-            for oid in ids:
-                try:
-                    await self._client.cancel_order(oid)
-                except Exception:
-                    logger.warning(f"motor5.exec.cancel_all: {oid} no se pudo cancelar")
-        for coid in coids:
-            self._mark_row(coid, "cancelled", note=f"cancel_all: {reason[:50]}")
-        logger.warning(f"motor5.exec.cancel_all n={len(ids)} reason={reason}")
-        return len(ids)
+        else:
+            items = response.get("orders") if isinstance(response, dict) else None
+            duplicates: set[str] = set()
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("error") is not None:
+                        # Guardar evidencia descartada por el cliente ANTES del
+                        # fallback: su lectura posterior podría devolver cero.
+                        oid = item.get("order_id")
+                        target = live_by_id.get(oid) if isinstance(oid, str) else None
+                        if target is not None:
+                            self._preserve_error_observations(
+                                *target,
+                                [*item.get("observed_orders", []), item.get("observed_order")],
+                            )
+                        continue
+                    order = item.get("order", item)
+                    if not isinstance(order, dict):
+                        continue
+                    oid = order.get("order_id")
+                    if not isinstance(oid, str) or not oid:
+                        continue
+                    if "order" in item and item.get("order_id", oid) != oid:
+                        continue
+                    if oid in batch_orders:
+                        duplicates.add(oid)
+                    batch_orders[oid] = order
+            for oid in duplicates:
+                del batch_orders[oid]
+        for ticker, live in pending:
+            order = batch_orders.get(live.kalshi_order_id or "")
+            if (
+                order is not None
+                and self._confirm_cancel(ticker, live, order, note=f"cancel_all: {reason[:50]}")
+            ) or await self._cancel(ticker, live):
+                confirmed += 1
+        logger.warning(
+            f"motor5.exec.cancel_all confirmed={confirmed} remaining={len(self.live_coids())} "
+            f"reason={reason}"
+        )
+        return confirmed
 
     def _mm_open_cost_usd(self) -> float:
         """Costo abierto TOTAL del Motor 5 (pending reserva completo; filled usa
@@ -285,23 +508,17 @@ class Motor5Executor:
                     s.exec(
                         select(Trade).where(
                             Trade.strategy == STRATEGY,
-                            col(Trade.status).in_(["pending", "filled"]),
+                            col(Trade.status).notin_(["settled", "cancelled"]),
                         )
                     )
                 )
+            return sum(open_risk_cents(trade) for trade in rows) / 100.0
         except Exception:
             logger.exception("motor5.exec.open_cost_error → cap bloquea (fail-safe)")
             return float("inf")
-        total = 0
-        for t in rows:
-            count = (
-                t.filled_count if t.status == "filled" and t.filled_count is not None else t.count
-            )
-            total += t.price_cents * count
-        return total / 100.0
 
     # =====================================================
-    # DB best-effort
+    # DB: la confirmación del cancel depende del commit, no sólo de la API.
     # =====================================================
 
     def _mark_row(
@@ -311,12 +528,26 @@ class Motor5Executor:
         *,
         filled_count: int | None = None,
         note: str | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             with get_session() as s:
                 row = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
-                if row is None:
-                    return
+                if row is None or row.strategy != STRATEGY:
+                    return False
+                if COUNT_QUARANTINE_NOTE in (row.notes or ""):
+                    return False  # requiere revisión de evidencia no representable
+                if filled_count is not None and (
+                    filled_count > row.count
+                    or (row.filled_count is not None and filled_count < row.filled_count)
+                ):
+                    return False
+                if row.status != "pending":
+                    # Una lectura tardía nunca revierte settlement ni borra un fill
+                    # previo. Sólo se tolera la confirmación idempotente exacta.
+                    return row.status == status and (
+                        row.filled_count == filled_count
+                        or (status == "cancelled" and row.filled_count in (None, 0))
+                    )
                 row.status = status
                 if filled_count is not None:
                     row.filled_count = filled_count
@@ -324,18 +555,25 @@ class Motor5Executor:
                     row.notes = f"{row.notes or ''} | {note}"[:500]
                 s.add(row)
                 s.commit()
+                return True
         except Exception:
             logger.exception(f"motor5.exec.mark_row_error coid={coid} status={status}")
+            return False
 
-    def _set_kalshi_id(self, coid: str, kid: str | None) -> None:
+    def _set_kalshi_id(self, coid: str, kid: str | None) -> bool:
         if kid is None:
-            return
+            return False
         try:
             with get_session() as s:
                 row = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
-                if row is not None:
-                    row.kalshi_order_id = kid
-                    s.add(row)
-                    s.commit()
+                if row is None or row.strategy != STRATEGY:
+                    return False
+                if row.kalshi_order_id not in (None, kid):
+                    return False
+                row.kalshi_order_id = kid
+                s.add(row)
+                s.commit()
+                return True
         except Exception:
             logger.exception(f"motor5.exec.set_kid_error coid={coid}")
+            return False

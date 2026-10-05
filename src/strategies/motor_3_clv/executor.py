@@ -240,6 +240,7 @@ class Motor3ExitExecutor:
                 ticker=ticker,
                 side=side,
                 action="sell",
+                reduce_only=True,
                 count=count,
                 order_type="limit",
                 yes_price=bid if side == "yes" else None,

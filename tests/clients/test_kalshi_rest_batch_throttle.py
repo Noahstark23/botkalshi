@@ -126,7 +126,7 @@ async def test_batch_create_posts_batched_endpoint(mock_settings, mock_signer):
         build_order_body(ticker="T", side="yes", action="sell", count=1, yes_price=53),
     ]
     await client.batch_create_orders(orders)
-    assert captured["method"] == "POST" and captured["path"] == "/portfolio/orders/batched"
+    assert captured["method"] == "POST" and captured["path"] == "/portfolio/events/orders/batched"
     assert captured["json"] == {"orders": orders}
 
 
@@ -135,10 +135,33 @@ async def test_batch_cancel_always_allowed(mock_settings, mock_signer):
     """Cancelar es protector → sin gate de trading (pieza del cancel-all del kill-switch)."""
     mock_settings.TRADING_ENABLED = False
     client = KalshiRestClient()
-    captured = _capturing(client)
-    await client.batch_cancel_orders(["a", "b"])
-    assert captured["method"] == "DELETE" and captured["path"] == "/portfolio/orders/batched"
-    assert captured["json"] == {"ids": ["a", "b"]}
+    before = {
+        "order_id": "a",
+        "client_order_id": "coid-a",
+        "ticker": "T",
+        "subaccount_number": 0,
+        "exchange_index": 0,
+        "status": "resting",
+        "initial_count_fp": "1.00",
+        "fill_count_fp": "0.00",
+        "remaining_count_fp": "1.00",
+    }
+    after = {**before, "status": "canceled", "remaining_count_fp": "0.00"}
+    client._request = AsyncMock(
+        side_effect=[
+            {"order": before},
+            {"orders": [{"order_id": "a", "client_order_id": "coid-a", "reduced_by": "1.00"}]},
+            {"order": after},
+        ]
+    )
+    assert await client.batch_cancel_orders(["a"]) == {
+        "orders": [{"order_id": "a", "order": after}]
+    }
+    write = client._request.await_args_list[1]
+    assert write.args == ("DELETE", "/portfolio/events/orders/batched")
+    assert write.kwargs["json"] == {
+        "orders": [{"order_id": "a", "market_ticker": "T", "subaccount": 0, "exchange_index": 0}]
+    }
 
 
 @pytest.mark.asyncio

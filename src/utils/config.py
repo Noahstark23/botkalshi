@@ -159,6 +159,12 @@ class Settings(BaseSettings):
     BALANCE_REFRESH_SECONDS: int = Field(
         default=300, ge=30, description="Refresh del balance real (s)"
     )
+    BALANCE_MAX_AGE_SECONDS: int = Field(
+        default=600,
+        ge=30,
+        le=600,
+        description="Edad máxima del saldo confirmado para abrir riesgo en producción (s)",
+    )
     # C-02: factor de seguridad sobre el cash real. El capital base de riesgo pasa a ser
     # min(cash_real × este %, hard cap de prod $5k). Colchón anti-desfase: nunca arriesgar
     # el 100% del cash (slippage, fills parciales, el balance se mueve entre refresh). SOLO

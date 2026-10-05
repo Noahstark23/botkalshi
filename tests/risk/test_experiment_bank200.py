@@ -91,10 +91,14 @@ def test_production_bank200_requires_timestamp_when_armed(
         Settings()
 
 
-def test_experiment_requires_fresh_real_balance() -> None:
+def test_experiment_requires_fresh_real_balance(monkeypatch) -> None:
     settings = MagicMock()
     settings.EXPERIMENT_BANK200_ENABLED = True
     settings.EXPERIMENT_BALANCE_MAX_AGE_SEC = 600
+    settings.BALANCE_MAX_AGE_SECONDS = 600
+    monkeypatch.setattr(RiskManager, "_last_raw_balance_usd", 200.0)
+    monkeypatch.setattr(RiskManager, "_cached_capital_usd", None)
+    monkeypatch.setattr(RiskManager, "_last_balance_at", None)
     settings.DYNAMIC_CAPITAL_ENABLED = True
     settings.CAPITAL_SAFETY_FACTOR_PCT = 100.0
     settings.CAPITAL_CAP_USD = 200.0

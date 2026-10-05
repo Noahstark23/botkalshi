@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from src.strategies.data_capture import discovery_series
 from src.utils.config import Settings, reset_settings_for_testing
 
 
@@ -24,6 +25,23 @@ def fake_key(tmp_path: Path) -> Path:
     p = tmp_path / "key.pem"
     p.write_text("dummy")
     return p
+
+
+def test_week200_capture_profile_has_both_leagues_and_no_order_executor(fake_key):
+    profile = Path(__file__).resolve().parents[1] / "infra/pilot-week200/capture.env.example"
+    settings = Settings(
+        _env_file=profile,
+        KALSHI_API_KEY_ID="test-key-id-200",
+        KALSHI_PRIVATE_KEY_PATH=str(fake_key),
+    )
+    assert {"KXNFLGAME", "KXMLBGAME"} <= set(discovery_series(settings))
+    assert set(settings.MOTOR2_SERIES.split(",")) == {"KXNFLGAME", "KXMLBGAME"}
+    assert settings.CAPITAL_CAP_USD == 200
+    assert settings.EXPERIMENT_BANK200_ENABLED is False
+    assert settings.TRADING_ENABLED is False
+    for name in Settings.model_fields:
+        if "EXECUTION_ENABLED" in name:
+            assert getattr(settings, name) is False
 
 
 def _enable_m5_f1_profile(monkeypatch) -> None:

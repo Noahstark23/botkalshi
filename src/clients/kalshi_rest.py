@@ -15,8 +15,9 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from decimal import Decimal
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -29,6 +30,7 @@ from tenacity import (
 )
 
 from src.auth.signer import KalshiSigner
+from src.math.balance import available_cash_usd
 from src.utils.config import get_settings
 
 
@@ -36,7 +38,8 @@ class _WriteThrottle:
     """
     Token bucket para WRITES de órdenes (place/cancel/batch) — Motor 5 F2.
 
-    Kalshi limita ~20 writes/seg; el techo interno es 5/seg (25%) con burst = capacidad.
+    Techo interno conservador de 5 operaciones/seg, no una copia del tier de Kalshi.
+    Kalshi usa presupuestos de tokens: create=10, cancel=2 por orden, incluso en batch.
     acquire(n) espera lo necesario (n>capacidad se degrada a esperar n/rate). Es
     PREVENTIVO: el retry del 429 sigue existiendo como red reactiva aguas abajo.
     time_fn/sleep_fn inyectables para tests determinísticos.
@@ -116,6 +119,171 @@ class TradingDisabledError(RuntimeError):
     """
 
 
+class KalshiOrdersPaginationError(RuntimeError):
+    """La colección de órdenes no pudo verificarse completa; no es una lista vacía."""
+
+
+class KalshiOrderConfirmationError(RuntimeError):
+    """La API no aportó evidencia suficiente: el caller debe conservar exposición."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        observed_order: dict | None = None,
+        observed_orders: list[dict] | None = None,
+    ) -> None:
+        # Evidencia para piso/cuarentena, nunca una confirmación. No entra en args,
+        # str ni repr: un log de excepción no debe volcar el payload de la cuenta.
+        self.observed_order = dict(observed_order) if observed_order is not None else None
+        self.observed_orders = [dict(order) for order in observed_orders or []]
+        super().__init__(message)
+
+
+@asynccontextmanager
+async def _preserve_order_observations(results: dict, before_by_id: dict) -> AsyncIterator[None]:
+    """Propaga la MISMA excepción con observed_orders: list[dict], máximo 60.
+
+    Incluye TimeoutError y CancelledError: un cleanup interrumpido no puede borrar
+    evidencia correlacionada que se obtuvo antes de fallar otra orden del batch.
+    """
+    try:
+        yield
+    except BaseException as exc:
+        observed_orders: list[dict] = []
+
+        def remember(oid: str, order: object) -> None:
+            if not isinstance(order, dict) or order.get("order_id") != oid:
+                return
+            before = before_by_id.get(oid)
+            if before is not None and any(
+                order.get(key) != before.get(key)
+                for key in ("client_order_id", "ticker", "subaccount_number", "exchange_index")
+            ):
+                return
+            # Dos GET por orden, hasta 20 órdenes: como máximo 40 lecturas distintas.
+            # El techo defensivo de 60 también acota metadatos de excepciones anómalas.
+            if len(observed_orders) < 60 and order not in observed_orders:
+                observed_orders.append(dict(order))
+
+        for oid, before in before_by_id.items():
+            remember(oid, before)
+        for oid, item in results.items():
+            remember(oid, item.get("order"))
+            remember(oid, item.get("observed_order"))
+            for order in item.get("observed_orders", [])[:60]:
+                remember(oid, order)
+        extra = getattr(exc, "observed_orders", None)
+        if isinstance(extra, list):
+            for order in extra[:60]:
+                if isinstance(order, dict) and order.get("order_id") in before_by_id:
+                    remember(order["order_id"], order)
+        if observed_orders:
+            # Atributo aparte: no cambia args/str/repr, ni envuelve la cancelación.
+            exc.observed_orders = observed_orders
+        raise
+
+
+# La reconciliación es parte del tick: ni una API cíclica ni sus retries pueden
+# bloquear indefinidamente la gestión de exposición pendiente.
+_ORDERS_MAX_PAGES = 100
+_ORDERS_MAX_CURSOR_LENGTH = 4096
+_ORDERS_PAGINATION_TIMEOUT_SECONDS = 30.0
+# Límites LOCALES: el límite del exchange depende del tier y del costo por ítem.
+# Basic admite 100 tokens de write: 10 creates (10 c/u); 20 cancels usan 40 tokens.
+_BATCH_CREATE_MAX_ORDERS = 10
+_BATCH_CANCEL_MAX_ORDERS = 20
+_ORDER_MUTATION_TIMEOUT_SECONDS = 30.0
+_TERMINAL_ORDER_STATUSES = frozenset({"canceled", "cancelled", "executed"})
+
+
+def _validate_order_id(order_id: object) -> None:
+    if (
+        not isinstance(order_id, str)
+        or not 1 <= len(order_id) <= 128
+        or not all(c.isascii() and (c.isalnum() or c in "-_") for c in order_id)
+    ):
+        raise ValueError("order_id inválido")
+
+
+def _observed_count(value: object) -> Decimal:
+    """Conservar precisión/fracciones; el ledger decide si puede representarlas."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise KalshiOrderConfirmationError("cantidad ausente o inválida")
+    if len(str(value)) > 64:
+        raise KalshiOrderConfirmationError("cantidad demasiado larga")
+    try:
+        count = Decimal(value)
+    except InvalidOperation as exc:
+        raise KalshiOrderConfirmationError("cantidad inválida") from exc
+    if not count.is_finite() or count < 0:
+        raise KalshiOrderConfirmationError("cantidad no finita o negativa")
+    return count
+
+
+def _order_count(order: dict, name: str) -> Decimal:
+    fixed = f"{name}_fp"
+    value = _observed_count(order[fixed] if fixed in order else order.get(name))
+    if fixed in order and name in order and _observed_count(order[name]) != value:
+        raise KalshiOrderConfirmationError("cantidades contradictorias")
+    return value
+
+
+def _cancel_route(order: dict) -> dict:
+    """Nunca cancelar a ciegas en shard/subcuenta 0 una orden listada en otro."""
+    if not all(
+        isinstance(order.get(key), str) and order[key] for key in ("ticker", "client_order_id")
+    ):
+        raise KalshiOrderConfirmationError("identidad incompleta para cancelar")
+    subaccount = order.get("subaccount_number")
+    exchange = order.get("exchange_index")
+    if type(subaccount) is not int or not 0 <= subaccount <= 63:
+        raise KalshiOrderConfirmationError("subcuenta de la orden inválida")
+    if type(exchange) is not int or exchange < 0:
+        raise KalshiOrderConfirmationError("exchange de la orden inválido")
+    return {"market_ticker": order["ticker"], "subaccount": subaccount, "exchange_index": exchange}
+
+
+def _validate_cancel_ack(ack: object, before: dict) -> None:
+    if (
+        not isinstance(ack, dict)
+        or ack.get("error") is not None
+        or ack.get("order_id") != before["order_id"]
+        or ("client_order_id" in ack and ack["client_order_id"] != before["client_order_id"])
+    ):
+        raise KalshiOrderConfirmationError("ack de cancelación no correlacionado")
+    # reduced_by sólo valida el ack: JAMÁS se usa para reconstruir fill_count.
+    _observed_count(ack.get("reduced_by"))
+
+
+def _validate_terminal_order(order: dict, before: dict) -> None:
+    for key in ("order_id", "client_order_id", "ticker", "subaccount_number", "exchange_index"):
+        if order.get(key) != before.get(key):
+            raise KalshiOrderConfirmationError("la lectura posterior cambió la identidad")
+    _cancel_route(order)
+    try:
+        if (
+            not isinstance(order.get("status"), str)
+            or order["status"] not in _TERMINAL_ORDER_STATUSES
+        ):
+            raise KalshiOrderConfirmationError("la orden todavía no es terminal")
+        filled = _order_count(order, "fill_count")
+        initial = _order_count(order, "initial_count")
+        if (
+            _order_count(order, "remaining_count") != 0
+            or initial != _order_count(before, "initial_count")
+            or not _order_count(before, "fill_count") <= filled <= initial
+            or (order["status"] == "executed" and (filled == 0 or filled != initial))
+        ):
+            raise KalshiOrderConfirmationError("cantidades terminales no confirmadas")
+    except KalshiOrderConfirmationError as exc:
+        # La identidad ya se correlacionó. Preservar incluso un fill imposible evita
+        # que una lectura posterior con cero borre la evidencia que exige cuarentena.
+        raise KalshiOrderConfirmationError(
+            str(exc), observed_order=order, observed_orders=[before, order]
+        ) from exc
+
+
 # Excepciones retryables
 _RETRYABLE_EXCEPTIONS = (
     httpx.TimeoutException,
@@ -171,6 +339,7 @@ def build_order_body(
     client_order_id: str | None = None,
     time_in_force: str = "gtc",
     post_only: bool = False,
+    reduce_only: bool = False,
 ) -> dict[str, Any]:
     """
     Traducción (side yes/no, action buy/sell, precio en ¢) → body del contrato V2.
@@ -190,6 +359,12 @@ def build_order_body(
     post_only=True agrega el campo al body (solo cuando se pide: los callers existentes
     no cambian ni un byte de su payload). Semántica a validar contra demo (plan §1.4).
     """
+    if action not in {"buy", "sell"}:
+        raise ValueError("build_order_body: action debe ser buy o sell")
+    if type(reduce_only) is not bool:
+        raise ValueError("build_order_body: reduce_only debe ser bool")
+    if reduce_only and (action != "sell" or time_in_force != "immediate_or_cancel" or post_only):
+        raise ValueError("build_order_body: salida reduce_only requiere SELL IOC sin post_only")
     if side == "yes":
         if yes_price is None:
             raise ValueError("build_order_body: side='yes' requiere yes_price")
@@ -223,6 +398,8 @@ def build_order_body(
     }
     if post_only:
         body["post_only"] = True
+    if reduce_only:
+        body["reduce_only"] = True
     return body
 
 
@@ -245,8 +422,8 @@ class KalshiRestClient:
         self.base_url = self.settings.rest_url
         self._client: httpx.AsyncClient | None = None
         # Throttle preventivo de WRITES (Motor 5 F2): hoy solo hay retry REACTIVO al 429;
-        # un MM que cotiza N tickers por tick puede rafaguear writes. Techo interno ~25%
-        # del límite de Kalshi (20 writes/s) = 5/s. Los READS no se limitan.
+        # un MM que cotiza N tickers por tick puede rafaguear writes. Techo interno
+        # conservador de 5 operaciones/s; no sustituye el presupuesto tokenizado del tier.
         self._write_throttle = _WriteThrottle()
 
     async def __aenter__(self) -> KalshiRestClient:
@@ -350,32 +527,51 @@ class KalshiRestClient:
     # =====================================================
     # Account
     # =====================================================
-    async def get_balance(self) -> dict:
+    async def get_balance(self, *, subaccount: int | None = None) -> dict:
         """Balance de la cuenta. Retorna `{'balance': cents}`."""
-        return await self._request("GET", "/portfolio/balance")
+        if subaccount is None:
+            return await self._request("GET", "/portfolio/balance")
+        return await self._request("GET", "/portfolio/balance", params={"subaccount": subaccount})
 
     async def get_available_balance_usd(self) -> float:
         """Cash disponible en USD (Bug 1, incidente 2026-07-07: pre-check antes de colocar
         patas de arb — el balance REAL de Kalshi es lo único que decide si acepta la orden).
-        Lanza ValueError si la respuesta no trae 'balance' (el caller decide fail-open)."""
-        data = await self.get_balance()
-        cents = data.get("balance") if isinstance(data, dict) else None
-        if cents is None:
-            raise ValueError(f"get_balance sin campo 'balance': {data!r}")
-        return float(cents) / 100.0
+        Lanza ValueError ante efectivo ausente, inválido o contradictorio."""
+        return float(available_cash_usd(await self.get_balance()))
 
-    async def get_positions(self, *, limit: int = 100, cursor: str | None = None) -> dict:
+    async def get_positions(
+        self, *, limit: int = 100, cursor: str | None = None, subaccount: int | None = None
+    ) -> dict:
         """Posiciones abiertas, paginadas."""
         params: dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/positions", params=params)
 
-    async def get_fills(self, *, limit: int = 100, ticker: str | None = None) -> dict:
+    async def get_fills(
+        self,
+        *,
+        limit: int = 100,
+        ticker: str | None = None,
+        cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+        subaccount: int | None = None,
+    ) -> dict:
         """Fills recientes (trades ejecutados de tu cuenta)."""
         params: dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/fills", params=params)
 
     async def get_settlements(
@@ -385,6 +581,7 @@ class KalshiRestClient:
         cursor: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,
+        subaccount: int | None = None,
     ) -> dict:
         """
         Posiciones resueltas por el exchange. `revenue` (¢) = lo recibido al settlement.
@@ -397,6 +594,8 @@ class KalshiRestClient:
             params["min_ts"] = min_ts
         if max_ts is not None:
             params["max_ts"] = max_ts
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/settlements", params=params)
 
     # =====================================================
@@ -473,6 +672,7 @@ class KalshiRestClient:
         client_order_id: str | None = None,
         time_in_force: str = "gtc",
         post_only: bool = False,
+        reduce_only: bool = False,
     ) -> dict:
         """
         Coloca una orden vía el endpoint V2 (POST /portfolio/events/orders).
@@ -503,31 +703,10 @@ class KalshiRestClient:
             (FOK: se ejecuta completa o se cancela, cero resting). NUNCA confiar
             en el default para órdenes de arbitraje.
         """
-        # ── Capa C del muro (defensa final de bajo nivel) ──────────────────────
-        # Con TRADING_ENABLED=false NINGUNA orden de ENTRADA puede salir, sin
-        # importar bugs aguas arriba. Default-deny: se bloquea todo SALVO
-        # action="sell", que es una SALIDA PROTECTORA (rollback cerrando una pata
-        # expuesta). Si el flag se apagara a mitad de una ejecución, bloquear el
-        # sell dejaría exposición abierta sin poder cerrarla — peor que no tener
-        # guard. Invariante: en los productos BINARIOS que este bot opera, buy =
-        # abrir posición y sell = cerrar. Reconcile usa get_orders/get_positions,
-        # no place_order, así que no se ve afectado.
-        #
-        # ⚠️ ALCANCE DEL INVARIANTE (acotado 2026-08-15): "no hay short" describe
-        # nuestro UNIVERSO (binarios de eventos), NO a Kalshi entero — desde el
-        # 3-jun-2026 el exchange lista PERPETUOS apalancados, donde un `sell`
-        # ABRE un corto. Hoy el bot no tiene una sola línea de perps, así que la
-        # excepción sigue siendo segura. PRE-CONDICIÓN para el futuro: si alguna
-        # vez entra CUALQUIER producto con posición corta (perps, márgenes), este
-        # guard se cierra ANTES de que exista su executor — no después. De lo
-        # contrario la Capa C, que es la defensa de último recurso, se convierte
-        # en el agujero por donde sale un corto apalancado con el trading
-        # supuestamente apagado.
-        if action != "sell" and not self.settings.TRADING_ENABLED:
-            raise TradingDisabledError(
-                f"place_order bloqueado: TRADING_ENABLED=false "
-                f"(action={action} ticker={ticker} count={count})"
-            )
+        # SELL también puede abrir exposición contraria. Sólo una salida IOC
+        # con reduce_only validado por el exchange conserva la excepción al OFF.
+        # La atribución al motor sigue siendo responsabilidad de cada executor.
+        self._guard_order_submission(action=action, reduce_only=reduce_only)
 
         body = build_order_body(
             ticker=ticker,
@@ -539,6 +718,7 @@ class KalshiRestClient:
             client_order_id=client_order_id,
             time_in_force=time_in_force,
             post_only=post_only,
+            reduce_only=reduce_only,
         )
         logger.info(
             f"Placing order (V2): {action} {count} {side} {ticker} "
@@ -546,53 +726,190 @@ class KalshiRestClient:
             f"{' post_only' if post_only else ''}"
         )
         await self._write_throttle.acquire()
+        self._guard_order_submission(action=action, reduce_only=reduce_only)
         return await self._request("POST", "/portfolio/events/orders", json=body)
 
+    def _guard_order_submission(self, *, action: str, reduce_only: bool) -> None:
+        if self.settings.TRADING_ENABLED is not True and not (
+            action == "sell" and reduce_only is True
+        ):
+            raise TradingDisabledError("Trading apagado: sólo se permiten salidas SELL reduce_only")
+
     async def cancel_order(self, order_id: str) -> dict:
-        """Cancela una orden por ID."""
-        logger.info(f"Cancelling order: {order_id}")
-        await self._write_throttle.acquire()
-        return await self._request("DELETE", f"/portfolio/orders/{order_id}")
+        """V2 ack + GET terminal; no libera exposición usando sólo reduced_by.
+
+        El GET previo conserva la firma histórica (sólo ID), pero resuelve shard y
+        subcuenta desde la orden observada. Todo el flujo, incluidos retries, tiene 30s.
+        """
+        _validate_order_id(order_id)
+        before_by_id: dict[str, dict] = {}
+        async with (
+            _preserve_order_observations({}, before_by_id),
+            asyncio.timeout(_ORDER_MUTATION_TIMEOUT_SECONDS),
+        ):
+            before = (await self.get_order(order_id))["order"]
+            # GET correlacionó el ID. Un routing incompleto prohíbe el DELETE, pero
+            # no borra fills observados: el consumidor revalida la identidad local.
+            before_by_id[order_id] = before
+            route = _cancel_route(before)
+            if (
+                isinstance(before.get("status"), str)
+                and before["status"] in _TERMINAL_ORDER_STATUSES
+            ):
+                _validate_terminal_order(before, before)
+                return {"order": before}
+            await self._write_throttle.acquire()
+            ack = await self._request(
+                "DELETE", f"/portfolio/events/orders/{order_id}", params=route
+            )
+            _validate_cancel_ack(ack, before)
+            after = (await self.get_order(order_id))["order"]
+            _validate_terminal_order(after, before)
+            return {"order": after}
+
+    async def get_order(self, order_id: str) -> dict:
+        """La lectura sigue en /portfolio/orders; V2 sólo migró las mutaciones."""
+        _validate_order_id(order_id)
+        async with asyncio.timeout(_ORDER_MUTATION_TIMEOUT_SECONDS):
+            response = await self._request("GET", f"/portfolio/orders/{order_id}")
+        order = response.get("order") if isinstance(response, dict) else None
+        if (
+            not isinstance(order, dict)
+            or response.get("error") is not None
+            or order.get("error") is not None
+            or order.get("order_id") != order_id
+        ):
+            raise KalshiOrderConfirmationError("GET de orden sin identidad confirmada")
+        return response
 
     async def batch_create_orders(self, orders: list[dict]) -> dict:
         """
-        Crea órdenes en batch (POST /portfolio/orders/batched) — Motor 5 F2.
+        Crea órdenes en batch (POST /portfolio/events/orders/batched) — Motor 5 F2.
 
         `orders` = bodies V2 construidos con build_order_body (misma traducción que
-        place_order, una sola fuente de verdad). ⚠️ Semántica del endpoint a VALIDAR
-        contra demo con respuestas crudas (plan §4 gate: matriz de validación API) —
-        por eso se loguea el response completo (truncado).
+        place_order, una sola fuente de verdad). Hasta 10 órdenes por llamada, límite
+        local compatible con los 100 tokens del bucket Basic (10 tokens/create).
 
         GUARD (más estricto que la Capa C de place_order): con TRADING_ENABLED=false
         se bloquea TODO el batch, incluidos asks. Un ask del MM NO es un sell protector:
         vender YES sin posición ABRE una posición NO (identidad V2) — es una ENTRADA.
         Ningún flujo de rollback usa batch, así que no hay sell legítimo que frenar.
         """
-        if not self.settings.TRADING_ENABLED:
+        if self.settings.TRADING_ENABLED is not True:
             raise TradingDisabledError(
                 f"batch_create_orders bloqueado: TRADING_ENABLED=false (n={len(orders)})"
             )
         if not orders:
             return {"orders": []}
-        await self._write_throttle.acquire(len(orders))
-        resp = await self._request("POST", "/portfolio/orders/batched", json={"orders": orders})
-        logger.info(f"batch_create_orders n={len(orders)} → {str(resp)[:400]}")
+        if len(orders) > _BATCH_CREATE_MAX_ORDERS:
+            raise ValueError("batch_create_orders: límite local de 10 órdenes")
+        async with asyncio.timeout(_ORDER_MUTATION_TIMEOUT_SECONDS):
+            await self._write_throttle.acquire(len(orders))
+            self._guard_order_submission(action="buy", reduce_only=False)
+            resp = await self._request(
+                "POST", "/portfolio/events/orders/batched", json={"orders": orders}
+            )
+        logger.info(f"batch_create_orders n={len(orders)}")
         return resp
 
     async def batch_cancel_orders(self, order_ids: list[str]) -> dict:
         """
-        Cancela órdenes en batch (DELETE /portfolio/orders/batched) — Motor 5 F2.
+        Cancelación V2, máximo local de 20 órdenes y 30s incluyendo lecturas.
 
-        Cancelar es SIEMPRE protector (reduce exposición pendiente) → sin gate de
-        trading. Es la pieza del cancel-all <5s del kill-switch del MM. ⚠️ Semántica a
-        validar contra demo (response crudo logueado).
+        Un ack no es un Order. Cada resultado exitoso devuelve únicamente el Order
+        terminal leído después; ausentes/duplicados/errores quedan sin confirmar.
+        Cancelar sigue permitido con trading apagado. Costo oficial: 2 tokens/ítem.
+        Si el batch sale por excepción, observed_orders contiene las evidencias
+        correlacionadas ya recogidas (máximo 60 Orders; piso de fill/cuarentena,
+        nunca confirmación de cierre). Los errores por ítem preservan la misma lista.
         """
         if not order_ids:
-            return {"ids": []}
-        await self._write_throttle.acquire(len(order_ids))
-        resp = await self._request("DELETE", "/portfolio/orders/batched", json={"ids": order_ids})
-        logger.info(f"batch_cancel_orders n={len(order_ids)} → {str(resp)[:400]}")
-        return resp
+            return {"orders": []}
+        if len(order_ids) > _BATCH_CANCEL_MAX_ORDERS:
+            raise ValueError("batch_cancel_orders: límite local de 20 órdenes")
+        for order_id in order_ids:
+            _validate_order_id(order_id)
+        if len(set(order_ids)) != len(order_ids):
+            raise ValueError("batch_cancel_orders: IDs duplicados")
+        results = {
+            oid: {"order_id": oid, "error": {"code": "cancel_unconfirmed"}} for oid in order_ids
+        }
+        before_by_id: dict[str, dict] = {}
+        requests = []
+        async with (
+            _preserve_order_observations(results, before_by_id),
+            asyncio.timeout(_ORDER_MUTATION_TIMEOUT_SECONDS),
+        ):
+            for oid in order_ids:
+                try:
+                    before = (await self.get_order(oid))["order"]
+                    before_by_id[oid] = before
+                    results[oid]["observed_orders"] = [before]
+                    route = _cancel_route(before)
+                    if (
+                        isinstance(before.get("status"), str)
+                        and before["status"] in _TERMINAL_ORDER_STATUSES
+                    ):
+                        _validate_terminal_order(before, before)
+                        results[oid] = {"order_id": oid, "order": before}
+                        continue
+                    requests.append({"order_id": oid, **route})
+                except Exception as exc:
+                    if (
+                        isinstance(exc, KalshiOrderConfirmationError)
+                        and exc.observed_order is not None
+                        and exc.observed_order.get("order_id") == oid
+                    ):
+                        results[oid]["observed_order"] = exc.observed_order
+                        results[oid]["observed_orders"] = exc.observed_orders
+                    logger.warning(
+                        f"batch_cancel_orders route_unconfirmed type={type(exc).__name__}"
+                    )
+            if requests:
+                await self._write_throttle.acquire(len(requests))
+                response = await self._request(
+                    "DELETE", "/portfolio/events/orders/batched", json={"orders": requests}
+                )
+                items = response.get("orders") if isinstance(response, dict) else None
+                if (
+                    not isinstance(items, list)
+                    or len(items) > _BATCH_CANCEL_MAX_ORDERS
+                    or response.get("error") is not None
+                ):
+                    raise KalshiOrderConfirmationError(
+                        "batch cancel sin resultados correlacionables"
+                    )
+                by_id: dict[str, dict] = {}
+                duplicates = set()
+                requested_ids = {request["order_id"] for request in requests}
+                for item in items:
+                    oid = item.get("order_id") if isinstance(item, dict) else None
+                    if not isinstance(oid, str) or oid not in requested_ids:
+                        raise KalshiOrderConfirmationError("batch cancel con identidad desconocida")
+                    if oid in by_id:
+                        duplicates.add(oid)
+                    by_id[oid] = item
+                for oid, before in before_by_id.items():
+                    if oid in duplicates or oid not in by_id:
+                        continue
+                    try:
+                        _validate_cancel_ack(by_id[oid], before)
+                        after = (await self.get_order(oid))["order"]
+                        _validate_terminal_order(after, before)
+                        results[oid] = {"order_id": oid, "order": after}
+                    except Exception as exc:
+                        if (
+                            isinstance(exc, KalshiOrderConfirmationError)
+                            and exc.observed_order is not None
+                            and exc.observed_order.get("order_id") == oid
+                        ):
+                            results[oid]["observed_order"] = exc.observed_order
+                            results[oid]["observed_orders"] = exc.observed_orders
+                        logger.warning(
+                            f"batch_cancel_orders confirmation_missing type={type(exc).__name__}"
+                        )
+        logger.info(f"batch_cancel_orders n={len(order_ids)}")
+        return {"orders": [results[oid] for oid in order_ids]}
 
     async def get_orders(
         self,
@@ -600,11 +917,71 @@ class KalshiRestClient:
         ticker: str | None = None,
         status: str | None = None,
         limit: int = 100,
+        cursor: str | None = None,
+        subaccount: int | None = None,
     ) -> dict:
-        """Lista de órdenes."""
+        """Una página de órdenes; no implica que la colección esté completa."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("get_orders: limit debe ser un entero entre 1 y 1000")
+        if cursor is not None and (
+            not isinstance(cursor, str) or len(cursor) > _ORDERS_MAX_CURSOR_LENGTH
+        ):
+            raise ValueError("get_orders: cursor inválido o demasiado largo")
         params: dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
         if status:
             params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
+        if subaccount is not None:
+            params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/orders", params=params)
+
+    async def get_all_orders(
+        self,
+        *,
+        ticker: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+        max_pages: int = 100,
+    ) -> list[dict]:
+        """Colección completa o excepción: nunca devuelve un prefijo parcial.
+
+        El contrato de Kalshi termina con cursor="", no con una página corta/vacía.
+        Cursor ausente, repetido o mal formado deja la exposición como incierta.
+        Tope duro: 100 páginas de hasta 1000 órdenes y 30s para toda la lectura.
+        Las identidades/estados de cada orden los valida el reconciliador.
+        """
+        if type(max_pages) is not int or not 1 <= max_pages <= _ORDERS_MAX_PAGES:
+            raise ValueError("get_all_orders: max_pages debe ser un entero entre 1 y 100")
+        # Validar también aquí evita arrancar una colección con presupuesto inválido,
+        # incluso si una implementación de prueba sustituye get_orders.
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("get_all_orders: limit debe ser un entero entre 1 y 1000")
+        orders: list[dict] = []
+        seen_cursors: set[str] = set()
+        cursor: str | None = None
+        async with asyncio.timeout(_ORDERS_PAGINATION_TIMEOUT_SECONDS):
+            for _ in range(max_pages):
+                page = await self.get_orders(
+                    ticker=ticker, status=status, limit=limit, cursor=cursor
+                )
+                if not isinstance(page, dict) or not isinstance(page.get("orders"), list):
+                    raise KalshiOrdersPaginationError("get_all_orders: página de orders inválida")
+                page_orders = page["orders"]
+                if len(page_orders) > limit:
+                    raise KalshiOrdersPaginationError("get_all_orders: página excede limit")
+                if any(not isinstance(order, dict) for order in page_orders):
+                    raise KalshiOrdersPaginationError("get_all_orders: entrada de orders inválida")
+                next_cursor = page.get("cursor")
+                if not isinstance(next_cursor, str) or len(next_cursor) > _ORDERS_MAX_CURSOR_LENGTH:
+                    raise KalshiOrdersPaginationError("get_all_orders: cursor ausente o inválido")
+                orders.extend(page_orders)
+                if not next_cursor:
+                    return orders
+                if next_cursor in seen_cursors:
+                    raise KalshiOrdersPaginationError("get_all_orders: ciclo de cursor")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        raise KalshiOrdersPaginationError("get_all_orders: max_pages agotado sin cursor final")

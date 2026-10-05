@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from sqlmodel import select
 
-from src.clients.kalshi_rest import KalshiClientError, KalshiServerError
+from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, KalshiServerError
 from src.storage.models import Trade, get_session
 from src.strategies.motor_5_mm.executor import COID_PREFIX, Motor5Executor
 from src.strategies.motor_5_mm.quoter import QuoteSet
@@ -24,6 +24,8 @@ def _clear_locks():
 
 
 class _FakeClient:
+    get_all_orders = KalshiRestClient.get_all_orders
+
     def __init__(self):
         self.placed: list[dict] = []
         self.cancelled: list[str] = []
@@ -44,14 +46,18 @@ class _FakeClient:
         if self.cancel_error is not None:
             raise self.cancel_error
         self.cancelled.append(order_id)
-        return {"order": {"order_id": order_id, "fill_count": "0.00"}}
+        return {"order": {"order_id": order_id, "status": "canceled", "fill_count": "0.00"}}
 
     async def batch_cancel_orders(self, ids: list[str]):
         self.batch_cancelled.append(ids)
-        return {"ids": ids}
+        return {
+            "orders": [
+                {"order_id": oid, "status": "canceled", "fill_count_fp": "0.00"} for oid in ids
+            ]
+        }
 
     async def get_orders(self, **kw):
-        return self.orders_response
+        return {"cursor": "", **self.orders_response}
 
 
 def _quote(bid=47, ask=53, size=10) -> QuoteSet:
@@ -140,7 +146,7 @@ async def test_cancel_partial_fill_records_filled_count():
     await ex.sync_quotes(_quote())
 
     async def cancel_with_fill(order_id: str):
-        return {"order": {"order_id": order_id, "fill_count": "4.00"}}
+        return {"order": {"order_id": order_id, "status": "canceled", "fill_count": "4.00"}}
 
     client.cancel_order = cancel_with_fill
     await ex.sync_quotes(_quote(bid=46, ask=54))  # ambos precios cambian → 2 cancels
@@ -309,7 +315,7 @@ async def test_reconcile_orphan_partial_fill_recorded_from_cancel_response():
     client.orders_response = {"orders": [_resting_order("m5mm-ggg")]}
 
     async def cancel_with_fill(order_id: str):
-        return {"order": {"order_id": order_id, "fill_count": "4.00"}}
+        return {"order": {"order_id": order_id, "status": "canceled", "fill_count": "4.00"}}
 
     client.cancel_order = cancel_with_fill
     report = await MMReconciler(client).reconcile(live_coids=set())
@@ -381,9 +387,10 @@ async def test_canary_cap_allows_within_ceiling():
 
 
 @pytest.mark.asyncio
-async def test_canary_cap_none_means_no_own_ceiling():
-    """Demo (F2): sin cap propio — manda solo el headroom global si hay RiskManager."""
+async def test_canary_cap_none_cannot_bypass_global_risk():
+    """Sin cap propio sigue siendo obligatorio respetar el riesgo global."""
     client = _FakeClient()
     _pending_row("m5mm-open2", ticker="T-OTRO", count=10_000)
     ex = Motor5Executor(client, max_exposure_usd=None)
-    assert await ex.sync_quotes(_quote()) == "synced"
+    assert await ex.sync_quotes(_quote()) == "risk_blocked"
+    assert client.placed == []

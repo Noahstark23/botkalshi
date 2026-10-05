@@ -17,8 +17,10 @@ from src.storage.models import (
     set_mm_quotes_paused,
 )
 from src.strategies.fair_value_book import FairValueBook
-from src.strategies.motor_5_mm.engine import Motor5Engine
-from src.strategies.motor_5_mm.reconciler import MMReconcileReport
+from src.strategies.motor_5_mm.engine import Motor5DataIntegrityError, Motor5Engine
+from src.strategies.motor_5_mm.executor import Motor5Executor
+from src.strategies.motor_5_mm.incidents import incident_status
+from src.strategies.motor_5_mm.reconciler import MMReconciler, MMReconcileReport
 
 
 class _ReadOnlyClient:
@@ -53,11 +55,17 @@ class _FakeExecutor:
     def live_coids(self) -> set[str]:
         return set()
 
+    def managed_coids(self) -> set[str]:
+        return set()
+
+    def forget_confirmed(self, coids):
+        pass
+
 
 class _FakeReconciler:
     def __init__(self):
         self.calls = 0
-        self.report = MMReconcileReport()
+        self.report = MMReconcileReport(complete=True)
         self.live_coids_seen: list[set[str] | None] = []
 
     async def reconcile(self, live_coids=None):
@@ -139,6 +147,104 @@ async def test_reconciler_corruption_propagates_to_executor():
 
 
 @pytest.mark.asyncio
+async def test_failed_reconcile_keeps_existing_block_and_stops_all_new_quotes():
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng, ex, rec = _live_engine(client)
+    ex.corrupted.add("OLD-TICKER")
+
+    # Usar la reconciliación real con cliente falso que falla: report sin certeza.
+    class FailedClient:
+        async def get_orders(self, **kwargs):
+            raise TimeoutError()
+
+        async def get_all_orders(self, **kwargs):
+            raise TimeoutError()
+
+    eng._reconciler = MMReconciler(FailedClient())
+    await eng._tick()
+    assert "OLD-TICKER" in ex.corrupted
+    assert ex.synced == []
+
+
+class _LifecycleClient(_ReadOnlyClient):
+    """Estado remoto falso; permite probar varios ticks sin tocar una cuenta."""
+
+    def __init__(self):
+        super().__init__()
+        self.orders = []
+        self.cancel_fails = True
+        self.cancel_attempts = 0
+
+    async def get_all_orders(self, **kwargs):
+        return [dict(order) for order in self.orders]
+
+    async def place_order(self, **kwargs):
+        order = {
+            **kwargs,
+            "order_id": f"K{len(self.orders) + 1}",
+            "status": "resting",
+            "fill_count_fp": "0.00",
+        }
+        self.orders.append(order)
+        return {"order": dict(order)}
+
+    async def cancel_order(self, oid):
+        self.cancel_attempts += 1
+        if self.cancel_fails:
+            raise TimeoutError()
+        order = next(order for order in self.orders if order["order_id"] == oid)
+        order["status"] = "canceled"
+        return {"order": dict(order)}
+
+    async def batch_cancel_orders(self, ids):
+        if self.cancel_fails:
+            raise TimeoutError()
+        return {"orders": [await self.cancel_order(oid) for oid in ids]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["kill_switch", "universe_expired"])
+async def test_failed_retirement_is_retried_without_engine_quote_cache(trigger):
+    client = _LifecycleClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng = Motor5Engine(max_tickers=2, trading_enabled=True)
+    eng._client = client
+    eng._executor = Motor5Executor(client)
+    eng._reconciler = MMReconciler(client)
+    await eng._tick()
+    assert len(client.orders) == 2
+    if trigger == "kill_switch":
+        engage_kill_switch("retry test")
+    else:
+        FairValueBook.clear()
+    await eng._tick()
+    first_attempts = client.cancel_attempts
+    assert first_attempts > 0
+    assert not eng._live_quotes
+    assert len(eng._executor.live_coids()) == 2
+    assert eng._executor.managed_coids() == set()
+    client.cancel_fails = False
+    await eng._tick()
+    assert client.cancel_attempts > first_attempts
+    assert eng._executor.live_coids() == set()
+    assert len(client.orders) == 2  # nunca reemplazar las órdenes inciertas
+    with get_session() as session:
+        assert all(row.status == "cancelled" for row in session.exec(select(Trade)))
+
+
+@pytest.mark.asyncio
+async def test_complete_empty_snapshot_does_not_clear_a_previous_block():
+    eng, executor, reconciler = _live_engine(_ReadOnlyClient())
+    executor.corrupted.add("UNKNOWN-T")
+    await eng._tick()
+    assert reconciler.report.complete
+    assert executor.corrupted == {"UNKNOWN-T"}
+
+
+@pytest.mark.asyncio
 async def test_ticker_leaving_universe_retires_real_quotes():
     client = _ReadOnlyClient()
     client.books["T-A"] = _book(40, 60)
@@ -170,7 +276,7 @@ async def test_shutdown_cancels_all_quotes():
     eng = Motor5Engine(trading_enabled=True, client_factory=_Factory)
     with (
         patch("src.strategies.motor_5_mm.engine.Motor5Executor", return_value=fake_ex),
-        patch("src.strategies.motor_5_mm.engine.MMReconciler"),
+        patch("src.strategies.motor_5_mm.engine.MMReconciler", return_value=_FakeReconciler()),
     ):
         await eng.run(stop)
     assert fake_ex.cancel_all_calls == ["shutdown"]
@@ -230,3 +336,45 @@ async def test_settled_fills_applied_once_to_inventory():
     await eng._tick()
     await eng._tick()
     assert eng._inventory.net("T-A") == 6  # idempotente
+
+
+@pytest.mark.asyncio
+async def test_inventory_read_failure_blocks_quotes_and_latches(monkeypatch):
+    client = _ReadOnlyClient()
+    client.books["T-A"] = _book(40, 60)
+    FairValueBook.publish({"T-A": 0.50})
+    eng, ex, _ = _live_engine(client)
+
+    def broken():
+        raise OSError("unavailable")
+
+    monkeypatch.setattr("src.strategies.motor_5_mm.engine.get_session", broken)
+    with pytest.raises(Motor5DataIntegrityError):
+        await eng._tick()
+    assert ex.synced == []
+    assert incident_status()[0] is True
+
+
+@pytest.mark.parametrize("count", [None, 0, 11])
+def test_unconfirmed_fill_never_becomes_inventory(count):
+    eng, _, _ = _live_engine(_ReadOnlyClient())
+    with get_session() as session:
+        session.add(
+            Trade(
+                client_order_id="m5mm-unconfirmed",
+                ticker="T-A",
+                side="yes",
+                action="buy",
+                count=10,
+                filled_count=count,
+                price_cents=47,
+                strategy="motor_5_mm",
+                status="filled",
+            )
+        )
+        session.commit()
+    with pytest.raises(Motor5DataIntegrityError):
+        eng._apply_settled_fills()
+    assert eng._inventory.net("T-A") == 0
+    assert "m5mm-unconfirmed" not in eng._settled_coids
+    assert incident_status()[0] is True

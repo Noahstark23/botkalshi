@@ -79,6 +79,7 @@ async def test_filled_sells_at_bid_with_ioc():
     assert kwargs["no_price"] is None
     assert kwargs["count"] == 10
     assert kwargs["time_in_force"] == "immediate_or_cancel"
+    assert kwargs["reduce_only"] is True
 
 
 @pytest.mark.asyncio

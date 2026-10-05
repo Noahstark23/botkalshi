@@ -538,6 +538,7 @@ class RestExecutor:
                     ticker=leg.market_ticker,
                     side=leg.side,
                     action="sell",
+                    reduce_only=True,
                     count=leg.count,
                     order_type="limit",
                     yes_price=self.ROLLBACK_PRICE_CENTS if leg.side == "yes" else None,

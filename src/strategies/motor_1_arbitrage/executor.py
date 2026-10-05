@@ -509,6 +509,7 @@ class ArbitrageExecutor:
                         ticker=leg.market_ticker,
                         side=leg.side,
                         action="sell",
+                        reduce_only=True,
                         count=remaining,
                         order_type="limit",
                         yes_price=1 if leg.side == "yes" else None,
