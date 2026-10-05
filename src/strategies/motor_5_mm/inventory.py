@@ -19,6 +19,7 @@ corrupto aguas arriba (el engine descarta la quote viva y re-sincroniza).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 
 from src.math.fees import (
     kalshi_fee_cents,
@@ -29,8 +30,8 @@ from src.strategies.motor_5_mm.shadow_fill import ShadowFill
 
 @dataclass(slots=True)
 class TickerInventory:
-    net_contracts: int = 0
-    cash_cents: int = 0
+    net_contracts: int | Fraction = 0
+    cash_cents: int | Fraction = 0
     fees_cents: int = 0
     fills: int = 0
 
@@ -73,11 +74,11 @@ class InventoryBook:
         inv.fills += 1
         return inv
 
-    def net(self, ticker: str) -> int:
+    def net(self, ticker: str) -> int | Fraction:
         inv = self.positions.get(ticker)
         return inv.net_contracts if inv else 0
 
-    def total_abs_contracts(self) -> int:
+    def total_abs_contracts(self) -> int | Fraction:
         return sum(abs(inv.net_contracts) for inv in self.positions.values())
 
     def total_mtm_cents(self, marks: dict[str, float]) -> int:

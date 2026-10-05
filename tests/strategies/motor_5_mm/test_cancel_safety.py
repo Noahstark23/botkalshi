@@ -118,7 +118,7 @@ def terminal(order_id="K1", *, filled="0.00", status="canceled", **kwargs):
     return {"order_id": order_id, "status": status, "fill_count_fp": filled, **kwargs}
 
 
-@pytest.mark.parametrize("invalid", ["0.50", "11.00", None])
+@pytest.mark.parametrize("invalid", ["0.005", "11.00", None])
 async def test_terminal_unrepresentable_fill_survives_later_zero(invalid):
     client = FakeClient()
     executor = Motor5Executor(client)
@@ -261,7 +261,7 @@ async def test_real_batch_keeps_early_bad_evidence_when_later_write_fails(fill):
         terminal(status=[]),
         terminal(order_id="wrong-order"),
         terminal(client_order_id="wrong-client"),
-        terminal(filled="1.50"),
+        terminal(filled="1.005"),
         terminal(filled="-1.00"),
         terminal(filled="NaN"),
         terminal(filled="Infinity"),
@@ -437,7 +437,9 @@ async def test_stale_cancel_does_not_regress_a_previously_persisted_fill():
     assert rows()[0].status == "filled"
 
 
-@pytest.mark.parametrize("value", [None, True, "1.5", "-1", "NaN", "Infinity", "1e10000", [], {}])
+@pytest.mark.parametrize(
+    "value", [None, True, "1.005", "-1", "NaN", "Infinity", "1e10000", "1e-1000000", [], {}]
+)
 def test_count_parser_never_truncates_or_accepts_unbounded_values(value):
     assert parse_count(value) is None
 
@@ -448,3 +450,37 @@ def test_count_parser_preserves_integer_precision_and_supports_legacy():
     assert filled_count({"fill_count_fp": "4.00", "fill_count": 4}) == 4
     assert filled_count({"fill_count_fp": None, "fill_count": 4}) is None
     assert terminal_fill_count(terminal(filled="4.00"), order_id="K1", count=10) == 4
+
+
+@pytest.mark.parametrize("filled", ["0.01", "0.50", "1.23"])
+async def test_fractional_cancel_fill_prevents_replacement_from_old_inventory(filled):
+    client = FakeClient()
+    executor = Motor5Executor(client)
+    await executor.sync_quotes(quote(ask=None))
+    client.cancel_responses["K1"] = {"order": terminal(filled=filled)}
+    assert await executor.sync_quotes(quote(bid=46, ask=54)) == "risk_blocked"
+    assert len(client.placed) == 1
+    assert executor.live_coids() == set()
+    row = rows()[0]
+    assert row.status == "filled" and row.filled_count_fp == filled
+    assert row.filled_count is None
+
+
+@pytest.mark.parametrize("filled", ["0.01", "0.50", "1.23"])
+async def test_fractional_evidence_from_failed_cancel_remains_pending_and_exact(filled):
+    from src.clients.kalshi_rest import KalshiOrderConfirmationError
+
+    client = FakeClient()
+    executor = Motor5Executor(client)
+    await executor.sync_quotes(quote(ask=None))
+    client.cancel_error = KalshiOrderConfirmationError(
+        "unconfirmed", observed_order=terminal(filled=filled)
+    )
+    await executor.retire_ticker("T")
+    row = rows()[0]
+    assert row.status == "pending" and row.filled_count_fp == filled
+    assert row.filled_count is None
+    assert COUNT_QUARANTINE_NOTE not in row.notes
+    assert executor.live_order_ids() == ["K1"]
+    assert executor.corrupted == {"T"}
+    assert executor._mm_open_cost_usd() == 4.70

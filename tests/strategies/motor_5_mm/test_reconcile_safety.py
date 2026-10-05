@@ -100,7 +100,7 @@ async def test_reconciliation_uses_complete_order_collection():
     "changes",
     [
         {"fill_count_fp": None},
-        {"fill_count_fp": "0.50"},
+        {"fill_count_fp": "0.005"},
         {"fill_count_fp": "NaN"},
         {"fill_count_fp": "11.00"},
         {"fill_count_fp": "3.00", "fill_count": "0"},
@@ -197,7 +197,7 @@ async def test_orphan_cancel_accepts_monotone_snapshot_fill(cancel_fill):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fill", [None, "0.50", "11.00"])
+@pytest.mark.parametrize("fill", [None, "0.005", "11.00"])
 async def test_orphan_invalid_snapshot_never_resolves(fill):
     _pending()
     client = _Client(
@@ -225,14 +225,14 @@ async def test_managed_fill_is_persisted_before_executor_retire():
     report = await MMReconciler(client).reconcile(live_coids=executor.managed_coids())
     executor.corrupted.update(report.corrupted_tickers)
     await executor.retire_ticker("T")
-    assert not report.complete
+    assert report.complete
     assert _row().status == "pending" and _row().filled_count == 4
     assert executor.live_coids() == {"m5mm-safe"}
     assert executor._mm_open_cost_usd() == 4.70  # reserva completa, no sólo 4 contratos
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", [None, "0.50", "11.00"])
+@pytest.mark.parametrize("invalid", [None, "0.005", "11.00"])
 async def test_unsupported_snapshot_stays_quarantined_after_cancel_and_restart(invalid):
     _pending()
     with get_session() as session:
@@ -267,7 +267,7 @@ async def test_unsupported_snapshot_stays_quarantined_after_cancel_and_restart(i
 async def test_failed_quarantine_write_aborts_before_further_accounting():
     _pending()
     client = _Client(
-        [_order(status="resting", fill_count_fp="0.50")], cancel_response={"order": _order()}
+        [_order(status="resting", fill_count_fp="0.005")], cancel_response={"order": _order()}
     )
     reconciler = MMReconciler(client)
     with (
@@ -296,7 +296,7 @@ async def test_failed_fill_floor_write_aborts_before_cancel_can_erase_it():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", [None, "0.50", "11.00"])
+@pytest.mark.parametrize("invalid", [None, "0.005", "11.00"])
 @pytest.mark.parametrize("via_orphan", [False, True])
 async def test_terminal_invalid_count_survives_later_zero_and_restart(invalid, via_orphan):
     _pending()
@@ -325,7 +325,7 @@ async def test_terminal_quarantine_write_failure_aborts_before_next_order():
     _pending(coid="m5mm-next", oid="K2")
     client = _Client(
         [
-            _order(fill_count_fp="0.50"),
+            _order(fill_count_fp="0.005"),
             _order(client_order_id="m5mm-next", order_id="K2", status="resting"),
         ],
         cancel_response={"order": _order(client_order_id="m5mm-next", order_id="K2")},
@@ -369,7 +369,7 @@ async def test_terminal_omitted_count_is_incomplete_but_can_be_retried():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["0.50", "11.00"])
+@pytest.mark.parametrize("invalid", ["0.005", "11.00"])
 async def test_orphan_confirmation_exception_retains_unrepresentable_fill(invalid):
     _pending()
     error = KalshiOrderConfirmationError("unconfirmed cancel")
@@ -459,7 +459,7 @@ async def test_orphan_observation_floor_write_failure_aborts():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observations", [["4.00", "0.50", "0.00"], ["11.00", "4.00", "0.00"]])
+@pytest.mark.parametrize("observations", [["4.00", "0.005", "0.00"], ["11.00", "4.00", "0.00"]])
 async def test_orphan_multiple_observations_keep_both_quarantine_and_fill_floor(observations):
     _pending()
     error = KalshiOrderConfirmationError("unconfirmed cancel")

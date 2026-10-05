@@ -32,16 +32,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from fractions import Fraction
 
 from src.analytics.shadow_fee_recalc import FEE_FIX_AT_DEFAULT
 from src.math.fees import kalshi_fee_cents
+from src.strategies.motor_5_mm.ledger import confirmed_fill
 
 
 def _naive(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 
-def _effective_count(row) -> int:
+def _effective_count(row) -> int | Fraction:
+    if row.strategy == "motor_5_mm" and row.status in ("filled", "settled"):
+        count = confirmed_fill(row)
+        if count is None:
+            raise ValueError("M5 sin cantidad confirmada para auditoría")
+        return count
     fc = getattr(row, "filled_count", None)
     return fc if (row.status in ("filled", "settled") and fc is not None) else row.count
 

@@ -9,6 +9,7 @@ Las órdenes históricas ausentes requieren resolución aparte.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 from loguru import logger
 from sqlmodel import select
@@ -17,6 +18,7 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.storage.models import Trade, get_session
 from src.strategies.motor_5_mm.executor import COID_PREFIX, STRATEGY
 from src.strategies.motor_5_mm.incidents import latch_incident
+from src.strategies.motor_5_mm.ledger import confirmed_fill, record_fill
 from src.strategies.motor_5_mm.order_state import (
     COUNT_QUARANTINE_NOTE,
     filled_count,
@@ -93,7 +95,7 @@ class MMReconciler:
             if status == "resting":
                 observed_fill = filled_count(order)
                 if observed_fill is None or observed_fill > row.count:
-                    # El ledger entero no representa esta evidencia. El marcador se
+                    # El ledger no representa esta evidencia. El marcador se
                     # preserva en DB: otro cancel o reinicio no la convierte en cero.
                     if not self._update(row.client_order_id, note=COUNT_QUARANTINE_NOTE):
                         # Sin registrar el bloqueo, no continuar hacia otros cancels.
@@ -101,7 +103,7 @@ class MMReconciler:
                         raise RuntimeError("no se pudo persistir cuarentena de cantidad M5")
                     self._uncertain(report, row.ticker)
                     continue
-                if observed_fill < (row.filled_count or 0):
+                if observed_fill < (confirmed_fill(row) or 0):
                     self._uncertain(report, row.ticker)
                     continue
                 if not self._update(
@@ -114,15 +116,12 @@ class MMReconciler:
                     latch_incident("no se pudo persistir evidencia resting M5")
                     raise RuntimeError("no se pudo persistir evidencia resting M5")
                 row.kalshi_order_id = order["order_id"]
-                row.filled_count = observed_fill
+                record_fill(row, observed_fill)
                 if live_coids is not None and row.client_order_id not in live_coids:
                     await self._cancel_orphan(row, order, report)
                     continue
-                # El ledger actual aplica fills solo al terminar. Un fill resting
-                # parcial no puede tratarse como inventario cero para cotizar.
-                if observed_fill != 0:
-                    self._uncertain(report, row.ticker)
-                    continue
+                # El engine reconstruye el inventario desde esta cantidad durable
+                # ANTES de cotizar; pending conserva la reserva de la orden completa.
                 report.still_resting += 1
             else:
                 self._resolve_terminal(row, order, report, note="reconcile: terminal")
@@ -201,13 +200,13 @@ class MMReconciler:
         if self._quarantine_observed_count(row, order):
             return
         observed_fill = filled_count(order)
-        if observed_fill is None or observed_fill <= (row.filled_count or 0):
+        if observed_fill is None or observed_fill <= (confirmed_fill(row) or 0):
             return
         if not self._update(row.client_order_id, filled_count=observed_fill):
             latch_incident("no se pudo persistir evidencia de cancel M5")
             raise RuntimeError("no se pudo persistir evidencia de cancel M5")
         # La siguiente observación de la MISMA excepción jamás rebaja este piso.
-        row.filled_count = observed_fill
+        record_fill(row, observed_fill)
 
     def _resolve_terminal(
         self, row: Trade, order: object, report: MMReconcileReport, *, note: str
@@ -219,7 +218,7 @@ class MMReconciler:
         filled = terminal_fill_count(
             order, order_id=oid, client_order_id=row.client_order_id, count=row.count
         )
-        if filled is None or filled < (row.filled_count or 0):
+        if filled is None or filled < (confirmed_fill(row) or 0):
             self._uncertain(report, row.ticker)
             return False
         if not self._update(
@@ -274,7 +273,7 @@ class MMReconciler:
         coid: str,
         *,
         status: str | None = None,
-        filled_count: int | None = None,
+        filled_count: int | Fraction | None = None,
         kalshi_order_id: str | None = None,
         note: str | None = None,
     ) -> bool:
@@ -285,14 +284,14 @@ class MMReconciler:
                     return False
                 if status and COUNT_QUARANTINE_NOTE in (row.notes or ""):
                     return False
-                if filled_count is not None and filled_count < (row.filled_count or 0):
+                if filled_count is not None and filled_count < (confirmed_fill(row) or 0):
                     return False
                 if kalshi_order_id and row.kalshi_order_id not in (None, "", kalshi_order_id):
                     return False
                 if status:
                     row.status = status
                 if filled_count is not None:
-                    row.filled_count = filled_count
+                    record_fill(row, filled_count)
                 if kalshi_order_id:
                     row.kalshi_order_id = kalshi_order_id
                 if note:

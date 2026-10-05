@@ -37,11 +37,14 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
+from math import ceil
 
 from loguru import logger
-from sqlmodel import select
+from sqlmodel import col, or_, select
 
 from src.clients.kalshi_rest import KalshiRestClient
+from src.math.quantities import fixed_count, signed_fixed_count
 from src.monitoring.health import BotState
 from src.risk.exposure import contract_risk_cents, exposure_count
 from src.risk.manager import RiskManager
@@ -71,6 +74,7 @@ from src.strategies.motor_5_mm.incidents import (
     latch_incident,
 )
 from src.strategies.motor_5_mm.inventory import InventoryBook
+from src.strategies.motor_5_mm.ledger import confirmed_fill
 from src.strategies.motor_5_mm.quoter import QuoteSet, compute_quote
 from src.strategies.motor_5_mm.reconciler import MMReconciler
 from src.strategies.motor_5_mm.shadow_fill import ShadowFill, fills_for_quote
@@ -126,6 +130,7 @@ class Motor5Engine:
     SHUTDOWN_CANCEL_TIMEOUT_SEC = 10.0
     F1_METRIC_VERSION = "f1-v2-bbo-depth"
     F1_OBSERVABLE_FILL_CAP = 1
+    MAX_LIVE_LEDGER_ROWS = 10_000
 
     def __init__(
         self,
@@ -250,7 +255,8 @@ class Motor5Engine:
         self._mm_exposure_cap_usd = mm_exposure_cap_usd
         self._executor: Motor5Executor | None = None
         self._reconciler: MMReconciler | None = None
-        self._settled_coids: set[str] = set()  # fills ya aplicados al inventario (1 sola vez)
+        self._settled_coids: set[str] = set()  # fills terminales del snapshot abierto
+        self._live_fill_state: dict[str, tuple] = {}
         self._kill_cancelled = False  # cancel-all del kill-switch ya disparado
         # Diagnóstico de book POR-TICKER con backoff (no un bool global de por vida): un
         # ticker sano en el boot no consume el diagnóstico del que tiene el problema, y
@@ -996,51 +1002,94 @@ class Motor5Engine:
         )
 
     def _apply_settled_fills(self) -> int:
-        """Aplica al inventario los fills REALES ya confirmados (filas Trade filled del
-        motor), UNA sola vez por client_order_id. Única fuente de mutación del inventario
-        en modo live: la verdad del reconciler/cancel-response — jamás la inferencia del
-        shadow ni el WS directo (evita doble conteo y carreras)."""
+        """Reconstruye inventario live atómicamente desde cantidades durables.
+
+        Incluye fills parciales resting, sin cobrar/aplicar otra vez el acumulado
+        en cada tick. Verifica regresiones y desapariciones antes de publicar RAM.
+        Una liquidación confirmada retira su exposición del inventario abierto.
+        """
         try:
-            with get_session() as s:
+            with get_session() as session:
                 rows = list(
-                    s.exec(
-                        select(Trade).where(Trade.strategy == STRATEGY, Trade.status == "filled")
+                    session.exec(
+                        select(Trade)
+                        .where(
+                            Trade.strategy == STRATEGY,
+                            or_(
+                                col(Trade.status).in_(["pending", "filled"]),
+                                col(Trade.client_order_id).in_(list(self._live_fill_state)),
+                            ),
+                        )
+                        .limit(self.MAX_LIVE_LEDGER_ROWS + 1)
                     )
                 )
-        except Exception as exc:
-            logger.exception("motor5.engine.settled_fills_query_error")
-            latch_incident("lectura de inventario M5 fallida")
-            raise Motor5DataIntegrityError("inventario live M5 no verificable") from exc
-        applied = 0
-        for row in rows:
-            if row.client_order_id in self._settled_coids:
-                continue
-            try:
-                count = exposure_count(row)
-                if count <= 0 or row.side != "yes":
-                    raise ValueError("fill M5 no representable en el inventario YES")
+            if len(rows) > self.MAX_LIVE_LEDGER_ROWS:
+                raise ValueError("inventario live supera el presupuesto de filas")
+            by_coid = {row.client_order_id: row for row in rows}
+            if len(by_coid) != len(rows) or not self._live_fill_state.keys() <= by_coid.keys():
+                raise ValueError("fill previo desaparecido o identidad repetida")
+            inventory = InventoryBook(fees_as_maker=self._fees_as_maker)
+            next_state: dict[str, tuple] = {}
+            terminal: set[str] = set()
+            changed = 0
+            for row in rows:
+                if (
+                    row.status not in {"pending", "filled", "settled", "cancelled"}
+                    or row.side != "yes"
+                ):
+                    raise ValueError("estado/side M5 no representable")
                 price = row.price_cents if row.fill_price_cents is None else row.fill_price_cents
                 contract_risk_cents(action=row.action, side=row.side, price_cents=price)
-                fill = ShadowFill(
-                    ticker=row.ticker,
-                    side=row.action,  # buy (bid) | sell (ask), eje YES
-                    price_cents=price,
-                    count=count,
-                    rule="real_fill",
+                count = confirmed_fill(row)
+                if row.status in {"pending", "filled"}:
+                    exposure_count(row)  # valida intent, cuarentena y cantidad <= solicitada
+                elif row.status == "cancelled" and count != 0:
+                    raise ValueError("cancelación que intenta borrar ejecución")
+                elif row.status == "settled" and (
+                    count is None or type(row.count) is not int or not 0 < count <= row.count
+                ):
+                    raise ValueError("liquidación sin cantidad confirmada")
+                if count is None:
+                    count = Fraction(0)  # pending no confirmado: reserva entera, sin fill inventado
+                if row.status == "filled" and count <= 0:
+                    raise ValueError("fila filled sin ejecución positiva")
+                identity = (row.ticker, row.side, row.action, price)
+                previous = self._live_fill_state.get(row.client_order_id)
+                if previous is not None:
+                    prior_identity, prior_count, prior_status = previous
+                    if identity != prior_identity or count < prior_count:
+                        raise ValueError("identidad o cantidad aplicada regresiva")
+                    if prior_status == "filled" and (
+                        row.status == "pending" or count != prior_count
+                    ):
+                        raise ValueError("fill terminal modificado")
+                if row.status in {"settled", "cancelled"}:
+                    continue
+                next_state[row.client_order_id] = (identity, count, row.status)
+                if count <= 0:
+                    continue
+                inventory.apply_fill(
+                    ShadowFill(
+                        ticker=row.ticker,
+                        side=row.action,
+                        price_cents=price,
+                        count=count,
+                        rule="real_fill",
+                    )
                 )
-                inv = self._inventory.apply_fill(fill)
-            except Exception as exc:
-                latch_incident("fill confirmado M5 no aplicable al inventario")
-                raise Motor5DataIntegrityError("inventario live M5 no verificable") from exc
-            # El marcador sólo se publica tras aplicar el fill válido. Una excepción
-            # no puede convertir un fill perdido en una operación ya procesada.
-            self._settled_coids.add(row.client_order_id)
-            applied += 1
-            logger.info(
-                f"[MOTOR 5 LIVE] fill {fill.side} {count}x{row.ticker} "
-                f"@{fill.price_cents}c net={inv.net_contracts} fees={inv.fees_cents}c"
-            )
-        return applied
+                if previous is None or count > previous[1]:
+                    changed += 1
+                if row.status == "filled":
+                    terminal.add(row.client_order_id)
+            # Publicación única: una fila inválida no deja un inventario a medias.
+            self._inventory = inventory
+            self._live_fill_state = next_state
+            self._settled_coids = terminal
+            return changed
+        except Exception as exc:
+            logger.exception("motor5.engine.live_inventory_invalid")
+            latch_incident("inventario live M5 no verificable")
+            raise Motor5DataIntegrityError("inventario live M5 no verificable") from exc
 
     def _settle_fills(
         self,
@@ -1440,7 +1489,9 @@ class Motor5Engine:
                         size=quote.size,
                         yes_bid=yes_bid,
                         yes_ask=yes_ask,
-                        inventory=self._inventory.net(quote.ticker),
+                        inventory=(1 if self._inventory.net(quote.ticker) >= 0 else -1)
+                        * ceil(abs(self._inventory.net(quote.ticker))),
+                        inventory_fp=signed_fixed_count(self._inventory.net(quote.ticker)),
                     )
                 )
                 s.commit()
@@ -1598,7 +1649,8 @@ class Motor5Engine:
                         skip_fee_policy=counters["skip_fee_policy"],
                         skip_pregame=counters["skip_pregame"],
                         fills=counters["fills"],
-                        inventory_abs=self._inventory.total_abs_contracts(),
+                        inventory_abs=ceil(self._inventory.total_abs_contracts()),
+                        inventory_abs_fp=fixed_count(self._inventory.total_abs_contracts()),
                         mtm_pnl_cents=mtm,
                     )
                 )

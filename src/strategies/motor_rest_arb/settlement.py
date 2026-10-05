@@ -29,12 +29,16 @@ import contextlib
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from fractions import Fraction
+from math import floor
 from typing import Protocol
 
 from loguru import logger
 from sqlmodel import col, select
 
 from src.math.fees import kalshi_fee_cents
+from src.math.quantities import precise_usd
+from src.risk.exposure import exposure_count
 from src.storage.models import Trade, get_session
 
 _ARB_ID_RE = re.compile(r"arb_id=([0-9a-fA-F-]{36})")
@@ -104,7 +108,7 @@ def arb_group_key(trade: Trade) -> str:
     return coid  # grupo unitario
 
 
-def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int, int]:
+def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int | Fraction, int]:
     """
     PnL realizado de una pata al resolverse el mercado, y el fee usado para calcularlo.
 
@@ -125,7 +129,13 @@ def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int, int]:
     cambia, pero el fee deja de ser invisible para las métricas del mes de prueba.
     """
     price = trade.fill_price_cents or trade.price_cents
-    count = trade.filled_count if trade.filled_count is not None else trade.count
+    count = (
+        exposure_count(trade)
+        if trade.strategy == "motor_5_mm"
+        else trade.filled_count
+        if trade.filled_count is not None
+        else trade.count
+    )
     side = trade.side
     if trade.action == "sell":
         side = "no" if trade.side == "yes" else "yes"
@@ -136,7 +146,7 @@ def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int, int]:
     return -price * count - fees, fees
 
 
-def _leg_pnl_cents(trade: Trade, result: str) -> int:
+def _leg_pnl_cents(trade: Trade, result: str) -> int | Fraction:
     """Compat: solo el PnL (lo consumen tests y análisis)."""
     return _leg_pnl_and_fees_cents(trade, result)[0]
 
@@ -240,7 +250,10 @@ class SettlementPoller:
                     if row is None or row.status != "filled":
                         continue  # carrera benigna: otro proceso la cerró
                     pnl, fee = _leg_pnl_and_fees_cents(row, resolutions[t.id])  # type: ignore[index]
-                    row.pnl_cents = pnl
+                    # Guardar precisión antes de ofrecer el piso en cents a lectores
+                    # legacy: éstos nunca sobreestiman beneficios ni ocultan pérdidas.
+                    row.pnl_usd_fp = precise_usd(pnl)
+                    row.pnl_cents = floor(pnl)
                     # Solo si falta: nunca pisar un fee ya registrado (M3 lo ajusta por
                     # tramos al cerrar por CLV; sobrescribirlo rompería esa contabilidad).
                     if row.fees_cents is None:

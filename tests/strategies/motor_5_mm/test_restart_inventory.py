@@ -145,8 +145,10 @@ async def test_resting_partial_then_cancel_race_recovers_actual_fill_after_resta
         session.add(_trade(status="pending", filled_count=0))
         session.commit()
     report = await MMReconciler(Client()).reconcile(live_coids={"m5mm-restart"})
-    assert not report.complete  # El fill resting pausa; nunca se cotiza con cero ficticio.
-    assert incident_status()[0]
+    assert report.complete  # El parcial confirmado se aplica antes de cotizar.
+    live = Motor5Engine(trading_enabled=True)
+    assert live._apply_settled_fills() == 1
+    assert live._inventory.net("KXMLBGAME-E1-YES") == 2
     with get_session() as session:
         row = session.exec(select(Trade)).one()
         assert row.status == "pending" and row.filled_count == 2
@@ -158,5 +160,4 @@ async def test_resting_partial_then_cancel_race_recovers_actual_fill_after_resta
     assert restarted._apply_settled_fills() == 1
     assert restarted._apply_settled_fills() == 0
     assert restarted._inventory.net("KXMLBGAME-E1-YES") == 3
-    # Una conciliación posterior no autoriza a borrar el incidente anterior.
-    assert incident_status()[0]
+    assert incident_status() == (False, None)

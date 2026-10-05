@@ -2,31 +2,19 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 
-_MAX_COUNT = 2**63 - 1  # SQLite y el ledger actual sólo representan contratos enteros.
+from src.math.quantities import contract_count
+
 COUNT_QUARANTINE_NOTE = "[m5_count_quarantined]"
 
 
-def parse_count(value: object) -> int | None:
-    """Fixed point entero, finito y no negativo; fracciones requieren otro ledger."""
-    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
-        return None
-    text = str(value)
-    if len(text) > 64:
-        return None
-    try:
-        count = Decimal(text)
-    except InvalidOperation:
-        return None
-    if not count.is_finite() or not 0 <= count <= _MAX_COUNT:
-        return None
-    if count != count.to_integral_value():
-        return None
-    return int(count)
+def parse_count(value: object) -> Fraction | None:
+    """Fixed point exacto, hasta centésimas; más precisión exige cuarentena."""
+    return contract_count(value)
 
 
-def _count_field(order: dict, name: str) -> int | None:
+def _count_field(order: dict, name: str) -> Fraction | None:
     fixed = f"{name}_fp"
     value = parse_count(order[fixed]) if fixed in order else parse_count(order.get(name))
     if value is None:
@@ -37,7 +25,7 @@ def _count_field(order: dict, name: str) -> int | None:
     return value
 
 
-def filled_count(order: object) -> int | None:
+def filled_count(order: object) -> Fraction | None:
     """Cantidad reportada sin convertir una omisión o fracción a cero."""
     return _count_field(order, "fill_count") if isinstance(order, dict) else None
 
@@ -46,7 +34,7 @@ def unrepresentable_fill(order: object, *, count: int) -> bool:
     """Evidencia explícita que no puede desaparecer con una lectura posterior.
 
     Un ack sin cantidades no acredita un fill ni un cero y sigue reintentable.
-    Un campo presente fraccionario, contradictorio o fuera del intent exige
+    Un campo presente con precisión no soportada, contradictorio o fuera del intent exige
     cuarentena durable; el caller primero debe correlacionar la identidad.
     """
     if not isinstance(order, dict) or not any(
@@ -63,7 +51,7 @@ def terminal_fill_count(
     order_id: str,
     client_order_id: str | None = None,
     count: int | None = None,
-) -> int | None:
+) -> Fraction | None:
     """Fill terminal confirmado por identidad; None conserva la incertidumbre.
 
     Un order_id exacto permite correlacionar respuestas antiguas sin coid. Si la

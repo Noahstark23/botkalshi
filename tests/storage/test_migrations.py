@@ -94,3 +94,28 @@ def test_migration_skips_non_sqlite(tmp_path):
     with patch("src.storage.models.get_settings", return_value=settings):
         models.apply_migrations(engine)  # no-op, no debe tocar el engine SQLite
     # edge_windows ni siquiera existe → si hubiera intentado ALTER, habría lanzado.
+
+
+def test_fractional_columns_preserve_legacy_fills_and_are_idempotent(tmp_path):
+    engine, settings = _sqlite_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE trades (id INTEGER PRIMARY KEY, count INTEGER, filled_count INTEGER, pnl_cents INTEGER)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO trades (count, filled_count, pnl_cents) VALUES (10, 3, -5)"
+        )
+        conn.exec_driver_sql("CREATE TABLE mm_quotes (id INTEGER PRIMARY KEY, inventory INTEGER)")
+        conn.exec_driver_sql(
+            "CREATE TABLE mm_funnel_snapshots (id INTEGER PRIMARY KEY, inventory_abs INTEGER)"
+        )
+    with patch("src.storage.models.get_settings", return_value=settings):
+        models.apply_migrations(engine)
+        models.apply_migrations(engine)
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp FROM trades"
+        ).one()
+    assert row == (10, 3, -5, None, None)
+    assert "inventory_fp" in _columns(engine, "mm_quotes")
+    assert "inventory_abs_fp" in _columns(engine, "mm_funnel_snapshots")

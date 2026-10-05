@@ -37,12 +37,17 @@ from sqlmodel import col, select
 
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import Trade, get_session
+from src.strategies.motor_5_mm.ledger import confirmed_fill
 
 
 def _fee_for(trade: Trade) -> int:
     """El MISMO cálculo que usó el settlement como fallback (settlement.py)."""
     price = trade.fill_price_cents or trade.price_cents
     count = trade.filled_count if trade.filled_count is not None else trade.count
+    if trade.strategy == "motor_5_mm":
+        count = confirmed_fill(trade)
+        if count is None or not 0 < count <= trade.count:
+            raise ValueError("M5 sin cantidad confirmada válida; no se infiere count completo")
     if trade.action == "sell":
         price = 100 - price
     return kalshi_fee_cents(count, price)

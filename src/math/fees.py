@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from fractions import Fraction
 
+from src.math.quantities import contract_count
+
 
 def _multiplier(value: int | float | str | Fraction) -> Fraction:
     """Normaliza M sin introducir error binario antes del ceil por orden."""
@@ -37,7 +39,7 @@ def maker_fee_multiplier_for_ticker(ticker: str, *, as_of: datetime | None = Non
 
 
 def kalshi_fee_cents(
-    count: int,
+    count: int | Fraction,
     price_cents: int,
     *,
     fee_multiplier: int | float | str | Fraction = 1,
@@ -49,10 +51,8 @@ def kalshi_fee_cents(
     0.07 × count × P × (1 − P), con P en dólares. En centavos enteros eso es:
         fee_cents = ceil(7 * count * price_cents * (100 - price_cents) / 10_000)
 
-    La implementación usa aritmética entera equivalente para evitar bugs de
-    float precision en boundary cases:
-        numerator = 7 * count * price_cents * (100 - price_cents)
-        return (numerator + 9_999) // 10_000
+    La implementación usa fracciones exactas y redondea una sola vez al final;
+    evita errores de float y conserva ejecuciones de centésimas de contrato.
 
     NOTA (fix auditoría 2026-07-01): la versión anterior dividía por 1_000_000,
     lo que produce el fee en DÓLARES ceileados pero etiquetado como centavos
@@ -86,8 +86,10 @@ def kalshi_fee_cents(
         >>> kalshi_fee_cents(100, 100)
         0
     """
-    if count < 0:
-        raise ValueError(f"count debe ser >= 0, got {count}")
+    parsed_count = contract_count(count)
+    if parsed_count is None:
+        raise ValueError("count inválido o con más de dos decimales")
+    count = parsed_count
     if price_cents < 0:
         raise ValueError(f"price_cents debe ser >= 0, got {price_cents}")
     if price_cents > 100:
@@ -99,11 +101,12 @@ def kalshi_fee_cents(
     multiplier = _multiplier(fee_multiplier)
     numerator = 7 * count * price_cents * (100 - price_cents) * multiplier.numerator
     denominator = 10_000 * multiplier.denominator
-    return (numerator + denominator - 1) // denominator
+    fee = numerator / denominator
+    return -(-fee.numerator // fee.denominator)
 
 
 def kalshi_maker_fee_cents(
-    count: int,
+    count: int | Fraction,
     price_cents: int,
     *,
     fee_multiplier: int | float | str | Fraction = 1,
@@ -132,8 +135,10 @@ def kalshi_maker_fee_cents(
         >>> kalshi_maker_fee_cents(0, 50)
         0
     """
-    if count < 0:
-        raise ValueError(f"count debe ser >= 0, got {count}")
+    parsed_count = contract_count(count)
+    if parsed_count is None:
+        raise ValueError("count inválido o con más de dos decimales")
+    count = parsed_count
     if price_cents < 0:
         raise ValueError(f"price_cents debe ser >= 0, got {price_cents}")
     if price_cents > 100:
@@ -145,4 +150,5 @@ def kalshi_maker_fee_cents(
     multiplier = _multiplier(fee_multiplier)
     numerator = 7 * count * price_cents * (100 - price_cents) * multiplier.numerator
     denominator = 40_000 * multiplier.denominator
-    return (numerator + denominator - 1) // denominator
+    fee = numerator / denominator
+    return -(-fee.numerator // fee.denominator)

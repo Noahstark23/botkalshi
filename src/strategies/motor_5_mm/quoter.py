@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from fractions import Fraction
 
 from src.math.fees import (
     kalshi_fee_cents,
@@ -50,7 +51,7 @@ def compute_quote(
     *,
     half_spread_cents: int,
     size_contracts: int,
-    inventory_contracts: int,
+    inventory_contracts: int | Fraction,
     max_inventory_contracts: int,
     best_yes_bid: int | None,
     best_yes_ask: int | None,
@@ -84,10 +85,16 @@ def compute_quote(
     if bid >= ask:
         return None, "degenerate"
     # Tope de inventario → one-sided (solo el lado que reduce |net|).
-    if inventory_contracts >= max_inventory_contracts:
+    buy_room = math.floor(max_inventory_contracts - inventory_contracts)
+    sell_room = math.floor(max_inventory_contracts + inventory_contracts)
+    if buy_room < 1:
         bid = None
-    elif inventory_contracts <= -max_inventory_contracts:
+    if sell_room < 1:
         ask = None
+    rooms = ([buy_room] if bid is not None else []) + ([sell_room] if ask is not None else [])
+    if not rooms or size_contracts <= 0:
+        return None, "inventory_limit"
+    size_contracts = min(size_contracts, *rooms)
     if bid is not None and ask is not None:
         captured = ask - bid
         if fees_as_maker:

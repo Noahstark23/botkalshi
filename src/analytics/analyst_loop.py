@@ -69,7 +69,7 @@ class MMAgg:
     quoted: int  # quotes emitidas (suma)
     fills: int  # fills hipotéticos (suma)
     mtm_last_cents: int  # PnL mark-to-market neto de fees, último tick
-    inventory_abs_last: int  # Σ|net| simulado, último tick
+    inventory_abs_last: float  # diagnóstico; el ledger conserva la cantidad exacta
 
 
 # =====================================================
@@ -127,12 +127,20 @@ def aggregate_mm(session: Session, since: datetime) -> MMAgg:
     )
     if not rows:
         return MMAgg(0, 0, 0, 0, 0)
+    from src.math.quantities import contract_count
+
+    latest = rows[-1]
+    inventory = contract_count(
+        latest.inventory_abs_fp if latest.inventory_abs_fp is not None else latest.inventory_abs
+    )
+    if inventory is None:
+        raise ValueError("snapshot M5 con cantidad inválida")
     return MMAgg(
         cycles=len(rows),
         quoted=sum(r.quoted for r in rows),
         fills=sum(r.fills for r in rows),
         mtm_last_cents=rows[-1].mtm_pnl_cents,
-        inventory_abs_last=rows[-1].inventory_abs,
+        inventory_abs_last=float(inventory),
     )
 
 

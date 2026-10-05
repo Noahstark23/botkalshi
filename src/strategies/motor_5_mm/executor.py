@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import ClassVar
 
 from loguru import logger
@@ -42,6 +43,7 @@ from src.risk.exposure import open_risk_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
 from src.strategies.motor_5_mm.incidents import incident_status, latch_incident
+from src.strategies.motor_5_mm.ledger import confirmed_fill, record_fill
 from src.strategies.motor_5_mm.order_state import (
     COUNT_QUARANTINE_NOTE,
     filled_count,
@@ -88,6 +90,7 @@ class Motor5Executor:
         self._max_exposure_usd = max_exposure_usd
         self._live: dict[str, dict[str, LiveOrder]] = {}  # ticker → {action: LiveOrder}
         self.corrupted: set[str] = set()  # bloqueo local enclavado; conciliar no lo levanta
+        self._cancel_fill_revision = 0
 
     def _lock(self, ticker: str) -> asyncio.Lock:
         return self._locks.setdefault(ticker, asyncio.Lock())
@@ -142,6 +145,7 @@ class Motor5Executor:
         desenlace ('synced' | 'corrupted' | 'risk_blocked' | 'error')."""
         ticker = quote.ticker
         async with self._lock(ticker):
+            inventory_revision = self._cancel_fill_revision
             if ticker in self.corrupted:
                 # Estado en duda: NO se cotiza encima. La conciliación puede confirmar
                 # el cierre, pero no levanta automáticamente este bloqueo enclavado.
@@ -165,6 +169,10 @@ class Motor5Executor:
                     ok = await self._cancel(ticker, current)
                     if not ok:
                         return "corrupted"  # tampoco emitir el lado opuesto del ticker
+                if self._cancel_fill_revision != inventory_revision:
+                    # La quote se calculó ANTES del cancel. Reconciliar y volver a
+                    # calcular inventario/tamaño en el próximo tick antes de reemplazar.
+                    return "risk_blocked"
                 placed = await self._place(ticker, action, price, count)
                 if placed is None:
                     outcome = "risk_blocked" if ticker not in self.corrupted else "corrupted"
@@ -344,6 +352,8 @@ class Motor5Executor:
             logger.warning(f"motor5.exec.cancel_unconfirmed {ticker} → conserva seguimiento")
             return False
         self.forget_confirmed({live.client_order_id})
+        if filled:
+            self._cancel_fill_revision += 1
         return True
 
     def _quarantine_unrepresentable_order(
@@ -400,7 +410,7 @@ class Motor5Executor:
                     ).first()
                     if row is None or row.strategy != STRATEGY or row.status != "pending":
                         raise RuntimeError("no se puede conservar fill observado M5")
-                    row.filled_count = max(row.filled_count or 0, observed)
+                    record_fill(row, max(confirmed_fill(row) or 0, observed))
                     session.add(row)
                     session.commit()
             except Exception:
@@ -526,7 +536,7 @@ class Motor5Executor:
         coid: str,
         status: str,
         *,
-        filled_count: int | None = None,
+        filled_count: int | Fraction | None = None,
         note: str | None = None,
     ) -> bool:
         try:
@@ -538,19 +548,19 @@ class Motor5Executor:
                     return False  # requiere revisión de evidencia no representable
                 if filled_count is not None and (
                     filled_count > row.count
-                    or (row.filled_count is not None and filled_count < row.filled_count)
+                    or (confirmed_fill(row) is not None and filled_count < confirmed_fill(row))
                 ):
                     return False
                 if row.status != "pending":
                     # Una lectura tardía nunca revierte settlement ni borra un fill
                     # previo. Sólo se tolera la confirmación idempotente exacta.
                     return row.status == status and (
-                        row.filled_count == filled_count
-                        or (status == "cancelled" and row.filled_count in (None, 0))
+                        confirmed_fill(row) == filled_count
+                        or (status == "cancelled" and confirmed_fill(row) in (None, 0))
                     )
                 row.status = status
                 if filled_count is not None:
-                    row.filled_count = filled_count
+                    record_fill(row, filled_count)
                 if note:
                     row.notes = f"{row.notes or ''} | {note}"[:500]
                 s.add(row)

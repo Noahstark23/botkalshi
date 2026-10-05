@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 
 from src.strategies.motor_5_mm.quoter import QuoteSet
 
@@ -32,7 +33,7 @@ class ShadowFill:
     ticker: str
     side: str  # "buy" (nuestro bid llenado) | "sell" (nuestro ask llenado)
     price_cents: int  # el precio de NUESTRA quote (a eso nos habrían llenado)
-    count: int
+    count: int | Fraction  # F1 produce enteros; el inventario live también recibe fracciones.
     rule: str  # evidencia del cruce, p.ej. "ask 38 < bid 40"
     observed_depth: Decimal | None = None  # size fixed-point del BBO que cruzó la quote
 

@@ -1032,7 +1032,7 @@ class RiskManager:
             mark = RiskManager._marks.get((t.ticker, t.side))
             if mark is None or (now - mark[1]).total_seconds() > ttl:
                 continue
-            count = t.filled_count if t.filled_count is not None else t.count
+            count = exposure_count(t)
             unrealized_cents += (mark[0] - t.price_cents) * count
             covered += 1
         unrealized_usd = unrealized_cents / 100.0

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+from math import ceil
+
 from src.storage.models import Trade
+from src.strategies.motor_5_mm.ledger import confirmed_fill
 from src.strategies.motor_5_mm.order_state import COUNT_QUARANTINE_NOTE
 
 MM_STRATEGY = "motor_5_mm"
@@ -32,7 +36,7 @@ def contract_risk_cents(*, action: str, side: str, price_cents: int) -> int:
     return price if action == "buy" else 100 - price
 
 
-def exposure_count(trade: Trade) -> int:
+def exposure_count(trade: Trade) -> int | Fraction:
     """Pending reserva íntegro; filled M5 exige cantidad confirmada persistida.
 
     Los FOK/IOC de otros motores conservan la semántica legacy documentada del
@@ -43,9 +47,13 @@ def exposure_count(trade: Trade) -> int:
         # que la reserva original alcanza mientras el ledger está en cuarentena.
         raise UnknownExposureError("M5 con cantidad en cuarentena")
     count = _integer(trade.count, minimum=1, field="count")
-    filled = trade.filled_count
+    try:
+        filled = confirmed_fill(trade) if trade.strategy == MM_STRATEGY else trade.filled_count
+    except ValueError as exc:
+        raise UnknownExposureError("cantidad M5 persistida inválida") from exc
     if filled is not None:
-        filled = _integer(filled, minimum=0, field="filled_count")
+        if trade.strategy != MM_STRATEGY:
+            filled = _integer(filled, minimum=0, field="filled_count")
         if filled > count:
             raise UnknownExposureError("filled_count excede count")
     if trade.status == "pending":
@@ -60,9 +68,12 @@ def exposure_count(trade: Trade) -> int:
 
 
 def open_risk_cents(trade: Trade) -> int:
-    return contract_risk_cents(
-        action=trade.action, side=trade.side, price_cents=trade.price_cents
-    ) * exposure_count(trade)
+    # El headroom legacy está en centavos enteros: reservar hacia arriba, jamás
+    # perder la exposición de una fracción. La cantidad original sigue exacta.
+    return ceil(
+        contract_risk_cents(action=trade.action, side=trade.side, price_cents=trade.price_cents)
+        * exposure_count(trade)
+    )
 
 
 def committed_risk_cents(trade: Trade) -> int:

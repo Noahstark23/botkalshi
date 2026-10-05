@@ -109,6 +109,9 @@ class Trade(SQLModel, table=True):
     # El RiskManager usa filled_count (si está) para la exposición de filas 'filled':
     # una resting de 1000 con 500 llenados (resto cancelado) expone 500, no 1000.
     filled_count: int | None = None
+    filled_count_fp: str | None = Field(default=None, max_length=32)
+    # Importe calculado a precisión de 0.0001 USD; pnl_cents es su piso legacy.
+    pnl_usd_fp: str | None = Field(default=None, max_length=40)
 
     # Timestamps
     placed_at: datetime = Field(default_factory=_utc_now, index=True)
@@ -309,6 +312,7 @@ class MMQuote(SQLModel, table=True):
     yes_bid: int | None = None  # top-of-book al momento de cotizar (contexto del quote)
     yes_ask: int | None = None
     inventory: int = 0  # net simulado ANTES del quote (explica el skew aplicado)
+    inventory_fp: str | None = Field(default=None, max_length=40)
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
 
@@ -468,6 +472,7 @@ class MMFunnelSnapshot(SQLModel, table=True):
     skip_pregame: int = 0
     fills: int = 0
     inventory_abs: int = 0  # Σ|net| simulado
+    inventory_abs_fp: str | None = Field(default=None, max_length=40)
     mtm_pnl_cents: int = 0  # PnL mark-to-market neto de fees (el número del gate)
     created_at: datetime = Field(default_factory=_utc_now, index=True)
 
@@ -574,6 +579,10 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("trades", "closed_by_clv", "BOOLEAN DEFAULT 0"),  # Motor 3: cierre anticipado CLV
     ("portfolio_positions", "peak_bid_cents", "INTEGER"),  # Motor 3 FASE 2: trailing stop
     ("trades", "filled_count", "INTEGER"),  # Motor 5 F2: fills parciales de resting orders
+    ("trades", "filled_count_fp", "VARCHAR(32)"),
+    ("trades", "pnl_usd_fp", "VARCHAR(40)"),
+    ("mm_quotes", "inventory_fp", "VARCHAR(40)"),
+    ("mm_funnel_snapshots", "inventory_abs_fp", "VARCHAR(40)"),
     # Motor 5 fair-at-fill: sin el fair del momento del fill, el A/B no puede separar
     # spread capturado de selección adversa (el dato que faltaba para graduar/archivar).
     ("mm_shadow_fills", "quote_fair_prob", "FLOAT"),

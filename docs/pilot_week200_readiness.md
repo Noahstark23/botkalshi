@@ -36,10 +36,20 @@ El 5/10 Noel confirmó expresamente que todavía no ha hecho el depósito.
   simulados. Se reprodujo la contaminación de 6 contratos confirmados con 9
   simulados, que daban un neto incorrecto de 15. Las cohortes de ejecución tienen
   identidad separada; la identidad histórica shadow se conserva.
-- Se verificó localmente la recuperación de compras y ventas de cantidad entera
-  tras reiniciar, sin duplicación. Una ejecución parcial resting de 2 contratos
-  seguida de otro fill durante el cancel recupera 3, conserva el incidente y
-  requiere revisión; nunca se transforma automáticamente en permiso de cotizar.
+- El ledger M5 representa cantidades exactas en centésimas de contrato. Recupera
+  compras, ventas y ejecuciones parciales después de reiniciar sin duplicarlas.
+  Una ejecución confirmada durante una cancelación obliga a recalcular inventario
+  y cotización antes del reemplazo. Una orden pendiente conserva la reserva de
+  riesgo completa, aunque sólo se haya ejecutado una fracción.
+- La reconstrucción del inventario es atómica: una fila inválida, una cantidad
+  regresiva, una identidad cambiada o una fila desaparecida bloquean nuevas
+  cotizaciones sin publicar inventario incompleto. Los incidentes y cuarentenas
+  anteriores no se levantan automáticamente al incorporar soporte de fracciones.
+- Los campos precisos se agregan con migraciones idempotentes sin reescribir filas
+  anteriores. El PnL calculado conserva cuatro decimales de dólar para precios en
+  centavos y cantidades en centésimas; los lectores legacy reciben centavos
+  redondeados hacia abajo. Esto no acredita costos, comisiones ni beneficios reales
+  de la cuenta: todavía requieren conciliación con Kalshi.
 - Se integró el reporte de lectura de `b176507`: saldo antes/después, órdenes,
   posiciones, fills y liquidaciones con subcuenta explícita y paginación acotada.
   También conserva la separación de depósitos y beneficio en la medición.
@@ -55,10 +65,10 @@ oportunidades rentables. La captura de ambos deportes no valida ninguna estrateg
 
 ## Verificación del candidato
 
-- macOS, Python 3.12.14: **2.275 pruebas aprobadas**, 31 advertencias
-  (`macos-restart-suite.log`). El grupo M5 aprobó 273 pruebas.
-- Ubuntu 24.04.5 AMD64, Python 3.12.3, emulado localmente: **2.273 aprobadas,
-  2 omitidas**, 31 advertencias (`ubuntu-amd64-suite.log`). Dependencias de
+- macOS, Python 3.12.14: **2.370 pruebas aprobadas**, 31 advertencias
+  (`macos-fractional-suite.log`).
+- Ubuntu 24.04.5 AMD64, Python 3.12.3, emulado localmente: **2.368 aprobadas,
+  2 omitidas**, 31 advertencias (`ubuntu-fractional-suite.log`). Dependencias de
   `infra/digitalocean-runtime/requirements.lock` instaladas con verificación de
   hashes; todas sus versiones contrastadas tras instalar las herramientas de QA.
   La ejecución de tests no tuvo red ni credenciales. Las dos pruebas omitidas
@@ -66,16 +76,9 @@ oportunidades rentables. La captura de ambos deportes no valida ninguna estrateg
 - La validación estática de servicio y timer del lector pasó con systemd 255 de
   Ubuntu, sin iniciar unidades. No acredita permisos, credenciales, recursos ni
   funcionamiento de esos servicios en el droplet.
-- La versión anterior `01b84b1`, en contenedor Linux ARM64 sin red, con el código
-  montado en sólo lectura:
-  **2.268 aprobadas, 2 omitidas**, 31 advertencias. Las dos omitidas comprueban
-  secretos versionados mediante Git, que no está disponible dentro de la imagen;
-  esas mismas pruebas sí aprobaron en macOS.
-- La primera ejecución Linux agotó el espacio temporal limitado a 256 MiB. Se
-  repitió con un volumen temporal desechable y aprobó; no se alteró código para
-  ocultar los errores de espacio. Esto no valida el servidor Ubuntu AMD64.
-- Ruff aprobó `src/`, `tests/` y los cuatro scripts del lector. El formato de
-  `src/` y `tests/`, y `git diff --check`, aprobaron. Las advertencias de pytest
+- Ruff aprobó `src/`, `tests/`, el cálculo de backfill y los cuatro scripts del
+  lector. El formato de los archivos de implementación modificados y
+  `git diff --check` aprobaron. Las advertencias de pytest
   incluyen deprecaciones y una corrutina de alertas sin esperar en una prueba
   anterior de M1; no se presentan como resueltas.
 - Los hashes de los 22 archivos previos se conservan en el checkout original.
@@ -108,17 +111,15 @@ antes de cualquier uso financiero.
    con Ubuntu AMD64 y el lock ya se comprobó; falta probar el host real. La suite
    local usa transporte simulado y SQLite temporal; no equivale a aceptación de
    órdenes, ejecución demo, producción ni rentabilidad.
-3. Adaptar el ledger M5 a ejecuciones fraccionarias y conciliar la exposición de
-   la cuenta. El reinicio para cantidades enteras y el fill durante cancelación
-   ya se verificaron. El lector admite fracciones, pero el ledger de ejecución
-   todavía sólo representa enteros y los casos fraccionarios quedan bloqueados.
+3. Conciliar la exposición, los precios y las comisiones reales de la cuenta.
+   El soporte local de cantidades fraccionarias de M5 ya está implementado y
+   probado; todavía no se instaló ni se contrastó con órdenes de esa cuenta.
    La [guía vigente de Kalshi](https://docs.kalshi.com/getting_started/fixed_point_migration)
    confirma que los fills pueden ser fraccionarios aunque la orden use contratos
    enteros. La consulta pública del 5/10 encontró 14 mercados MLB y 32 NFL;
    ninguno incluyó `fractional_trading_enabled`, cuya ausencia no prueba que las
    fracciones estén desactivadas. Se conserva `public-market-capabilities.json`.
-   Los parsers legacy
-   de otros motores todavía requieren revisión; el perfil mantiene sus órdenes
+   Los parsers legacy de otros motores todavía requieren revisión; el perfil mantiene sus órdenes
    apagadas. La guarda reduce_only limita la orden en el exchange, no convierte
    una conciliación incompleta en una cartera correcta.
 4. Comprobar suministro real de cuotas, comisiones de cada serie y resultados
@@ -132,6 +133,14 @@ US$200 es la asignación propuesta, no una garantía de pérdida máxima proporc
 por este parche. Los stops heredados más estrictos siguen vigentes. No se eleva
 el riesgo para forzar actividad ni se promete rentabilidad o una fecha de primera
 operación antes de completar las verificaciones.
+
+## Compatibilidad de los datos
+
+Las migraciones se probaron sólo sobre bases temporales; no se tocó producción.
+Una vez que una base contenga fills fraccionarios, no debe abrirse con ejecutores
+anteriores que interpreten `filled_count=NULL` como la cantidad solicitada entera.
+Un rollback exige una versión compatible y una recuperación de datos verificada;
+volver al binario anterior sobre la misma base no es un rollback validado.
 
 ## Referencias verificadas
 
