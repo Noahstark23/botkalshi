@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,55 @@ def fake_key(tmp_path: Path) -> Path:
     p = tmp_path / "key.pem"
     p.write_text("dummy")
     return p
+
+
+@pytest.mark.parametrize("encoding", ["pem", "escaped", "base64"])
+def test_settings_accepts_ed25519_through_shared_key_parser(encoding, tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    from src.auth.signer import KalshiSigner
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    raw = {
+        "pem": pem,
+        "escaped": pem.replace("\n", "\\n"),
+        "base64": base64.b64encode(pem.encode()).decode(),
+    }[encoding]
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "offline-ed25519")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", raw)
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(tmp_path / "absent.pem"))
+    settings = Settings(_env_file=None)
+    signer = KalshiSigner(
+        api_key_id=settings.KALSHI_API_KEY_ID, private_key_pem=settings.clave_privada_env()
+    )
+    headers = signer.sign("GET", "/trade-api/v2/portfolio/balance")
+    message = (headers["KALSHI-ACCESS-TIMESTAMP"] + "GET/trade-api/v2/portfolio/balance").encode()
+    key.public_key().verify(base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"]), message)
+    assert pem.splitlines()[1] not in repr(settings)
+
+
+def test_settings_rejects_unsupported_algorithm_through_shared_parser(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed448
+
+    pem = (
+        ed448.Ed448PrivateKey.generate()
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "offline-ed448")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", pem)
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(tmp_path / "absent.pem"))
+    with pytest.raises(ValidationError, match="no es RSA ni Ed25519"):
+        Settings(_env_file=None)
 
 
 def test_week200_capture_profile_has_both_leagues_and_no_order_executor(fake_key):

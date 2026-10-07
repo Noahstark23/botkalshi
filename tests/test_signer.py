@@ -1,15 +1,17 @@
-"""Tests del signer RSA-PSS."""
+"""Firmas verificables RSA-PSS y Ed25519 con material temporal, sin API."""
 
 from __future__ import annotations
 
 import base64
+import traceback
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa, x25519
 
-from src.auth.signer import KalshiSigner
+from src.auth.signer import KalshiSigner, cargar_clave_pem
 
 
 @pytest.fixture
@@ -114,3 +116,103 @@ def test_signature_changes_per_call(temp_key: Path):
 
     assert sig1["KALSHI-ACCESS-TIMESTAMP"] != sig2["KALSHI-ACCESS-TIMESTAMP"]
     assert sig1["KALSHI-ACCESS-SIGNATURE"] != sig2["KALSHI-ACCESS-SIGNATURE"]
+
+
+@pytest.fixture(params=["rsa", "ed25519"])
+def supported_key(request):
+    if request.param == "ed25519":
+        return ed25519.Ed25519PrivateKey.generate()
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _pem(key, *, encryption=None):
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        encryption or serialization.NoEncryption(),
+    )
+
+
+def _verify(key, signature, message):
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        key.public_key().verify(signature, message)
+    else:
+        key.public_key().verify(
+            signature,
+            message,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
+
+
+@pytest.mark.parametrize("source", ["file", "pem", "escaped", "base64"])
+def test_both_algorithms_sign_exact_timestamp_method_and_path(
+    supported_key, source, tmp_path, monkeypatch
+):
+    pem = _pem(supported_key)
+    if source == "file":
+        path = tmp_path / "temporary.pem"
+        path.write_bytes(pem)
+        signer = KalshiSigner(path, "offline-key-id")
+    else:
+        raw = {
+            "pem": pem,
+            "escaped": pem.decode().replace("\n", "\\n"),
+            "base64": base64.b64encode(pem).decode(),
+        }[source]
+        signer = KalshiSigner(api_key_id="offline-key-id", private_key_pem=raw)
+    monkeypatch.setattr("src.auth.signer.time.time", lambda: 1_700_000_000.125)
+    headers = signer.sign("get", "/trade-api/v2/portfolio/orders?limit=5")
+    assert headers["KALSHI-ACCESS-TIMESTAMP"] == "1700000000125"
+    assert headers["KALSHI-ACCESS-KEY"] == "offline-key-id"
+    signature = base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"], validate=True)
+    message = b"1700000000125GET/trade-api/v2/portfolio/orders"
+    _verify(supported_key, signature, message)
+    for wrong in (message + b"?limit=5", message.replace(b"GET", b"POST"), b"0" + message):
+        with pytest.raises(InvalidSignature):
+            _verify(supported_key, signature, wrong)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ec.generate_private_key(ec.SECP256R1()),
+        ed448.Ed448PrivateKey.generate,
+        x25519.X25519PrivateKey.generate,
+    ],
+)
+def test_other_key_algorithms_are_rejected(factory):
+    with pytest.raises(ValueError, match="no es RSA ni Ed25519"):
+        cargar_clave_pem(_pem(factory()), origen="test temporal")
+
+
+def test_encrypted_private_keys_are_rejected(supported_key):
+    with pytest.raises(ValueError, match="no esté encriptada"):
+        cargar_clave_pem(
+            _pem(supported_key, encryption=serialization.BestAvailableEncryption(b"test-only")),
+            origen="test temporal",
+        )
+
+
+def test_public_key_is_not_a_signing_private_key(supported_key):
+    public = supported_key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    with pytest.raises(ValueError, match="No se pudo cargar"):
+        cargar_clave_pem(public, origen="test temporal")
+
+
+def test_parser_error_never_echoes_crypto_exception_payload(monkeypatch, supported_key):
+    def invalid(*args, **kwargs):
+        raise ValueError("sensitive-fixture-never-log")
+
+    monkeypatch.setattr("src.auth.signer.serialization.load_pem_private_key", invalid)
+    with pytest.raises(ValueError) as exc:
+        cargar_clave_pem(_pem(supported_key), origen="test temporal")
+    assert "sensitive-fixture-never-log" not in str(exc.value)
+    assert "sensitive-fixture-never-log" not in "".join(traceback.format_exception(exc.value))
+
+
+def test_non_utf8_pem_has_sanitized_validation_error():
+    with pytest.raises(ValueError, match="UTF-8"):
+        cargar_clave_pem(b"\xff", origen="test temporal")

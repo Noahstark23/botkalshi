@@ -1,12 +1,12 @@
 """
-Autenticación RSA-PSS para Kalshi API v2.
+Autenticación RSA-PSS o Ed25519 para Kalshi API v2.
 
 Cada request requiere 3 headers:
     KALSHI-ACCESS-KEY:       UUID del API key (público)
     KALSHI-ACCESS-TIMESTAMP: timestamp en milisegundos
-    KALSHI-ACCESS-SIGNATURE: firma RSA-PSS de "{timestamp}{METHOD}{path}"
+    KALSHI-ACCESS-SIGNATURE: firma de "{timestamp}{METHOD}{path sin query}"
 
-Reference: https://trading-api.readme.io/reference/api-authentication-key-management
+Referencia: https://docs.kalshi.com/getting_started/quick_start_authenticated_requests
 """
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ import time
 from pathlib import Path
 
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
 _MARCADOR_PEM = "-----BEGIN"
+SigningPrivateKey = rsa.RSAPrivateKey | ed25519.Ed25519PrivateKey
 
 
 def normalizar_pem(raw: str) -> bytes:
@@ -72,31 +73,34 @@ def normalizar_pem(raw: str) -> bytes:
     return texto.encode("utf-8")
 
 
-def cargar_clave_pem(raw: str | bytes, *, origen: str) -> rsa.RSAPrivateKey:
-    """Normaliza, parsea y VALIDA material PEM → la clave RSA lista para firmar.
+def cargar_clave_pem(raw: str | bytes, *, origen: str) -> SigningPrivateKey:
+    """Normaliza, parsea y valida PEM → RSA fuerte o Ed25519 lista para firmar.
 
     Única puerta de entrada de una clave privada al proceso: la usan el signer y el
     validador de Settings, así el boot rechaza exactamente lo mismo que rechazaría el
-    primer request (RSA, ≥2048 bits) en vez de una aproximación — un PEM que pasa el
+    primer request (RSA ≥2048 bits o Ed25519) en vez de una aproximación — un PEM que pasa el
     boot y explota en el primer request es el peor de los dos mundos.
 
     `origen` describe DE DÓNDE vino ("env" o la ruta) solo para el mensaje de error;
     el material JAMÁS se incluye: un mensaje de error termina en los logs.
     """
-    crudo = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    try:
+        crudo = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    except UnicodeError:
+        raise ValueError(f"El material PEM desde {origen} no es UTF-8 válido.") from None
     pem = normalizar_pem(crudo)
     try:
         key = serialization.load_pem_private_key(pem, password=None)
     except Exception as e:
         raise ValueError(
             f"No se pudo cargar la key desde {origen}. "
-            f"Verifica formato PEM y que no esté encriptada. Error: {e}"
-        ) from e
+            f"Verifica formato PEM y que no esté encriptada. Error: {type(e).__name__}"
+        ) from None
 
-    if not isinstance(key, rsa.RSAPrivateKey):
-        raise ValueError(f"Key desde {origen} no es RSA (tipo: {type(key).__name__})")
+    if not isinstance(key, (rsa.RSAPrivateKey, ed25519.Ed25519PrivateKey)):
+        raise ValueError(f"Key desde {origen} no es RSA ni Ed25519 (tipo: {type(key).__name__})")
 
-    if key.key_size < 2048:
+    if isinstance(key, rsa.RSAPrivateKey) and key.key_size < 2048:
         raise ValueError(f"Key size {key.key_size} muy pequeño. Mínimo 2048 (recomendado 4096)")
 
     return key
@@ -134,7 +138,7 @@ class KalshiSigner:
             )
 
     @staticmethod
-    def _load_private_key(path: Path) -> rsa.RSAPrivateKey:
+    def _load_private_key(path: Path) -> SigningPrivateKey:
         """Cargar y validar private key desde archivo PEM."""
         if not path.exists():
             raise FileNotFoundError(f"Private key no encontrada: {path}")
@@ -148,7 +152,7 @@ class KalshiSigner:
 
         Args:
             method: HTTP method en mayúsculas (GET, POST, DELETE, etc.)
-            path: Path completo desde dominio, incluyendo query string si la hay
+            path: Path completo desde dominio; el query string se excluye de la firma
                   Ejemplo: "/trade-api/v2/portfolio/balance"
                   Ejemplo: "/trade-api/v2/markets?status=open&limit=100"
 
@@ -162,18 +166,26 @@ class KalshiSigner:
             raise ValueError("method requerido")
         if not path:
             raise ValueError("path requerido")
+        path_without_query = path.split("?", 1)[0]
+        if not path_without_query:
+            raise ValueError("path requerido")
 
         timestamp_ms = str(int(time.time() * 1000))
-        message = f"{timestamp_ms}{method.upper()}{path}".encode()
+        message = f"{timestamp_ms}{method.upper()}{path_without_query}".encode()
 
-        signature = self._private_key.sign(
-            message,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
+        # El tipo viene del parser criptográfico, no de la cabecera PEM (PKCS8
+        # puede contener cualquiera). Ed25519 firma el mensaje, sin pre-hash RSA.
+        if isinstance(self._private_key, ed25519.Ed25519PrivateKey):
+            signature = self._private_key.sign(message)
+        else:
+            signature = self._private_key.sign(
+                message,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
 
         return {
             "KALSHI-ACCESS-KEY": self.api_key_id,
