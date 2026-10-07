@@ -18,6 +18,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any
 
 import httpx
@@ -31,6 +32,7 @@ from tenacity import (
 
 from src.auth.signer import KalshiSigner
 from src.math.balance import available_cash_usd
+from src.math.quantities import contract_count, fixed_count
 from src.utils.config import get_settings
 
 
@@ -224,7 +226,7 @@ def _observed_count(value: object) -> Decimal:
 def _order_count(order: dict, name: str) -> Decimal:
     fixed = f"{name}_fp"
     value = _observed_count(order[fixed] if fixed in order else order.get(name))
-    if fixed in order and name in order and _observed_count(order[name]) != value:
+    if fixed in order and order.get(name) is not None and _observed_count(order[name]) != value:
         raise KalshiOrderConfirmationError("cantidades contradictorias")
     return value
 
@@ -333,7 +335,7 @@ def build_order_body(
     ticker: str,
     side: str,  # "yes" | "no"
     action: str,  # "buy" | "sell"
-    count: int,
+    count: int | Fraction,
     yes_price: int | None = None,
     no_price: int | None = None,
     client_order_id: str | None = None,
@@ -361,6 +363,9 @@ def build_order_body(
     """
     if action not in {"buy", "sell"}:
         raise ValueError("build_order_body: action debe ser buy o sell")
+    parsed_count = contract_count(count)
+    if parsed_count is None or parsed_count <= 0:
+        raise ValueError("build_order_body: cantidad positiva en centésimas requerida")
     if type(reduce_only) is not bool:
         raise ValueError("build_order_body: reduce_only debe ser bool")
     if reduce_only and (action != "sell" or time_in_force != "immediate_or_cancel" or post_only):
@@ -390,7 +395,9 @@ def build_order_body(
         # client_order_id es REQUERIDO en V2 (idempotencia); los callers siempre lo pasan.
         "client_order_id": client_order_id or str(uuid.uuid4()),
         "side": book_side,
-        "count": str(count),  # FixedPointCount: acepta "10"
+        "count": str(int(parsed_count))
+        if parsed_count.denominator == 1
+        else fixed_count(parsed_count),
         "price": f"{Decimal(price_cents) / 100:.2f}",
         "time_in_force": tif,
         # Cancela la pata taker si se auto-cruzaría (lo ya matcheado igual ejecuta).

@@ -38,6 +38,7 @@ def mock_runner_settings():
         s.MOTOR_1_ARBITRAGE_ENABLED = False
         s.MOTOR_2_SPORTSBOOK_ENABLED = False
         s.MOTOR_3_CLV_ENABLED = False
+        s.MOTOR_REST_ENABLED = False
         s.HEALTH_HOST = "0.0.0.0"
         s.HEALTH_PORT = 8080
         m.return_value = s
@@ -80,51 +81,41 @@ async def test_motor5_terminal_failure_propagates_to_supervisor(mock_runner_sett
 
 
 @pytest.mark.asyncio
-async def test_reconcile_on_boot_calls_initialize(mock_runner_settings):
-    """Durante boot, ArbitrageExecutor.initialize() debe ser invocado."""
+async def test_reconcile_on_boot_uses_read_only_function(mock_runner_settings):
+    """Recuperación independiente de construir un executor con permiso de órdenes."""
+    from src.storage.order_reconciliation import ReconciliationResult
+
+    mock_runner_settings.MOTOR_2_SPORTSBOOK_ENABLED = True
     with (
-        patch("src.runner.KalshiRestClient") as mock_rest_cls,
-        patch("src.runner.RiskManager"),
-        patch("src.runner.ArbitrageExecutor") as mock_exec_cls,
+        patch("src.runner.KalshiRestClient", return_value=AsyncMock()) as rest,
+        patch("src.runner.ArbitrageExecutor") as executor,
+        patch(
+            "src.runner.reconcile_pending_orders",
+            new=AsyncMock(return_value=ReconciliationResult()),
+        ) as reconcile,
     ):
-        mock_rest_cls.return_value.__aenter__ = AsyncMock(return_value=mock_rest_cls.return_value)
-        mock_rest_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        mock_executor = mock_exec_cls.return_value
-        mock_executor.initialize = AsyncMock()
-
-        runner = ProductionRunner()
-        await runner._reconcile_on_boot()
-
-        mock_executor.initialize.assert_called_once()
+        await ProductionRunner()._reconcile_on_boot()
+    reconcile.assert_awaited_once_with(
+        rest.return_value.__aenter__.return_value, strategies=("motor_2_consensus",)
+    )
+    executor.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_reconcile_failure_does_not_crash_boot(mock_runner_settings):
-    """
-    Si ArbitrageExecutor.initialize() lanza excepcion, _reconcile_on_boot
-    debe capturarla, registrarla en BotState.last_error, y NO re-levantar.
-
-    Un Kalshi flap al arranque NO debe impedir que el bot arranque.
-    """
+    """La telemetría arranca, pero una recuperación fallida pausa durablemente."""
+    mock_runner_settings.MOTOR_2_SPORTSBOOK_ENABLED = True
     with (
-        patch("src.runner.KalshiRestClient") as mock_rest_cls,
-        patch("src.runner.RiskManager"),
-        patch("src.runner.ArbitrageExecutor") as mock_exec_cls,
+        patch("src.runner.KalshiRestClient", return_value=AsyncMock()),
+        patch(
+            "src.runner.reconcile_pending_orders",
+            new=AsyncMock(side_effect=RuntimeError("Kalshi unreachable at boot")),
+        ),
+        patch("src.runner.engage_kill_switch") as pause,
     ):
-        mock_rest_cls.return_value.__aenter__ = AsyncMock(return_value=mock_rest_cls.return_value)
-        mock_rest_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        mock_executor = mock_exec_cls.return_value
-        mock_executor.initialize = AsyncMock(side_effect=RuntimeError("Kalshi unreachable at boot"))
-
-        runner = ProductionRunner()
-
-        # NO debe re-raise
-        await runner._reconcile_on_boot()
-
-        assert BotState.last_error is not None
-        assert "Reconcile" in BotState.last_error or "Kalshi" in BotState.last_error
+        await ProductionRunner()._reconcile_on_boot()
+    assert BotState.is_paused and "Kalshi" in BotState.last_error
+    pause.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -456,9 +447,10 @@ def test_supervisor_no_convierte_excepcion_de_task_en_exit_cero():
 @pytest.mark.asyncio
 async def test_reconcile_network_error_does_not_crash_boot(mock_runner_settings):
     """ConnectionError (red caida) tampoco debe crashear el bot."""
+    mock_runner_settings.MOTOR_2_SPORTSBOOK_ENABLED = True
     with (
         patch("src.runner.KalshiRestClient") as mock_rest_cls,
-        patch("src.runner.RiskManager"),
+        patch("src.runner.engage_kill_switch") as pause,
         patch("src.runner.ArbitrageExecutor"),
     ):
         mock_rest_cls.return_value.__aenter__ = AsyncMock(
@@ -470,6 +462,8 @@ async def test_reconcile_network_error_does_not_crash_boot(mock_runner_settings)
         await runner._reconcile_on_boot()
 
         assert BotState.last_error is not None
+        assert BotState.is_paused
+        pause.assert_called_once()
 
 
 @pytest.mark.asyncio

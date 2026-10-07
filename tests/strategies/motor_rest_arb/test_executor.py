@@ -50,7 +50,7 @@ def _filled_resp(count: int = 5, coid: str | None = None) -> dict:
 
 
 def _killed_resp(count: int = 5) -> dict:
-    return {"order": {"order_id": "OID2", "fill_count": 0, "remaining_count": count}}
+    return {"order": {"order_id": "OID2", "fill_count": 0, "remaining_count": 0}}
 
 
 @pytest.mark.asyncio
@@ -102,7 +102,17 @@ async def test_error_red_cheap_reconciles_filled_rolls_back_both():
     )
     # Reconciliación de 'yes': fuente 1 (get_orders executed) + fuente 2 (posición) → LLENA.
     client.get_orders = AsyncMock(
-        return_value={"orders": [{"status": "executed", "client_order_id": ""}]}
+        side_effect=lambda **kw: {
+            "orders": [
+                {
+                    "status": "executed",
+                    "fill_count_fp": "5.00",
+                    "client_order_id": client.place_order.call_args_list[1].kwargs[
+                        "client_order_id"
+                    ],
+                }
+            ]
+        }
     )
     client.get_positions = AsyncMock(
         return_value={"market_positions": [{"ticker": "KXWC-26-ARG", "position": 5}]}
@@ -116,7 +126,7 @@ async def test_error_red_cheap_reconciles_filled_rolls_back_both():
     # Ambas expuestas (no FILL + yes reconciliada llena) → rollback de ambas.
     assert out.rollback_triggered is True
     client.get_orders.assert_awaited()  # fuente 1
-    client.get_positions.assert_awaited()  # fuente 2 (cruce independiente)
+    client.get_positions.assert_not_awaited()  # Un neto global no acredita el fill de una orden.
 
 
 @pytest.mark.asyncio
@@ -158,8 +168,10 @@ async def test_error_red_never_assumed_as_kill():
     assert out.reconciled is True
     # Solo se envió la hard → un único estado en leg_states.
     assert out.leg_states == [LegState.ERROR_RED]
-    # fail-safe: la hard se trata como expuesta → rollback intentado.
-    assert out.rollback_triggered is True
+    # Cantidad desconocida: pausa durable, nunca vender count supuesto.
+    assert out.rollback_triggered is False
+    assert out.kill_switch_fired is True
+    assert client.place_order.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -269,7 +281,9 @@ def test_get_orders_filled_status():
     """Reconciliación: GetOrders usa status=='executed'."""
     leg = ArbLeg(market_ticker="T", side="yes", price_cents=40, count=5, available_size=100)
     g = RestExecutor._get_orders_filled
-    assert g({"status": "executed"}, leg) is True
+    assert g({"status": "executed"}, leg) is False
+    assert g({"status": "executed", "fill_count_fp": "5.00"}, leg) is True
+    assert g({"status": "executed", "fill_count_fp": "0.25"}, leg) is False
     assert g({"status": "resting"}, leg) is False
     assert g({"status": "canceled"}, leg) is False
     assert g({}, leg) is False  # conservador

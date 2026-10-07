@@ -25,6 +25,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from fractions import Fraction
 
 from loguru import logger
 from sqlmodel import col, select
@@ -32,8 +33,10 @@ from sqlmodel import col, select
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.fees import kalshi_fee_cents
+from src.math.quantities import terminal_fill
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, engage_kill_switch, get_session
+from src.storage.quantities import filled_fields, hold_uncertain_order, quantity_fields
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 
@@ -45,27 +48,13 @@ def _naive_utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _as_int(value: object) -> int | None:
-    """Castea a int un campo que puede venir int o fixed-point string. None si inválido."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, (str, float)):
-        try:
-            return int(round(float(value)))
-        except (ValueError, TypeError):
-            return None
-    return None
-
-
 @dataclass
 class Motor2ExecutionOutcome:
     """Desenlace de intentar ejecutar una señal de Motor 2."""
 
     placed: bool  # llegó a tocar la red (place_order invocado)
     filled: bool  # llenó (posición real abierta)
-    filled_count: int = 0
+    filled_count: int | Fraction = 0
     reason: str = ""
     client_order_id: str | None = None
     uncertain: bool = False  # ERROR_RED: fill desconocido (fila queda pending)
@@ -237,11 +226,9 @@ class Motor2Executor:
         order_id = str(order.get("order_id", "")) or None
         # Coalesce por is-not-None (deuda auditoría 2026-07-01): fill_count PRESENTE con
         # null enmascaraba el fallback fill_count_fp.
-        fill_raw = order.get("fill_count")
-        if fill_raw is None:
-            fill_raw = order.get("fill_count_fp")
-        fill_count = _as_int(fill_raw)
+        fill_count = terminal_fill(order, count, placement=True)
         if fill_count is None:
+            hold_uncertain_order(coid, order)
             # HTTP 200 con fill ILEGIBLE en ambos shapes: NO asumir no-fill (la orden pudo
             # llenar — tratarla como 'cancelled' dejaba una posible posición viva INVISIBLE
             # al RiskManager). La fila queda 'pending' (exposición conservadora, mismo
@@ -270,7 +257,7 @@ class Motor2Executor:
                 critical=True,
                 status="filled",
                 filled_at=_naive_utc_now(),
-                count=fill_count,
+                **filled_fields(fill_count),
                 fill_price_cents=price,
                 fees_cents=kalshi_fee_cents(fill_count, price),
                 kalshi_order_id=order_id,
@@ -381,7 +368,7 @@ class Motor2Executor:
                         ticker=signal.market_ticker,
                         side=side,
                         action="buy",
-                        count=count,
+                        **quantity_fields(count),
                         price_cents=price,
                         strategy=STRATEGY,
                         estimated_edge_pct=signal.edge_pct,

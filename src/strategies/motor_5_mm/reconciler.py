@@ -18,7 +18,7 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.storage.models import Trade, get_session
 from src.strategies.motor_5_mm.executor import COID_PREFIX, STRATEGY
 from src.strategies.motor_5_mm.incidents import latch_incident
-from src.strategies.motor_5_mm.ledger import confirmed_fill, record_fill
+from src.strategies.motor_5_mm.ledger import confirmed_fill, record_fill, record_order_fill
 from src.strategies.motor_5_mm.order_state import (
     COUNT_QUARANTINE_NOTE,
     filled_count,
@@ -110,6 +110,7 @@ class MMReconciler:
                     row.client_order_id,
                     kalshi_order_id=order["order_id"],
                     filled_count=observed_fill,
+                    order=order,
                 ):
                     # Volver al engine permitiría cancelar usando una DB que perdió
                     # el fill recién observado. El supervisor debe ver un fallo fatal.
@@ -202,7 +203,7 @@ class MMReconciler:
         observed_fill = filled_count(order)
         if observed_fill is None or observed_fill <= (confirmed_fill(row) or 0):
             return
-        if not self._update(row.client_order_id, filled_count=observed_fill):
+        if not self._update(row.client_order_id, filled_count=observed_fill, order=order):
             latch_incident("no se pudo persistir evidencia de cancel M5")
             raise RuntimeError("no se pudo persistir evidencia de cancel M5")
         # La siguiente observación de la MISMA excepción jamás rebaja este piso.
@@ -225,6 +226,7 @@ class MMReconciler:
             row.client_order_id,
             status="filled" if filled else "cancelled",
             filled_count=filled,
+            order=order,
             kalshi_order_id=oid,
             note=note,
         ):
@@ -274,6 +276,7 @@ class MMReconciler:
         *,
         status: str | None = None,
         filled_count: int | Fraction | None = None,
+        order: object = None,
         kalshi_order_id: str | None = None,
         note: str | None = None,
     ) -> bool:
@@ -291,7 +294,7 @@ class MMReconciler:
                 if status:
                     row.status = status
                 if filled_count is not None:
-                    record_fill(row, filled_count)
+                    record_order_fill(row, filled_count, order)
                 if kalshi_order_id:
                     row.kalshi_order_id = kalshi_order_id
                 if note:

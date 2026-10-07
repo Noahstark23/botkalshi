@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import PortfolioPosition
+from src.storage.quantities import requested_quantity
 
 # Umbral de take-profit en cents. Calibrable desde Coolify (MOTOR_3_TAKE_PROFIT_CENTS).
 # 90c = asegurar cuando la posición ya "casi ganó". Trade-off: deja ~10c de upside en las que
@@ -43,16 +44,19 @@ def take_profit_due(
     """
     if current_bid_cents is None:
         return False
-    if position.count <= 0:
+    try:
+        quantity = requested_quantity(position)
+    except ValueError:
+        return False
+    if quantity <= 0:
         return False
     if entry_cents is None:
         return False
     if current_bid_cents < threshold_cents:
         return False
     net_per_contract = (
-        current_bid_cents
-        - entry_cents
-        - kalshi_fee_cents(1, current_bid_cents)
-        - kalshi_fee_cents(1, entry_cents)
+        quantity * (current_bid_cents - entry_cents)
+        - kalshi_fee_cents(quantity, current_bid_cents)
+        - kalshi_fee_cents(quantity, entry_cents)
     )
     return net_per_contract > 0

@@ -65,7 +65,7 @@ async def test_filled_sells_at_bid_with_ioc():
     """Vende al MEJOR bid del lado, action=sell, IOC; reporta el fill."""
     c = _client(
         {"orderbook": {"yes": [["0.55", "100"], ["0.60", "50"]], "no": []}},
-        place_resp={"order": {"order_id": "o1", "fill_count": 10}},
+        place_resp={"order": {"remaining_count": 0, "order_id": "o1", "fill_count": 10}},
     )
     _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
@@ -87,7 +87,7 @@ async def test_no_side_uses_no_price():
     """Posición NO → vende el lado 'no' al bid del 'no' (no_price)."""
     c = _client(
         {"orderbook": {"yes": [], "no": [["0.40", "30"]]}},
-        place_resp={"order": {"fill_count": 5}},
+        place_resp={"order": {"remaining_count": 0, "fill_count": 5}},
     )
     _seed_open_buy(side="no", count=5)
     ex = Motor3ExitExecutor(c)
@@ -103,7 +103,7 @@ async def test_lock_released_after_exit_allows_reattempt():
     tick puede reintentar el remanente. Si no se liberara, la salida quedaría trabada."""
     c = _client(
         {"orderbook": {"yes": [["0.60", "50"]], "no": []}},
-        place_resp={"order": {"fill_count": 4}},  # parcial: vende 4 de 10
+        place_resp={"order": {"remaining_count": 0, "fill_count": 4}},  # parcial: vende 4 de 10
     )
     _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
@@ -118,7 +118,7 @@ async def test_concurrent_exit_skips_busy():
     """Si el lock del ticker ya está tomado (otra venta en curso) → se descarta, no doble-vende."""
     c = _client(
         {"orderbook": {"yes": [["0.60", "50"]], "no": []}},
-        place_resp={"order": {"fill_count": 10}},
+        place_resp={"order": {"remaining_count": 0, "fill_count": 10}},
     )
     ex = Motor3ExitExecutor(c)
     pos = _pos("yes")
@@ -150,7 +150,7 @@ async def test_bid_at_floor_sells():
     _seed_open_buy(side="yes", count=10)
     c = _client(
         {"orderbook": {"yes": [[5, 100]], "no": []}},
-        place_resp={"order": {"order_id": "k1", "fill_count": 10}},
+        place_resp={"order": {"remaining_count": 0, "order_id": "k1", "fill_count": 10}},
     )
     ex = Motor3ExitExecutor(c, min_sell_bid_cents=5)
     out = await ex.exit_position(_pos("yes"))
@@ -164,7 +164,7 @@ async def test_floor_zero_keeps_previous_behavior():
     _seed_open_buy(side="yes", count=10)
     c = _client(
         {"orderbook": {"yes": [[1, 100]], "no": []}},
-        place_resp={"order": {"order_id": "k1", "fill_count": 10}},
+        place_resp={"order": {"remaining_count": 0, "order_id": "k1", "fill_count": 10}},
     )
     ex = Motor3ExitExecutor(c)
     out = await ex.exit_position(_pos("yes"))

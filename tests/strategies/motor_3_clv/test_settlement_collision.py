@@ -45,7 +45,7 @@ def _exec_with_fill(orderbook_side_levels, fill_count) -> Motor3ExitExecutor:
         return_value={"orderbook": {"yes": orderbook_side_levels, "no": orderbook_side_levels}}
     )
     client.place_order = AsyncMock(
-        return_value={"order": {"order_id": "o1", "fill_count": fill_count}}
+        return_value={"order": {"remaining_count": 0, "order_id": "o1", "fill_count": fill_count}}
     )
     return Motor3ExitExecutor(client)
 

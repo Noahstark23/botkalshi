@@ -9,6 +9,8 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -19,17 +21,18 @@ from src.math.balance import available_cash_usd
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
+from src.risk.commitments import daily_committed_cents
 from src.risk.experiment_policy import limits_for_capital
 from src.risk.exposure import (
     MM_STRATEGY,
-    UnknownExposureError,
-    committed_risk_cents,
     contract_risk_cents,
     exposure_count,
     open_risk_cents,
 )
 from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
+from src.storage.quantities import filled_quantity
 from src.strategies.motor_5_mm.incidents import incident_status
+from src.strategies.motor_5_mm.order_state import COUNT_QUARANTINE_NOTE
 from src.strategies.motor_rest_arb.settlement import arb_group_key
 from src.utils.config import get_settings
 
@@ -39,6 +42,32 @@ class TradeDecision:
     approved: bool
     reason: str
     max_allowed_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RiskMark:
+    bid_cents: int | None
+    ask_cents: int | None
+    observed_at: datetime
+    fee_multiplier: Fraction | None
+
+
+def _exact_usd_cents(value: object) -> Fraction:
+    """Coste observado: USD decimal exacto, hasta seis decimales, sin redondearlo."""
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError("coste USD debe ser texto decimal acotado")
+    try:
+        number = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError("coste USD inválido") from exc
+    if (
+        not number.is_finite()
+        or number < 0
+        or number > Decimal("1000000000000000000")
+        or number.as_tuple().exponent < -6
+    ):
+        raise ValueError("coste USD no representable")
+    return Fraction(number) * 100
 
 
 class RiskManager:
@@ -382,42 +411,18 @@ class RiskManager:
         now_utc = datetime.now(UTC)
         la = ZoneInfo("America/Los_Angeles")
         now_la = now_utc.astimezone(la)
-        day_start_la = datetime.combine(now_la.date(), time.min, tzinfo=la)
         week_date = now_la.date() - timedelta(days=now_la.weekday())
         week_start_la = datetime.combine(week_date, time.min, tzinfo=la)
-        day_start = day_start_la.astimezone(UTC).replace(tzinfo=None)
         week_start = week_start_la.astimezone(UTC).replace(tzinfo=None)
 
         with get_session() as s:
-            entries = list(
-                s.exec(
-                    select(Trade).where(or_(Trade.action == "buy", Trade.strategy == MM_STRATEGY))
-                )
-            )
-            settled = list(s.exec(select(Trade).where(Trade.status == "settled")))
-
-        committed_cents = 0
-        committed_statuses = {"pending", "filled", "settled", "cancelled"}
-        for trade in entries:
-            placed = self._as_utc_naive(trade.placed_at)
-            if placed < start or placed < day_start:
-                continue
-            if trade.status not in committed_statuses:
-                if trade.strategy == MM_STRATEGY:
-                    return {"valid": False, "reason": "M5 con estado de compromiso desconocido"}
-                continue
             try:
-                committed = committed_risk_cents(trade)
-            except UnknownExposureError as exc:
-                return {"valid": False, "reason": f"Compromiso de riesgo inválido: {exc}"}
-            fee_cents = (
-                trade.fees_cents
-                if trade.fees_cents is not None
-                else kalshi_fee_cents(trade.count, trade.price_cents)
+                committed_cents = daily_committed_cents(s, start=start, now=now_utc)
+            except ValueError as exc:
+                return {"valid": False, "reason": str(exc)}
+            settled = list(
+                s.exec(select(Trade).where(Trade.status == "settled", Trade.settled_at >= start))
             )
-            if type(fee_cents) is not int or fee_cents < 0:
-                return {"valid": False, "reason": "Comisión de riesgo desconocida"}
-            committed_cents += committed + fee_cents
 
         weekly_cents = 0
         cumulative_cents = 0
@@ -515,6 +520,27 @@ class RiskManager:
                 return TradeDecision(False, "persist_intent_failed", 0)
             return decision
 
+    def m1_reservation_limits(self) -> dict:
+        """Foto síncrona para revalidar admisión M1 bajo BEGIN IMMEDIATE, sin red."""
+        if not self.can_open_new_positions():
+            raise ValueError("M1 sin capital confirmado sobre el piso")
+        capital = self._get_effective_capital_usd()
+        limits = {
+            "max_open_cents": math.floor(capital * self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT),
+            "event_cap_cents": math.floor(self.settings.MAX_EVENT_DIRECTIONAL_EXPOSURE_USD * 100),
+        }
+        if self._experiment_enabled():
+            start = self._experiment_start_utc_naive()
+            if start is None:
+                raise ValueError("inicio experimental inválido")
+            policy = limits_for_capital(capital)
+            limits.update(
+                max_open_cents=min(limits["max_open_cents"], int(policy.max_open_usd * 100)),
+                max_daily_cents=int(policy.max_daily_new_risk_usd * 100),
+                experiment_start=start,
+            )
+        return limits
+
     def _confirmed_quote_capital_usd(self) -> float | None:
         """M5 sólo abre contra cash observado fresco, nunca contra piso/fallback.
 
@@ -529,6 +555,14 @@ class RiskManager:
         if confirmed < self.settings.CAPITAL_FLOOR_USD:
             return None
         return min(confirmed, self._get_effective_capital_usd())
+
+    def can_quote_new_positions(self) -> bool:
+        """Permiso de cash M5 compartido con su gate de reservas, incluso en demo.
+
+        Permite retirar quotes resting al perder una lectura confirmada; no sustituye
+        stops, incidentes ni el check atómico previo a cada nueva orden.
+        """
+        return self._confirmed_quote_capital_usd() is not None
 
     async def check_quote_and_reserve(
         self,
@@ -986,65 +1020,236 @@ class RiskManager:
         except Exception as exc:
             logger.warning(f"risk.sl_status falló: {type(exc).__name__}: {exc}")
 
-    # ── Gate SOFT de pérdida LATENTE (mark-to-market) — flag default OFF ─────────────
-    # ⚠️ Cambia la semántica realized-only (decisión documentada del owner) → solo corre
-    # con UNREALIZED_STOP_ENABLED=true. Marks: los publican los brazos de salida (M3/M2
-    # exit ya leen el bid de cada posición abierta por tick) como PASAJEROS — este gate
-    # no hace I/O de red (prohibido bajo _check_lock). Posición sin mark fresco NO cuenta:
-    # cobertura parcial honesta > mark inventado.
-    _marks: dict[tuple[str, str], tuple[int, datetime]] = {}
+    # Gate SOFT: sólo habilitado explícitamente. Datos incompletos bloquean entradas,
+    # nunca salidas ni reconciliación. Un mark es BBO observable, no fair ni midpoint.
+    _marks: dict[tuple[str, str], _RiskMark] = {}
     _unrealized_alert_date: date | None = None
 
     @classmethod
-    def record_mark(cls, ticker: str, side: str, bid_cents: int | None) -> None:
-        """Publica el bid actual de (ticker, side) para el MTM. Best-effort y barato —
-        lo llaman M3/M2-exit con el bid que YA leyeron para sus take-profits."""
+    def record_mark(
+        cls,
+        ticker: str,
+        side: str,
+        bid_cents: int | None,
+        *,
+        ask_cents: int | None = None,
+        observed_at: datetime | None = None,
+        fee_multiplier: int | float | str | Fraction | None = None,
+    ) -> None:
+        """Publica BBO real y fee de cierre verificada, sin I/O adicional.
+
+        BUY se liquida al bid, SELL se cubre al ask. Un libro parcial no inventa
+        el lado ausente. None/None o evidencia inválida invalida el mark anterior;
+        conservarlo rejuvenecido escondería la pérdida de cobertura. Los callers
+        legacy con sólo bid siguen siendo compatibles, pero su fee desconocida
+        bloquea MTM cuando el gate está habilitado.
+        """
+        if not isinstance(ticker, str) or not ticker or side not in ("yes", "no"):
+            logger.warning("risk.record_mark_invalid_identity")
+            return
+        key = (ticker, side)
         try:
-            if bid_cents is not None and 1 <= bid_cents <= 99:
-                cls._marks[(ticker, side)] = (
-                    bid_cents,
-                    datetime.now(UTC).replace(tzinfo=None),
+            for price in (bid_cents, ask_cents):
+                if price is not None and (type(price) is not int or not 1 <= price <= 99):
+                    raise ValueError("precio de mark inválido")
+            if bid_cents is None and ask_cents is None:
+                cls._marks.pop(key, None)
+                return
+            if bid_cents is not None and ask_cents is not None and bid_cents > ask_cents:
+                raise ValueError("BBO cruzado")
+            moment = cls._as_utc_naive(observed_at or datetime.now(UTC))
+            if moment > datetime.now(UTC).replace(tzinfo=None):
+                raise ValueError("mark futuro")
+            multiplier = None
+            if fee_multiplier is not None:
+                if isinstance(fee_multiplier, bool):
+                    raise ValueError("fee inválida")
+                multiplier = Fraction(str(fee_multiplier))
+                if multiplier <= 0:
+                    raise ValueError("fee no positiva")
+            existing = cls._marks.get(key)
+            if isinstance(existing, _RiskMark) and moment < existing.observed_at:
+                return  # una observación tardía no desplaza otra más reciente
+            cls._marks[key] = _RiskMark(bid_cents, ask_cents, moment, multiplier)
+            # Cache de diagnóstico acotada; retirar un mark sólo puede frenar entradas.
+            if len(cls._marks) > 8192:
+                oldest = min(cls._marks, key=lambda k: cls._marks[k].observed_at)
+                cls._marks.pop(oldest, None)
+        except Exception:  # el publicador conserva su ciclo; el gate detecta el hueco
+            cls._marks.pop(key, None)
+            logger.warning("risk.record_mark_invalid ticker={} side={}", ticker, side)
+
+    @staticmethod
+    def _entry_costs(trade: Trade, quantity: Fraction) -> tuple[Fraction, Fraction, bool]:
+        """Bruto y fees de entrada en cents exactos; None nunca equivale a fee cero.
+
+        Sin coste bruto observado usamos el límite como cota conservadora: coste
+        máximo BUY / ingreso mínimo SELL. Esa cota no se persiste como fill real.
+        La tarifa actual jamás reconstruye una comisión histórica desconocida.
+        """
+        fixed_fee = getattr(trade, "fees_usd_fp", None)
+        legacy_fee = trade.fees_cents
+        if legacy_fee is not None and (type(legacy_fee) is not int or legacy_fee < 0):
+            raise ValueError("INVALID_ENTRY_FEES")
+        if fixed_fee is not None:
+            fees = _exact_usd_cents(fixed_fee)
+            # Espejo legacy: versiones anteriores truncaban; el escritor nuevo
+            # reserva hacia arriba. La verdad monetaria siempre es el FP exacto.
+            if legacy_fee is not None and legacy_fee not in (math.floor(fees), math.ceil(fees)):
+                raise ValueError("CONTRADICTORY_ENTRY_FEES")
+        elif legacy_fee is not None:
+            fees = Fraction(legacy_fee)
+        else:
+            raise ValueError("MISSING_ENTRY_FEES")
+        fixed_cost = getattr(trade, "fill_cost_usd_fp", None)
+        if fixed_cost is not None:
+            gross = _exact_usd_cents(fixed_cost)
+            if gross > 100 * quantity:
+                raise ValueError("INVALID_ENTRY_COST")
+            return gross, fees, False
+        observed = trade.fill_price_cents
+        price = trade.price_cents if observed is None else observed
+        if type(price) is not int or not 1 <= price <= 99:
+            raise ValueError("INVALID_ENTRY_PRICE")
+        return price * quantity, fees, observed is None
+
+    def _closing_mark(self, ticker: str, quantity: Fraction, now: datetime) -> tuple[int, Fraction]:
+        """Una sola liquidación del neto YES; acepta el BBO NO complementario real."""
+        ttl = self.settings.UNREALIZED_MARK_TTL_SEC
+        if not isinstance(ttl, (int, float)) or not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError("INVALID_MARK_TTL")
+        problems = []
+        for side in ("yes", "no"):
+            mark = RiskManager._marks.get((ticker, side))
+            if not isinstance(mark, _RiskMark):
+                problems.append("MISSING_MARK")
+                continue
+            age = (now - mark.observed_at).total_seconds()
+            if age < 0 or age > ttl:
+                problems.append("STALE_MARK")
+                continue
+            # Un long YES se vende al bid YES o se cubre comprando NO al ask NO.
+            price = (
+                (mark.bid_cents if quantity > 0 else mark.ask_cents)
+                if side == "yes"
+                else (mark.ask_cents if quantity > 0 else mark.bid_cents)
+            )
+            if price is None:
+                problems.append("MISSING_CLOSE_SIDE")
+                continue
+            if mark.fee_multiplier is None:
+                problems.append("MISSING_CLOSE_FEE")
+                continue
+            return (price if side == "yes" else 100 - price), mark.fee_multiplier
+        raise ValueError("/".join(dict.fromkeys(problems)))
+
+    def _unrealized_snapshot(self) -> dict:
+        """PnL de cierre conservador desde cantidades realmente ejecutadas.
+
+        Normaliza BUY YES/SELL NO a +YES y SELL YES/BUY NO a -YES. Los pares
+        compensados del mismo contrato quedan con su resultado bloqueado, sin
+        cobrarles spread ni fee de cierre otra vez. El sobrante sí requiere mark.
+        Un arb_id, por sí solo, no prueba que una pata esté cubierta.
+        """
+        now = datetime.now(UTC).replace(tzinfo=None)
+        with get_session() as session:
+            trades = list(
+                session.exec(
+                    select(Trade).where(
+                        Trade.status != "settled",
+                        col(Trade.closed_by_clv).is_(False),
+                        or_(
+                            col(Trade.status).in_(["filled", "pending"]),
+                            Trade.filled_count > 0,
+                            col(Trade.filled_count_fp).is_not(None),
+                        ),
+                    )
                 )
-        except Exception:  # pragma: no cover - jamás romper al publicador
-            logger.exception("risk.record_mark_failed")
+            )
+        cash: dict[str, Fraction] = {}
+        net: dict[str, Fraction] = {}
+        unknown = []
+        limit_rows = 0
+        executed_rows = 0
+        for trade in trades:
+            try:
+                if COUNT_QUARANTINE_NOTE in (trade.notes or ""):
+                    raise ValueError("QUANTITY_QUARANTINED")
+                quantity = filled_quantity(trade)
+                if quantity is None:
+                    raise ValueError("QUANTITY_UNKNOWN")
+                if not quantity:
+                    continue
+                if trade.side not in ("yes", "no") or trade.action not in ("buy", "sell"):
+                    raise ValueError("INVALID_DIRECTION")
+                gross, fees, limited = self._entry_costs(trade, quantity)
+                sign = 1 if trade.action == "buy" else -1
+                amount = -sign * gross - fees
+                if trade.side == "no":
+                    amount += sign * 100 * quantity
+                    sign *= -1
+                cash[trade.ticker] = cash.get(trade.ticker, Fraction(0)) + amount
+                net[trade.ticker] = net.get(trade.ticker, Fraction(0)) + sign * quantity
+                limit_rows += limited
+                executed_rows += 1
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                unknown.append(f"{trade.ticker}:{exc}")
+        pnl = sum(cash.values(), Fraction(0))
+        covered = 0
+        for ticker, quantity in net.items():
+            if not quantity:
+                continue
+            try:
+                price, multiplier = self._closing_mark(ticker, quantity, now)
+                pnl += quantity * price - kalshi_fee_cents(
+                    abs(quantity), price, fee_multiplier=multiplier
+                )
+                covered += 1
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                unknown.append(f"{ticker}:{exc}")
+        return {
+            "pnl_cents": None if unknown else pnl,
+            "unknown": unknown,
+            "covered": covered,
+            "executed_rows": executed_rows,
+            "limit_price_rows": limit_rows,
+            "net_contracts": net,
+        }
+
+    def unrealized_entry_block_reason(self) -> str | None:
+        """Mismo gate MTM para retirar quotes resting que podrían seguir llenándose.
+
+        El engine debe publicar los marks primero y mantener la reconciliación y
+        su refresco aunque este gate bloquee; no toca las rutas de salida.
+        """
+        return self._check_unrealized_stop()
 
     def _check_unrealized_stop(self) -> str | None:
-        """Pérdida LATENTE de las posiciones abiertas (filled no-settled, direccionales)
-        contra max(capital × %, piso). Breach → razón de rechazo (SOFT: solo entradas;
-        sin kill-switch, sin BotState — igual filosofía que el stop diario). Las patas
-        con arb_id se saltan (hedged: su MTM neto ≈ 0 y el netting ya las descuenta)."""
+        """Gate SOFT de entradas: cobertura completa o bloqueo, jamás marks inventados."""
         if not self.settings.UNREALIZED_STOP_ENABLED:
             return None
-        now = datetime.now(UTC).replace(tzinfo=None)
-        ttl = self.settings.UNREALIZED_MARK_TTL_SEC
-        with get_session() as s:
-            stmt = select(Trade).where(
-                Trade.status == "filled",
-                Trade.action == "buy",
-                col(Trade.closed_by_clv).is_(False),
-            )
-            open_trades = list(s.exec(stmt))
-        unrealized_cents = 0
-        covered = 0
-        for t in open_trades:
-            if "arb_id=" in (t.notes or ""):
-                continue
-            mark = RiskManager._marks.get((t.ticker, t.side))
-            if mark is None or (now - mark[1]).total_seconds() > ttl:
-                continue
-            count = exposure_count(t)
-            unrealized_cents += (mark[0] - t.price_cents) * count
-            covered += 1
-        unrealized_usd = unrealized_cents / 100.0
-        capital_usd = self._get_effective_capital_usd()
+        try:
+            snap = self._unrealized_snapshot()
+        except Exception:
+            logger.exception("risk.unrealized_unavailable")
+            return "MTM sin valoración completa: lectura del ledger falló; entradas nuevas en pausa"
+        if snap["unknown"]:
+            detail = "; ".join(snap["unknown"][:3])
+            return f"MTM sin valoración completa: {detail}; entradas nuevas en pausa"
+        pnl_cents = snap["pnl_cents"]
         limit_usd = max(
-            capital_usd * (self.settings.MAX_UNREALIZED_LOSS_PCT / 100.0),
-            self.settings.MAX_UNREALIZED_LOSS_FLOOR_USD,
+            Fraction(str(self._get_effective_capital_usd()))
+            * Fraction(str(self.settings.MAX_UNREALIZED_LOSS_PCT))
+            / 100,
+            Fraction(str(self.settings.MAX_UNREALIZED_LOSS_FLOOR_USD)),
         )
-        if unrealized_usd < 0 and abs(unrealized_usd) >= limit_usd:
+        if pnl_cents < 0 and -pnl_cents >= limit_usd * 100:
+            # Comparación exacta; al mostrar una pérdida redondeamos hacia arriba,
+            # nunca dejamos desaparecer fracciones adversas por el formato en USD.
+            loss_cents = math.ceil(-pnl_cents)
             reason = (
-                f"Pérdida latente ${unrealized_usd:.2f} ≥ límite ${-limit_usd:.2f} "
-                f"({covered} posiciones con mark): entradas nuevas en pausa (MTM soft)"
+                f"Pérdida latente ${-loss_cents / 100:.2f} ≥ límite ${-float(limit_usd):.2f} "
+                f"({snap['covered']} posiciones netas con mark): entradas nuevas en pausa (MTM soft)"
             )
             today = datetime.now(UTC).date()
             if RiskManager._unrealized_alert_date != today:

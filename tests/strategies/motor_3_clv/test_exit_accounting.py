@@ -26,7 +26,9 @@ TICKER = "KXACCT"
 def _client(*, fill_count: int) -> MagicMock:
     c = MagicMock()
     c.get_orderbook = AsyncMock(return_value={"orderbook": {"yes": [["0.60", "100"]], "no": []}})
-    c.place_order = AsyncMock(return_value={"order": {"order_id": "o", "fill_count": fill_count}})
+    c.place_order = AsyncMock(
+        return_value={"order": {"remaining_count": 0, "order_id": "o", "fill_count": fill_count}}
+    )
     c.get_orders = AsyncMock(return_value={"orders": []})
     return c
 

@@ -57,7 +57,8 @@ def _client(*, place=None, place_exc=None, orders=None) -> MagicMock:
         c.place_order = AsyncMock(side_effect=place_exc)
     else:
         c.place_order = AsyncMock(
-            return_value=place or {"order": {"order_id": "o", "fill_count": 10}}
+            return_value=place
+            or {"order": {"remaining_count": 0, "order_id": "o", "fill_count": 10}}
         )
     c.get_orders = AsyncMock(return_value={"orders": orders or []})
     return c
@@ -128,7 +129,7 @@ async def test_clean_fill_transitions_intent_to_settled():
 @pytest.mark.asyncio
 async def test_ioc_no_fill_cancels_intent():
     _seed_buy()
-    ex = _ex(_client(place={"order": {"order_id": "o", "fill_count": 0}}))
+    ex = _ex(_client(place={"order": {"remaining_count": 0, "order_id": "o", "fill_count": 0}}))
 
     out = await ex.exit_position(_pos())
 

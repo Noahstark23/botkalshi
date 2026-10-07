@@ -198,7 +198,7 @@ async def test_execution_marks_closed_by_clv_and_pnl():
     client = MagicMock()
     client.get_orderbook = AsyncMock(return_value=_orderbook("yes", bid))
     client.place_order = AsyncMock(
-        return_value={"order": {"order_id": "ord-1", "fill_count": count}}
+        return_value={"order": {"remaining_count": 0, "order_id": "ord-1", "fill_count": count}}
     )
 
     eng = Motor2ExitEngine(trading_enabled=True, take_profit_enabled=True, tp_threshold=62)

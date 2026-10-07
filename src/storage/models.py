@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import event
+from sqlalchemy import Index, event
 from sqlmodel import Field, Session, SQLModel, create_engine
 
 from src.utils.config import get_settings
@@ -74,6 +74,7 @@ class Trade(SQLModel, table=True):
     """Registro de un trade del bot."""
 
     __tablename__ = "trades"
+    __table_args__ = (Index("ix_trades_status_settled", "status", "settled_at"),)
 
     id: int | None = Field(default=None, primary_key=True)
     client_order_id: str = Field(unique=True, max_length=100)
@@ -81,6 +82,7 @@ class Trade(SQLModel, table=True):
     side: str = Field(max_length=10)  # yes/no
     action: str = Field(max_length=10)  # buy/sell
     count: int
+    count_fp: str | None = Field(default=None, max_length=32)
     price_cents: int
 
     # Estrategia que generó el trade
@@ -104,14 +106,18 @@ class Trade(SQLModel, table=True):
     # el PnL (la pérdida/ganancia ya quedó realizada al precio de salida).
     closed_by_clv: bool = False
 
-    # Motor 5 F2 (fills PARCIALES de órdenes resting): contratos realmente llenados.
-    # None = semántica legacy (orden inmediata FOK/IOC: count entero se llenó o nada).
-    # El RiskManager usa filled_count (si está) para la exposición de filas 'filled':
-    # una resting de 1000 con 500 llenados (resto cancelado) expone 500, no 1000.
+    # Cantidad ejecutada de TODOS los motores. _fp es canónico; el entero sólo se
+    # escribe cuando la cantidad es integral. El count legacy conserva ceil(count_fp).
+    # Únicamente filas históricas sin count_fp admiten inferir fill desde count por
+    # su antiguo status filled; una respuesta nueva nunca usa ese supuesto.
     filled_count: int | None = None
     filled_count_fp: str | None = Field(default=None, max_length=32)
     # Importe calculado a precisión de 0.0001 USD; pnl_cents es su piso legacy.
     pnl_usd_fp: str | None = Field(default=None, max_length=40)
+    fill_cost_usd_fp: str | None = Field(default=None, max_length=40)
+    fees_usd_fp: str | None = Field(default=None, max_length=40)
+    # Las porciones contables conservan el origen; nunca crean presupuesto nuevo.
+    commitment_origin_id: str | None = Field(default=None, max_length=100)
 
     # Timestamps
     placed_at: datetime = Field(default_factory=_utc_now, index=True)
@@ -119,6 +125,25 @@ class Trade(SQLModel, table=True):
     settled_at: datetime | None = None
 
     notes: str | None = Field(default=None, max_length=500)
+
+
+class RiskCommitment(SQLModel, table=True):
+    """Presupuesto original por intent: no se actualiza al llenar, cancelar o partir."""
+
+    __tablename__ = "risk_commitments"
+
+    client_order_id: str = Field(primary_key=True, max_length=100)
+    group_key: str = Field(index=True, max_length=64)
+    ticker: str = Field(index=True, max_length=100)
+    event_ticker: str = Field(index=True, max_length=100)
+    strategy: str = Field(max_length=50)
+    action: str = Field(max_length=10)
+    side: str = Field(max_length=10)
+    count_fp: str = Field(max_length=32)
+    price_cents: int
+    risk_cents: int
+    fee_reserve_cents: int
+    created_at: datetime = Field(default_factory=_naive_utc_now, index=True)
 
 
 class PortfolioPosition(SQLModel, table=True):
@@ -138,6 +163,7 @@ class PortfolioPosition(SQLModel, table=True):
     ticker: str = Field(unique=True, index=True, max_length=100)
     side: str = Field(max_length=10)  # "yes" | "no" — lado neto que tenemos abierto
     count: int  # contratos (abs de la posición neta de Kalshi)
+    count_fp: str | None = Field(default=None, max_length=32)
     exposure_cents: int | None = None  # market_exposure de Kalshi (capital en riesgo)
     close_time: datetime | None = None  # cierre del mercado (NAIVE UTC) — gate del CLV
     synced_at: datetime = Field(default_factory=_naive_utc_now, index=True)
@@ -580,6 +606,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("portfolio_positions", "peak_bid_cents", "INTEGER"),  # Motor 3 FASE 2: trailing stop
     ("trades", "filled_count", "INTEGER"),  # Motor 5 F2: fills parciales de resting orders
     ("trades", "filled_count_fp", "VARCHAR(32)"),
+    ("trades", "count_fp", "VARCHAR(32)"),
+    ("trades", "fill_cost_usd_fp", "VARCHAR(40)"),
+    ("trades", "fees_usd_fp", "VARCHAR(40)"),
+    ("trades", "commitment_origin_id", "VARCHAR(100)"),
+    ("portfolio_positions", "count_fp", "VARCHAR(32)"),
     ("trades", "pnl_usd_fp", "VARCHAR(40)"),
     ("mm_quotes", "inventory_fp", "VARCHAR(40)"),
     ("mm_funnel_snapshots", "inventory_abs_fp", "VARCHAR(40)"),
@@ -666,6 +697,10 @@ def apply_migrations(engine: Any) -> None:
             if column not in existing:
                 conn.exec_driver_sql(f'ALTER TABLE {table} ADD COLUMN "{column}" {col_type}')
                 logger.info(f"migration: ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        if {"status", "settled_at"} <= _existing_columns(conn, "trades"):
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_trades_status_settled ON trades (status, settled_at)"
+            )
         mm_fill_columns = _existing_columns(conn, "mm_shadow_fills")
         if {"experiment_id", "metric_version", "created_at"} <= mm_fill_columns:
             for statement in _INDEX_MIGRATIONS:

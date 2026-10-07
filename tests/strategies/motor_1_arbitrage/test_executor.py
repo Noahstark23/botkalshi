@@ -15,6 +15,7 @@ from src.monitoring.health import BotState
 from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import RiskEvent, Trade, get_session
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 # =====================================================
 # Fixtures
@@ -56,6 +57,7 @@ def mock_risk_manager() -> MagicMock:
     rm.check_pre_trade = AsyncMock(
         return_value=TradeDecision(approved=True, reason="ok", max_allowed_count=10)
     )
+    wire_reservation_fake(rm)
     return rm
 
 
@@ -110,7 +112,9 @@ async def test_dry_run_skips_network(executor, mock_client, binary_opp):
 
 @pytest.mark.asyncio
 async def test_all_legs_fill_returns_true(executor, mock_client, binary_opp):
-    mock_client.place_order.return_value = {"order": {"order_id": "kalshi-001", "fill_count": 10}}
+    mock_client.place_order.return_value = {
+        "order": {"remaining_count": 0, "order_id": "kalshi-001", "fill_count": 10}
+    }
 
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",
@@ -138,9 +142,9 @@ async def test_all_legs_fill_returns_true(executor, mock_client, binary_opp):
 async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp):
     # Hard-first: la dura (NO, precio 45 > 40) va primero y LLENA; la fácil (YES) falla.
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
         Exception("network error"),  # YES (fácil) buy fails
-        {"order": {"fill_count": 10}},  # NO rollback sell fills
+        {"order": {"remaining_count": 0, "fill_count": 10}},  # NO rollback sell fills
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[44, 8], [43, 5]], "yes": []}}
 
@@ -159,7 +163,7 @@ async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp)
     # 2026-07-07: antes 'rolled_back' sin pnl → invisible para los stop-losses).
     # YES leg (fácil): SÍ se envió (la dura llenó), falló con excepción no-kill → estado
     # DESCONOCIDO → queda pending (la resuelve reconcile). Es el caso residual raro.
-    by_side = {t.side: t for t in trades}
+    by_side = {t.side: t for t in trades if t.action == "buy"}
     assert by_side["no"].status == "settled"
     expected_pnl = 10 * (44 - 45) - kalshi_fee_cents(10, 44) - kalshi_fee_cents(10, 45)
     assert by_side["no"].pnl_cents == expected_pnl
@@ -170,9 +174,9 @@ async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp)
 @pytest.mark.asyncio
 async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_opp):
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
         Exception("fail"),  # YES (fácil) buy fails
-        {"order": {"fill_count": 10}},  # NO rollback sell fills
+        {"order": {"remaining_count": 0, "fill_count": 10}},  # NO rollback sell fills
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[44, 10]], "yes": []}}
 
@@ -198,7 +202,7 @@ async def test_rollback_uses_aggressive_price_1(executor, mock_client, binary_op
 @pytest.mark.asyncio
 async def test_rollback_aborts_on_excessive_slippage(executor, mock_client, binary_opp):
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
         Exception("fail"),  # YES (fácil) buy fails
     ]
     # NO bid = 5¢, original price = 45¢ → slippage = (45-5)/45*100 = 88.9% > 10%
@@ -226,7 +230,7 @@ async def test_rollback_aborts_on_excessive_slippage(executor, mock_client, bina
     # RiskManager y gestionable como huérfana por Motor 3 — jamás desaparece en silencio.
     with get_session() as s:
         trades = list(s.exec(select(Trade)).all())
-    by_side = {t.side: t for t in trades}
+    by_side = {t.side: t for t in trades if t.action == "buy"}
     assert by_side["no"].status == "filled"
     assert by_side["no"].pnl_cents is None
 
@@ -296,6 +300,7 @@ async def test_reconcile_matches_executed_kalshi_order(executor, mock_client):
                 "client_order_id": coid,
                 "order_id": "kalshi-xyz",
                 "status": "executed",
+                "fill_count_fp": "5.00",
             }
         ]
     }
@@ -311,7 +316,7 @@ async def test_reconcile_matches_executed_kalshi_order(executor, mock_client):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_marks_missing_as_error_missing(executor, mock_client):
+async def test_reconcile_missing_keeps_pending_exposure(executor, mock_client):
     coid = "missing-coid-999"
     with get_session() as s:
         trade = Trade(
@@ -342,7 +347,7 @@ async def test_reconcile_marks_missing_as_error_missing(executor, mock_client):
     with get_session() as s:
         t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
     assert t is not None
-    assert t.status == "error_missing"
+    assert t.status == "pending"  # Ausencia en una página no demuestra que no llenó.
 
 
 @pytest.mark.asyncio
@@ -364,7 +369,14 @@ async def test_reconcile_marks_canceled_trade(executor, mock_client):
         s.commit()
 
     mock_client.get_orders.return_value = {
-        "orders": [{"client_order_id": coid, "order_id": "k-x", "status": "canceled"}]
+        "orders": [
+            {
+                "client_order_id": coid,
+                "order_id": "k-x",
+                "status": "canceled",
+                "fill_count_fp": "0.00",
+            }
+        ]
     }
     await executor.reconcile_pending_trades()
 
@@ -375,7 +387,7 @@ async def test_reconcile_marks_canceled_trade(executor, mock_client):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_marks_unknown_status_as_error(executor, mock_client):
+async def test_reconcile_unknown_quantity_keeps_pending_exposure(executor, mock_client):
     coid = "unknown-001"
     with get_session() as s:
         trade = Trade(
@@ -400,7 +412,7 @@ async def test_reconcile_marks_unknown_status_as_error(executor, mock_client):
     with get_session() as s:
         t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
     assert t is not None
-    assert t.status == "error"
+    assert t.status == "pending"  # No liberar riesgo desde un status sin cantidad.
 
 
 @pytest.mark.asyncio
@@ -505,7 +517,7 @@ async def test_rollback_skips_leg_when_no_bid(mock_client, mock_risk_manager, bi
     # Use max_rollback_retries=1 to keep test fast (1 sleep instead of 3)
     ex = ArbitrageExecutor(mock_client, mock_risk_manager, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-yes", "fill_count": 10}},
+        {"order": {"remaining_count": 0, "order_id": "k-yes", "fill_count": 10}},
         Exception("fail"),
     ]
     # No bids available on any side
@@ -530,7 +542,7 @@ async def test_rollback_retries_on_sell_exception(mock_client, mock_risk_manager
     """Verify the except block fires when the sell call itself raises."""
     ex = ArbitrageExecutor(mock_client, mock_risk_manager, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
         Exception("no easy"),  # YES (fácil) buy fails
         Exception("sell failed"),  # rollback sell also fails
     ]

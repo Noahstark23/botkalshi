@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 
-from src.math.quantities import contract_count
+from src.math.quantities import api_count, contract_count
 
 COUNT_QUARANTINE_NOTE = "[m5_count_quarantined]"
 
@@ -15,14 +15,7 @@ def parse_count(value: object) -> Fraction | None:
 
 
 def _count_field(order: dict, name: str) -> Fraction | None:
-    fixed = f"{name}_fp"
-    value = parse_count(order[fixed]) if fixed in order else parse_count(order.get(name))
-    if value is None:
-        return None
-    # El campo nuevo manda, pero una contradicción con el legado exige conciliar.
-    if fixed in order and name in order and parse_count(order[name]) != value:
-        return None
-    return value
+    return api_count(order, name)
 
 
 def filled_count(order: object) -> Fraction | None:

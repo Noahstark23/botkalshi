@@ -13,8 +13,11 @@ from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiAPIError, KalshiRestClient
 from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
+from src.math.fees import kalshi_fee_cents
+from src.math.quantities import terminal_fill
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
+from src.risk.commitments import reserve_m1_intents
 from src.risk.manager import RiskManager
 from src.storage.models import (
     PortfolioPosition,
@@ -24,6 +27,9 @@ from src.storage.models import (
     engage_kill_switch,
     get_session,
 )
+from src.storage.order_reconciliation import reconcile_pending_orders
+from src.storage.quantities import hold_uncertain_order, quantity_fields, resize_filled
+from src.storage.reductions import finalize_reduction, persist_reduction
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker
 from src.utils.config import get_settings
@@ -37,20 +43,6 @@ if TYPE_CHECKING:
 # match estricto 409 + code conocido; cualquier otro error → estado DESCONOCIDO (queda
 # pending → lo resuelve reconcile_pending_trades).
 _FOK_KILL_ERROR_CODES = frozenset({"fill_or_kill_insufficient_resting_volume"})
-
-
-def _as_int(value: object) -> int | None:
-    """Castea a int un campo que puede venir int o fixed-point string. None si inválido."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, (str, float)):
-        try:
-            return int(round(float(value)))
-        except (ValueError, TypeError):
-            return None
-    return None
 
 
 class ArbitrageExecutor:
@@ -67,7 +59,6 @@ class ArbitrageExecutor:
     - asyncio.gather has no per-order timeout; consider adding in future
     - Slippage estimate uses depth=5 best bid, not full fill simulation
     - get_orders in reconcile has no pagination (limit=100 hard cap)
-    - reconcile not yet wired into runner.py boot (Fase 6 task)
 
     Kalshi API assumptions (verify if API changes):
     - GET /portfolio/orders response: {"orders": [{..., "client_order_id": ...,
@@ -134,74 +125,17 @@ class ArbitrageExecutor:
         await self.reconcile_pending_trades()
 
     async def reconcile_pending_trades(self) -> None:
-        """
-        Resolve pending trades older than 30s against Kalshi's order list.
-
-        Statuses after reconcile:
-            "filled"        — Kalshi confirms executed
-            "cancelled"     — Kalshi confirms canceled
-            "error"         — Kalshi returned unexpected status
-            "error_missing" — trade not found in Kalshi at all (critical)
-        """
-        cutoff = datetime.now(UTC) - timedelta(seconds=30)
-        with get_session() as s:
-            pending: list[Trade] = list(
-                s.exec(
-                    select(Trade).where(
-                        Trade.status == "pending",
-                        Trade.placed_at <= cutoff,
-                    )
-                ).all()
-            )
-
-        if not pending:
-            return
-
-        try:
-            resp = await self.client.get_orders(limit=100)
-        except Exception as exc:
-            logger.error(f"reconcile_pending_trades: get_orders failed: {exc}")
-            return
-
-        kalshi_orders: list[dict] = resp.get("orders", [])
-        by_coid: dict[str, dict] = {
-            o["client_order_id"]: o for o in kalshi_orders if "client_order_id" in o
-        }
-
-        for trade in pending:
-            kalshi_order = by_coid.get(trade.client_order_id)
-            if kalshi_order is None:
-                logger.critical(
-                    f"reconcile: trade {trade.client_order_id} NOT found in Kalshi — "
-                    "possible lost order"
-                )
-                self._update_trade_status(trade.client_order_id, "error_missing")
+        """Compatibilidad del executor: sólo recupera sus propios intents antiguos."""
+        result = await reconcile_pending_orders(
+            self.client, strategies=("motor_1_arbitrage",), min_age_seconds=30
+        )
+        if result.unresolved:
+            try:
                 await alert_error(
-                    f"Trade {trade.client_order_id} (ticker={trade.ticker}) not found in "
-                    "Kalshi orders during reconciliation. Manual review required."
+                    f"Reconcile M1: {len(result.unresolved)} intents pendientes; revisión requerida."
                 )
-                continue
-
-            kalshi_status = kalshi_order.get("status", "")
-            if kalshi_status == "executed":
-                with get_session() as s:
-                    t = s.exec(
-                        select(Trade).where(Trade.client_order_id == trade.client_order_id)
-                    ).first()
-                    if t:
-                        t.status = "filled"
-                        t.filled_at = _naive_utc_now()
-                        t.kalshi_order_id = str(kalshi_order.get("order_id", ""))
-                        s.add(t)
-                        s.commit()
-            elif kalshi_status == "canceled":
-                self._update_trade_status(trade.client_order_id, "cancelled")
-            else:
-                logger.warning(
-                    f"reconcile: trade {trade.client_order_id} has unexpected Kalshi "
-                    f"status={kalshi_status!r}"
-                )
-                self._update_trade_status(trade.client_order_id, "error")
+            except Exception:
+                logger.exception("No se pudo enviar alerta de reconciliación")
 
     async def execute(self, opp: ArbOpportunity) -> bool:
         """
@@ -309,7 +243,30 @@ class ArbitrageExecutor:
         # motor_rest_arb (executor.py, #85); select_hard_leg es la fuente única. NO se agrega
         # pre-check de depth: sería un no-op (count = min(available_size) ya, por construcción).
         coids = {leg: str(uuid.uuid4()) for leg in opp.legs}
-        self._persist_intents(opp, count, [coids[leg] for leg in opp.legs])
+
+        def persist_reserved(final_decision) -> bool:
+            nonlocal count
+            count = min(count, final_decision.max_allowed_count)
+            gross = (100 - sum(leg.price_cents for leg in opp.legs)) * count
+            fees = sum(kalshi_fee_cents(count, leg.price_cents) for leg in opp.legs)
+            if count <= 0 or gross <= fees:
+                return False
+            try:
+                return self._persist_intents(
+                    opp,
+                    count,
+                    [coids[leg] for leg in opp.legs],
+                    limits=self.risk_manager.m1_reservation_limits(),
+                )
+            except Exception:
+                logger.exception("motor1.reservation_rejected → no se envía ninguna pata")
+                return False
+
+        # Recheck global + reserva bajo el lock común; la transacción SQLite del
+        # callback serializa presupuesto/evento también entre procesos.
+        reserved = await self.risk_manager.check_and_reserve(opp, persist_reserved)
+        if not reserved.approved:
+            return False
 
         hard_leg, other_legs = select_hard_leg(opp)
 
@@ -412,7 +369,10 @@ class ArbitrageExecutor:
 
         order = result.get("order", result) if isinstance(result, dict) else {}
         order_id = str(order.get("order_id", "") or result.get("order_id", ""))
-        fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+        fill_count = terminal_fill(order, count, placement=True)
+        if fill_count is None:
+            hold_uncertain_order(coid, order)
+            return "error", 0
         if fill_count <= 0:
             logger.warning(
                 f"ArbitrageExecutor: leg {leg.market_ticker} ({leg.side}) FOK sin fill "
@@ -437,7 +397,8 @@ class ArbitrageExecutor:
             t = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
             if t:
                 t.status = "filled"
-                t.count = fill_count  # el count REAL fillado, no el pedido
+                resize_filled(t, fill_count)
+                t.fees_cents = kalshi_fee_cents(fill_count, leg.price_cents)
                 t.fill_price_cents = leg.price_cents
                 t.filled_at = _naive_utc_now()
                 if order_id:
@@ -505,6 +466,8 @@ class ArbitrageExecutor:
                         f"rollback: selling {remaining} {leg.market_ticker} ({leg.side}) "
                         f"IOC at price=1 (best bid={current_bid}¢), attempt {attempt + 1}"
                     )
+                    rollback_coid = f"{original_coid}-rb{uuid.uuid4().hex[:8]}"
+                    persist_reduction(original_coid, rollback_coid, remaining, current_bid)
                     resp = await self.client.place_order(
                         ticker=leg.market_ticker,
                         side=leg.side,
@@ -514,11 +477,15 @@ class ArbitrageExecutor:
                         order_type="limit",
                         yes_price=1 if leg.side == "yes" else None,
                         no_price=1 if leg.side == "no" else None,
-                        client_order_id=f"{original_coid}-rb{attempt}",
+                        client_order_id=rollback_coid,
                         time_in_force="immediate_or_cancel",
                     )
                     order = resp.get("order", resp) if isinstance(resp, dict) else {}
-                    sold = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+                    sold = terminal_fill(order, remaining, placement=True)
+                    if sold is None:
+                        hold_uncertain_order(rollback_coid, order)
+                        raise ValueError("fill de rollback desconocido")
+                    finalize_reduction(rollback_coid, sold, order.get("order_id"))
                     if sold <= 0:
                         logger.warning(
                             f"rollback: IOC sin fill para {leg.market_ticker} ({leg.side}) — "
@@ -530,7 +497,6 @@ class ArbitrageExecutor:
                     # SOLO lo confirmado libera posición y realiza pérdida. Precio contable:
                     # el bid leído (el IOC a 1¢ cruza desde el mejor bid; para sizes chicos es
                     # el precio efectivo — se anota como estimación en notes).
-                    self._settle_rollback_fill(original_coid, leg, sold, current_bid)
                     remaining -= sold
                     # Log AFIRMATIVO del éxito (sonda 2026-08-11): este era el ÚNICO
                     # desenlace silencioso del rollback — el operador tenía que inferir
@@ -555,7 +521,9 @@ class ArbitrageExecutor:
                         f"rollback: exception for {leg.market_ticker} ({leg.side}), "
                         f"attempt {attempt + 1}/{self.max_rollback_retries}: {exc}"
                     )
-                    await asyncio.sleep(1)
+                    # Respuesta perdida: el intent queda pending; no reenviar otra venta.
+                    engage_kill_switch("M1 rollback desconocido; requiere conciliación")
+                    break
             if remaining > 0:
                 # Lo no vendido sigue ABIERTO (fila filled con el remanente): visible como
                 # exposición para el RiskManager y gestionable como huérfana por Motor 3.
@@ -575,57 +543,9 @@ class ArbitrageExecutor:
         patrón que _settle_originals de M3): hija settled por lo vendido, la original conserva
         el remanente abierto (exposición real, reintentable/gestionable). Best-effort: un fallo
         de DB se loguea CRITICAL y no rompe el rollback (prioridad: seguir vendiendo)."""
-        from src.math.fees import kalshi_fee_cents
-
-        now = _naive_utc_now()
-        # Fee del round-trip (entrada + salida): ya estaba descontado del PnL pero se
-        # perdía sin registrar. Se guarda para que /stats/motors pueda medir el costo
-        # de transacción del motor, no solo su resultado neto.
-        fees = kalshi_fee_cents(sold, sell_price_cents) + kalshi_fee_cents(sold, leg.price_cents)
-        pnl = sold * (sell_price_cents - leg.price_cents) - fees
-        note = f"rollback_sell~{sell_price_cents}c"
-        try:
-            with get_session() as s:
-                t = s.exec(select(Trade).where(Trade.client_order_id == original_coid)).first()
-                if t is None:
-                    logger.critical(f"rollback settle: fila {original_coid} no encontrada")
-                    return
-                if sold >= t.count:
-                    t.status = "settled"
-                    t.settled_at = now
-                    t.pnl_cents = pnl
-                    t.fees_cents = fees  # round-trip completo, reemplaza el estimado de entrada
-                    t.notes = f"{t.notes or ''} {note}".strip()[:500]
-                    s.add(t)
-                else:
-                    t.count = t.count - sold  # remanente sigue abierto (filled)
-                    if t.fees_cents is not None:
-                        # El tramo vendido se lleva su fee de entrada a la hija: sin esto
-                        # el fee de esos contratos quedaría contado dos veces (patrón de
-                        # _settle_originals en M3).
-                        entry_tramo = kalshi_fee_cents(sold, leg.price_cents)
-                        t.fees_cents = max(0, t.fees_cents - entry_tramo)
-                    s.add(t)
-                    s.add(
-                        Trade(
-                            client_order_id=f"{original_coid}-rbs{uuid.uuid4().hex[:8]}",
-                            ticker=leg.market_ticker,
-                            side=leg.side,
-                            action="buy",
-                            count=sold,
-                            price_cents=leg.price_cents,
-                            fill_price_cents=leg.price_cents,
-                            strategy="motor_1_arbitrage",
-                            status="settled",
-                            settled_at=now,
-                            pnl_cents=pnl,
-                            fees_cents=fees,
-                            notes=f"{t.notes or ''} {note} split".strip()[:500],
-                        )
-                    )
-                s.commit()
-        except Exception:
-            logger.exception(f"rollback settle falló coid={original_coid} (pérdida sin realizar)")
+        coid = f"{original_coid}-rb{uuid.uuid4().hex[:8]}"
+        persist_reduction(original_coid, coid, sold, sell_price_cents)
+        finalize_reduction(coid, sold)
 
     def _breaker_params(self) -> tuple[int, float, bool]:
         """(threshold, window_min, count_clean) desde settings — tunables EN VIVO (incidente
@@ -1032,7 +952,9 @@ class ArbitrageExecutor:
         opp: ArbOpportunity,
         count: int,
         client_ids: list[str],
-    ) -> None:
+        *,
+        limits: dict | None = None,
+    ) -> bool:
         """Insert one Trade row per leg with status='pending' before touching network.
 
         arb_id COMPARTIDO en notes (bug producción 2026-07-02): el RiskManager solo
@@ -1044,28 +966,28 @@ class ArbitrageExecutor:
         from src.math.fees import kalshi_fee_cents
 
         arb_id = str(uuid.uuid4())
-        with get_session() as s:
-            for leg, coid in zip(opp.legs, client_ids, strict=True):
-                trade = Trade(
-                    client_order_id=coid,
-                    ticker=leg.market_ticker,
-                    side=leg.side,
-                    action="buy",
-                    count=count,
-                    price_cents=leg.price_cents,
-                    # Fee de entrada estimado, como ya hacían M2 y REST al persistir la
-                    # intención. Faltaba SOLO acá → los 519 trades settleados de M1
-                    # reportaban fees $0.00 y un criterio "PnL/trade vs fee" lo aprobaba
-                    # por comparar contra cero (2026-07-28). El PnL no cambia: el
-                    # settlement ya descontaba este mismo fee vía fallback.
-                    fees_cents=kalshi_fee_cents(count, leg.price_cents),
-                    strategy="motor_1_arbitrage",
-                    estimated_edge_pct=opp.edge_pct,
-                    status="pending",
-                    notes=f"arb_id={arb_id}",
-                )
-                s.add(trade)
-            s.commit()
+        trades = []
+        for leg, coid in zip(opp.legs, client_ids, strict=True):
+            trade = Trade(
+                client_order_id=coid,
+                ticker=leg.market_ticker,
+                side=leg.side,
+                action="buy",
+                **quantity_fields(count),
+                price_cents=leg.price_cents,
+                # Fee de entrada estimado, como ya hacían M2 y REST al persistir la
+                # intención. Faltaba SOLO acá → los 519 trades settleados de M1
+                # reportaban fees $0.00 y un criterio "PnL/trade vs fee" lo aprobaba
+                # por comparar contra cero (2026-07-28). El PnL no cambia: el
+                # settlement ya descontaba este mismo fee vía fallback.
+                fees_cents=kalshi_fee_cents(count, leg.price_cents),
+                strategy="motor_1_arbitrage",
+                estimated_edge_pct=opp.edge_pct,
+                status="pending",
+                notes=f"arb_id={arb_id}",
+            )
+            trades.append(trade)
+        return reserve_m1_intents(trades, limits=limits)
 
     def _update_trade_status(self, coid: str, status: str) -> None:
         """Update trade status (and filled_at if status='filled')."""

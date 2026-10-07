@@ -165,7 +165,9 @@ async def test_executor_sells_and_settles_only_orphans():
     )
     client = MagicMock()
     client.get_orderbook = AsyncMock(return_value={"orderbook": {"yes": [["0.15", "500.00"]]}})
-    client.place_order = AsyncMock(return_value={"order": {"order_id": "k1", "fill_count": 21}})
+    client.place_order = AsyncMock(
+        return_value={"order": {"remaining_count": 0, "order_id": "k1", "fill_count": 21}}
+    )
 
     ex = Motor3ExitExecutor(client, include_motor1_orphans=True)
     pos = _position(count=433)

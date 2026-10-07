@@ -63,7 +63,7 @@ def _trade() -> models.Trade | None:
 @pytest.mark.asyncio
 async def test_desired_count_floors_not_rounds():
     """$3.00 a 45c → 6.67 contratos: FLOOR = 6 (round daba 7 = $3.15, +5% del stake)."""
-    client = _FakeClient({"order": {"order_id": "o", "fill_count": 6}})
+    client = _FakeClient({"order": {"remaining_count": 0, "order_id": "o", "fill_count": 6}})
     risk = _FakeRisk()
     ex = Motor2Executor(client, risk)
 
@@ -77,7 +77,7 @@ async def test_desired_count_floors_not_rounds():
 async def test_stake_below_one_contract_skips():
     """$0.60 recomendado a 90c: max(1,...) forzaba 1 contrato = $0.90 (1.5× el stake).
     Ahora se saltea sin tocar red ni RiskManager."""
-    client = _FakeClient({"order": {"order_id": "o", "fill_count": 1}})
+    client = _FakeClient({"order": {"remaining_count": 0, "order_id": "o", "fill_count": 1}})
     risk = _FakeRisk()
     ex = Motor2Executor(client, risk)
 
@@ -91,7 +91,16 @@ async def test_stake_below_one_contract_skips():
 @pytest.mark.asyncio
 async def test_fill_count_null_falls_back_to_fp_field():
     """fill_count presente con null NO enmascara fill_count_fp (coalesce por is-not-None)."""
-    client = _FakeClient({"order": {"order_id": "o", "fill_count": None, "fill_count_fp": "5.00"}})
+    client = _FakeClient(
+        {
+            "order": {
+                "remaining_count": 0,
+                "order_id": "o",
+                "fill_count": None,
+                "fill_count_fp": "5.00",
+            }
+        }
+    )
     ex = Motor2Executor(client, _FakeRisk())
 
     out = await ex.execute(_signal(size_usd=3.00, price=45))
@@ -105,7 +114,16 @@ async def test_unreadable_fill_leaves_pending_not_cancelled():
     """HTTP 200 con fill ilegible en ambos campos → la fila queda 'pending' (el RiskManager
     la ve como exposición, conservador) en vez de 'cancelled' (posible posición viva
     invisible). Outcome incierto, sin kill-switch."""
-    client = _FakeClient({"order": {"order_id": "o", "fill_count": None, "fill_count_fp": None}})
+    client = _FakeClient(
+        {
+            "order": {
+                "remaining_count": 0,
+                "order_id": "o",
+                "fill_count": None,
+                "fill_count_fp": None,
+            }
+        }
+    )
     ex = Motor2Executor(client, _FakeRisk())
 
     out = await ex.execute(_signal(size_usd=3.00, price=45))

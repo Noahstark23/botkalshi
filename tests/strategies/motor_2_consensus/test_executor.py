@@ -158,7 +158,7 @@ async def test_trading_disabled_wall_is_clean_no_position():
 
 @pytest.mark.asyncio
 async def test_ioc_no_fill_cancels_without_position():
-    client = _FakeClient(resp={"order": {"order_id": "X", "fill_count": 0, "remaining_count": 3}})
+    client = _FakeClient(resp={"order": {"order_id": "X", "fill_count": 0, "remaining_count": 0}})
     risk = _FakeRisk(TradeDecision(True, "Aprobado", 3))
     ex = Motor2Executor(client, risk)
 

@@ -29,6 +29,7 @@ from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_1_arbitrage.engine import Motor1Engine
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 
 @pytest.fixture(autouse=True)
@@ -108,15 +109,16 @@ async def test_rollback_exitoso_loguea_vendido():
     client = AsyncMock()
     client.get_available_balance_usd.return_value = 10_000.0
     client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("fail"),  # YES (fácil) falla
-        {"order": {"fill_count": 10}},  # rollback IOC llena
+        {"order": {"remaining_count": 0, "fill_count": 10}},  # rollback IOC llena
     ]
     client.get_orderbook.return_value = {"orderbook": {"no": [[44, 10]], "yes": []}}
     rm = MagicMock(spec=RiskManager)
     rm.check_pre_trade = AsyncMock(
         return_value=TradeDecision(approved=True, reason="ok", max_allowed_count=10)
     )
+    wire_reservation_fake(rm)
     executor = ArbitrageExecutor(client, rm)
 
     lineas: list[str] = []

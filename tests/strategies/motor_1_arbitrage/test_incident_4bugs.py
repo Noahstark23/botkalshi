@@ -20,6 +20,7 @@ from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import PortfolioPosition, RiskEvent, get_session, kill_switch_engaged
 from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker, event_ticker_of
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 EVENT = "KXMLBGAME-26JUL061845HOUWSH"
 
@@ -47,7 +48,9 @@ def reset_bot_state():
 def mock_client() -> AsyncMock:
     client = AsyncMock()
     client.get_available_balance_usd.return_value = 10_000.0
-    client.place_order.return_value = {"order": {"order_id": "k-1", "fill_count": 10}}
+    client.place_order.return_value = {
+        "order": {"remaining_count": 0, "order_id": "k-1", "fill_count": 10}
+    }
     return client
 
 
@@ -57,6 +60,7 @@ def mock_risk() -> MagicMock:
     rm.check_pre_trade = AsyncMock(
         return_value=TradeDecision(approved=True, reason="ok", max_allowed_count=10)
     )
+    wire_reservation_fake(rm)
     return rm
 
 
@@ -260,10 +264,34 @@ async def test_bug3_successful_rollback_does_not_pause(executor, mock_client):
     leg = ArbLeg(
         market_ticker=f"{EVENT}-HOU", side="yes", price_cents=18, count=10, available_size=100
     )
+    # El rollback necesita un BUY confirmado durable, como después de la entrada real.
+    from src.storage.quantities import filled_fields
+
+    with get_session() as session:
+        session.add(
+            _models.Trade(
+                client_order_id="coid-1",
+                ticker=leg.market_ticker,
+                side="yes",
+                action="buy",
+                price_cents=18,
+                fill_price_cents=18,
+                status="filled",
+                strategy="motor_1_arbitrage",
+                **filled_fields(10),
+            )
+        )
+        session.commit()
     with patch(
         "src.strategies.motor_1_arbitrage.executor.alert_risk_event", new_callable=AsyncMock
     ):
         await executor._execute_iterative_rollback([(leg, "coid-1", 10)])
+    with get_session() as session:
+        original = session.exec(
+            select(_models.Trade).where(_models.Trade.client_order_id == "coid-1")
+        ).one()
+    assert original.status == "settled" and original.closed_by_clv
+    assert mock_client.place_order.call_args.kwargs["count"] == 10
     engaged, _ = kill_switch_engaged()
     assert engaged is False
     # el circuit breaker genérico (3 en 60min) sigue intacto para rollbacks normales

@@ -11,7 +11,7 @@ Notas de fidelidad (verificadas contra src/strategies/motor_rest_arb/executor.py
   - leg_states se arma en orden [hard, *baratas]; para que `state_of` por índice de
     opp.legs sea válido, los opp con asserts por-pata ponen la dura en opp.legs[0]. El
     test del reordenamiento (hard-first) la pone NO-primera y valida por orden de llamadas.
-  - El reconcile de un ERROR_RED usa DOBLE fuente → se mockea get_orders Y get_positions.
+  - ERROR_RED exige evidencia de su orden exacta; el neto de posición no sustituye un fill.
 """
 
 from __future__ import annotations
@@ -100,9 +100,7 @@ def make_mock_client(state_by_ticker: dict[str, str], *, count=1):
         if st == "ERROR_RED":
             raise RuntimeError("network timeout (desconocido)")
         if st == "KILL_NOFILL":
-            return {
-                "order": {"order_id": f"OID-{ticker}", "fill_count": 0, "remaining_count": count}
-            }
+            return {"order": {"order_id": f"OID-{ticker}", "fill_count": 0, "remaining_count": 0}}
         # FILL (default y rollback-sell)
         return {"order": {"order_id": f"OID-{ticker}", "fill_count": count, "remaining_count": 0}}
 
@@ -199,7 +197,7 @@ async def test_hard_leg_fill_proceeds():
 
 
 # =====================================================
-# 5. ERROR_RED de la dura → no-op + reconcilia (doble fuente)
+# 5. ERROR_RED de la dura → conserva intent y pausa si no hay evidencia
 # =====================================================
 
 
@@ -216,9 +214,13 @@ async def test_hard_leg_error_red_is_noop_and_flags_reconcile():
     assert outcome.rollback_triggered is False
     assert client.place_order.await_count == 1  # solo se intentó la dura; baratas no se envían
     assert state_of(opp, outcome, hard) is LegState.ERROR_RED
-    assert outcome.reconciled is True  # se resolvió el estado desconocido...
-    client.get_orders.assert_awaited()  # ...consultando la doble fuente
-    client.get_positions.assert_awaited()
+    assert outcome.reconciled is True  # se intentó reconciliar; ausencia no confirma cero.
+    client.get_orders.assert_awaited()
+    client.get_positions.assert_not_awaited()  # Un neto no identifica el fill de esta orden.
+    assert _all_trades()["HARD"].status == "pending"
+    assert _all_trades()["HARD"].filled_count_fp is None
+    assert models.kill_switch_engaged()[0]
+    assert all(call.kwargs["action"] == "buy" for call in client.place_order.await_args_list)
     # La barata no enviada queda marcada not_sent_hard_first.
     assert "not_sent_hard_first" in (_all_trades()["C1"].notes or "")
 

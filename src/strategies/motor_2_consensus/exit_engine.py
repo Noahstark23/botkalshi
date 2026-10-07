@@ -42,6 +42,7 @@ from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
+from src.storage.quantities import open_quantity
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.take_profit import DEFAULT_TAKE_PROFIT_CENTS, take_profit_due
@@ -212,10 +213,10 @@ class Motor2ExitEngine:
 
         groups: dict[tuple[str, str], list[tuple[int, int]]] = {}
         for b in buys:
-            if b.count <= 0 or b.side not in ("yes", "no"):
+            if open_quantity(b) <= 0 or b.side not in ("yes", "no"):
                 continue
             entry = b.fill_price_cents or b.price_cents
-            groups.setdefault((b.ticker, b.side), []).append((b.count, entry))
+            groups.setdefault((b.ticker, b.side), []).append((open_quantity(b), entry))
 
         positions: list[Motor2Position] = []
         for (ticker, side), legs in groups.items():

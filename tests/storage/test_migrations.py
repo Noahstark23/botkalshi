@@ -109,13 +109,19 @@ def test_fractional_columns_preserve_legacy_fills_and_are_idempotent(tmp_path):
         conn.exec_driver_sql(
             "CREATE TABLE mm_funnel_snapshots (id INTEGER PRIMARY KEY, inventory_abs INTEGER)"
         )
+        conn.exec_driver_sql(
+            "CREATE TABLE portfolio_positions (id INTEGER PRIMARY KEY, count INTEGER)"
+        )
+        conn.exec_driver_sql("INSERT INTO portfolio_positions(count) VALUES(7)")
     with patch("src.storage.models.get_settings", return_value=settings):
         models.apply_migrations(engine)
         models.apply_migrations(engine)
     with engine.begin() as conn:
         row = conn.exec_driver_sql(
-            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp FROM trades"
+            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp,count_fp,fill_cost_usd_fp,fees_usd_fp FROM trades"
         ).one()
-    assert row == (10, 3, -5, None, None)
+        position = conn.exec_driver_sql("SELECT count,count_fp FROM portfolio_positions").one()
+    assert row == (10, 3, -5, None, None, None, None, None)
+    assert position == (7, None)
     assert "inventory_fp" in _columns(engine, "mm_quotes")
     assert "inventory_abs_fp" in _columns(engine, "mm_funnel_snapshots")

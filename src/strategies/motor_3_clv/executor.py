@@ -24,14 +24,20 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
+from fractions import Fraction
+from math import floor
 from typing import ClassVar
 
 from loguru import logger
+from sqlalchemy import text
 from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.math.fees import kalshi_fee_cents
+from src.math.quantities import terminal_fill
+from src.storage.cost_allocation import allocate_entry, usd_text
 from src.storage.models import (
     PortfolioPosition,
     Trade,
@@ -39,8 +45,16 @@ from src.storage.models import (
     engage_kill_switch,
     get_session,
 )
+from src.storage.quantities import (
+    confirmed_fill,
+    filled_fields,
+    hold_uncertain_order,
+    open_quantity,
+    quantity_fields,
+    requested_quantity,
+    resize_filled,
+)
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
-from src.strategies.motor_3_clv.poller import _as_int
 
 STRATEGY = "motor_3_clv"
 
@@ -51,7 +65,7 @@ class Motor3ExitOutcome:
 
     placed: bool  # llegó a tocar la red (place_order invocado)
     filled: bool  # llenó algo (posición reducida/cerrada)
-    filled_count: int = 0
+    filled_count: int | Fraction = 0
     sell_price_cents: int | None = None
     reason: str = ""
     client_order_id: str | None = None
@@ -146,7 +160,7 @@ class Motor3ExitExecutor:
                     "(sin patas BUY abiertas atribuibles — otro exit ya cerró o posición ajena)"
                 )
                 return Motor3ExitOutcome(False, False, reason="already_closed")
-            count = min(position.count, open_count)
+            count = min(requested_quantity(position), open_count)
             return await self._exit_locked(position.ticker, position.side, count)
 
     def _attributable_buys(self, s, ticker: str, side: str) -> list[Trade]:
@@ -192,7 +206,7 @@ class Motor3ExitExecutor:
         (ticker, side). Fail-safe: error de DB → 0 (ante la duda, NO vender)."""
         try:
             with get_session() as s:
-                return sum(b.count for b in self._attributable_buys(s, ticker, side))
+                return sum(open_quantity(b) for b in self._attributable_buys(s, ticker, side))
         except Exception:
             logger.exception(f"motor3.exit.attributable_check_failed ticker={ticker}")
             return 0
@@ -284,7 +298,10 @@ class Motor3ExitExecutor:
 
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = str(order.get("order_id", "")) or None
-        fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp"))) or 0
+        fill_count = terminal_fill(order, count, placement=True)
+        if fill_count is None:
+            hold_uncertain_order(coid, order)
+            return Motor3ExitOutcome(True, False, reason="fill_unreadable", client_order_id=coid)
 
         if fill_count > 0:
             # Fill REAL: intent→settled + cierre de las patas BUY. CRÍTICO: si la
@@ -330,7 +347,7 @@ class Motor3ExitExecutor:
                         ticker=ticker,
                         side=side,
                         action="sell",
-                        count=count,
+                        **quantity_fields(count),
                         price_cents=price,
                         strategy=self._strategy,
                         status="pending",
@@ -379,19 +396,35 @@ class Motor3ExitExecutor:
         engancha la pausa preventiva — un fill real sin registrar deja al sistema ciego.
         """
         now = _naive_utc_now()
-        self._update_sell_intent(
-            coid,
-            critical=True,
-            status="settled",
-            count=fill_count,
-            fill_price_cents=price,
-            fees_cents=kalshi_fee_cents(fill_count, price),
-            kalshi_order_id=order_id,
-            filled_at=now,
-            settled_at=now,
-            notes_append="clv_exit_filled",
-        )
-        self._settle_originals(ticker, side, price, fill_count)
+        with get_session() as s:
+            s.exec(text("BEGIN IMMEDIATE"))
+            sell = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
+            if sell is None:
+                raise ValueError("intent de salida ausente")
+            if sell.status == "settled":
+                if fill_count != open_quantity(sell) or (
+                    order_id is not None
+                    and sell.kalshi_order_id is not None
+                    and order_id != sell.kalshi_order_id
+                ):
+                    raise ValueError("replay de salida contradice el ledger")
+                return  # Reconciliación repetida después de reiniciar: no volver a cerrar BUYs.
+            if fill_count > requested_quantity(sell):
+                raise ValueError("fill de salida excede intent")
+            observed = confirmed_fill(sell)
+            if observed is not None and fill_count < observed:
+                raise ValueError("fill de salida regresivo")
+            self._settle_originals(ticker, side, price, fill_count, session=s)
+            resize_filled(sell, fill_count)
+            sell.status = "settled"
+            sell.fill_price_cents = price
+            sell.fees_cents = kalshi_fee_cents(fill_count, price)
+            sell.kalshi_order_id = order_id
+            sell.filled_at = now
+            sell.settled_at = now
+            sell.notes = f"{sell.notes or ''} clv_exit_filled".strip()[:500]
+            s.add(sell)
+            s.commit()  # SELL y splits BUY juntos: ningún crash deja el ledger a medias.
 
     async def _reconcile_pending_sells(self, ticker: str, side: str) -> bool:
         """Resuelve intents SELL 'pending' (ERROR_RED previo) contra get_orders, por coid.
@@ -442,10 +475,16 @@ class Motor3ExitExecutor:
                 clear = False
                 continue
             status = str(o.get("status", ""))
-            fill = _as_int(o.get("fill_count", o.get("fill_count_fp")))
-            if fill is None and status == "executed":
-                fill = t.count  # executed sin fill_count legible → IOC lleno completo
-            fill = fill or 0
+            fill = terminal_fill(o, requested_quantity(t))
+            observed = confirmed_fill(t)
+            if fill is not None and observed is not None and fill < observed:
+                clear = False
+                self._engage_preventive_pause(t.client_order_id)
+                continue
+            if fill is None:
+                hold_uncertain_order(t.client_order_id, o)
+                clear = False
+                continue
             if fill > 0:
                 try:
                     self._finalize_fill(
@@ -471,6 +510,8 @@ class Motor3ExitExecutor:
                     t.client_order_id,
                     critical=False,
                     status="cancelled",
+                    filled_count=0,
+                    filled_count_fp="0.00",
                     notes_append=f"reconciled_{status or 'unknown'}",
                 )
         return clear
@@ -489,7 +530,9 @@ class Motor3ExitExecutor:
         except Exception:  # pragma: no cover - último recurso
             logger.exception("motor3.exit.preventive_pause_failed")
 
-    def _settle_originals(self, ticker: str, side: str, exit_price: int, filled_count: int) -> None:
+    def _settle_originals(
+        self, ticker: str, side: str, exit_price: int, filled_count: int | Fraction, *, session=None
+    ) -> None:
         """
         Cierra las patas BUY originales (Motor 2/REST) que este exit liquidó (FIFO por
         antigüedad), marcándolas closed_by_clv + settled con el PnL REALIZADO al precio de
@@ -504,11 +547,15 @@ class Motor3ExitExecutor:
         """
         now = _naive_utc_now()
         try:
-            with get_session() as s:
+            with get_session() if session is None else nullcontext(session) as s:
+                if session is None:
+                    s.exec(text("BEGIN IMMEDIATE"))
                 # Mismo criterio que _open_attributable_count (entry_origin + huérfanas de
                 # Motor 1 si el flag está on) → el settle cierra EXACTAMENTE las patas que
                 # habilitaron la venta, FIFO. Un hedge de Motor 1 jamás aparece acá.
                 buys = self._attributable_buys(s, ticker, side)
+                if sum(open_quantity(b) for b in buys) < filled_count:
+                    raise ValueError("fill de salida excede cantidad atribuible")
                 remaining = filled_count
                 # Fee del EXIT asignada por tramo ACUMULATIVO (deuda auditoría 2026-07-01):
                 # sumar ceil(fee(closed)) por pata sobre-cobraba hasta (n_patas−1)¢ y no
@@ -521,50 +568,58 @@ class Motor3ExitExecutor:
                     if b.closed_by_clv:
                         continue
                     buy_price = b.fill_price_cents or b.price_cents
-                    closed = min(b.count, remaining)
+                    quantity = open_quantity(b)
+                    closed = min(quantity, remaining)
                     exit_fee_tramo = kalshi_fee_cents(
                         closed_so_far + closed, exit_price
                     ) - kalshi_fee_cents(closed_so_far, exit_price)
-                    entry_fee_tramo = kalshi_fee_cents(closed, buy_price)
-                    # PnL realizado del tramo cerrado: (salida − entrada) − fees de ambos lados.
-                    pnl = closed * (exit_price - buy_price) - exit_fee_tramo - entry_fee_tramo
-                    if closed == b.count:
+                    allocation = allocate_entry(b, closed)
+                    pnl = (
+                        closed * exit_price
+                        - allocation.gross_cents
+                        - exit_fee_tramo
+                        - allocation.fee_cents
+                    )
+                    if closed == quantity:
                         b.status = "settled"
                         b.closed_by_clv = True
                         b.settled_at = now
-                        b.pnl_cents = pnl
+                        b.pnl_usd_fp = usd_text(pnl / 100)
+                        b.pnl_cents = floor(pnl)
+                        for field, value in allocation.closed_fields.items():
+                            setattr(b, field, value)
                         b.notes = f"{b.notes or ''} closed_by_clv".strip()[:500]
                         s.add(b)
                     else:
                         # Partial: reduce el original (remanente sigue abierto) + hija settled.
-                        b.count = b.count - closed
-                        if b.fees_cents is not None:
-                            # Prorratear las fees de ENTRADA al remanente (deuda auditoría:
-                            # dejar el fee del count original hacía que _leg_pnl_cents las
-                            # restara DOS veces cuando el remanente settlea por resolución).
-                            b.fees_cents = max(0, b.fees_cents - entry_fee_tramo)
+                        resize_filled(b, quantity - closed)
+                        for field, value in allocation.remaining_fields.items():
+                            setattr(b, field, value)
                         s.add(b)
                         s.add(
                             Trade(
                                 client_order_id=f"{b.client_order_id}-clv{uuid.uuid4().hex[:8]}",
+                                commitment_origin_id=b.commitment_origin_id,
                                 ticker=ticker,
                                 side=side,
                                 action="buy",
-                                count=closed,
+                                **filled_fields(closed),
                                 price_cents=b.price_cents,
                                 fill_price_cents=buy_price,
                                 strategy=b.strategy,
                                 status="settled",
                                 closed_by_clv=True,
                                 settled_at=now,
-                                pnl_cents=pnl,
-                                fees_cents=entry_fee_tramo,
+                                pnl_cents=floor(pnl),
+                                pnl_usd_fp=usd_text(pnl / 100),
+                                **allocation.closed_fields,
                                 notes="closed_by_clv split",
                             )
                         )
                     remaining -= closed
                     closed_so_far += closed
-                s.commit()
+                if session is None:
+                    s.commit()
         except Exception:
             logger.exception(f"motor3.exit.settle_originals_failed ticker={ticker}")
             raise

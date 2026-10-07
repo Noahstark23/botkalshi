@@ -32,7 +32,14 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState, app
 from src.monitoring.telegram_alerts import alert_shutdown, alert_startup, send_alert
 from src.risk.manager import RiskManager
-from src.storage.models import BotRun, get_session, init_db, kill_switch_engaged
+from src.storage.models import (
+    BotRun,
+    engage_kill_switch,
+    get_session,
+    init_db,
+    kill_switch_engaged,
+)
+from src.storage.order_reconciliation import reconcile_pending_orders
 from src.strategies.data_capture import DataCaptureService
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
 from src.strategies.motor_rest_arb.settlement import KalshiSettlementSource, SettlementPoller
@@ -681,27 +688,39 @@ class ProductionRunner:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
 
     async def _reconcile_on_boot(self) -> None:
-        """
-        Reconcilia trades huérfanos post-crash.
+        """GET + ledger de motores habilitados; incertidumbre pausa durablemente.
 
-        Tolerante a fallas: si Kalshi está caído al arranque, el bot SIGUE
-        corriendo — los trades pending quedan sin resolver en DB, pero el
-        operador ve el error en BotState.last_error y /status.
+        Recuperar contabilidad no requiere habilitar ejecución. No se construyen
+        executors y este hook nunca envía, cancela ni liquida una orden.
         """
+        strategies = tuple(
+            name
+            for name, enabled in (
+                ("motor_1_arbitrage", self.settings.MOTOR_1_ARBITRAGE_ENABLED),
+                ("motor_2_consensus", self.settings.MOTOR_2_SPORTSBOOK_ENABLED),
+                ("motor_rest_arb", self.settings.MOTOR_REST_ENABLED),
+            )
+            if enabled
+        )
+        if not strategies:
+            return
+        failure = None
         try:
             async with KalshiRestClient() as rest_client:
-                risk_manager = RiskManager()
-                executor = ArbitrageExecutor(
-                    rest_client=rest_client,
-                    risk_manager=risk_manager,
-                )
-                await executor.initialize()
-                logger.success("Reconcile post-crash completado")
-        except Exception as e:
-            msg = f"Reconcile en boot falló: {type(e).__name__}: {e}"
-            logger.exception(msg)
-            BotState.record_error(msg)
-            # NO re-raise: el bot debe seguir arrancando
+                result = await reconcile_pending_orders(rest_client, strategies=strategies)
+            if result.unresolved:
+                failure = f"Reconcile boot: {len(result.unresolved)} intents sin resolver"
+            else:
+                logger.success("Reconcile post-crash: {} intents resueltos", result.resolved)
+        except Exception as exc:
+            failure = f"Reconcile en boot falló: {type(exc).__name__}: {exc}"
+            logger.exception(failure)
+        if failure:
+            BotState.is_paused = True
+            BotState.pause_reason = failure
+            BotState.record_error(failure)
+            # Si SQLite falla, abortar boot: no existe una pausa durable verificable.
+            engage_kill_switch(failure)
 
     # =====================================================
     # Lifecycle
@@ -750,7 +769,7 @@ class ProductionRunner:
             # Despausa SOLO manual (clear_kill_switch.py).
             await self._rehydrate_kill_switch()
 
-            # Fase 6 Motor 1: Reconciliación de trades huérfanos post-crash.
+            # Reconciliación de intents de motores habilitados, sin enviar órdenes.
             await self._reconcile_on_boot()
 
             # Capital REAL temprano (best-effort, fix 2026-07-01): las señales de

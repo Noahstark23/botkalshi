@@ -35,3 +35,15 @@ def _clear_shared_exit_locks():
     Motor3ExitExecutor._locks.clear()
     yield
     Motor3ExitExecutor._locks.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_pause_between_tests():
+    """Una pausa deliberada del executor no puede contaminar otros casos/DBs."""
+    from src.monitoring.health import BotState
+
+    BotState.is_paused = False
+    BotState.pause_reason = None
+    yield
+    BotState.is_paused = False
+    BotState.pause_reason = None

@@ -40,7 +40,7 @@ _FOK_KILL_CODE = "fill_or_kill_insufficient_resting_volume"
 def _trades() -> dict[str, models.Trade]:
     """Filas Trade persistidas por A.1, indexadas por side (una por pata)."""
     with models.get_session() as s:
-        rows = list(s.exec(select(models.Trade)).all())
+        rows = list(s.exec(select(models.Trade).where(models.Trade.action == "buy")).all())
     return {t.side: t for t in rows}
 
 
@@ -91,10 +91,8 @@ def _create_order_fill(count: int = 5) -> dict:
 
 
 def _create_order_nofill(count: int = 5) -> dict:
-    """CreateOrder que no llenó (FOK cancelado): fill 0, remaining = count."""
-    return {
-        "order": {"order_id": "OID", "fill_count_fp": "0.00", "remaining_count_fp": f"{count}.00"}
-    }
+    """CreateOrder terminal que no llenó: fill 0, remaining 0."""
+    return {"order": {"order_id": "OID", "fill_count_fp": "0.00", "remaining_count_fp": "0.00"}}
 
 
 def _kill_409() -> KalshiClientError:
@@ -140,6 +138,9 @@ class HarnessClient:
             {
                 "client_order_id": c["client_order_id"],
                 "status": self.reconcile_status,
+                "fill_count_fp": f"{c['count']}.00"
+                if self.reconcile_status == "executed"
+                else "0.00",
                 "order_id": "OID",
             }
             for m, c in self.calls
@@ -228,7 +229,7 @@ async def test_route_fill_plus_rollback_ok():
     assert trades["no"].status == "settled"
     assert trades["no"].pnl_cents is not None and trades["no"].pnl_cents < 0
     assert trades["no"].settled_at is not None
-    assert "rollback_closed" in (trades["no"].notes or "")
+    assert "rollback_sell~1c" in (trades["no"].notes or "")
     assert trades["yes"].status == "cancelled"
 
 
@@ -273,12 +274,14 @@ async def test_route_error_red_reconciles_to_filled():
     assert outcome.reconciled is True
     # Doble fuente consultada para resolver el estado desconocido:
     assert any(m == "get_orders" for m, _ in client.calls)
-    assert any(m == "get_positions" for m, _ in client.calls)
+    assert not any(
+        m == "get_positions" for m, _ in client.calls
+    )  # El neto no atribuye fills a esta orden.
     assert outcome.rollback_triggered is True  # ambas expuestas (yes reconciliada llena + no FILL)
     # A.1: la reconciliada-llena quedó marcada y, como el rollback cerró, ambas
     # terminan settled con pérdida realizada.
     trades = _trades()
-    assert "error_red_reconciled_filled" in (trades["yes"].notes or "")
+    assert trades["yes"].filled_count_fp == "5.00"
     assert trades["yes"].status == "settled" and trades["no"].status == "settled"
     assert all((t.pnl_cents or 0) < 0 for t in trades.values())
 
@@ -302,7 +305,7 @@ async def test_route_error_red_reconciles_to_not_filled():
     # la barata (yes), nunca enviada, se cierra con not_sent_hard_first.
     trades = _trades()
     assert trades["no"].status == "cancelled"
-    assert "error_red_reconciled" in (trades["no"].notes or "")
+    assert "reconciled_zero" in (trades["no"].notes or "")
     assert trades["yes"].status == "cancelled"
     assert "not_sent_hard_first" in (trades["yes"].notes or "")
 

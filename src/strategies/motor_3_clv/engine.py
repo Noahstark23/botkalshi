@@ -22,6 +22,7 @@ from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.risk.manager import RiskManager
 from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
+from src.storage.quantities import open_quantity, quantity_fields, requested_quantity
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_3_clv.detector import detect_and_log, summarize_exits
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
@@ -206,7 +207,9 @@ class Motor3Engine:
             return []
         rest_tickers = {b.ticker for b in open_buys if b.strategy == "motor_rest_arb"}
         attributable = {
-            (b.ticker, b.side) for b in open_buys if b.strategy in _ENTRY_ORIGIN and b.count > 0
+            (b.ticker, b.side)
+            for b in open_buys
+            if b.strategy in _ENTRY_ORIGIN and open_quantity(b) > 0
         }
         # Bug 4: pares (ticker, side) con HUÉRFANAS de Motor 1 → gestionables, pero con el
         # count CAPEADO al total huérfano (la posición neta puede incluir pares hedged que
@@ -220,7 +223,10 @@ class Motor3Engine:
                 count, entry = self._orphan_by_pair.get(
                     key, (0, b.fill_price_cents or b.price_cents)
                 )
-                self._orphan_by_pair[key] = (count + b.count, entry)  # entry = FIFO (el 1ro)
+                self._orphan_by_pair[key] = (
+                    count + open_quantity(b),
+                    entry,
+                )  # entry = FIFO (el 1ro)
         kept: list[PortfolioPosition] = []
         skipped_rest, skipped_foreign, orphan_capped = 0, 0, 0
         for p in positions:
@@ -239,7 +245,7 @@ class Motor3Engine:
                     PortfolioPosition(
                         ticker=p.ticker,
                         side=p.side,
-                        count=min(p.count, orphan[0]),
+                        **quantity_fields(min(requested_quantity(p), orphan[0])),
                         close_time=p.close_time,
                         peak_bid_cents=p.peak_bid_cents,
                     )
@@ -276,7 +282,7 @@ class Motor3Engine:
                             col(Trade.strategy).in_(_ENTRY_ORIGIN),
                         )
                     )
-                    if not b.closed_by_clv and b.count > 0
+                    if not b.closed_by_clv and open_quantity(b) > 0
                 ]
         except Exception as exc:
             logger.warning(f"motor3.trail.entry_error ticker={position.ticker}: {exc}")
@@ -286,8 +292,8 @@ class Motor3Engine:
             # el entry sale del primer BUY huérfano (FIFO), cacheado por tick en attribution.
             orphan = self._orphan_by_pair.get((position.ticker, position.side))
             return orphan[1] if orphan is not None else None
-        total = sum(b.count for b in buys)
-        wavg = sum((b.fill_price_cents or b.price_cents) * b.count for b in buys) / total
+        total = sum(open_quantity(b) for b in buys)
+        wavg = sum((b.fill_price_cents or b.price_cents) * open_quantity(b) for b in buys) / total
         return round(wavg)
 
     def _shadow_pnl_str(self, position: PortfolioPosition, bid: int, entry: int | None) -> str:
@@ -297,8 +303,10 @@ class Motor3Engine:
         Si no hay entry, no se puede calcular."""
         if entry is None:
             return "entry=? net_pnl=?"
-        gross_cents = position.count * (bid - entry)
-        fees_cents = kalshi_fee_cents(position.count, bid) + kalshi_fee_cents(position.count, entry)
+        gross_cents = requested_quantity(position) * (bid - entry)
+        fees_cents = kalshi_fee_cents(requested_quantity(position), bid) + kalshi_fee_cents(
+            requested_quantity(position), entry
+        )
         net_cents = gross_cents - fees_cents
         return (
             f"entry={entry}c gross=${gross_cents / 100:+.2f} "

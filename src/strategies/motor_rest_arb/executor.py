@@ -24,9 +24,10 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from fractions import Fraction
 
 from loguru import logger
 from sqlmodel import select
@@ -34,7 +35,15 @@ from sqlmodel import select
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
 from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.math.fees import kalshi_fee_cents
+from src.math.quantities import api_count, fixed_count, terminal_fill
 from src.storage.models import Trade, engage_kill_switch, get_session
+from src.storage.quantities import (
+    confirmed_fill,
+    filled_fields,
+    hold_uncertain_order,
+    quantity_fields,
+)
+from src.storage.reductions import finalize_reduction, persist_reduction
 
 
 def _naive_utc_now() -> datetime:
@@ -51,20 +60,6 @@ def _naive_utc_now() -> datetime:
 _FOK_KILL_ERROR_CODES = frozenset({"fill_or_kill_insufficient_resting_volume"})
 
 
-def _as_int(value: object) -> int | None:
-    """Castea a int un campo que puede venir int o fixed-point string. None si inválido."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, (str, float)):
-        try:
-            return int(round(float(value)))
-        except (ValueError, TypeError):
-            return None
-    return None
-
-
 class LegState(StrEnum):
     """Estado resuelto de una pata tras intentar ejecutarla."""
 
@@ -79,6 +74,8 @@ class LegResult:
     state: LegState
     client_order_id: str
     order_id: str | None = None  # id de Kalshi si se conoce
+    fill_count: Fraction | None = None
+    terminal: bool = True
 
 
 @dataclass
@@ -229,14 +226,18 @@ class RestExecutor:
         residual la marca el reconcile de boot con alerta conservadora). ERROR_RED no se
         toca acá: lo resuelve _resolve_exposure tras reconciliar.
         """
-        if r.state is LegState.FILL:
+        if not r.terminal:
+            order = {"fill_count_fp": fixed_count(r.fill_count)} if r.fill_count is not None else {}
+            hold_uncertain_order(r.client_order_id, order)
+        elif r.fill_count is not None and r.fill_count > 0:
             self._update_trade(
                 r.client_order_id,
                 critical=True,
                 status="filled",
                 filled_at=_naive_utc_now(),
                 fill_price_cents=r.leg.price_cents,
-                fees_cents=kalshi_fee_cents(r.leg.count, r.leg.price_cents),
+                fees_cents=kalshi_fee_cents(r.fill_count, r.leg.price_cents),
+                **filled_fields(r.fill_count),
                 kalshi_order_id=r.order_id,
             )
         elif r.state is LegState.KILL:
@@ -313,40 +314,23 @@ class RestExecutor:
 
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = str(order.get("order_id", "")) or None
+        fill = terminal_fill(order, leg.count, placement=True)
+        if fill is None:
+            observed = api_count(order, "fill_count")
+            if observed is not None and observed > leg.count:
+                observed = None
+            return LegResult(leg, LegState.ERROR_RED, coid, order_id, observed, False)
         if self._create_order_filled(order, leg):
-            return LegResult(leg=leg, state=LegState.FILL, client_order_id=coid, order_id=order_id)
-        # FOK que no llenó (remaining_count > 0 / fill_count < count) → cancelado limpio.
-        return LegResult(leg=leg, state=LegState.KILL, client_order_id=coid, order_id=order_id)
+            return LegResult(leg, LegState.FILL, coid, order_id, fill)
+        if fill > 0:
+            # FOK parcial es exposición confirmada; no KILL ni permiso para la pata fácil.
+            return LegResult(leg, LegState.ERROR_RED, coid, order_id, fill)
+        return LegResult(leg, LegState.KILL, coid, order_id, fill)
 
     @staticmethod
     def _create_order_filled(order: dict, leg: ArbLeg) -> bool:
-        """
-        True si la respuesta de CreateOrder indica fill COMPLETO de la pata.
-
-        Shape real de Kalshi CreateOrder (V2), verificado contra la doc:
-        https://docs.kalshi.com/api-reference/orders/create-order
-          - fill_count: contratos llenados inmediatamente al colocar.
-          - remaining_count: contratos restantes; para FOK/IOC es el estado final
-            tras cancelar lo no llenado.
-        NO existe un campo `status` en CreateOrder; tampoco `filled`/`count_filled`.
-
-        FALLO CONSERVADOR HACIA KILL: si los campos esperados no están presentes o
-        no son enteros, se devuelve False (KILL). Mejor un rollback innecesario que
-        leer un KILL como FILL → exposición direccional silenciosa (Issue #14).
-
-        ⚠️ [verificar en demo] El nombre exacto puede venir como fixed-point
-        (`fill_count_fp`/`remaining_count_fp`, strings) según endpoint/versión. Se
-        prueban ambos; lo que no se confirme aquí se valida mandando una FOK real
-        en cuenta demo y observando la respuesta cruda antes de operar capital.
-        """
-        fill_count = _as_int(order.get("fill_count", order.get("fill_count_fp")))
-        remaining = _as_int(order.get("remaining_count", order.get("remaining_count_fp")))
-        if fill_count is None:
-            return False  # sin señal de fill confiable → KILL conservador
-        # Fill completo: se llenó al menos lo pedido y no quedó nada pendiente.
-        if remaining is not None:
-            return fill_count >= leg.count and remaining == 0
-        return fill_count >= leg.count
+        """Fill completo y terminal, validando ambos shapes oficiales de respuesta."""
+        return terminal_fill(order, leg.count, placement=True) == leg.count
 
     @staticmethod
     def _get_orders_filled(order: dict, leg: ArbLeg) -> bool:
@@ -358,7 +342,9 @@ class RestExecutor:
           - status ∈ {"resting", "canceled", "executed"}.
         FILL = status == "executed". Fallo conservador: cualquier otro → no llena.
         """
-        return str(order.get("status", "")).lower() == "executed"
+        return str(
+            order.get("status", "")
+        ).lower() == "executed" and RestExecutor._create_order_filled(order, leg)
 
     # =====================================================
     # Reconciliación de ERROR_RED (estado desconocido)
@@ -367,94 +353,66 @@ class RestExecutor:
     async def _resolve_exposure(
         self, results: list[LegResult], outcome: ExecutionOutcome
     ) -> list[LegResult]:
-        """
-        Determina qué patas quedaron REALMENTE llenas (exposición a cerrar).
-
-        FILL → llena. KILL → no llena. ERROR_RED → desconocido: consultar posición
-        real (get_positions / get_orders por client_order_id) antes de decidir.
-        Devuelve la lista de patas confirmadas llenas que requieren rollback.
-        """
         exposed: list[LegResult] = []
         for r in results:
-            if r.state is LegState.FILL:
-                exposed.append(r)
-            elif r.state is LegState.ERROR_RED:
+            if r.state is LegState.KILL:
+                continue
+            fill = r.fill_count if r.terminal else None
+            if fill is None:
                 outcome.reconciled = True
-                really_filled = await self._reconcile_leg(r)
-                if really_filled:
-                    logger.warning(
-                        f"rest_exec.reconcile ticker={r.leg.market_ticker} → FILLED (rollback)"
-                    )
-                    # A.1 — la pata desconocida resultó LLENA: posición real → crítico.
-                    self._update_trade(
-                        r.client_order_id,
-                        critical=True,
-                        status="filled",
-                        filled_at=_naive_utc_now(),
-                        fill_price_cents=r.leg.price_cents,
-                        fees_cents=kalshi_fee_cents(r.leg.count, r.leg.price_cents),
-                        notes_append="error_red_reconciled_filled",
-                    )
-                    exposed.append(r)
-                else:
-                    logger.info(f"rest_exec.reconcile ticker={r.leg.market_ticker} → not filled")
-                    # A.1 — confirmada no-llena por doble fuente → cerrar la fila.
-                    self._update_trade(
-                        r.client_order_id,
-                        critical=False,
-                        status="cancelled",
-                        notes_append="error_red_reconciled",
-                    )
+                fill = await self._reconcile_leg(r)
+            if fill is None:
+                # Una posición neta no atribuye un fill a esta orden. No vender una cantidad
+                # inventada: conservar intent y detener entradas hasta conciliación manual.
+                outcome.kill_switch_fired = True
+                self._paused = True
+                engage_kill_switch("REST: cantidad desconocida; prohibido rollback supuesto")
+                continue
+            if fill == 0:
+                self._update_trade(
+                    r.client_order_id,
+                    critical=False,
+                    status="cancelled",
+                    notes_append="reconciled_zero",
+                )
+                continue
+            self._update_trade(
+                r.client_order_id,
+                critical=True,
+                status="filled",
+                filled_at=_naive_utc_now(),
+                fill_price_cents=r.leg.price_cents,
+                fees_cents=kalshi_fee_cents(fill, r.leg.price_cents),
+                **filled_fields(fill),
+            )
+            exposed.append(replace(r, leg=replace(r.leg, count=fill), fill_count=fill))
         return exposed
 
-    async def _reconcile_leg(self, r: LegResult) -> bool:
-        """
-        Consulta el estado REAL de una pata ERROR_RED con DOS fuentes independientes.
-
-        Es la decisión más cara del sistema, así que no descansa en una sola fuente
-        (que además comparte el shape de parsing dudoso):
-          1) PRIMARIA: get_orders, match por client_order_id → status=="executed".
-          2) SECUNDARIA: get_positions, ¿hay posición abierta en el ticker?
-
-        Reglas (fail-safe hacia exposición = rollback, la opción segura):
-          - Si CUALQUIERA de las dos consultas falla (red sigue caída) → exposición.
-          - Si DISCREPAN (una dice llena, la otra no) → exposición (no confiar en
-            la fuente optimista).
-          - Solo si AMBAS coinciden en "no llena" → no llena (no rollback).
-        """
-        # Fuente 1: get_orders por client_order_id.
+    async def _reconcile_leg(self, r: LegResult) -> Fraction | None:
         try:
-            resp = await self.client.get_orders(ticker=r.leg.market_ticker)
-            orders = resp.get("orders", []) if isinstance(resp, dict) else []
-            matched = next(
-                (o for o in orders if str(o.get("client_order_id", "")) == r.client_order_id),
-                None,
-            )
-            # No apareció la orden → probablemente no llegó a Kalshi (no llena por esta fuente).
-            orders_says_filled = self._get_orders_filled(matched, r.leg) if matched else False
-        except Exception as exc:
-            logger.critical(
-                f"rest_exec.reconcile.get_orders_failed ticker={r.leg.market_ticker}: {exc} → assume exposed"
-            )
-            return True
-
-        # Fuente 2: get_positions, independiente del parsing de órdenes.
-        try:
-            has_position = await self._has_open_position(r.leg.market_ticker)
-        except Exception as exc:
-            logger.critical(
-                f"rest_exec.reconcile.get_positions_failed ticker={r.leg.market_ticker}: {exc} → assume exposed"
-            )
-            return True
-
-        if orders_says_filled == has_position:
-            return orders_says_filled  # ambas coinciden
-        # Discrepancia entre fuentes → tratar como exposición (rollback, lo seguro).
-        logger.critical(
-            f"rest_exec.reconcile.discrepancy ticker={r.leg.market_ticker} "
-            f"get_orders={orders_says_filled} get_positions={has_position} → assume exposed"
-        )
-        return True
+            response = await self.client.get_orders(ticker=r.leg.market_ticker)
+            orders = response.get("orders", []) if isinstance(response, dict) else []
+            matched = [
+                o
+                for o in orders
+                if isinstance(o, dict) and o.get("client_order_id") == r.client_order_id
+            ]
+            if len(matched) != 1:
+                return None
+            order = matched[0]
+            fill = terminal_fill(order, r.leg.count)
+            with get_session() as s:
+                row = s.exec(select(Trade).where(Trade.client_order_id == r.client_order_id)).one()
+                observed = confirmed_fill(row)
+            if fill is not None and observed is not None and fill < observed:
+                return None  # Nunca borrar un piso confirmado con un acumulado regresivo.
+            if fill is None:
+                hold_uncertain_order(r.client_order_id, order)
+                return None
+            return fill
+        except Exception:
+            logger.exception("REST: no se pudo conciliar cantidad atribuible")
+            return None
 
     async def _has_open_position(self, ticker: str) -> bool:
         """True si hay una posición abierta (no-cero) en el ticker, vía get_positions."""
@@ -469,7 +427,7 @@ class RestExecutor:
                 # Contratos netos != 0 → posición abierta. Kalshi devuelve el numérico como
                 # fixed-point string en `position_fp` (ej. "-1.00"); el `position` plano puede
                 # no venir. Leer _fp primero con fallback al plano (robusto ante ambos shapes).
-                pos = _as_int(p.get("position_fp", p.get("position")))
+                pos = api_count(p, "position", signed=True)
                 if pos is not None and pos != 0:
                     return True
         return False
@@ -490,35 +448,11 @@ class RestExecutor:
 
         all_closed = True
         for r in filled_legs:
-            closed = await self._sell_to_exit(r.leg)
+            closed = await self._sell_to_exit(r.leg, r.client_order_id)
             all_closed = all_closed and closed
-            if closed:
-                # A.1 — la pérdida del rollback se REALIZA al instante: settled +
-                # pnl_cents NEGATIVO a PRECIOS LÍMITE (venta a ROLLBACK_PRICE_CENTS=1¢).
-                # SESGO CONSERVADOR documentado: el sell IOC pudo llenar a mejor precio
-                # (al bid); registrar 1¢ sobrestima la pérdida → seguro para el stop-loss.
-                # [verificar en smoke] leer el precio real vía get_fills y reemplazar.
-                pnl = (
-                    (self.ROLLBACK_PRICE_CENTS - r.leg.price_cents) * r.leg.count
-                    - kalshi_fee_cents(r.leg.count, r.leg.price_cents)
-                    - kalshi_fee_cents(r.leg.count, self.ROLLBACK_PRICE_CENTS)
-                )
+            if not closed:
                 self._update_trade(
-                    r.client_order_id,
-                    critical=True,
-                    status="settled",
-                    settled_at=_naive_utc_now(),
-                    pnl_cents=pnl,
-                    notes_append="rollback_closed",
-                )
-            else:
-                # A.1 — la pata queda EXPUESTA (kill-switch a continuación): se mantiene
-                # status="filled" para que el cap de exposición del 25% LA VEA, con
-                # marca de auditoría para el runbook.
-                self._update_trade(
-                    r.client_order_id,
-                    critical=True,
-                    notes_append="exposed_killswitch",
+                    r.client_order_id, critical=True, notes_append="exposed_killswitch"
                 )
 
         outcome.rollback_filled = all_closed
@@ -530,36 +464,37 @@ class RestExecutor:
         # Tras registrar el rollback, evaluar si el circuit breaker debe pausar.
         self._maybe_trip_circuit_breaker()
 
-    async def _sell_to_exit(self, leg: ArbLeg) -> bool:
-        """Sell a 1¢ con reintentos. True si se llenó (posición cerrada)."""
-        for attempt in range(self.ROLLBACK_MAX_RETRIES):
+    async def _sell_to_exit(self, leg: ArbLeg, original_coid: str) -> bool:
+        """Vende sólo remanentes confirmados; cada intento tiene un ledger recuperable."""
+        remaining = leg.count
+        for _attempt in range(self.ROLLBACK_MAX_RETRIES):
+            coid = f"{original_coid}-rb{uuid.uuid4().hex[:8]}"
             try:
+                persist_reduction(original_coid, coid, remaining, self.ROLLBACK_PRICE_CENTS)
                 resp = await self.client.place_order(
                     ticker=leg.market_ticker,
                     side=leg.side,
                     action="sell",
                     reduce_only=True,
-                    count=leg.count,
+                    count=remaining,
                     order_type="limit",
                     yes_price=self.ROLLBACK_PRICE_CENTS if leg.side == "yes" else None,
                     no_price=self.ROLLBACK_PRICE_CENTS if leg.side == "no" else None,
-                    client_order_id=str(uuid.uuid4()),
+                    client_order_id=coid,
                     time_in_force="immediate_or_cancel",
                 )
                 order = resp.get("order", resp) if isinstance(resp, dict) else {}
-                if self._create_order_filled(order, leg):
-                    logger.info(
-                        f"rest_exec.rollback.filled ticker={leg.market_ticker} attempt={attempt + 1}"
-                    )
+                sold = terminal_fill(order, remaining, placement=True)
+                if sold is None:
+                    hold_uncertain_order(coid, order)
+                    return False  # Pending preservado: el próximo intento podría revender.
+                finalize_reduction(coid, sold, order.get("order_id"))
+                remaining -= sold
+                if remaining == 0:
                     return True
-                logger.warning(
-                    f"rest_exec.rollback.not_filled ticker={leg.market_ticker} "
-                    f"attempt={attempt + 1}/{self.ROLLBACK_MAX_RETRIES}"
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"rest_exec.rollback.error ticker={leg.market_ticker} attempt={attempt + 1}: {exc}"
-                )
+            except Exception:
+                logger.exception(f"rest_exec.rollback.unresolved coid={coid}")
+                return False
         return False
 
     # =====================================================
@@ -584,7 +519,7 @@ class RestExecutor:
                             ticker=leg.market_ticker,
                             side=leg.side,
                             action="buy",
-                            count=leg.count,
+                            **quantity_fields(leg.count),
                             price_cents=leg.price_cents,
                             strategy="motor_rest_arb",
                             estimated_edge_pct=opp.edge_pct,

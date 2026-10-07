@@ -35,6 +35,7 @@ from pathlib import Path
 # Tablas de ESTADO DE TRADING: se copian ENTERAS (nunca se pierden).
 _SACRED = [
     "trades",
+    "risk_commitments",  # presupuesto original: jamás reiniciar por rebuild/cierre
     "portfolio_positions",
     "risk_events",
     "daily_pnl",

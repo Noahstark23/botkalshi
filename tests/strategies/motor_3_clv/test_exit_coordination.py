@@ -42,7 +42,9 @@ def _client(*, bid_cents: int = 60, fill_count: int = 10) -> MagicMock:
     c.get_orderbook = AsyncMock(
         return_value={"orderbook": {"yes": [[f"0.{bid_cents:02d}", "100"]], "no": []}}
     )
-    c.place_order = AsyncMock(return_value={"order": {"order_id": "o", "fill_count": fill_count}})
+    c.place_order = AsyncMock(
+        return_value={"order": {"remaining_count": 0, "order_id": "o", "fill_count": fill_count}}
+    )
     return c
 
 

@@ -6,7 +6,7 @@ from fractions import Fraction
 from math import ceil
 
 from src.storage.models import Trade
-from src.strategies.motor_5_mm.ledger import confirmed_fill
+from src.storage.quantities import filled_quantity, requested_quantity
 from src.strategies.motor_5_mm.order_state import COUNT_QUARANTINE_NOTE
 
 MM_STRATEGY = "motor_5_mm"
@@ -46,24 +46,21 @@ def exposure_count(trade: Trade) -> int | Fraction:
         # La evidencia puede exceder count; tampoco otros motores pueden asumir
         # que la reserva original alcanza mientras el ledger está en cuarentena.
         raise UnknownExposureError("M5 con cantidad en cuarentena")
-    count = _integer(trade.count, minimum=1, field="count")
     try:
-        filled = confirmed_fill(trade) if trade.strategy == MM_STRATEGY else trade.filled_count
+        count = requested_quantity(trade)
+        if count <= 0:
+            raise ValueError("count debe ser positivo")
+        filled = filled_quantity(trade)
     except ValueError as exc:
-        raise UnknownExposureError("cantidad M5 persistida inválida") from exc
-    if filled is not None:
-        if trade.strategy != MM_STRATEGY:
-            filled = _integer(filled, minimum=0, field="filled_count")
-        if filled > count:
-            raise UnknownExposureError("filled_count excede count")
+        raise UnknownExposureError("cantidad persistida inválida") from exc
+    if filled is not None and filled > count:
+        raise UnknownExposureError("filled_count excede count")
     if trade.status == "pending":
         return count
     if trade.status != "filled":
         raise UnknownExposureError(f"estado abierto desconocido: {trade.status}")
     if filled is None:
-        if trade.strategy == MM_STRATEGY:
-            raise UnknownExposureError("M5 filled sin cantidad confirmada")
-        return count
+        raise UnknownExposureError("filled sin cantidad confirmada")
     return filled
 
 

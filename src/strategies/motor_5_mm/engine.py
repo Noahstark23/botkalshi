@@ -265,6 +265,7 @@ class Motor5Engine:
         self._book_diag_last: dict[str, float] = {}
         self._experiment_run_id: int | None = None
         self._execution_session: str | None = None
+        self._risk_mark_cursor: str | None = None
 
     def _begin_experiment_run(self) -> None:
         """Abre una época durable antes de tocar estado shadow.
@@ -675,6 +676,13 @@ class Motor5Engine:
         # ── Gates F2 (solo con executor) — se evalúan ANTES de cualquier quote ──────
         quotes_allowed = True
         if self._executor is not None:
+            capital_allowed = self._quote_capital_allowed()
+            if not capital_allowed:
+                # Una quote sin cambios no pasa por _place: perder cash fresco
+                # obliga a retirar también las resting, no sólo nuevas entradas.
+                quotes_allowed = False
+                counters["exec_risk_blocked"] += 1
+                logger.warning("motor5.capital_unavailable → retirar quotes y conciliar")
             blocked, incident_reason = incident_status()
             if blocked:
                 quotes_allowed = False
@@ -702,7 +710,9 @@ class Motor5Engine:
                 # live_coids: lo que ESTE proceso gestiona. Tras un restart es vacío →
                 # el reconcile cancela las resting del proceso anterior (huérfanas, P0
                 # auditoría 2026-07-07) antes de que el tick cotice encima.
-                report = await self._reconciler.reconcile(live_coids=self._executor.managed_coids())
+                report = await self._reconciler.reconcile(
+                    live_coids=self._executor.managed_coids() if capital_allowed else set()
+                )
                 # Lectura fallida o barrido vacío NO acreditan recuperación. Mantener
                 # el bloqueo hasta revisión explícita de la exposición desconocida.
                 self._executor.corrupted.update(report.corrupted_tickers)
@@ -724,6 +734,14 @@ class Motor5Engine:
             or ticker.split("-", 1)[0].upper() in self._allowed_series
         }
         fairs = raw_fairs
+        # Las posiciones reales se valoran aun sin fair o con entradas pausadas.
+        # La cobertura parcial bloquea entradas en RiskManager; no inventa marks.
+        risk_fees = await self._refresh_position_risk_marks(raw_fairs)
+        mtm_reason = self._unrealized_quote_block_reason()
+        if mtm_reason is not None:
+            quotes_allowed = False
+            counters["exec_risk_blocked"] += 1
+            logger.warning("motor5.mtm_blocked → retirar quotes: {}", mtm_reason)
         if self._require_pregame:
             before_pregame = len(fairs)
             fairs = {
@@ -853,6 +871,7 @@ class Motor5Engine:
                         continue
                 except Exception as exc:
                     counters["skip_fee_policy"] += 1
+                    self._invalidate_risk_mark(ticker)
                     if prev is not None and self._executor is None:
                         self._invalidate_experiment(
                             f"fee no observable con quote expuesta {ticker}: "
@@ -865,6 +884,13 @@ class Motor5Engine:
                         f"motor5.fee_policy_block ticker={ticker}: {type(exc).__name__}: {exc}"
                     )
                     continue
+            self._publish_risk_mark(
+                ticker,
+                yes_bid,
+                yes_ask,
+                observed_at=observed_at,
+                fee=fee_observation or risk_fees.get(ticker),
+            )
             if prev is not None and self._executor is None:
                 try:
                     # El fill que un salto ya causó SE CUENTA (un maker real tampoco
@@ -924,6 +950,14 @@ class Motor5Engine:
                 if self._executor is not None:
                     await self._executor.retire_ticker(ticker)
                 continue
+            if not self._quote_capital_allowed() or self._unrealized_quote_block_reason():
+                # Cash/marks pudieron caducar durante GET book/fee. Retirar todo
+                # antes de sync, incluso si conservaría los mismos precios.
+                counters["exec_risk_blocked"] += 1
+                for resting_ticker in list(self._live_quotes):
+                    self._forget_live_quote(resting_ticker)
+                    await self._executor.retire_ticker(resting_ticker)
+                break
             quote, skip = compute_quote(
                 ticker,
                 fv.fair_prob,
@@ -967,6 +1001,10 @@ class Motor5Engine:
                     counters["exec_corrupted"] += 1
                 elif outcome == "risk_blocked":
                     counters["exec_risk_blocked"] += 1
+        if self._executor is not None:
+            # Un fill confirmado durante retiro pertenece al inventario de ESTE
+            # tick, aunque ya no haya quotes ni permiso para volver a emitirlas.
+            counters["fills"] += self._apply_settled_fills()
         # Los tickers con markout pendiente que rotaron FUERA del universo necesitan su
         # mark refrescado aparte: si no, su horizonte largo no se mide nunca (bug 15-ago).
         await self._refrescar_marks_pendientes(tickers)
@@ -1053,7 +1091,9 @@ class Motor5Engine:
                     count = Fraction(0)  # pending no confirmado: reserva entera, sin fill inventado
                 if row.status == "filled" and count <= 0:
                     raise ValueError("fila filled sin ejecución positiva")
-                identity = (row.ticker, row.side, row.action, price)
+                # El precio medio confirmado puede cambiar al llegar otro fill;
+                # la identidad inmutable pertenece al límite del intent original.
+                identity = (row.ticker, row.side, row.action, row.price_cents)
                 previous = self._live_fill_state.get(row.client_order_id)
                 if previous is not None:
                     prior_identity, prior_count, prior_status = previous
@@ -1068,6 +1108,9 @@ class Motor5Engine:
                 next_state[row.client_order_id] = (identity, count, row.status)
                 if count <= 0:
                     continue
+                # Inventario/skew y telemetría histórica conservan el modelo de
+                # fees de InventoryBook. No son PnL live confirmado: el stop MTM
+                # usa por separado el ledger exacto en RiskManager (gross/fees FP).
                 inventory.apply_fill(
                     ShadowFill(
                         ticker=row.ticker,
@@ -1354,10 +1397,110 @@ class Motor5Engine:
         self._live_quote_fairs.pop(ticker, None)
         self._quote_jump.pop(ticker, None)
 
+    def _quote_capital_allowed(self) -> bool:
+        if self._executor is None:
+            return True
+        if self._risk is None:
+            self._risk = RiskManager()
+        return self._risk.can_quote_new_positions()
+
+    def _unrealized_quote_block_reason(self) -> str | None:
+        if self._executor is None or self._risk is None:
+            return None
+        return self._risk.unrealized_entry_block_reason()
+
+    def _invalidate_risk_mark(self, ticker: str) -> None:
+        if self._executor is not None:
+            RiskManager.record_mark(ticker, "yes", None)
+            RiskManager.record_mark(ticker, "no", None)
+
+    def _publish_risk_mark(
+        self,
+        ticker: str,
+        yes_bid: int,
+        yes_ask: int,
+        *,
+        observed_at: datetime,
+        fee: SeriesFeeObservation | None,
+    ) -> None:
+        """MTM de liquidación: bid para largos, ask para cortos; nunca fair/mid."""
+        if self._executor is None:
+            return
+        multiplier = fee.multiplier if fee is not None else None
+        RiskManager.record_mark(
+            ticker,
+            "yes",
+            yes_bid,
+            ask_cents=yes_ask,
+            observed_at=observed_at,
+            fee_multiplier=multiplier,
+        )
+        RiskManager.record_mark(
+            ticker,
+            "no",
+            100 - yes_ask,
+            ask_cents=100 - yes_bid,
+            observed_at=observed_at,
+            fee_multiplier=multiplier,
+        )
+
+    async def _refresh_position_risk_marks(
+        self, fairs: dict[str, FairValue]
+    ) -> dict[str, SeriesFeeObservation]:
+        """Refresco live acotado, sin depender del universo de nuevas quotes.
+
+        Como máximo max_tickers libros por tick. La rotación evita congelar una
+        posición al salir del fair; las no observadas envejecen según el TTL de
+        RiskManager y bloquean nuevas entradas cuando falta cobertura.
+        """
+        if (
+            self._executor is None
+            or self._risk is None
+            or not self._risk.settings.UNREALIZED_STOP_ENABLED
+        ):
+            return {}
+        observed_fees: dict[str, SeriesFeeObservation] = {}
+        tickers = sorted(t for t, inv in self._inventory.positions.items() if inv.net_contracts)
+        if self._risk_mark_cursor is not None:
+            tickers = [t for t in tickers if t > self._risk_mark_cursor] + [
+                t for t in tickers if t <= self._risk_mark_cursor
+            ]
+        for ticker in tickers[: self._max_tickers]:
+            self._risk_mark_cursor = ticker
+            top = await self._book_top(ticker)
+            observed_at = datetime.now(UTC)
+            if top is None:
+                self._invalidate_risk_mark(ticker)
+                continue
+            yes_bid, yes_ask, _, _ = top
+            fair = fairs.get(ticker) or self._live_quote_fairs.get(ticker)
+            event = fair.event_ticker if fair is not None else None
+            fee = None
+            try:
+                if event is None:
+                    # Tras restart/fair vencido, identidad oficial: jamás inferir
+                    # event_ticker recortando el símbolo del contrato.
+                    body = await self._client.get_market(ticker)
+                    market = body.get("market") if isinstance(body, dict) else None
+                    if not isinstance(market, dict) or market.get("ticker") != ticker:
+                        raise ValueError("identidad de market no verificable para MTM")
+                    event = market.get("event_ticker")
+                if not isinstance(event, str) or not event or self._fee_policy is None:
+                    raise ValueError("fee/evento no verificable para MTM")
+                fee = await self._fee_policy.observe(ticker, event_ticker=event)
+                observed_fees[ticker] = fee
+            except Exception:
+                # El precio observado sigue siendo real, pero no autoriza entrada
+                # con MTM incompleto: falta la fee de cierre demostrada.
+                logger.exception(f"motor5.risk_mark_fee_unavailable ticker={ticker}")
+            self._publish_risk_mark(ticker, yes_bid, yes_ask, observed_at=observed_at, fee=fee)
+        return observed_fees
+
     def _invalidate_mark(self, ticker: str) -> None:
         """Un book ausente/unilateral invalida el BBO previo para cualquier markout."""
         self._last_marks.pop(ticker, None)
         self._last_marks_at.pop(ticker, None)
+        self._invalidate_risk_mark(ticker)
 
     @staticmethod
     def _markout_cents(p: dict, mark_cents: float) -> float:

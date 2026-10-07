@@ -276,6 +276,7 @@ def _open_filled(db, coid: str, ticker: str, price: int, count: int) -> None:
                 price_cents=price,
                 strategy="motor_2_consensus",
                 status="filled",
+                fees_cents=0,
                 placed_at=_FROZEN_NOW - timedelta(hours=3),
                 filled_at=_FROZEN_NOW - timedelta(hours=3),
             )
@@ -291,7 +292,7 @@ async def test_unrealized_stop_pauses_entries_softly(settings, db, opp):
     settings.UNREALIZED_STOP_ENABLED = True
     _open_filled(db, "open-bleeding", "KX-MTM", 60, 100)
     with patch("src.risk.manager.datetime", _FrozenDatetime):
-        RiskManager.record_mark("KX-MTM", "yes", 15)
+        RiskManager.record_mark("KX-MTM", "yes", 15, fee_multiplier=1)
         decision = await RiskManager().check_pre_trade(opp)
     assert decision.approved is False
     assert "latente" in decision.reason
@@ -299,9 +300,8 @@ async def test_unrealized_stop_pauses_entries_softly(settings, db, opp):
 
 
 @pytest.mark.asyncio
-async def test_unrealized_without_fresh_mark_never_triggers(settings, db, opp):
-    """FAIL-SAFE honesto: sin mark fresco la posición NO cuenta (cobertura parcial
-    declarada > mark inventado) — un mark viejo (TTL vencido) tampoco."""
+async def test_unrealized_without_fresh_mark_blocks_new_entries(settings, db, opp):
+    """Sin mark fresco no se inventa PnL ni se autoriza riesgo adicional."""
     settings.UNREALIZED_STOP_ENABLED = True
     settings.UNREALIZED_MARK_TTL_SEC = 60.0
     _open_filled(db, "open-nomark", "KX-MTM", 60, 100)
@@ -309,13 +309,13 @@ async def test_unrealized_without_fresh_mark_never_triggers(settings, db, opp):
     with patch("src.risk.manager.datetime", _FrozenDatetime):
         RiskManager._marks[("KX-MTM", "yes")] = stale
         decision = await RiskManager().check_pre_trade(opp)
-    assert decision.approved is True
+    assert decision.approved is False
+    assert "valoración completa" in decision.reason
 
 
 @pytest.mark.asyncio
-async def test_unrealized_skips_hedged_arb_legs(settings, db, opp):
-    """CONTROL: una pata con arb_id (hedged) NO entra al MTM — su neto real ≈ 0 y el
-    netting de exposición ya la descuenta; contarla acá doblaría el castigo."""
+async def test_unrealized_does_not_skip_an_orphan_with_arb_id(settings, db, opp):
+    """El identificador de un arb no demuestra que sus otras patas se ejecutaran."""
     settings.UNREALIZED_STOP_ENABLED = True
     with Session(db) as s:
         s.add(
@@ -328,6 +328,7 @@ async def test_unrealized_skips_hedged_arb_legs(settings, db, opp):
                 price_cents=60,
                 strategy="motor_rest_arb",
                 status="filled",
+                fees_cents=0,
                 notes="arb_id=abc123",
                 placed_at=_FROZEN_NOW - timedelta(hours=3),
                 filled_at=_FROZEN_NOW - timedelta(hours=3),
@@ -335,9 +336,10 @@ async def test_unrealized_skips_hedged_arb_legs(settings, db, opp):
         )
         s.commit()
     with patch("src.risk.manager.datetime", _FrozenDatetime):
-        RiskManager.record_mark("KX-MTM", "yes", 15)
+        RiskManager.record_mark("KX-MTM", "yes", 15, fee_multiplier=1)
         decision = await RiskManager().check_pre_trade(opp)
-    assert decision.approved is True
+    assert decision.approved is False
+    assert "latente" in decision.reason
 
 
 @pytest.mark.asyncio

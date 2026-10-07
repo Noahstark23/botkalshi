@@ -43,7 +43,7 @@ from src.risk.exposure import open_risk_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
 from src.strategies.motor_5_mm.incidents import incident_status, latch_incident
-from src.strategies.motor_5_mm.ledger import confirmed_fill, record_fill
+from src.strategies.motor_5_mm.ledger import confirmed_fill, record_order_fill
 from src.strategies.motor_5_mm.order_state import (
     COUNT_QUARANTINE_NOTE,
     filled_count,
@@ -170,8 +170,8 @@ class Motor5Executor:
                     if not ok:
                         return "corrupted"  # tampoco emitir el lado opuesto del ticker
                 if self._cancel_fill_revision != inventory_revision:
-                    # La quote se calculó ANTES del cancel. Reconciliar y volver a
-                    # calcular inventario/tamaño en el próximo tick antes de reemplazar.
+                    # La quote se calculó ANTES del fill observado en create/cancel.
+                    # Recalcular inventario/tamaño antes de emitir otra pata.
                     return "risk_blocked"
                 placed = await self._place(ticker, action, price, count)
                 if placed is None:
@@ -286,9 +286,15 @@ class Motor5Executor:
             self._latch_corruption(ticker, "place_response_invalid")
             return None
         live.kalshi_order_id = kid
-        if not self._set_kalshi_id(coid, kid):
+        if not self._set_kalshi_id(coid, kid, order=order):
             self._latch_corruption(ticker, "order_id_persist_failed")
             return None
+        if self._quarantine_unrepresentable_order(ticker, live, order):
+            return None
+        if (filled_count(order) or 0) > 0:
+            # Un fill puede ganar la carrera al ack post_only. La otra pata fue
+            # calculada con inventario anterior y espera al próximo tick.
+            self._cancel_fill_revision += 1
         logger.info(f"motor5.exec.placed {ticker} {action} {count}@{price}c coid={coid[:13]}…")
         return live
 
@@ -344,6 +350,7 @@ class Motor5Executor:
             live.client_order_id,
             "filled" if filled else "cancelled",
             filled_count=filled,
+            order=order,
             note=note,
         ):
             # La reserva pending y el dueño sobreviven incluso a un HTTP 200 si
@@ -410,7 +417,7 @@ class Motor5Executor:
                     ).first()
                     if row is None or row.strategy != STRATEGY or row.status != "pending":
                         raise RuntimeError("no se puede conservar fill observado M5")
-                    record_fill(row, max(confirmed_fill(row) or 0, observed))
+                    record_order_fill(row, max(confirmed_fill(row) or 0, observed), order)
                     session.add(row)
                     session.commit()
             except Exception:
@@ -537,6 +544,7 @@ class Motor5Executor:
         status: str,
         *,
         filled_count: int | Fraction | None = None,
+        order: object = None,
         note: str | None = None,
     ) -> bool:
         try:
@@ -560,7 +568,7 @@ class Motor5Executor:
                     )
                 row.status = status
                 if filled_count is not None:
-                    record_fill(row, filled_count)
+                    record_order_fill(row, filled_count, order)
                 if note:
                     row.notes = f"{row.notes or ''} | {note}"[:500]
                 s.add(row)
@@ -570,7 +578,7 @@ class Motor5Executor:
             logger.exception(f"motor5.exec.mark_row_error coid={coid} status={status}")
             return False
 
-    def _set_kalshi_id(self, coid: str, kid: str | None) -> bool:
+    def _set_kalshi_id(self, coid: str, kid: str | None, *, order: object = None) -> bool:
         if kid is None:
             return False
         try:
@@ -581,6 +589,11 @@ class Motor5Executor:
                 if row.kalshi_order_id not in (None, kid):
                     return False
                 row.kalshi_order_id = kid
+                observed = filled_count(order)
+                if observed is not None and observed <= row.count:
+                    # Sólo evidencia explícita del create ya correlacionado. Un
+                    # ack sin fill_count conserva None; nunca supone fill cero.
+                    record_order_fill(row, observed, order)
                 s.add(row)
                 s.commit()
                 return True

@@ -129,13 +129,7 @@ def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int | Fraction, 
     cambia, pero el fee deja de ser invisible para las métricas del mes de prueba.
     """
     price = trade.fill_price_cents or trade.price_cents
-    count = (
-        exposure_count(trade)
-        if trade.strategy == "motor_5_mm"
-        else trade.filled_count
-        if trade.filled_count is not None
-        else trade.count
-    )
+    count = exposure_count(trade)
     side = trade.side
     if trade.action == "sell":
         side = "no" if trade.side == "yes" else "yes"

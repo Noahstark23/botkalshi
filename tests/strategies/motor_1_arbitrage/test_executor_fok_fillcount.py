@@ -28,6 +28,7 @@ from src.monitoring.health import BotState
 from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import Trade, get_session
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 # =====================================================
 # Fixtures (mismas convenciones que test_executor.py)
@@ -66,6 +67,7 @@ def mock_risk() -> MagicMock:
     rm.check_pre_trade = AsyncMock(
         return_value=TradeDecision(approved=True, reason="ok", max_allowed_count=10)
     )
+    wire_reservation_fake(rm)
     return rm
 
 
@@ -103,7 +105,7 @@ def _sell_calls(mock_client):
 
 def _trade(coid_contains: str | None = None, side: str | None = None) -> list[Trade]:
     with get_session() as s:
-        trades = list(s.exec(select(Trade)).all())
+        trades = list(s.exec(select(Trade).where(Trade.action == "buy")).all())
     if side is not None:
         trades = [t for t in trades if t.side == side]
     if coid_contains is not None:
@@ -119,7 +121,9 @@ def _trade(coid_contains: str | None = None, side: str | None = None) -> list[Tr
 @pytest.mark.asyncio
 async def test_buy_legs_use_fill_or_kill(executor, mock_client, binary_opp):
     """Issue #14 / auditoría 2026-07-07: sin FOK el default gtc dejaba la pata RESTING."""
-    mock_client.place_order.return_value = {"order": {"order_id": "k-1", "fill_count": 10}}
+    mock_client.place_order.return_value = {
+        "order": {"remaining_count": 0, "order_id": "k-1", "fill_count": 10}
+    }
     with _patched():
         assert await executor.execute(binary_opp) is True
     buys = _buy_calls(mock_client)
@@ -136,7 +140,9 @@ async def test_buy_legs_use_fill_or_kill(executor, mock_client, binary_opp):
 async def test_hard_first_full_arb_places_hard_then_easy(executor, mock_client, binary_opp):
     """Caso feliz hard-first: la dura (NO) llena → recién ahí la fácil (YES) → arb completo.
     Verifica el ORDEN (dura primero) y que ambas quedan filled."""
-    mock_client.place_order.return_value = {"order": {"order_id": "k", "fill_count": 10}}
+    mock_client.place_order.return_value = {
+        "order": {"remaining_count": 0, "order_id": "k", "fill_count": 10}
+    }
     with _patched():
         assert await executor.execute(binary_opp) is True
 
@@ -155,7 +161,9 @@ async def test_hard_leg_killed_skips_without_sending_easy(executor, mock_client,
     killa (HTTP 200 con fill 0), la fácil (YES) NUNCA se envía → cero exposición, skip limpio,
     SIN rollback. Es el caso DOMINANTE que antes encadenaba partial→rollback→circuit breaker."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 0}},  # NO (dura) FOK killed
+        {
+            "order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 0}
+        },  # NO (dura) FOK killed
     ]
     with _patched():
         assert await executor.execute(binary_opp) is False
@@ -205,8 +213,10 @@ async def test_hard_partial_fill_rolls_back_without_sending_easy(executor, mock_
     el arb no puede quedar simétrico → la fácil NO se envía y se rollbackea la dura por el
     count REAL (6), no el pedido (10)."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 6}},  # NO (dura) parcial 6/10
-        {"order": {"fill_count": 6}},  # sell del rollback de la dura
+        {
+            "order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 6}
+        },  # NO (dura) parcial 6/10
+        {"order": {"remaining_count": 0, "fill_count": 6}},  # sell del rollback de la dura
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
     with _patched():
@@ -230,9 +240,9 @@ async def test_rollback_settles_row_with_realized_pnl(executor, mock_client, bin
     """La dura (NO) llena, la fácil (YES) falla → rollback de la dura con la pérdida REALIZADA
     en pnl_cents (venta − compra − ambas fees): lo que agregan las ventanas de stop-loss."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("no easy"),  # YES (fácil) falla
-        {"order": {"fill_count": 10}},  # sell del rollback de NO
+        {"order": {"remaining_count": 0, "fill_count": 10}},  # sell del rollback de NO
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
@@ -252,10 +262,10 @@ async def test_rollback_partial_sell_splits_row(executor, mock_client, binary_op
     """El IOC vende 4 y después 6: la fila se PARTE (patrón _settle_originals de M3) —
     hija settled por lo vendido, original con el remanente hasta que también se vende."""
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("no easy"),  # YES (fácil) falla
-        {"order": {"fill_count": 4}},  # sell parcial
-        {"order": {"fill_count": 6}},  # sell del remanente
+        {"order": {"remaining_count": 0, "fill_count": 4}},  # sell parcial
+        {"order": {"remaining_count": 0, "fill_count": 6}},  # sell del remanente
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
@@ -279,9 +289,9 @@ async def test_rollback_sell_without_fill_keeps_row_open(mock_client, mock_risk,
     Jamás se marca cerrada una posición que sigue viva."""
     ex = ArbitrageExecutor(mock_client, mock_risk, max_rollback_retries=1)
     mock_client.place_order.side_effect = [
-        {"order": {"order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
+        {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("no easy"),  # YES (fácil) falla
-        {"order": {"fill_count": 0}},  # IOC sin fill
+        {"order": {"remaining_count": 0, "fill_count": 0}},  # IOC sin fill
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 

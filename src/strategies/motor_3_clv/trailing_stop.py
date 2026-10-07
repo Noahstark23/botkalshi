@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import PortfolioPosition
+from src.storage.quantities import requested_quantity
 
 # Retroceso (cents) desde el pico que dispara el cierre. Placeholder calibrable desde la
 # distribución de las líneas [MOTOR 3 TRAIL SHADOW] (Coolify: MOTOR_3_TRAILING_DROP_CENTS).
@@ -56,7 +57,11 @@ def trailing_stop_due(
     """
     if drop_cents <= 0:
         return False
-    if position.count <= 0:
+    try:
+        quantity = requested_quantity(position)
+    except ValueError:
+        return False
+    if quantity <= 0:
         return False
     if peak_bid is None or current_bid is None or entry_bid is None:
         return False
@@ -65,7 +70,9 @@ def trailing_stop_due(
     if current_bid > peak_bid:
         return False
     net_per_contract = (
-        current_bid - entry_bid - kalshi_fee_cents(1, current_bid) - kalshi_fee_cents(1, entry_bid)
+        quantity * (current_bid - entry_bid)
+        - kalshi_fee_cents(quantity, current_bid)
+        - kalshi_fee_cents(quantity, entry_bid)
     )
     if net_per_contract <= 0:
         return False

@@ -25,7 +25,9 @@ from loguru import logger
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiRestClient
+from src.math.quantities import api_count
 from src.storage.models import PortfolioPosition, get_session
+from src.storage.quantities import quantity_fields
 
 
 def _as_int(value: object) -> int | None:
@@ -143,8 +145,10 @@ class PortfolioPoller:
                 # Kalshi devuelve los numéricos como fixed-point string en el campo
                 # `<name>_fp` (ej. position_fp="-1.00"); el `<name>` plano puede no venir.
                 # Leer el _fp primero con fallback al plano (robusto ante ambos shapes).
-                pos = _as_int(p.get("position_fp", p.get("position")))
-                if not ticker or pos is None or pos == 0:
+                pos = api_count(p, "position", signed=True)
+                if not ticker or pos is None:
+                    raise ValueError("snapshot de posiciones sin cantidad válida; no purgar cache")
+                if pos == 0:
                     continue  # sin posición abierta en este market
                 side = "yes" if pos > 0 else "no"
                 exposure = _money_to_cents(p, "market_exposure")
@@ -239,7 +243,7 @@ class PortfolioPoller:
                 for ticker, (side, count, exposure) in open_now.items():
                     row = existing.get(ticker)
                     if row is None:
-                        row = PortfolioPosition(ticker=ticker, side=side, count=count)
+                        row = PortfolioPosition(ticker=ticker, side=side, **quantity_fields(count))
                     if row.side != side:
                         # Flip de side entre polls (yes→no sin pasar por 0 en un snapshot):
                         # es una posición de identidad NUEVA — el peak del episodio
@@ -248,7 +252,8 @@ class PortfolioPoller:
                         # 25 vendía la posición nueva al primer tick).
                         row.peak_bid_cents = None
                     row.side = side
-                    row.count = count
+                    for name, value in quantity_fields(count).items():
+                        setattr(row, name, value)
                     row.exposure_cents = exposure
                     row.close_time = close_times.get(ticker)
                     row.synced_at = now

@@ -34,6 +34,7 @@ from loguru import logger
 from sqlmodel import select
 
 from src.storage.models import PortfolioPosition, get_session
+from src.storage.quantities import requested_quantity
 
 
 def event_ticker_of(market_ticker: str) -> str:
@@ -108,9 +109,11 @@ class EventExposureTracker:
         pro: dict[str, float] = {}
         anti: dict[str, float] = {}
         for p in rows:
-            if event_ticker_of(p.ticker) != event or p.count <= 0:
+            if event_ticker_of(p.ticker) != event or requested_quantity(p) <= 0:
                 continue
-            usd = (p.exposure_cents if p.exposure_cents is not None else p.count * 100) / 100.0
+            usd = (
+                p.exposure_cents if p.exposure_cents is not None else requested_quantity(p) * 100
+            ) / 100.0
             (pro if p.side == "yes" else anti)[p.ticker] = usd
         tickers = set(pro) | set(anti)
         best = 0.0

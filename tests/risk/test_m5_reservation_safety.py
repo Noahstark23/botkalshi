@@ -12,7 +12,6 @@ from sqlmodel import SQLModel, create_engine, select
 
 import src.storage.models as models
 from src.math.arbitrage import ArbLeg, ArbOpportunity
-from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.risk.manager import RiskManager
 from src.storage.models import OperationalState, Trade, get_session
@@ -351,7 +350,7 @@ async def test_invalid_place_response_keeps_reservation_and_stops_other_side(ris
 async def test_order_id_write_failure_keeps_owner_and_blocks_other_side(risk, monkeypatch):
     client = FakeClient()
     executor = Motor5Executor(client, risk=risk)
-    monkeypatch.setattr(executor, "_set_kalshi_id", lambda *args: False)
+    monkeypatch.setattr(executor, "_set_kalshi_id", lambda *args, **kwargs: False)
     assert await executor.sync_quotes(quote(bid=47, ask=53)) == "corrupted"
     assert len(client.placed) == 1
     assert len(executor.live_order_ids()) == 1
@@ -380,13 +379,13 @@ async def test_cancelled_place_task_keeps_pending_and_latches(risk):
 
 
 @pytest.mark.parametrize("status", ["pending", "filled", "cancelled", "settled"])
-def test_bank200_daily_commitment_counts_sell_complement(risk, status):
+def test_bank200_daily_commitment_rejects_untracked_sell(risk, status):
     risk.settings.EXPERIMENT_BANK200_ENABLED = True
     risk.settings.EXPERIMENT_START_AT = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     insert(trade(status=status, filled_count=2))
     snap = risk._experiment_accounting_snapshot()
-    assert snap["valid"]
-    assert snap["daily_new_risk_usd"] == pytest.approx((950 + kalshi_fee_cents(10, 5)) / 100)
+    assert not snap["valid"]
+    assert "compromiso original" in snap["reason"]
 
 
 def test_binary_arb_discounts_confirmed_quantity_only(risk):
