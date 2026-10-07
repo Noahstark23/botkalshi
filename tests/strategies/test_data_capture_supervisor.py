@@ -256,3 +256,41 @@ def test_current_error_returns_fresh_error():
     """current_error() devuelve el error si esta dentro del TTL."""
     BotState.record_error("error fresco")
     assert BotState.current_error() == "error fresco"
+
+
+async def test_parent_cancellation_finishes_every_capture_child(service):
+    """Cancelar captura por otro motor caído no debe dejar handlers WS vivos."""
+    service._tracked_tickers = {"FAKE-TICKER"}
+    ready = asyncio.Event()
+    started = set()
+    cleaned = set()
+
+    def child(name):
+        async def run():
+            started.add(name)
+            if len(started) == 4:
+                ready.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.add(name)
+
+        return run
+
+    with (
+        patch.object(service, "_ensure_v2_manager"),
+        patch.object(service, "_discover_markets", new=AsyncMock()),
+        patch.object(service, "_register_ws_handlers"),
+        patch.object(service, "_run_ws_supervised", side_effect=child("ws")),
+        patch.object(service, "_run_snapshots_supervised", side_effect=child("snapshots")),
+        patch.object(service, "_run_rediscovery", side_effect=child("discovery")),
+        patch.object(service, "_run_seed_watchdog", side_effect=child("seed")),
+    ):
+        task = asyncio.create_task(service.run())
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+    assert cleaned == {"ws", "snapshots", "discovery", "seed"}
+    assert not BotState.capture_running
+    assert not BotState.ws_connected

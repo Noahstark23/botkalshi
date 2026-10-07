@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from bisect import bisect_right
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
@@ -208,6 +209,7 @@ class DataCaptureService:
         self.ws = KalshiWebSocket()
         self._stop_event = asyncio.Event()
         self._tracked_tickers: set[str] = set()
+        self._last_snapshot_ticker: str = ""
         self._delta_shape_logged = False
         self._snapshot_shape_logged = False
         self._v2_manager = None  # OrderbookManagerV2 | None, set if USE_ORDERBOOK_MANAGER_V2
@@ -702,7 +704,13 @@ class DataCaptureService:
             return
 
         async with KalshiRestClient() as client:
-            tickers_to_snap = list(self._tracked_tickers)[: self.MAX_TICKERS_PER_SNAPSHOT_CYCLE]
+            # El set estable repetía los mismos 50 para siempre. Un cursor por nombre
+            # conserva el recorrido aunque discovery agregue o retire mercados; no
+            # aumenta el presupuesto REST ni necesita una cola adicional sin límite.
+            universe = sorted(self._tracked_tickers)
+            start = bisect_right(universe, self._last_snapshot_ticker)
+            count = min(len(universe), self.MAX_TICKERS_PER_SNAPSHOT_CYCLE)
+            tickers_to_snap = (universe[start:] + universe[:start])[:count]
             captured = 0
             failed = 0
             last_error_msg: str | None = None
@@ -745,8 +753,15 @@ class DataCaptureService:
                     failed += 1
                     last_error_msg = f"{type(e).__name__}: {e}"
                     logger.debug(f"Snapshot failed for {ticker}: {e}")
+                finally:
+                    # Un ticker fallido vuelve en la siguiente vuelta, sin impedir
+                    # que los demás reciban su oportunidad de muestreo.
+                    self._last_snapshot_ticker = ticker
 
-        logger.info(f"Snapshots: {captured}/{len(tickers_to_snap)}")
+        logger.info(
+            f"Snapshots: {captured}/{len(tickers_to_snap)} "
+            f"tracked={len(universe)} cursor={self._last_snapshot_ticker}"
+        )
 
         if captured == 0 and failed > 0:
             BotState.record_error(
@@ -1027,15 +1042,13 @@ class DataCaptureService:
         # no dispara el FIRST_COMPLETED en operación normal.
         seed_task = asyncio.create_task(self._run_seed_watchdog(), name="seed_watchdog")
         stop_task = asyncio.create_task(self._stop_event.wait(), name="stop_waiter")
+        children = [ws_task, snap_task, rediscovery_task, seed_task, stop_task]
 
         try:
-            done, pending = await asyncio.wait(
-                [ws_task, snap_task, rediscovery_task, seed_task, stop_task],
+            done, _pending = await asyncio.wait(
+                children,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            for t in pending:
-                t.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
             for t in done:
                 if not t.cancelled():
                     exc = t.exception()
@@ -1044,6 +1057,12 @@ class DataCaptureService:
         finally:
             BotState.capture_running = False
             BotState.ws_connected = False
+            # También se ejecuta si el runner cancela captura por otro motor caído.
+            # No dejar WS y sus handlers vivos mientras el resto termina de limpiar.
+            for child in children:
+                if not child.done():
+                    child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
 
     async def stop(self) -> None:
         self._stop_event.set()

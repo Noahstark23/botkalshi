@@ -22,6 +22,7 @@ import contextlib
 import json
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import uvicorn
@@ -97,6 +98,18 @@ class ProductionRunner:
     # Servicios
     # =====================================================
 
+    def _start_required_service(
+        self, name: str, service: Callable[[], Awaitable[None]]
+    ) -> asyncio.Task[None]:
+        async def supervise() -> None:
+            await service()
+            # FIRST_EXCEPTION no detecta un retorno normal inesperado. Sólo el
+            # shutdown permite que termine un servicio requerido sin fallar el run.
+            if not self._stop_event.is_set():
+                raise RuntimeError(f"Servicio requerido {name} terminó sin shutdown")
+
+        return asyncio.create_task(supervise(), name=name)
+
     async def _run_health_server(self) -> None:
         """Health server FastAPI con uvicorn."""
         config = uvicorn.Config(
@@ -117,6 +130,8 @@ class ProductionRunner:
         """Data capture service."""
         # Pequeño delay para que health server esté listo primero
         await asyncio.sleep(2)
+        if self._stop_event.is_set():
+            return  # shutdown pudo llegar antes de que existiera self._capture
 
         # Cliente REST PERSISTENTE para el path de ejecución del Motor REST (live):
         # se instancia UNA vez, pool abierto toda la vida del servicio, inyectado al
@@ -167,8 +182,8 @@ class ProductionRunner:
         poller no devuelve nada). Atómico por arb_id (heredado de SettlementPoller:
         ambas patas en una transacción o ninguna; huérfana imposible).
 
-        Read-only contra Kalshi (get_market.result). Si el cliente/poller cae, se
-        registra y la task termina — NO tira el bot (el resto sigue capturando).
+        Read-only contra Kalshi (get_market.result). Los fallos recuperables se manejan
+        dentro del poller; una falla terminal se propaga para no perder contabilidad.
         """
         await asyncio.sleep(5)  # dejar que init_db / boot terminen
         try:
@@ -179,14 +194,15 @@ class ProductionRunner:
             msg = f"settlement runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+            raise
 
     async def _run_motor3_clv(self) -> None:
         """
         Motor 3 (CLV) — gateado por MOTOR_3_CLV_ENABLED. Liquida posiciones direccionales
         a T-30min del cierre para capturar el closing line value. CAPA A: el executor (que
-        vende) solo se construye con TRADING_ENABLED=true — en shadow detecta y loguea las
-        salidas pero NUNCA vende (clave: place_order no frena 'sell', así que la protección
-        es Capa A, no el muro global). Best-effort: si cae, se registra y la task termina.
+        vende) sólo se habilita con los flags global y de ejecución — en shadow detecta
+        y loguea las salidas. Una falla terminal se propaga: el resto del proceso no
+        puede seguir apareciendo sano sin la gestión de salidas requerida.
         """
         if not self.settings.MOTOR_3_CLV_ENABLED:
             return  # opt-in; default off → no-op (no toca nada en prod)
@@ -209,6 +225,7 @@ class ProductionRunner:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+            raise
 
     async def _run_motor5_mm(self) -> None:
         """
@@ -284,8 +301,8 @@ class ProductionRunner:
         construye con TRADING_ENABLED=true Y MOTOR_1_EXECUTION_ENABLED=true (auditoría
         2026-07-07, P1: con TRADING_ENABLED solo, prender el trading global para que M3
         venda armaba también las compras de M1) — en shadow el engine recibe executor=None
-        y es estructuralmente incapaz de ejecutar. Best-effort: si cae, se registra y la
-        task termina — NO tira el bot.
+        y es estructuralmente incapaz de ejecutar. Una falla terminal se registra y
+        se propaga al supervisor, preservando la recuperación interna por tick.
         """
         if not self.settings.MOTOR_1_ARBITRAGE_ENABLED:
             return  # opt-in; default off → no-op (no toca nada en prod)
@@ -315,6 +332,7 @@ class ProductionRunner:
             msg = f"motor1_arb runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+            raise
 
     def _build_motor6_shadow(self):
         """Motor 6 F1 (line-moves) — pasajero del ciclo de M2; None = apagado. En F1 NO
@@ -462,7 +480,7 @@ class ProductionRunner:
         MOTOR_2_SPORTSBOOK_ENABLED (corre junto al shadow poller, gestionando lo que ya hay
         abierto). CAPA A: el executor (que vende) solo se construye con TRADING_ENABLED=true Y
         MOTOR_2_EXECUTION_ENABLED=true — en shadow detecta y loguea [MOTOR 2 TP SHADOW] con net
-        de fees pero NUNCA vende. Best-effort: si cae, se registra y la task termina.
+        de fees pero NUNCA vende. Una falla terminal se registra y se propaga al supervisor.
         """
         if not self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
             return  # opt-in; default off → no-op (no toca nada en prod)
@@ -484,6 +502,7 @@ class ProductionRunner:
             msg = f"motor2_exits runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+            raise
 
     async def _run_telegram_commands(self) -> None:
         """
@@ -753,26 +772,31 @@ class ProductionRunner:
             # Lanzar servicios concurrentemente
             tasks = [
                 asyncio.create_task(self._run_health_server(), name="health"),
-                asyncio.create_task(self._run_data_capture(), name="capture"),
-                asyncio.create_task(self._run_settlement(), name="settlement"),
-                asyncio.create_task(self._run_motor2_shadow(), name="motor2_shadow"),
-                asyncio.create_task(self._run_motor2_exits(), name="motor2_exits"),
+                self._start_required_service("capture", self._run_data_capture),
+                self._start_required_service("settlement", self._run_settlement),
                 asyncio.create_task(self._run_telegram_commands(), name="telegram_commands"),
                 asyncio.create_task(self._run_balance_refresh(), name="balance_refresh"),
                 asyncio.create_task(self._run_memory_monitor(), name="memory_monitor"),
                 asyncio.create_task(self._run_db_maintenance(), name="db_maintenance"),
                 asyncio.create_task(self._run_disk_guard(), name="disk_guard"),
             ]
+            if self.settings.MOTOR_2_SPORTSBOOK_ENABLED:
+                tasks.extend(
+                    [
+                        self._start_required_service("motor2_shadow", self._run_motor2_shadow),
+                        self._start_required_service("motor2_exits", self._run_motor2_exits),
+                    ]
+                )
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))
             if self.settings.DAILY_PNL_REPORT_ENABLED:
                 tasks.append(asyncio.create_task(self._run_daily_pnl(), name="daily_pnl"))
             if self.settings.MOTOR_3_CLV_ENABLED:
-                tasks.append(asyncio.create_task(self._run_motor3_clv(), name="motor3_clv"))
+                tasks.append(self._start_required_service("motor3_clv", self._run_motor3_clv))
             if self.settings.MOTOR_1_ARBITRAGE_ENABLED:
-                tasks.append(asyncio.create_task(self._run_motor1_arb(), name="motor1_arb"))
+                tasks.append(self._start_required_service("motor1_arb", self._run_motor1_arb))
             if self.settings.MOTOR_MM_ENABLED:
-                tasks.append(asyncio.create_task(self._run_motor5_mm(), name="motor5_mm"))
+                tasks.append(self._start_required_service("motor5_mm", self._run_motor5_mm))
 
             # Esperar a que cualquiera termine (idealmente nunca, salvo shutdown)
             done, pending = await asyncio.wait(
@@ -793,6 +817,13 @@ class ProductionRunner:
                     err = f"Task {task.get_name()} crashed: {exc}"
                     logger.exception(err)
                     BotState.record_error(err)
+
+            if failures:
+                # Frenar nuevos ciclos antes de esperar la limpieza de las tareas.
+                # Las reservas y órdenes pendientes se conservan para conciliación.
+                BotState.is_paused = True
+                BotState.pause_reason = f"servicio requerido caído: {failures[0][0]}"
+                self._stop_event.set()
 
             # Cancelar pendientes
             for task in pending:

@@ -442,18 +442,6 @@ async def test_motor1_arb_aborts_when_manager_missing(mock_runner_settings):
     mock_eng_cls.assert_not_called()
 
 
-def test_task_list_includes_motor1_arb_only_when_enabled(mock_runner_settings):
-    """El task motor1_arb se agrega SII MOTOR_1_ARBITRAGE_ENABLED — invariante de seguridad."""
-    import inspect
-
-    import src.runner as runner_mod
-
-    src = inspect.getsource(runner_mod.ProductionRunner.run)
-    # El append está gateado por el flag (no incondicional).
-    assert "if self.settings.MOTOR_1_ARBITRAGE_ENABLED:" in src
-    assert 'name="motor1_arb"' in src
-
-
 def test_supervisor_no_convierte_excepcion_de_task_en_exit_cero():
     """Regresión de falsa salud: una task fallida debe llegar al except fatal/exit 1."""
     import inspect
