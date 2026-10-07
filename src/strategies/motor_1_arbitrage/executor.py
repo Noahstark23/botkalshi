@@ -521,8 +521,16 @@ class ArbitrageExecutor:
                         f"rollback: exception for {leg.market_ticker} ({leg.side}), "
                         f"attempt {attempt + 1}/{self.max_rollback_retries}: {exc}"
                     )
-                    # Respuesta perdida: el intent queda pending; no reenviar otra venta.
-                    engage_kill_switch("M1 rollback desconocido; requiere conciliación")
+                    # El freno debe regir antes del próximo tick, no sólo después de
+                    # reiniciar. Persistir sin pausar BotState permitía otra admisión
+                    # mientras la venta desconocida seguía pendiente (ensayo nocturno).
+                    reason = "M1 rollback desconocido; requiere conciliación"
+                    BotState.is_paused = True
+                    BotState.pause_reason = reason
+                    try:
+                        engage_kill_switch(reason)
+                    except Exception:
+                        logger.exception("M1 rollback: persistencia falló; pausa runtime activa")
                     break
             if remaining > 0:
                 # Lo no vendido sigue ABIERTO (fila filled con el remanente): visible como
@@ -609,7 +617,9 @@ class ArbitrageExecutor:
         threshold, window_min, count_clean = self._breaker_params()
         counted, _aborted = self._rollbacks_in_window(window_min, count_clean=count_clean)
 
-        if counted >= threshold:
+        # Un breaker temporal no puede sustituir el motivo de una pausa más fuerte:
+        # su auto-resume sólo reconoce el prefijo y podría levantar el kill-switch.
+        if counted >= threshold and not BotState.is_paused:
             BotState.is_paused = True
             BotState.pause_reason = (
                 f"circuit_breaker: {counted}+ rollbacks in {window_min:.0f}min window"

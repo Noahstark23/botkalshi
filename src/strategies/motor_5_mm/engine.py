@@ -283,6 +283,15 @@ class Motor5Engine:
                         )
                     )
                 )
+                # El commit expira las entidades ORM; fuera de esta sesión ya no
+                # pueden cargar status/reason. Un reinicio tras cierre incierto
+                # debe llegar al reconciliador, no fallar al formar el diagnóstico.
+                prior_reason = (
+                    f"cohorte arrastra {len(prior)} run(s) no-clean: "
+                    f"{prior[0].status} {(prior[0].reason or 'sin cierre')[:300]}"
+                    if prior
+                    else None
+                )
                 row = MMExperimentRun(experiment_id=self._experiment_id, status="running")
                 s.add(row)
                 s.commit()
@@ -294,12 +303,9 @@ class Motor5Engine:
         if row.id is None:  # pragma: no cover - SQLite asigna PK tras refresh
             raise Motor5DataIntegrityError("run M5 sin id durable")
         self._experiment_run_id = row.id
-        if prior:
+        if prior_reason is not None:
             BotState.motor5_experiment_invalid = True
-            BotState.motor5_experiment_invalid_reason = (
-                f"cohorte arrastra {len(prior)} run(s) no-clean: "
-                f"{prior[0].status} {(prior[0].reason or 'sin cierre')[:300]}"
-            )
+            BotState.motor5_experiment_invalid_reason = prior_reason
         else:
             BotState.motor5_experiment_invalid = False
             BotState.motor5_experiment_invalid_reason = None

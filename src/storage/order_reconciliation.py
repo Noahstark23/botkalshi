@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
+from sqlalchemy import text
 from sqlmodel import select
 
 from src.math.fees import kalshi_fee_cents
@@ -79,7 +80,25 @@ async def reconcile_pending_orders(
             if status == "executed" and fill == 0:
                 continue
             if row.action == "sell":
-                if terminal and (row.notes or "").startswith(REDUCTION_PREFIX):
+                if not (row.notes or "").startswith(REDUCTION_PREFIX):
+                    continue
+                # Un IOC cuyo ACK se perdió puede aparecer primero como resting.
+                # Conservar ese piso ANTES de otro GET/reinicio: un cancel posterior
+                # con menor fill jamás prueba cero. No cerrar la venta ni reducir la
+                # reserva hasta confirmación terminal; costes SELL no se inventan.
+                with get_session() as s:
+                    s.exec(text("BEGIN IMMEDIATE"))
+                    current = s.get(Trade, row.id)
+                    if current is None or current.status != "pending":
+                        continue
+                    if current.kalshi_order_id and order_id and current.kalshi_order_id != order_id:
+                        raise ValueError("order_id contradictorio")
+                    record_fill(current, fill)
+                    if order_id:
+                        current.kalshi_order_id = order_id
+                    s.add(current)
+                    s.commit()
+                if terminal:
                     finalize_reduction(row.client_order_id, fill, order_id)
                     unresolved.remove(row.client_order_id)
                 continue

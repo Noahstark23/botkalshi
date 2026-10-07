@@ -271,3 +271,60 @@ async def test_auto_resume_jamas_toca_otras_pausas():
     ):
         ex._maybe_auto_resume()
     assert BotState.is_paused is True  # intocable
+
+
+async def test_breaker_no_convierte_kill_switch_en_pausa_autorreanudable(monkeypatch):
+    """Otro rollback no puede borrar el motivo durable antes de vaciarse la ventana."""
+    import src.strategies.motor_1_arbitrage.executor as mod
+
+    monkeypatch.setattr(mod, "alert_risk_event", AsyncMock())
+    ex = _executor()
+    reason = "M1 rollback desconocido; requiere conciliación"
+    models.engage_kill_switch(reason)
+    BotState.is_paused, BotState.pause_reason = True, reason
+    with patch(
+        "src.strategies.motor_1_arbitrage.executor.get_settings",
+        return_value=_settings(MOTOR_1_BREAKER_THRESHOLD=1, MOTOR_1_BREAKER_AUTO_RESUME=True),
+    ):
+        await ex._check_circuit_breaker()
+        assert BotState.pause_reason == reason
+        monkeypatch.setattr(ex, "_rollbacks_in_window", lambda *a, **kw: (0, 0))
+        ex._maybe_auto_resume()
+    assert BotState.is_paused
+    assert models.kill_switch_engaged() == (True, reason)
+
+
+async def test_rollback_desconocido_con_db_fallida_frena_runtime_y_no_revende(monkeypatch):
+    """El timeout del IOC conserva la venta pending aunque falle persistir el freno."""
+    from sqlmodel import select
+
+    import src.strategies.motor_1_arbitrage.executor as mod
+    from src.storage.quantities import filled_fields
+
+    with models.get_session() as session:
+        session.add(
+            models.Trade(
+                client_order_id="entrada-huerfana",
+                ticker="KXT-1",
+                side="yes",
+                action="buy",
+                strategy="motor_1_arbitrage",
+                status="filled",
+                price_cents=45,
+                **filled_fields(1),
+            )
+        )
+        session.commit()
+    client = AsyncMock()
+    client.get_orderbook.return_value = {"orderbook": {"yes": [[45, 2]], "no": [[54, 2]]}}
+    client.place_order.side_effect = TimeoutError("respuesta IOC perdida")
+    ex = ArbitrageExecutor(client, MagicMock())
+    monkeypatch.setattr(mod, "engage_kill_switch", MagicMock(side_effect=OSError("DB fallida")))
+    with patch("src.strategies.motor_1_arbitrage.executor.get_settings", return_value=_settings()):
+        await ex._execute_iterative_rollback([(_opp().legs[0], "entrada-huerfana", 1)])
+    assert BotState.is_paused
+    assert "desconocido" in BotState.pause_reason
+    client.place_order.assert_awaited_once()
+    with models.get_session() as session:
+        sells = list(session.exec(select(models.Trade).where(models.Trade.action == "sell")))
+    assert len(sells) == 1 and sells[0].status == "pending"
