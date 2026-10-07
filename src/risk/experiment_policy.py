@@ -51,3 +51,25 @@ def limits_for_capital(capital_usd: Decimal | float | int | str) -> ExperimentLi
         max_open_usd=aggregate,
         max_daily_new_risk_usd=aggregate,
     )
+
+
+def limits_for_bank50(capital_usd: Decimal | float | int | str) -> ExperimentLimits:
+    """Perfil separado: un par entero debe caber sin ampliar el capital asignado.
+
+    Límites de compromisos calculados, no garantía del PnL de la cuenta.
+    El cap histórico de 5.000c se revalida en la transacción de reserva.
+    """
+    capital = min(_money(capital_usd), Decimal("50.00"))
+    unit = min(Decimal("1.00"), (capital * Decimal("0.03")).quantize(CENT, rounding=ROUND_DOWN))
+    aggregate = min(
+        Decimal("3.00"), (capital * Decimal("0.10")).quantize(CENT, rounding=ROUND_DOWN)
+    )
+    return ExperimentLimits(
+        capital_usd=capital,
+        unit_usd=unit,
+        habitual_usd=(unit / 2).quantize(CENT, rounding=ROUND_DOWN),
+        max_per_operation_usd=unit,
+        max_per_thesis_usd=unit,
+        max_open_usd=aggregate,
+        max_daily_new_risk_usd=aggregate,
+    )

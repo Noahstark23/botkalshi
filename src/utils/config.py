@@ -8,6 +8,7 @@ no inicia (fail fast).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -219,9 +220,14 @@ class Settings(BaseSettings):
     # y aplica la política acordada: unidad=min($2,1% capital), $6 máx abierto/día,
     # pausa semanal -$12 y experimental -$20.
     EXPERIMENT_BANK200_ENABLED: bool = False
+    # Perfil independiente: no reutiliza límites/consumo de Bank200 ni arma motores.
+    EXPERIMENT_BANK50_ENABLED: bool = Field(
+        default=False,
+        description="Perfil aislado USD50, opt-in; requiere límites explícitos incluso sin trading.",
+    )
     EXPERIMENT_START_AT: str = Field(
         default="",
-        description="ISO-8601 con timezone del inicio REAL confirmado; obligatorio al armar trading.",
+        description="ISO-8601 con timezone del inicio confirmado; obligatorio en Bank50 incluso desarmado y al armar Bank200.",
     )
     EXPERIMENT_BALANCE_MAX_AGE_SEC: int = Field(
         default=600,
@@ -1043,6 +1049,83 @@ class Settings(BaseSettings):
                 f"  (b) montá el archivo en {self.KALSHI_PRIVATE_KEY_PATH} "
                 f"(los file mounts del panel NO funcionan en apps compose) o generalo "
                 f"localmente con scripts/gen_keys.py."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _experiment_bank50_profile(self) -> Settings:
+        """Rechaza perfiles parciales en ambos entornos; jamás cambia flags por el usuario."""
+        if not self.EXPERIMENT_BANK50_ENABLED:
+            return self
+
+        problems: list[str] = []
+        if self.EXPERIMENT_BANK200_ENABLED:
+            problems.append("EXPERIMENT_BANK200_ENABLED=false (perfiles incompatibles)")
+        exact = {
+            "ACTIVE_CAPITAL_USD": 50.0,
+            "CAPITAL_CAP_USD": 50.0,
+            "CAPITAL_FLOOR_USD": 40.5,
+            "CAPITAL_SAFETY_FACTOR_PCT": 90.0,
+            "CAPITAL_SMOOTHING_PCT": 0.0,
+            "MAX_DAILY_LOSS_FLOOR_USD": 0.0,
+            "MAX_WEEKLY_LOSS_FLOOR_USD": 0.0,
+            "MAX_MONTHLY_LOSS_FLOOR_USD": 0.0,
+        }
+        for name, expected in exact.items():
+            if getattr(self, name) != expected:
+                problems.append(f"{name}={expected:g}")
+        ceilings = {
+            # El RiskManager añade topes absolutos por operación/día; estos porcentajes
+            # no bastan para ampliarlos aunque crezca el efectivo confirmado.
+            "MAX_TRADE_SIZE_USD": 1.0,
+            "MAX_TRADE_SIZE_PCT": 3.0,
+            "MAX_SIMULTANEOUS_EXPOSURE_PCT": 10.0,
+            "MAX_EVENT_DIRECTIONAL_EXPOSURE_USD": 1.0,
+            "BALANCE_MAX_AGE_SECONDS": 60,
+            "EXPERIMENT_BALANCE_MAX_AGE_SEC": 60,
+        }
+        for name, ceiling in ceilings.items():
+            if getattr(self, name) > ceiling:
+                problems.append(f"{name}<={ceiling:g}")
+        if (
+            min(self.BALANCE_MAX_AGE_SECONDS, self.EXPERIMENT_BALANCE_MAX_AGE_SEC)
+            < self.BALANCE_REFRESH_SECONDS
+        ):
+            problems.append(
+                "BALANCE_REFRESH_SECONDS<=min(BALANCE_MAX_AGE_SECONDS, EXPERIMENT_BALANCE_MAX_AGE_SEC)"
+            )
+        if not self.DYNAMIC_CAPITAL_ENABLED:
+            problems.append("DYNAMIC_CAPITAL_ENABLED=true")
+        if self.DAILY_STOP_ENTRIES_ONLY:
+            problems.append("DAILY_STOP_ENTRIES_ONLY=false")
+        for name in (
+            "MOTOR_2_ENTRY_EXECUTION_ENABLED",
+            "MOTOR_2_EXECUTION_ENABLED",
+            "MOTOR_REST_EXECUTION_ENABLED",
+            "MOTOR_MM_EXECUTION_ENABLED",
+            "MOTOR_3_CLV_ENABLED",
+            "MOTOR_3_EXECUTION_ENABLED",
+            "MOTOR_3_MANAGES_ORPHANS",
+        ):
+            if getattr(self, name):
+                problems.append(f"{name}=false (fase inicial aislada M1)")
+        try:
+            started = datetime.fromisoformat(self.EXPERIMENT_START_AT.replace("Z", "+00:00"))
+            if started.tzinfo is None or started.utcoffset() is None:
+                raise ValueError
+            if started > datetime.now(UTC):
+                problems.append("EXPERIMENT_START_AT no puede estar en el futuro")
+        except (TypeError, ValueError, OverflowError):
+            problems.append("EXPERIMENT_START_AT ISO-8601 válido con timezone")
+        if self.TRADING_ENABLED:
+            if self.EXPERIMENT_BANK_CONFIRMED_USD != 50.0:
+                problems.append("EXPERIMENT_BANK_CONFIRMED_USD=50 (ack explícito)")
+            for name in ("MOTOR_1_ARBITRAGE_ENABLED", "MOTOR_1_EXECUTION_ENABLED"):
+                if not getattr(self, name):
+                    problems.append(f"{name}=true al armar trading")
+        if problems:
+            raise ValueError(
+                "EXPERIMENT_BANK50_ENABLED no cumple el perfil fail-closed: " + "; ".join(problems)
             )
         return self
 

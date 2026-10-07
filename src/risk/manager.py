@@ -21,8 +21,8 @@ from src.math.balance import available_cash_usd
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
-from src.risk.commitments import daily_committed_cents
-from src.risk.experiment_policy import limits_for_capital
+from src.risk.commitments import daily_committed_cents, lifetime_committed_cents
+from src.risk.experiment_policy import limits_for_bank50, limits_for_capital
 from src.risk.exposure import (
     MM_STRATEGY,
     contract_risk_cents,
@@ -124,7 +124,16 @@ class RiskManager:
 
     def _experiment_enabled(self) -> bool:
         """Solo un bool True explícito activa el guard; mocks/ausencia nunca lo arman."""
-        return getattr(self.settings, "EXPERIMENT_BANK200_ENABLED", False) is True
+        return (
+            getattr(self.settings, "EXPERIMENT_BANK200_ENABLED", False) is True
+            or self._bank50_enabled()
+        )
+
+    def _bank50_enabled(self) -> bool:
+        return getattr(self.settings, "EXPERIMENT_BANK50_ENABLED", False) is True
+
+    def _experiment_limits(self, capital):
+        return limits_for_bank50(capital) if self._bank50_enabled() else limits_for_capital(capital)
 
     def _requires_confirmed_cash(self) -> bool:
         return self.settings.KALSHI_ENV == "production" or self._experiment_enabled()
@@ -400,7 +409,7 @@ class RiskManager:
         return parsed.astimezone(UTC).replace(tzinfo=None)
 
     def _experiment_accounting_snapshot(self) -> dict:
-        """Ledger derivado para el bank-200; no hace red y no muta estado."""
+        """Ledger derivado para el perfil opt-in; no hace red y no muta estado."""
         if not self._experiment_enabled():
             return {}
 
@@ -418,30 +427,41 @@ class RiskManager:
         with get_session() as s:
             try:
                 committed_cents = daily_committed_cents(s, start=start, now=now_utc)
+                lifetime_cents = (
+                    lifetime_committed_cents(s, now=now_utc) if self._bank50_enabled() else None
+                )
             except ValueError as exc:
                 return {"valid": False, "reason": str(exc)}
-            settled = list(
-                s.exec(select(Trade).where(Trade.status == "settled", Trade.settled_at >= start))
-            )
+            settled_query = select(Trade).where(Trade.status == "settled")
+            if not self._bank50_enabled():
+                settled_query = settled_query.where(Trade.settled_at >= start)
+            settled = list(s.exec(settled_query))
 
         weekly_cents = 0
         cumulative_cents = 0
         for trade in settled:
+            if self._bank50_enabled() and (
+                trade.settled_at is None
+                or type(trade.pnl_cents) is not int
+                or self._as_utc_naive(trade.settled_at) > now_utc.replace(tzinfo=None)
+            ):
+                return {"valid": False, "reason": "settlement sin fecha/PnL verificable"}
             if trade.settled_at is None:
                 continue
             settled_at = self._as_utc_naive(trade.settled_at)
-            if settled_at < start:
+            if settled_at < start and not self._bank50_enabled():
                 continue
             pnl = trade.pnl_cents or 0
             cumulative_cents += pnl
             if settled_at >= week_start:
                 weekly_cents += pnl
 
-        limits = limits_for_capital(self._get_effective_capital_usd())
+        limits = self._experiment_limits(self._get_effective_capital_usd())
         return {
             "valid": True,
             "start_utc": start.isoformat(),
             "daily_new_risk_usd": committed_cents / 100.0,
+            "lifetime_committed_cents": lifetime_cents,
             "weekly_pnl_usd": weekly_cents / 100.0,
             "cumulative_pnl_usd": cumulative_cents / 100.0,
             "limits": limits,
@@ -456,12 +476,23 @@ class RiskManager:
 
         weekly = float(snap["weekly_pnl_usd"])
         cumulative = float(snap["cumulative_pnl_usd"])
-        if cumulative <= -20.0:
-            reason = f"Experimento bank-200 alcanzó pérdida acumulada ${cumulative:.2f} <= -$20.00"
+        label = "bank-50" if self._bank50_enabled() else "bank-200"
+        cumulative_limit, weekly_limit = (5.0, 3.0) if self._bank50_enabled() else (20.0, 12.0)
+        if self._bank50_enabled() and snap["lifetime_committed_cents"] >= 5000:
+            reason = "Presupuesto histórico bank-50 consumido: $50.00 en compromisos"
             await self._trigger_kill_switch(reason)
             return reason
-        if weekly <= -12.0:
-            reason = f"Experimento bank-200 alcanzó pérdida semanal ${weekly:.2f} <= -$12.00"
+        if cumulative <= -cumulative_limit:
+            reason = (
+                f"Experimento {label} alcanzó pérdida acumulada "
+                f"${cumulative:.2f} <= -${cumulative_limit:.2f}"
+            )
+            await self._trigger_kill_switch(reason)
+            return reason
+        if weekly <= -weekly_limit:
+            reason = (
+                f"Experimento {label} alcanzó pérdida semanal ${weekly:.2f} <= -${weekly_limit:.2f}"
+            )
             await self._trigger_kill_switch(reason)
             return reason
 
@@ -469,7 +500,7 @@ class RiskManager:
         daily = float(snap["daily_new_risk_usd"])
         daily_cap = float(limits.max_daily_new_risk_usd)
         if daily >= daily_cap:
-            return f"Presupuesto diario bank-200 consumido: ${daily:.2f} / ${daily_cap:.2f}"
+            return f"Presupuesto diario {label} consumido: ${daily:.2f} / ${daily_cap:.2f}"
         return None
 
     async def check_pre_trade(self, opp: ArbOpportunity) -> TradeDecision:
@@ -533,12 +564,14 @@ class RiskManager:
             start = self._experiment_start_utc_naive()
             if start is None:
                 raise ValueError("inicio experimental inválido")
-            policy = limits_for_capital(capital)
+            policy = self._experiment_limits(capital)
             limits.update(
                 max_open_cents=min(limits["max_open_cents"], int(policy.max_open_usd * 100)),
                 max_daily_cents=int(policy.max_daily_new_risk_usd * 100),
                 experiment_start=start,
             )
+            if self._bank50_enabled():
+                limits["max_lifetime_cents"] = 5000
         return limits
 
     def _confirmed_quote_capital_usd(self) -> float | None:
@@ -698,7 +731,7 @@ class RiskManager:
         daily_remaining_usd = float("inf")
         experiment_limits = None
         if self._experiment_enabled():
-            experiment_limits = limits_for_capital(capital_usd)
+            experiment_limits = self._experiment_limits(capital_usd)
             max_total_exposure_usd = min(
                 max_total_exposure_usd,
                 float(experiment_limits.max_open_usd),
@@ -712,6 +745,11 @@ class RiskManager:
                 0.0,
                 float(experiment_limits.max_daily_new_risk_usd) - float(snap["daily_new_risk_usd"]),
             )
+            if self._bank50_enabled():
+                daily_remaining_usd = min(
+                    daily_remaining_usd,
+                    max(0, 5000 - snap["lifetime_committed_cents"]) / 100.0,
+                )
 
         remaining_exposure_usd = max_total_exposure_usd - current_exposure_usd
         if remaining_exposure_usd <= 0:
@@ -773,7 +811,7 @@ class RiskManager:
         capital_usd = self._get_effective_capital_usd()
         max_total = capital_usd * (self.settings.MAX_SIMULTANEOUS_EXPOSURE_PCT / 100.0)
         if self._experiment_enabled():
-            max_total = min(max_total, float(limits_for_capital(capital_usd).max_open_usd))
+            max_total = min(max_total, float(self._experiment_limits(capital_usd).max_open_usd))
         return max_total - self._get_current_exposure_usd()
 
     def _get_current_exposure_usd(self) -> float:

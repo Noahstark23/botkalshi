@@ -23,6 +23,19 @@ def naive_utc(value: datetime) -> datetime:
 
 def daily_committed_cents(session, *, start: datetime, now: datetime) -> int:
     """No reconstruir originales desde cantidades mutables ni aceptar legacy sin evidencia."""
+    return _committed_cents(session, start=start, now=now, daily=True)
+
+
+def lifetime_committed_cents(session, *, now: datetime) -> int:
+    """Historial completo: cambiar el inicio o el día no renueva el presupuesto.
+
+    Incluye compromisos anteriores de esta DB. No reconstruye presupuesto desde
+    cantidades mutables. Una entrada legacy sin compromiso verificable bloquea.
+    """
+    return _committed_cents(session, start=datetime.min, now=now, daily=False)
+
+
+def _committed_cents(session, *, start: datetime, now: datetime, daily: bool) -> int:
     start, now = naive_utc(start), naive_utc(now)
     if start > now:
         raise ValueError("inicio experimental futuro")
@@ -46,7 +59,7 @@ def daily_committed_cents(session, *, start: datetime, now: datetime) -> int:
         raise ValueError("entrada posterior al inicio sin compromiso original verificable")
     local = now.replace(tzinfo=UTC).astimezone(ZoneInfo("America/Los_Angeles"))
     day_start = naive_utc(datetime.combine(local.date(), time.min, tzinfo=local.tzinfo))
-    since = max(start, day_start)
+    since = max(start, day_start) if daily else start
     invalid = session.exec(
         select(RiskCommitment.client_order_id)
         .where(
@@ -201,6 +214,13 @@ def reserve_m1_intents(trades: list[Trade], *, limits: dict | None = None, now=N
                 cap = limits.get("max_daily_cents")
                 if type(cap) is not int or cap <= 0 or daily + proposed > cap:
                     raise ValueError("reserva M1 excede presupuesto diario")
+            if "max_lifetime_cents" in limits:
+                cap = limits["max_lifetime_cents"]
+                if type(cap) is not int or not 0 < cap <= 5000:
+                    raise ValueError("límite histórico de reserva inválido")
+                total = lifetime_committed_cents(session, now=now)
+                if total + proposed > cap:
+                    raise ValueError("reserva M1 excede presupuesto histórico")
         for trade, commitment in zip(trades, commitments, strict=True):
             trade.commitment_origin_id = commitment.client_order_id
             trade.placed_at = now.replace(tzinfo=UTC)
