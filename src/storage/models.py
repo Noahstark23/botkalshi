@@ -112,7 +112,7 @@ class Trade(SQLModel, table=True):
     # su antiguo status filled; una respuesta nueva nunca usa ese supuesto.
     filled_count: int | None = None
     filled_count_fp: str | None = Field(default=None, max_length=32)
-    # Importe calculado a precisión de 0.0001 USD; pnl_cents es su piso legacy.
+    # Importe calculado con hasta 6 decimales USD; pnl_cents es su piso legacy.
     pnl_usd_fp: str | None = Field(default=None, max_length=40)
     fill_cost_usd_fp: str | None = Field(default=None, max_length=40)
     fees_usd_fp: str | None = Field(default=None, max_length=40)

@@ -30,18 +30,21 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fractions import Fraction
-from math import floor
+from math import ceil, floor
 from typing import Protocol
 
 from loguru import logger
+from sqlalchemy import text
 from sqlmodel import col, select
 
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import precise_usd
 from src.risk.exposure import exposure_count
+from src.storage.cost_allocation import usd_text
 from src.storage.models import Trade, get_session
 
 _ARB_ID_RE = re.compile(r"arb_id=([0-9a-fA-F-]{36})")
+_USD_RE = re.compile(r"[0-9]{1,15}(?:\.[0-9]{1,6})?")
 
 
 def _naive_utc_now() -> datetime:
@@ -108,36 +111,91 @@ def arb_group_key(trade: Trade) -> str:
     return coid  # grupo unitario
 
 
-def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[int | Fraction, int]:
+@dataclass(frozen=True, slots=True)
+class _SettlementAmounts:
+    pnl_cents: Fraction
+    fee_cents: Fraction
+    observed_costs: bool
+
+
+def _observed_cents(value: object, maximum: Fraction) -> Fraction:
+    if not isinstance(value, str) or not _USD_RE.fullmatch(value):
+        raise ValueError("importe observado inválido")
+    cents = Fraction(value) * 100
+    if cents > maximum:
+        raise ValueError("importe observado excede pago máximo")
+    return cents
+
+
+def _settlement_amounts(trade: Trade, result: str) -> _SettlementAmounts:
+    """BUY usa totales observados; ausencia permite estimación, invalidez no.
+
+    SELL se valora como posición opuesta a 100-P sólo en el camino estimado: el
+    ledger todavía no acredita si fill_cost representa ingreso o colateral.
+    No se sintetizan costes/fees FP a partir de límites o tarifas.
     """
-    PnL realizado de una pata al resolverse el mercado, y el fee usado para calcularlo.
+    if result not in ("yes", "no") or trade.side not in ("yes", "no"):
+        raise ValueError("resultado/lado desconocido")
+    if trade.action not in ("buy", "sell"):
+        raise ValueError("acción desconocida")
+    count = Fraction(exposure_count(trade))
+    if count <= 0:
+        raise ValueError("settlement sin cantidad ejecutada positiva")
+    maximum = count * 100
+    cost_fp, fee_fp = trade.fill_cost_usd_fp, trade.fees_usd_fp
+    if trade.action == "sell" and cost_fp is not None:
+        raise ValueError("coste observado de SELL sin semántica acreditada")
 
-    Ganadora (side == result): payout 100¢/contrato − costo − fees.
-    Perdedora: −costo − fees. Usa fill_price_cents si existe (precio real), si no el
-    límite; fees de la fila (A.1 los registró al fill) o recomputados como fallback.
-
-    Un SELL fillado (Motor 5: el ask del MM es sell yes) ABRE la posición del lado
-    OPUESTO a 100−P — se colapsa a la fórmula de long con lado/precio efectivos (el fee
-    no cambia: P(100−P) es simétrico). Count: filled_count si existe (Motor 5 registra
-    ahí el fill REAL de una quote parcial); las filas de los otros motores lo dejan
-    None y caen a count, sin cambios.
-
-    DEVUELVE EL FEE (2026-07-28): el fallback recomputado se usaba y se tiraba, así que
-    las filas que llegaban con fees_cents NULL settleaban con fee descontado del PnL
-    pero SIN dejarlo registrado (caso M1: 519 trades con fees $0.00, ver
-    docs/runbook_activacion_motores.md §PASO 3). El caller lo persiste: el PnL no
-    cambia, pero el fee deja de ser invisible para las métricas del mes de prueba.
-    """
-    price = trade.fill_price_cents or trade.price_cents
-    count = exposure_count(trade)
+    legacy_fee = trade.fees_cents
+    if legacy_fee is not None and (type(legacy_fee) is not int or legacy_fee < 0):
+        raise ValueError("fee legacy inválida")
+    price = trade.fill_price_cents if trade.fill_price_cents is not None else trade.price_cents
+    if (cost_fp is None or (fee_fp is None and legacy_fee is None)) and (
+        type(price) is not int or not 1 <= price <= 99
+    ):
+        raise ValueError("precio estimado fuera de [1,99]")
     side = trade.side
     if trade.action == "sell":
-        side = "no" if trade.side == "yes" else "yes"
+        side = "no" if side == "yes" else "yes"
         price = 100 - price
-    fees = trade.fees_cents if trade.fees_cents is not None else kalshi_fee_cents(count, price)
-    if side == result:
-        return (100 - price) * count - fees, fees
-    return -price * count - fees, fees
+
+    gross = _observed_cents(cost_fp, maximum) if cost_fp is not None else count * price
+    if fee_fp is not None:
+        fees = _observed_cents(fee_fp, maximum)
+        if legacy_fee is not None and legacy_fee not in (floor(fees), ceil(fees)):
+            raise ValueError("fee observada contradice espejo legacy")
+    else:
+        fees = Fraction(legacy_fee if legacy_fee is not None else kalshi_fee_cents(count, price))
+    payout = maximum if side == result else Fraction(0)
+    return _SettlementAmounts(
+        payout - gross - fees, fees, cost_fp is not None and fee_fp is not None
+    )
+
+
+def _leg_pnl_and_fees_cents(trade: Trade, result: str) -> tuple[Fraction, Fraction]:
+    """Compatibilidad para lectores puros; conserva fracciones de centavo."""
+    amounts = _settlement_amounts(trade, result)
+    return amounts.pnl_cents, amounts.fee_cents
+
+
+def _pnl_usd_text(cents: Fraction) -> str:
+    # Mantener formato histórico de cuatro decimales cuando sea exacto; no redondear
+    # ni perder los microUSD que ya llegaron en costes/fees observados.
+    if (cents * 100).denominator == 1:
+        return precise_usd(cents)
+    return usd_text(cents / 100)
+
+
+def _settlement_notes(notes: str | None, observed: bool) -> str:
+    basis = "settlement_observed_costs" if observed else "settlement_estimated"
+    original = notes or ""
+    marker = f"{basis} settled_by_poller"
+    group = _ARB_ID_RE.search(original)
+    if group:
+        # La procedencia y arb_id sobreviven incluso con notes ya al límite.
+        marker += f" {group.group(0)}"
+        original = _ARB_ID_RE.sub("", original, count=1)
+    return f"{marker} {original.strip()}".strip()[:500]
 
 
 def _leg_pnl_cents(trade: Trade, result: str) -> int | Fraction:
@@ -237,24 +295,40 @@ class SettlementPoller:
             #    un crash a mitad → rollback de SQLAlchemy → ninguna pata queda a medias.
             now = _naive_utc_now()
             with get_session() as s:
+                # Serializar con las reducciones/reconciliación locales. Releer TODO
+                # el grupo antes de escribir: un cierre concurrente no deja medias patas.
+                s.exec(text("BEGIN IMMEDIATE"))
+                rows = []
                 for t in legs:
                     row = s.exec(
                         select(Trade).where(Trade.client_order_id == t.client_order_id)
                     ).first()
-                    if row is None or row.status != "filled":
-                        continue  # carrera benigna: otro proceso la cerró
-                    pnl, fee = _leg_pnl_and_fees_cents(row, resolutions[t.id])  # type: ignore[index]
+                    if (
+                        row is None
+                        or row.status != "filled"
+                        or row.closed_by_clv
+                        or row.ticker != t.ticker
+                        or row.strategy != t.strategy
+                        or arb_group_key(row) != arb_id
+                    ):
+                        break
+                    amounts = _settlement_amounts(row, resolutions[t.id])  # type: ignore[index]
+                    rows.append((row, amounts))
+                if len(rows) != len(legs):
+                    continue  # rollback al salir; no contabilizar cierres ajenos.
+                for row, amounts in rows:
+                    pnl, fee = amounts.pnl_cents, amounts.fee_cents
                     # Guardar precisión antes de ofrecer el piso en cents a lectores
                     # legacy: éstos nunca sobreestiman beneficios ni ocultan pérdidas.
-                    row.pnl_usd_fp = precise_usd(pnl)
+                    row.pnl_usd_fp = _pnl_usd_text(pnl)
                     row.pnl_cents = floor(pnl)
                     # Solo si falta: nunca pisar un fee ya registrado (M3 lo ajusta por
                     # tramos al cerrar por CLV; sobrescribirlo rompería esa contabilidad).
                     if row.fees_cents is None:
-                        row.fees_cents = fee
+                        row.fees_cents = ceil(fee)
                     row.status = "settled"
                     row.settled_at = now
-                    row.notes = f"{row.notes or ''} settled_by_poller".strip()[:500]
+                    row.notes = _settlement_notes(row.notes, amounts.observed_costs)
                     s.add(row)
                 s.commit()
             settled_count += len(legs)
