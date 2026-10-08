@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from fractions import Fraction
 from typing import ClassVar
 
@@ -39,6 +40,7 @@ from src.clients.kalshi_rest import (
     KalshiOrderConfirmationError,
     KalshiRestClient,
 )
+from src.risk.commitments import reserve_trade_intents, validate_multi_fee
 from src.risk.exposure import open_risk_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
@@ -140,11 +142,18 @@ class Motor5Executor:
     # Sync de quotes por tick
     # =====================================================
 
-    async def sync_quotes(self, quote: QuoteSet) -> str:
+    async def sync_quotes(self, quote: QuoteSet, *, fee_observation=None) -> str:
         """Sincroniza las órdenes vivas del ticker con la quote deseada. Devuelve el
         desenlace ('synced' | 'corrupted' | 'risk_blocked' | 'error')."""
         ticker = quote.ticker
         async with self._lock(ticker):
+            if getattr(self._risk, "multi_profile_enabled", lambda: False)() is True:
+                try:
+                    validate_multi_fee(ticker, fee_observation, now=datetime.now(UTC))
+                except ValueError:
+                    # Una quote idéntica también puede llenarse con la nueva tarifa.
+                    await self._cancel_ticker(ticker, reason="multi_fee_unverified")
+                    return "corrupted" if ticker in self.corrupted else "risk_blocked"
             inventory_revision = self._cancel_fill_revision
             if ticker in self.corrupted:
                 # Estado en duda: NO se cotiza encima. La conciliación puede confirmar
@@ -173,7 +182,12 @@ class Motor5Executor:
                     # La quote se calculó ANTES del fill observado en create/cancel.
                     # Recalcular inventario/tamaño antes de emitir otra pata.
                     return "risk_blocked"
-                placed = await self._place(ticker, action, price, count)
+                if getattr(self._risk, "multi_profile_enabled", lambda: False)() is True:
+                    placed = await self._place(
+                        ticker, action, price, count, fee_observation=fee_observation
+                    )
+                else:
+                    placed = await self._place(ticker, action, price, count)
                 if placed is None:
                     outcome = "risk_blocked" if ticker not in self.corrupted else "corrupted"
                     if ticker in self.corrupted:
@@ -189,12 +203,20 @@ class Motor5Executor:
     # Place / cancel de una orden
     # =====================================================
 
-    async def _place(self, ticker: str, action: str, price: int, count: int) -> LiveOrder | None:
+    async def _place(
+        self, ticker: str, action: str, price: int, count: int, *, fee_observation=None
+    ) -> LiveOrder | None:
         blocked, reason = incident_status()
         if blocked:
             self.corrupted.add(ticker)
             logger.warning(f"motor5.exec.incident_blocked {ticker}: {reason}")
             return None
+        if getattr(self._risk, "multi_profile_enabled", lambda: False)() is True:
+            try:
+                validate_multi_fee(ticker, fee_observation, now=datetime.now(UTC))
+            except ValueError:
+                logger.warning("motor5.multi_fee_unverified → sin admisión")
+                return None
         coid = f"{COID_PREFIX}{uuid.uuid4()}"
         intent = Trade(
             client_order_id=coid,
@@ -215,10 +237,22 @@ class Motor5Executor:
                 self.corrupted.add(ticker)
                 return False
             try:
+                if getattr(self._risk, "multi_profile_enabled", lambda: False)() is True:
+                    return reserve_trade_intents(
+                        [intent],
+                        limits=self._risk.reservation_limits(
+                            max_strategy_usd=self._max_exposure_usd
+                        ),
+                        fee_observations={ticker: fee_observation},
+                    )
                 with get_session() as session:
                     session.add(intent)
                     session.commit()
                 return True
+            except ValueError as exc:
+                # Rechazo de admisión (carrera/cap/propiedad) no es corrupción del ledger.
+                logger.warning("motor5.admission_rejected {}: {}", ticker, exc)
+                return False
             except Exception:
                 logger.exception(f"motor5.exec.intent_persist_error {ticker} → no se coloca")
                 self._latch_corruption(ticker, "intent_persist_failed")

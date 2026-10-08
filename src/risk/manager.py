@@ -139,12 +139,15 @@ class RiskManager:
     def _dynamic_m1_enabled(self) -> bool:
         return getattr(self.settings, "EXPERIMENT_DYNAMIC_M1_ENABLED", False) is True
 
+    def multi_profile_enabled(self) -> bool:
+        return getattr(self.settings, "EXPERIMENT_DYNAMIC_MULTI_ENABLED", False) is True
+
     def _controlled_m1_enabled(self) -> bool:
         """Controles comunes M1; sólo Bank50 conserva el límite histórico50."""
-        return self._bank50_enabled() or self._dynamic_m1_enabled()
+        return self._bank50_enabled() or self._dynamic_m1_enabled() or self.multi_profile_enabled()
 
     def _experiment_limits(self, capital):
-        if self._dynamic_m1_enabled():
+        if self._dynamic_m1_enabled() or self.multi_profile_enabled():
             return limits_for_dynamic_m1(capital)
         return limits_for_bank50(capital) if self._bank50_enabled() else limits_for_capital(capital)
 
@@ -480,7 +483,7 @@ class RiskManager:
             "limits": limits,
         }
 
-    async def _check_experiment_stops(self) -> str | None:
+    async def _check_experiment_stops(self, *, include_admission_budget: bool = True) -> str | None:
         if not self._experiment_enabled():
             return None
         snap = self._experiment_accounting_snapshot()
@@ -490,7 +493,9 @@ class RiskManager:
         weekly = float(snap["weekly_pnl_usd"])
         cumulative = float(snap["cumulative_pnl_usd"])
         label = (
-            "dynamic-M1"
+            "dynamic-multi"
+            if self.multi_profile_enabled()
+            else "dynamic-M1"
             if self._dynamic_m1_enabled()
             else "bank-50"
             if self._bank50_enabled()
@@ -520,7 +525,7 @@ class RiskManager:
         limits = snap["limits"]
         daily = float(snap["daily_new_risk_usd"])
         daily_cap = float(limits.max_daily_new_risk_usd)
-        if daily >= daily_cap:
+        if include_admission_budget and daily >= daily_cap:
             return f"Presupuesto diario {label} consumido: ${daily:.2f} / ${daily_cap:.2f}"
         return None
 
@@ -574,6 +579,10 @@ class RiskManager:
 
     def m1_reservation_limits(self) -> dict:
         """Foto síncrona para revalidar admisión M1 bajo BEGIN IMMEDIATE, sin red."""
+        return self.reservation_limits()
+
+    def reservation_limits(self, *, max_strategy_usd: float | None = None) -> dict:
+        """Mismos topes para todos los motores; sólo la transacción concede reserva."""
         if not self.can_open_new_positions():
             raise ValueError("M1 sin capital confirmado sobre el piso")
         capital = self._get_effective_capital_usd()
@@ -593,7 +602,38 @@ class RiskManager:
             )
             if self._bank50_enabled():
                 limits["max_lifetime_cents"] = 5000
+            if self.multi_profile_enabled():
+                limits.update(
+                    multi_profile=True,
+                    max_operation_cents=min(100, int(policy.max_per_operation_usd * 100)),
+                )
+                if max_strategy_usd is not None:
+                    if not math.isfinite(max_strategy_usd) or max_strategy_usd <= 0:
+                        raise ValueError("subtope del motor inválido")
+                    limits["max_strategy_cents"] = math.floor(max_strategy_usd * 100)
         return limits
+
+    async def resting_quote_block_reason(self) -> str | None:
+        """Una reserva ya concedida no consume presupuesto otra vez.
+
+        Sí se retira ante pérdida, pausa o evidencia incierta. Se omite únicamente
+        el agotamiento de nuevas admisiones, para no cancelar por su propia reserva.
+        """
+        if not self.multi_profile_enabled():
+            return None
+        if BotState.is_paused:
+            return BotState.pause_reason or "pausa global"
+        incident = self._shared_incident_block()
+        if incident:
+            return incident.reason
+        if not self.can_quote_new_positions():
+            return "cash no confirmado para quotes"
+        experiment = await self._check_experiment_stops(include_admission_budget=False)
+        if experiment:
+            return experiment
+        if await self._check_timeframe_stop_losses():
+            return "stop-loss global"
+        return self._check_unrealized_stop()
 
     def _confirmed_quote_capital_usd(self) -> float | None:
         """M5 sólo abre contra cash observado fresco, nunca contra piso/fallback.

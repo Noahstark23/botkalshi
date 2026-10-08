@@ -86,6 +86,7 @@ class Motor2ExitEngine:
         trailing_enabled: bool = False,
         trailing_drop: int = DEFAULT_TRAILING_DROP_CENTS,
         min_sell_bid_cents: int = 0,
+        publish_bid_marks: bool = True,
     ) -> None:
         self._trading_enabled = trading_enabled
         self._take_profit_enabled = take_profit_enabled
@@ -93,6 +94,7 @@ class Motor2ExitEngine:
         self._trailing_enabled = trailing_enabled
         self._trailing_drop = trailing_drop
         self._min_sell_bid_cents = min_sell_bid_cents
+        self._publish_bid_marks = publish_bid_marks
         self._executor: Motor3ExitExecutor | None = None
         self._client: KalshiRestClient | None = None
         # Peak del bid por (ticker, side) para el trailing. EN MEMORIA (Motor 2 no tiene fila
@@ -260,7 +262,8 @@ class Motor2ExitEngine:
                 bid, _ = _top_bid(rest_orderbook_sides(ob)[side])
                 # Pasajero (2026-07-17): mark para el gate MTM del RiskManager (cero I/O
                 # extra — el bid ya se leyó para el TP). Best-effort adentro.
-                RiskManager.record_mark(ticker, side, bid)
+                if self._publish_bid_marks:
+                    RiskManager.record_mark(ticker, side, bid)
             except Exception as exc:
                 logger.warning(f"motor2.exit.orderbook_error ticker={ticker} side={side}: {exc}")
                 bid = None

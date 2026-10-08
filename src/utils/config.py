@@ -230,6 +230,10 @@ class Settings(BaseSettings):
         default=False,
         description="M1 con capital observado dinámico y límites absolutos; sin bank ni turnover fijo50.",
     )
+    EXPERIMENT_DYNAMIC_MULTI_ENABLED: bool = Field(
+        default=False,
+        description="Validación offline/shadow M1/M2/M5 MLB con presupuesto compartido; prohíbe ejecución.",
+    )
     EXPERIMENT_START_AT: str = Field(
         default="",
         description="ISO-8601 con timezone del inicio confirmado; obligatorio en Bank50/DynamicM1 incluso desarmados y al armar Bank200.",
@@ -736,6 +740,8 @@ class Settings(BaseSettings):
     # ENCENDIDO POR CONFIG: con la key seteada, el runner usa LiveOddsSource (odds reales);
     # vacía → FakeOddsSource (fixture, shadow). No requiere editar código para el flip.
     ODDS_API_KEY: str = ""
+    ODDS_SHARED_SNAPSHOT_DIR: str = ""
+    ODDS_SHARED_SNAPSHOT_MAX_AGE_SEC: float = Field(default=600, gt=0, le=660)
     # Deportes a consultar en The Odds API (sport_keys separados por coma). MLB diario =
     # "baseball_mlb" (el play sostenible cuando acabe el Mundial). El Mundial es
     # "soccer_fifa_world_cup". Para correr ambos en transición: "baseball_mlb,soccer_fifa_world_cup"
@@ -1139,8 +1145,22 @@ class Settings(BaseSettings):
         """La referencia de saldo no arma ni limita capital; los controles M1 sí son fijos."""
         if not self.EXPERIMENT_DYNAMIC_M1_ENABLED:
             return self
+        return self._validate_dynamic_profile(multi=False)
+
+    @model_validator(mode="after")
+    def _experiment_dynamic_multi_profile(self) -> Settings:
+        if not self.EXPERIMENT_DYNAMIC_MULTI_ENABLED:
+            return self
+        return self._validate_dynamic_profile(multi=True)
+
+    def _validate_dynamic_profile(self, *, multi: bool) -> Settings:
         problems: list[str] = []
-        for name in ("EXPERIMENT_BANK50_ENABLED", "EXPERIMENT_BANK200_ENABLED"):
+        incompatible = (
+            "EXPERIMENT_BANK50_ENABLED",
+            "EXPERIMENT_BANK200_ENABLED",
+            "EXPERIMENT_DYNAMIC_M1_ENABLED" if multi else "EXPERIMENT_DYNAMIC_MULTI_ENABLED",
+        )
+        for name in incompatible:
             if getattr(self, name):
                 problems.append(f"{name}=false (perfiles incompatibles)")
         exact = {
@@ -1174,17 +1194,50 @@ class Settings(BaseSettings):
             problems.append("DYNAMIC_CAPITAL_ENABLED=true")
         if self.DAILY_STOP_ENTRIES_ONLY:
             problems.append("DAILY_STOP_ENTRIES_ONLY=false")
-        for name in (
-            "MOTOR_2_ENTRY_EXECUTION_ENABLED",
-            "MOTOR_2_EXECUTION_ENABLED",
+        prohibited = [
             "MOTOR_REST_EXECUTION_ENABLED",
-            "MOTOR_MM_EXECUTION_ENABLED",
             "MOTOR_3_CLV_ENABLED",
             "MOTOR_3_EXECUTION_ENABLED",
             "MOTOR_3_MANAGES_ORPHANS",
-        ):
+        ]
+        if multi:
+            prohibited += [
+                "MOTOR_1_EXECUTION_ENABLED",
+                "MOTOR_2_ENTRY_EXECUTION_ENABLED",
+                "MOTOR_2_EXECUTION_ENABLED",
+                "MOTOR_MM_EXECUTION_ENABLED",
+                "MOTOR_REST_ENABLED",
+                "MOTOR_6_LINEMOVE_ENABLED",
+                "MOTOR_8_OFI_ENABLED",
+                "MOTOR_9_SPILLOVER_ENABLED",
+            ]
+            if self.TRADING_ENABLED:
+                problems.append("TRADING_ENABLED=false (perfil exclusivamente offline/shadow)")
+            if not self.ODDS_SHARED_SNAPSHOT_DIR:
+                problems.append("ODDS_SHARED_SNAPSHOT_DIR requerido")
+            if self.MOTOR2_SERIES != "KXMLBGAME" or self.MOTOR_MM_SERIES != "KXMLBGAME":
+                problems.append("MOTOR2_SERIES=MOTOR_MM_SERIES=KXMLBGAME")
+            if self.MOTOR_MM_FAIR_TTL_SEC != 360:
+                problems.append("MOTOR_MM_FAIR_TTL_SEC=360")
+            if not self.UNREALIZED_STOP_ENABLED:
+                problems.append("UNREALIZED_STOP_ENABLED=true")
+            if not self.MOTOR_2_ONE_BET_PER_EVENT:
+                problems.append("MOTOR_2_ONE_BET_PER_EVENT=true")
+            if self.MOTOR_MM_MAX_EXPOSURE_USD > 3:
+                problems.append("MOTOR_MM_MAX_EXPOSURE_USD<=3 (subtope del global)")
+            if self.MOTOR_2_EXECUTION_ENABLED:
+                problems.append(
+                    "MOTOR_2_EXECUTION_ENABLED=false (salidas anticipadas no incluidas)"
+                )
+        else:
+            prohibited += [
+                "MOTOR_2_ENTRY_EXECUTION_ENABLED",
+                "MOTOR_2_EXECUTION_ENABLED",
+                "MOTOR_MM_EXECUTION_ENABLED",
+            ]
+        for name in prohibited:
             if getattr(self, name):
-                problems.append(f"{name}=false (fase inicial aislada M1)")
+                problems.append(f"{name}=false (fuera del perfil)")
         try:
             started = datetime.fromisoformat(self.EXPERIMENT_START_AT.replace("Z", "+00:00"))
             if started.tzinfo is None or started.utcoffset() is None:
@@ -1193,15 +1246,26 @@ class Settings(BaseSettings):
                 problems.append("EXPERIMENT_START_AT no puede estar en el futuro")
         except (TypeError, ValueError, OverflowError):
             problems.append("EXPERIMENT_START_AT ISO-8601 válido con timezone")
-        if self.TRADING_ENABLED:
-            for name in ("MOTOR_1_ARBITRAGE_ENABLED", "MOTOR_1_EXECUTION_ENABLED"):
+        if self.TRADING_ENABLED and not multi:
+            required = ["MOTOR_1_ARBITRAGE_ENABLED", "MOTOR_1_EXECUTION_ENABLED"]
+            for name in required:
                 if not getattr(self, name):
                     problems.append(f"{name}=true al armar trading")
         if problems:
             raise ValueError(
-                "EXPERIMENT_DYNAMIC_M1_ENABLED no cumple el perfil fail-closed: "
+                ("EXPERIMENT_DYNAMIC_MULTI_ENABLED" if multi else "EXPERIMENT_DYNAMIC_M1_ENABLED")
+                + " no cumple el perfil fail-closed: "
                 + "; ".join(problems)
             )
+        return self
+
+    @model_validator(mode="after")
+    def _shared_odds_source(self) -> Settings:
+        if self.ODDS_SHARED_SNAPSHOT_DIR:
+            if not Path(self.ODDS_SHARED_SNAPSHOT_DIR).is_absolute():
+                raise ValueError("ODDS_SHARED_SNAPSHOT_DIR debe ser ruta absoluta")
+            if self.ODDS_API_KEY.strip():
+                raise ValueError("ODDS_SHARED_SNAPSHOT_DIR y ODDS_API_KEY son excluyentes")
         return self
 
     @model_validator(mode="after")
@@ -1223,8 +1287,8 @@ class Settings(BaseSettings):
             problems.append("KALSHI_ENV=production (F1 mide el book real; ejecución sigue OFF)")
         if not self.MOTOR_2_SPORTSBOOK_ENABLED:
             problems.append("MOTOR_2_SPORTSBOOK_ENABLED=true")
-        if not self.ODDS_API_KEY.strip():
-            problems.append("ODDS_API_KEY no vacía (odds LIVE, no fixture fake)")
+        if not self.ODDS_API_KEY.strip() and not self.ODDS_SHARED_SNAPSHOT_DIR:
+            problems.append("ODDS_API_KEY o ODDS_SHARED_SNAPSHOT_DIR (odds LIVE, no fixture fake)")
         if not self.MOTOR_MM_FEES_AS_MAKER:
             problems.append("MOTOR_MM_FEES_AS_MAKER=true")
         if self.MOTOR_2_MIN_BOOKS < 3:

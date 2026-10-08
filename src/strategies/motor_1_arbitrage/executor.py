@@ -17,7 +17,7 @@ from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_error, alert_risk_event
-from src.risk.commitments import reserve_m1_intents
+from src.risk.commitments import reserve_m1_intents, validate_multi_fee
 from src.risk.manager import RiskManager
 from src.storage.models import (
     PortfolioPosition,
@@ -31,7 +31,7 @@ from src.storage.order_reconciliation import reconcile_pending_orders
 from src.storage.quantities import hold_uncertain_order, quantity_fields, resize_filled
 from src.storage.reductions import finalize_reduction, persist_reduction
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
-from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker
+from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker, event_ticker_of
 from src.utils.config import get_settings
 
 if TYPE_CHECKING:
@@ -243,6 +243,20 @@ class ArbitrageExecutor:
         # motor_rest_arb (executor.py, #85); select_hard_leg es la fuente única. NO se agrega
         # pre-check de depth: sería un no-op (count = min(available_size) ya, por construcción).
         coids = {leg: str(uuid.uuid4()) for leg in opp.legs}
+        fee_observations = None
+        if getattr(self.risk_manager, "multi_profile_enabled", lambda: False)() is True:
+            from src.strategies.motor_5_mm.fee_policy import SeriesFeePolicy
+
+            policy = SeriesFeePolicy(self.client)
+            fee_observations = {}
+            try:
+                for ticker in {leg.market_ticker for leg in opp.legs}:
+                    observation = await policy.observe(ticker, event_ticker=event_ticker_of(ticker))
+                    validate_multi_fee(ticker, observation, now=datetime.now(UTC))
+                    fee_observations[ticker] = observation
+            except Exception:
+                logger.warning("motor1.multi_fee_unverified → sin admisión")
+                return False
 
         def persist_reserved(final_decision) -> bool:
             nonlocal count
@@ -257,6 +271,7 @@ class ArbitrageExecutor:
                     count,
                     [coids[leg] for leg in opp.legs],
                     limits=self.risk_manager.m1_reservation_limits(),
+                    fee_observations=fee_observations,
                 )
             except Exception:
                 logger.exception("motor1.reservation_rejected → no se envía ninguna pata")
@@ -964,6 +979,7 @@ class ArbitrageExecutor:
         client_ids: list[str],
         *,
         limits: dict | None = None,
+        fee_observations: dict | None = None,
     ) -> bool:
         """Insert one Trade row per leg with status='pending' before touching network.
 
@@ -997,7 +1013,7 @@ class ArbitrageExecutor:
                 notes=f"arb_id={arb_id}",
             )
             trades.append(trade)
-        return reserve_m1_intents(trades, limits=limits)
+        return reserve_m1_intents(trades, limits=limits, fee_observations=fee_observations)
 
     def _update_trade_status(self, coid: str, status: str) -> None:
         """Update trade status (and filled_at if status='filled')."""

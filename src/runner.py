@@ -402,15 +402,28 @@ class ProductionRunner:
             kalshi_source = RestKalshiQuoteSource(
                 lambda: self._capture.motor2_event_universe(motor2_series)
             )
-            # FLIP POR CONFIG: con la API paga (ODDS_API_KEY) usa odds REALES; si no, el
-            # fixture fake (shadow, jamás apuesta). Sin editar código para encender.
-            if self.settings.ODDS_API_KEY:
+            # Una fuente compartida conserva las fechas originales sin consumir API.
+            # Si no se configuró fuente real, sólo se usa el fixture de simulación.
+            if self.settings.ODDS_SHARED_SNAPSHOT_DIR or self.settings.ODDS_API_KEY:
                 sport_keys = [
                     s.strip() for s in self.settings.ODDS_API_SPORT_KEYS.split(",") if s.strip()
                 ]
-                odds_source = LiveOddsSource(sport_keys, regions=self.settings.ODDS_API_REGIONS)
+                if self.settings.ODDS_SHARED_SNAPSHOT_DIR:
+                    from src.clients.odds_snapshot import OddsSnapshotClient
+
+                    odds_source = LiveOddsSource(
+                        sport_keys,
+                        regions=self.settings.ODDS_API_REGIONS,
+                        client_factory=lambda: OddsSnapshotClient(
+                            self.settings.ODDS_SHARED_SNAPSHOT_DIR,
+                            max_age_seconds=self.settings.ODDS_SHARED_SNAPSHOT_MAX_AGE_SEC,
+                        ),
+                    )
+                else:
+                    odds_source = LiveOddsSource(sport_keys, regions=self.settings.ODDS_API_REGIONS)
                 logger.info(
-                    f"motor2 odds=LIVE sports={sport_keys} regions={self.settings.ODDS_API_REGIONS}"
+                    f"motor2 odds={'SHARED_SNAPSHOT' if self.settings.ODDS_SHARED_SNAPSHOT_DIR else 'API'} "
+                    f"sports={sport_keys} regions={self.settings.ODDS_API_REGIONS}"
                 )
             else:
                 odds_source = FakeOddsSource(
@@ -504,6 +517,7 @@ class ProductionRunner:
                 trailing_enabled=self.settings.MOTOR_2_TRAILING_ENABLED,
                 trailing_drop=self.settings.MOTOR_2_TRAILING_DROP_CENTS,
                 min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
+                publish_bid_marks=not self.settings.EXPERIMENT_DYNAMIC_MULTI_ENABLED,
             ).run(self._stop_event)
         except Exception as e:
             msg = f"motor2_exits runner: {type(e).__name__}: {e}"
@@ -586,6 +600,19 @@ class ProductionRunner:
             msg = f"analyst_loop runner: {type(e).__name__}: {e}"
             logger.exception(msg)
             BotState.record_error(msg)
+
+    async def _run_position_marks(self) -> None:
+        """Read-only marks for every open leg of the explicit multi-engine profile."""
+        from src.monitoring.position_marks import PositionMarkRefresher
+
+        async with KalshiRestClient() as client:
+            refresher = PositionMarkRefresher(client)
+            while not self._stop_event.is_set():
+                await refresher.refresh()
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=15)
+                except TimeoutError:
+                    continue
 
     async def _run_memory_monitor(self) -> None:
         """
@@ -805,6 +832,10 @@ class ProductionRunner:
                         self._start_required_service("motor2_shadow", self._run_motor2_shadow),
                         self._start_required_service("motor2_exits", self._run_motor2_exits),
                     ]
+                )
+            if self.settings.EXPERIMENT_DYNAMIC_MULTI_ENABLED:
+                tasks.append(
+                    self._start_required_service("position_marks", self._run_position_marks)
                 )
             if self.settings.ANALYST_LOOP_ENABLED:
                 tasks.append(asyncio.create_task(self._run_analyst_loop(), name="analyst_loop"))

@@ -743,6 +743,11 @@ class Motor5Engine:
         # Las posiciones reales se valoran aun sin fair o con entradas pausadas.
         # La cobertura parcial bloquea entradas en RiskManager; no inventa marks.
         risk_fees = await self._refresh_position_risk_marks(raw_fairs)
+        global_reason = await self._global_resting_block_reason()
+        if global_reason is not None:
+            quotes_allowed = False
+            counters["exec_risk_blocked"] += 1
+            logger.warning("motor5.global_stop → retirar quotes: {}", global_reason)
         mtm_reason = self._unrealized_quote_block_reason()
         if mtm_reason is not None:
             quotes_allowed = False
@@ -956,7 +961,11 @@ class Motor5Engine:
                 if self._executor is not None:
                     await self._executor.retire_ticker(ticker)
                 continue
-            if not self._quote_capital_allowed() or self._unrealized_quote_block_reason():
+            if (
+                not self._quote_capital_allowed()
+                or self._unrealized_quote_block_reason()
+                or await self._global_resting_block_reason()
+            ):
                 # Cash/marks pudieron caducar durante GET book/fee. Retirar todo
                 # antes de sync, incluso si conservaría los mismos precios.
                 counters["exec_risk_blocked"] += 1
@@ -1002,7 +1011,15 @@ class Motor5Engine:
             )
             # CAPA B: guard en el call site — sin executor (shadow) acá no pasa nada.
             if self._executor is not None:
-                outcome = await self._executor.sync_quotes(quote)
+                if (
+                    self._risk is not None
+                    and getattr(self._risk, "multi_profile_enabled", lambda: False)() is True
+                ):
+                    outcome = await self._executor.sync_quotes(
+                        quote, fee_observation=fee_observation
+                    )
+                else:
+                    outcome = await self._executor.sync_quotes(quote)
                 if outcome == "corrupted":
                     counters["exec_corrupted"] += 1
                 elif outcome == "risk_blocked":
@@ -1414,6 +1431,15 @@ class Motor5Engine:
         if self._executor is None or self._risk is None:
             return None
         return self._risk.unrealized_entry_block_reason()
+
+    async def _global_resting_block_reason(self) -> str | None:
+        if (
+            self._executor is None
+            or self._risk is None
+            or getattr(self._risk, "multi_profile_enabled", lambda: False)() is not True
+        ):
+            return None
+        return await self._risk.resting_quote_block_reason()
 
     def _invalidate_risk_mark(self, ticker: str) -> None:
         if self._executor is not None:

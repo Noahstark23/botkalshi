@@ -34,6 +34,7 @@ from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, Trading
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
+from src.risk.commitments import reserve_trade_intents, validate_multi_fee
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, engage_kill_switch, get_session
 from src.storage.quantities import filled_fields, hold_uncertain_order, quantity_fields
@@ -165,9 +166,22 @@ class Motor2Executor:
         # ENTERO, sin descuento de hedge). Si el persist falla → ABORT sin colocar.
         bet_id = str(uuid.uuid4())
         coid = f"{bet_id}-{side}"
+        fee_observation = None
+        if getattr(self.risk, "multi_profile_enabled", lambda: False)() is True:
+            from src.strategies.motor_5_mm.fee_policy import SeriesFeePolicy
+
+            try:
+                fee_observation = await SeriesFeePolicy(self.client).observe(
+                    signal.market_ticker, event_ticker=signal.event_key
+                )
+                validate_multi_fee(signal.market_ticker, fee_observation, now=datetime.now(UTC))
+            except Exception:
+                return Motor2ExecutionOutcome(False, False, reason="multi_fee_unverified")
         decision = await self.risk.check_and_reserve(
             opp,
-            lambda d: self._persist_intent(signal, side, price, d.max_allowed_count, coid),
+            lambda d: self._persist_intent(
+                signal, side, price, d.max_allowed_count, coid, fee_observation=fee_observation
+            ),
         )
         if not decision.approved:
             logger.info(
@@ -357,10 +371,35 @@ class Motor2Executor:
             return True
 
     def _persist_intent(
-        self, signal: ConsensusSignal, side: str, price: int, count: int, coid: str
+        self,
+        signal: ConsensusSignal,
+        side: str,
+        price: int,
+        count: int,
+        coid: str,
+        *,
+        fee_observation=None,
     ) -> bool:
         """Escribe la fila Trade 'pending' ANTES de tocar la red (patrón A.1). False si falla."""
         try:
+            if getattr(self.risk, "multi_profile_enabled", lambda: False)() is True:
+                trade = Trade(
+                    client_order_id=coid,
+                    ticker=signal.market_ticker,
+                    side=side,
+                    action="buy",
+                    **quantity_fields(count),
+                    price_cents=price,
+                    strategy=STRATEGY,
+                    estimated_edge_pct=signal.edge_pct,
+                    status="pending",
+                    notes=f"motor2 fair={signal.odds_api_fair_prob}",
+                )
+                return reserve_trade_intents(
+                    [trade],
+                    limits=self.risk.reservation_limits(),
+                    fee_observations={trade.ticker: fee_observation},
+                )
             with get_session() as s:
                 s.add(
                     Trade(
