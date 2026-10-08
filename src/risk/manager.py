@@ -22,7 +22,11 @@ from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
 from src.monitoring.telegram_alerts import alert_risk_event, send_alert
 from src.risk.commitments import daily_committed_cents, lifetime_committed_cents
-from src.risk.experiment_policy import limits_for_bank50, limits_for_capital
+from src.risk.experiment_policy import (
+    limits_for_bank50,
+    limits_for_capital,
+    limits_for_dynamic_m1,
+)
 from src.risk.exposure import (
     MM_STRATEGY,
     contract_risk_cents,
@@ -126,13 +130,22 @@ class RiskManager:
         """Solo un bool True explícito activa el guard; mocks/ausencia nunca lo arman."""
         return (
             getattr(self.settings, "EXPERIMENT_BANK200_ENABLED", False) is True
-            or self._bank50_enabled()
+            or self._controlled_m1_enabled()
         )
 
     def _bank50_enabled(self) -> bool:
         return getattr(self.settings, "EXPERIMENT_BANK50_ENABLED", False) is True
 
+    def _dynamic_m1_enabled(self) -> bool:
+        return getattr(self.settings, "EXPERIMENT_DYNAMIC_M1_ENABLED", False) is True
+
+    def _controlled_m1_enabled(self) -> bool:
+        """Controles comunes M1; sólo Bank50 conserva el límite histórico50."""
+        return self._bank50_enabled() or self._dynamic_m1_enabled()
+
     def _experiment_limits(self, capital):
+        if self._dynamic_m1_enabled():
+            return limits_for_dynamic_m1(capital)
         return limits_for_bank50(capital) if self._bank50_enabled() else limits_for_capital(capital)
 
     def _requires_confirmed_cash(self) -> bool:
@@ -433,14 +446,14 @@ class RiskManager:
             except ValueError as exc:
                 return {"valid": False, "reason": str(exc)}
             settled_query = select(Trade).where(Trade.status == "settled")
-            if not self._bank50_enabled():
+            if not self._controlled_m1_enabled():
                 settled_query = settled_query.where(Trade.settled_at >= start)
             settled = list(s.exec(settled_query))
 
         weekly_cents = 0
         cumulative_cents = 0
         for trade in settled:
-            if self._bank50_enabled() and (
+            if self._controlled_m1_enabled() and (
                 trade.settled_at is None
                 or type(trade.pnl_cents) is not int
                 or self._as_utc_naive(trade.settled_at) > now_utc.replace(tzinfo=None)
@@ -449,7 +462,7 @@ class RiskManager:
             if trade.settled_at is None:
                 continue
             settled_at = self._as_utc_naive(trade.settled_at)
-            if settled_at < start and not self._bank50_enabled():
+            if settled_at < start and not self._controlled_m1_enabled():
                 continue
             pnl = trade.pnl_cents or 0
             cumulative_cents += pnl
@@ -476,8 +489,16 @@ class RiskManager:
 
         weekly = float(snap["weekly_pnl_usd"])
         cumulative = float(snap["cumulative_pnl_usd"])
-        label = "bank-50" if self._bank50_enabled() else "bank-200"
-        cumulative_limit, weekly_limit = (5.0, 3.0) if self._bank50_enabled() else (20.0, 12.0)
+        label = (
+            "dynamic-M1"
+            if self._dynamic_m1_enabled()
+            else "bank-50"
+            if self._bank50_enabled()
+            else "bank-200"
+        )
+        cumulative_limit, weekly_limit = (
+            (5.0, 3.0) if self._controlled_m1_enabled() else (20.0, 12.0)
+        )
         if self._bank50_enabled() and snap["lifetime_committed_cents"] >= 5000:
             reason = "Presupuesto histórico bank-50 consumido: $50.00 en compromisos"
             await self._trigger_kill_switch(reason)

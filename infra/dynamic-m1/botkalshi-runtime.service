@@ -1,0 +1,57 @@
+[Unit]
+Description=Botkalshi - runtime con perfil M1 dinamico
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/botkalshi-runtime/runtime.env
+ConditionPathExists=/etc/botkalshi-runtime/kalshi_private_key.pem
+# Nombre legado de compatibilidad; no es un ack nuevo ni autoriza trading.
+ConditionPathExists=/etc/botkalshi-runtime/STANDBY_REVIEWED
+ConditionPathIsDirectory=/opt/botkalshi-runtime/current
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=botkalshi-runtime
+Group=botkalshi-runtime
+WorkingDirectory=/opt/botkalshi-runtime/current
+EnvironmentFile=/etc/botkalshi-runtime/runtime.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/botkalshi-runtime/current
+StateDirectory=botkalshi-runtime
+StateDirectoryMode=0700
+LogsDirectory=botkalshi-runtime
+LogsDirectoryMode=0700
+# El montaje solo existe en el namespace de la unidad; no reemplaza /app del host.
+BindPaths=/var/log/botkalshi-runtime:/app/logs
+ReadWritePaths=/var/lib/botkalshi-runtime /var/log/botkalshi-runtime /app/logs
+# Candidato LOCAL NO instalado; plantilla inicial: TRADING_ENABLED=false, ack=0 y ejecucion M1=false en runtime.env.
+# El chequeo valida configuracion local; no prueba tarifas, saldo ni autorizacion.
+ExecStartPre=/opt/botkalshi-runtime/current/.venv/bin/python -m scripts.check_dynamic_m1_deployment
+ExecStart=/opt/botkalshi-runtime/current/.venv/bin/python -m src.runner
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryAccounting=true
+MemoryHigh=500M
+MemoryMax=650M
+MemorySwapMax=256M
+CPUQuota=80%
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botkalshi-runtime
+
+[Install]
+WantedBy=multi-user.target

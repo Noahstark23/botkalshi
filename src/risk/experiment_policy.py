@@ -59,7 +59,15 @@ def limits_for_bank50(capital_usd: Decimal | float | int | str) -> ExperimentLim
     Límites de compromisos calculados, no garantía del PnL de la cuenta.
     El cap histórico de 5.000c se revalida en la transacción de reserva.
     """
-    capital = min(_money(capital_usd), Decimal("50.00"))
+    return _small_m1_limits(min(_money(capital_usd), Decimal("50.00")))
+
+
+def limits_for_dynamic_m1(capital_usd: Decimal | float | int | str) -> ExperimentLimits:
+    """Capital observado sin clamp50; los techos absolutos no crecen por depósitos."""
+    return _small_m1_limits(_money(capital_usd))
+
+
+def _small_m1_limits(capital: Decimal) -> ExperimentLimits:
     unit = min(Decimal("1.00"), (capital * Decimal("0.03")).quantize(CENT, rounding=ROUND_DOWN))
     aggregate = min(
         Decimal("3.00"), (capital * Decimal("0.10")).quantize(CENT, rounding=ROUND_DOWN)

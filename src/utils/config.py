@@ -8,6 +8,7 @@ no inicia (fail fast).
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -225,9 +226,13 @@ class Settings(BaseSettings):
         default=False,
         description="Perfil aislado USD50, opt-in; requiere límites explícitos incluso sin trading.",
     )
+    EXPERIMENT_DYNAMIC_M1_ENABLED: bool = Field(
+        default=False,
+        description="M1 con capital observado dinámico y límites absolutos; sin bank ni turnover fijo50.",
+    )
     EXPERIMENT_START_AT: str = Field(
         default="",
-        description="ISO-8601 con timezone del inicio confirmado; obligatorio en Bank50 incluso desarmado y al armar Bank200.",
+        description="ISO-8601 con timezone del inicio confirmado; obligatorio en Bank50/DynamicM1 incluso desarmados y al armar Bank200.",
     )
     EXPERIMENT_BALANCE_MAX_AGE_SEC: int = Field(
         default=600,
@@ -1126,6 +1131,76 @@ class Settings(BaseSettings):
         if problems:
             raise ValueError(
                 "EXPERIMENT_BANK50_ENABLED no cumple el perfil fail-closed: " + "; ".join(problems)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _experiment_dynamic_m1_profile(self) -> Settings:
+        """La referencia de saldo no arma ni limita capital; los controles M1 sí son fijos."""
+        if not self.EXPERIMENT_DYNAMIC_M1_ENABLED:
+            return self
+        problems: list[str] = []
+        for name in ("EXPERIMENT_BANK50_ENABLED", "EXPERIMENT_BANK200_ENABLED"):
+            if getattr(self, name):
+                problems.append(f"{name}=false (perfiles incompatibles)")
+        exact = {
+            "CAPITAL_SAFETY_FACTOR_PCT": 90.0,
+            "CAPITAL_SMOOTHING_PCT": 0.0,
+            "BALANCE_REFRESH_SECONDS": 30,
+            "BALANCE_MAX_AGE_SECONDS": 60,
+            "EXPERIMENT_BALANCE_MAX_AGE_SEC": 60,
+            "MAX_DAILY_LOSS_FLOOR_USD": 0.0,
+            "MAX_WEEKLY_LOSS_FLOOR_USD": 0.0,
+            "MAX_MONTHLY_LOSS_FLOOR_USD": 0.0,
+        }
+        for name, expected in exact.items():
+            if getattr(self, name) != expected:
+                problems.append(f"{name}={expected:g}")
+        if not (
+            math.isfinite(self.CAPITAL_FLOOR_USD)
+            and math.isfinite(self.CAPITAL_CAP_USD)
+            and 0 < self.CAPITAL_FLOOR_USD <= self.CAPITAL_CAP_USD <= 5000
+        ):
+            problems.append("0<CAPITAL_FLOOR_USD<=CAPITAL_CAP_USD<=5000 finitos")
+        for name, ceiling in {
+            "MAX_TRADE_SIZE_USD": 1.0,
+            "MAX_TRADE_SIZE_PCT": 3.0,
+            "MAX_SIMULTANEOUS_EXPOSURE_PCT": 10.0,
+            "MAX_EVENT_DIRECTIONAL_EXPOSURE_USD": 1.0,
+        }.items():
+            if getattr(self, name) > ceiling:
+                problems.append(f"{name}<={ceiling:g}")
+        if not self.DYNAMIC_CAPITAL_ENABLED:
+            problems.append("DYNAMIC_CAPITAL_ENABLED=true")
+        if self.DAILY_STOP_ENTRIES_ONLY:
+            problems.append("DAILY_STOP_ENTRIES_ONLY=false")
+        for name in (
+            "MOTOR_2_ENTRY_EXECUTION_ENABLED",
+            "MOTOR_2_EXECUTION_ENABLED",
+            "MOTOR_REST_EXECUTION_ENABLED",
+            "MOTOR_MM_EXECUTION_ENABLED",
+            "MOTOR_3_CLV_ENABLED",
+            "MOTOR_3_EXECUTION_ENABLED",
+            "MOTOR_3_MANAGES_ORPHANS",
+        ):
+            if getattr(self, name):
+                problems.append(f"{name}=false (fase inicial aislada M1)")
+        try:
+            started = datetime.fromisoformat(self.EXPERIMENT_START_AT.replace("Z", "+00:00"))
+            if started.tzinfo is None or started.utcoffset() is None:
+                raise ValueError
+            if started > datetime.now(UTC):
+                problems.append("EXPERIMENT_START_AT no puede estar en el futuro")
+        except (TypeError, ValueError, OverflowError):
+            problems.append("EXPERIMENT_START_AT ISO-8601 válido con timezone")
+        if self.TRADING_ENABLED:
+            for name in ("MOTOR_1_ARBITRAGE_ENABLED", "MOTOR_1_EXECUTION_ENABLED"):
+                if not getattr(self, name):
+                    problems.append(f"{name}=true al armar trading")
+        if problems:
+            raise ValueError(
+                "EXPERIMENT_DYNAMIC_M1_ENABLED no cumple el perfil fail-closed: "
+                + "; ".join(problems)
             )
         return self
 
