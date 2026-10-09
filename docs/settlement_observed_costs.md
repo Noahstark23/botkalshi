@@ -33,6 +33,35 @@ No se recalculan automáticamente filas históricas ya `settled`. Los agregados 
 riesgo existentes siguen sumando centavos enteros; este cambio no convierte esos
 agregados en sumas de microUSD ni modifica límites, estrategias o activación.
 
+## Captura contable M2 y M5
+
+`src/storage/order_costs.py` registra cantidad y totales del mismo acumulado.
+M5 conserva sus imports mediante el reexport de `ledger.py`. M2 utiliza el mismo
+registro tanto en ACK terminal/incierto como en recuperación GET, antes de reducir
+la cantidad de la fila a su porción ejecutada. Los campos de identidad presentes
+deben corresponder a la intención; GET los revalida bajo el bloqueo de escritura.
+
+M2 conserva su fallback legacy sólo si la respuesta no contiene ninguna de las
+cuatro claves monetarias, no había FP previos y no hay cuarentena. Los FP siguen
+vacíos: el settlement no etiqueta esa estimación como coste observado. Una cantidad
+nueva sin importes nunca hereda los totales de una cantidad anterior.
+
+Un importe explícito inválido, contradictorio o regresivo activa
+`fill_cost_quarantined`. La cantidad confirmada se conserva; el dinero dudoso se
+descarta. La marca persiste al reabrir SQLite y repetir respuestas; no se levanta
+automáticamente con otro mensaje. M2 conserva `pending`, la reserva original y
+su pausa ante esos ACK; GET los mantiene inconclusos y settlement los rechaza.
+Un ACK terminal cero pasa por el mismo escritor y no puede borrar un fill positivo
+guardado mientras se esperaba esa respuesta.
+
+Límite: la comparación monetaria utiliza el FP previo disponible. Si una respuesta
+sin datos ya lo eliminó, no se conserva otro piso monetario histórico. La cuarentena
+durable cubre contradicciones detectadas; no sustituye un archivo completo de fills.
+SELL continúa sin interpretación acreditada de ingresos/collateral.
+
+Campos contrastados con la [documentación oficial de órdenes de Kalshi](https://docs.kalshi.com/api-reference/orders/get-order).
+La documentación del formato no equivale a observar un fill conectado de este candidato.
+
 ## Evidencia offline
 
 `tests/strategies/motor_rest_arb/test_settlement_observed_costs.py` reproduce el
@@ -46,7 +75,9 @@ reenvío, fill durante cancelación tardía, cantidades regresivas, nuevas insta
 y conexiones, resolución ganadora/perdedora y presupuesto original conservado.
 
 Esta integración no arranca ProductionRunner ni mata un proceso del sistema
-operativo. M2 sigue usando estimaciones de entrada en estos casos; M5 aporta
-totales inventados por el transporte de pruebas. Pasar estos escenarios no prueba
+operativo. M2 y M5 conservan los totales inventados por el transporte cuando existen;
+las respuestas sin importes siguen etiquetadas como estimaciones. Los tests de
+`test_observed_accounting.py` y `test_order_costs.py` cubren la captura, cuarentena,
+ACK cero tardío, identidad y recuperación sin reenvío. Pasar estos escenarios no prueba
 fills conectados, conciliación de una cuenta, ventaja económica ni instalación
 del candidato. No habilita ejecución real.

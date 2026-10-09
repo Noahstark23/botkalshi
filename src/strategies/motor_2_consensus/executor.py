@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from fractions import Fraction
 
 from loguru import logger
+from sqlalchemy import text
 from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
@@ -37,7 +38,13 @@ from src.math.quantities import terminal_fill
 from src.risk.commitments import reserve_trade_intents, validate_multi_fee
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, engage_kill_switch, get_session
-from src.storage.quantities import filled_fields, hold_uncertain_order, quantity_fields
+from src.storage.order_costs import COST_QUARANTINE_NOTE, record_order_fill
+from src.storage.quantities import (
+    hold_uncertain_order,
+    quantity_fields,
+    resize_filled,
+    validate_order_identity,
+)
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 
@@ -237,7 +244,18 @@ class Motor2Executor:
             )
 
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
-        order_id = str(order.get("order_id", "")) or None
+        try:
+            with get_session() as s:
+                row = s.exec(select(Trade).where(Trade.client_order_id == coid)).one()
+                validate_order_identity(row, order)
+        except Exception:
+            logger.exception(f"motor2.exec.response_identity_unknown coid={coid}")
+            self._engage_preventive_pause(
+                coid, detail="respuesta no correlacionada con intención persistida"
+            )
+            return Motor2ExecutionOutcome(
+                True, False, uncertain=True, reason="order_identity_unknown", client_order_id=coid
+            )
         # Coalesce por is-not-None (deuda auditoría 2026-07-01): fill_count PRESENTE con
         # null enmascaraba el fallback fill_count_fp.
         fill_count = terminal_fill(order, count, placement=True)
@@ -263,19 +281,14 @@ class Motor2Executor:
             )
 
         if fill_count > 0:
-            # Posición real abierta. Precio: se usa el LÍMITE (la IOC marketable llena
-            # al límite o mejor; registrar el límite sobrestima el costo levemente →
-            # conservador para el stop-loss). [verificar en smoke] leer avg fill real.
-            self._update_trade(
-                coid,
-                critical=True,
-                status="filled",
-                filled_at=_naive_utc_now(),
-                **filled_fields(fill_count),
-                fill_price_cents=price,
-                fees_cents=kalshi_fee_cents(fill_count, price),
-                kalshi_order_id=order_id,
-            )
+            if not self._record_terminal_order(coid, fill_count, order):
+                return Motor2ExecutionOutcome(
+                    True,
+                    False,
+                    uncertain=True,
+                    reason="fill_accounting_unknown",
+                    client_order_id=coid,
+                )
             logger.info(
                 f"motor2.exec.filled ticker={signal.market_ticker} side={side} "
                 f"count={fill_count} price={price}c edge={signal.edge_pct:.3f}"
@@ -283,13 +296,10 @@ class Motor2Executor:
             return Motor2ExecutionOutcome(True, True, filled_count=fill_count, client_order_id=coid)
 
         # IOC sin fill (no había liquidez al límite) → cancelado limpio, sin posición.
-        self._update_trade(
-            coid,
-            critical=False,
-            status="cancelled",
-            notes_append="ioc_no_fill",
-            kalshi_order_id=order_id,
-        )
+        if not self._record_terminal_order(coid, fill_count, order):
+            return Motor2ExecutionOutcome(
+                True, False, uncertain=True, reason="fill_accounting_unknown", client_order_id=coid
+            )
         logger.info(
             f"motor2.exec.no_fill ticker={signal.market_ticker} side={side} (IOC sin liquidez al límite)"
         )
@@ -298,6 +308,39 @@ class Motor2Executor:
     # =====================================================
     # Helpers
     # =====================================================
+
+    def _record_terminal_order(self, coid: str, fill_count: Fraction, order: dict) -> bool:
+        """Cantidad y dinero del mismo ACK, sobre el intent original y en una transacción."""
+        try:
+            with get_session() as s:
+                s.exec(text("BEGIN IMMEDIATE"))
+                row = s.exec(select(Trade).where(Trade.client_order_id == coid)).one()
+                if row.status != "pending":
+                    raise ValueError("intención ya finalizada")
+                validate_order_identity(row, order)
+                record_order_fill(row, fill_count, order, legacy_estimates=True)
+                quarantined = COST_QUARANTINE_NOTE in (row.notes or "")
+                if not quarantined:
+                    if fill_count > 0:
+                        resize_filled(row, fill_count)
+                        row.status = "filled"
+                    else:
+                        row.status = "cancelled"
+                        row.notes = f"{row.notes or ''} ioc_no_fill".strip()[:500]
+                if fill_count > 0:
+                    row.filled_at = _naive_utc_now()
+                if order.get("order_id"):
+                    row.kalshi_order_id = order["order_id"]
+                s.add(row)
+                s.commit()
+            if quarantined:
+                self._engage_preventive_pause(coid, detail="costes contradictorios en cuarentena")
+                return False
+            return True
+        except Exception:
+            logger.exception(f"motor2.exec.record_fill_failed coid={coid}")
+            self._engage_preventive_pause(coid)
+            return False
 
     @staticmethod
     def _as_single_leg_opp(
@@ -448,9 +491,11 @@ class Motor2Executor:
             if critical:
                 self._engage_preventive_pause(coid)
 
-    def _engage_preventive_pause(self, coid: str) -> None:
+    def _engage_preventive_pause(
+        self, coid: str, *, detail: str = "persist post-fill falló"
+    ) -> None:
         """Fill real que no se pudo registrar → kill-switch persistente (RiskManager ciego)."""
-        msg = f"motor2: persist post-fill falló (coid={coid}) — RiskManager ciego a posición viva"
+        msg = f"motor2: {detail} (coid={coid}) — requiere conciliación antes de nuevas entradas"
         logger.critical(f"motor2.exec.preventive_pause {msg}")
         try:
             from src.monitoring.health import BotState

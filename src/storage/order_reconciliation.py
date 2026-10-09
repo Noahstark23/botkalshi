@@ -10,7 +10,13 @@ from sqlmodel import select
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import api_count, terminal_fill
 from src.storage.models import Trade, _naive_utc_now, get_session
-from src.storage.quantities import record_fill, requested_quantity, resize_filled
+from src.storage.order_costs import COST_QUARANTINE_NOTE, record_order_fill
+from src.storage.quantities import (
+    record_fill,
+    requested_quantity,
+    resize_filled,
+    validate_order_identity,
+)
 from src.storage.reductions import REDUCTION_PREFIX, finalize_reduction
 
 RECOVERABLE_STRATEGIES = frozenset({"motor_1_arbitrage", "motor_2_consensus", "motor_rest_arb"})
@@ -105,10 +111,17 @@ async def reconcile_pending_orders(
             if row.action != "buy":
                 continue
             with get_session() as s:
+                s.exec(text("BEGIN IMMEDIATE"))
                 current = s.get(Trade, row.id)
                 if current is None or current.status != "pending":
                     continue
-                record_fill(current, fill)
+                validate_order_identity(current, order)
+                if current.strategy == "motor_2_consensus":
+                    record_order_fill(current, fill, order, legacy_estimates=True)
+                    if COST_QUARANTINE_NOTE in (current.notes or ""):
+                        terminal = False  # Conservar reserva y piso confirmado; exige conciliación.
+                else:
+                    record_fill(current, fill)
                 if terminal:
                     if fill > 0:
                         resize_filled(current, fill)
@@ -117,8 +130,9 @@ async def reconcile_pending_orders(
                         current.status = "cancelled"
                 if fill > 0:
                     current.filled_at = _naive_utc_now()
-                    current.fill_price_cents = current.price_cents
-                    current.fees_cents = kalshi_fee_cents(fill, current.price_cents)
+                    if current.strategy != "motor_2_consensus":
+                        current.fill_price_cents = current.price_cents
+                        current.fees_cents = kalshi_fee_cents(fill, current.price_cents)
                 if order_id:
                     current.kalshi_order_id = order_id
                 s.add(current)

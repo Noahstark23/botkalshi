@@ -42,6 +42,7 @@ from src.math.quantities import precise_usd
 from src.risk.exposure import exposure_count
 from src.storage.cost_allocation import usd_text
 from src.storage.models import Trade, get_session
+from src.storage.order_costs import COST_QUARANTINE_NOTE
 
 _ARB_ID_RE = re.compile(r"arb_id=([0-9a-fA-F-]{36})")
 _USD_RE = re.compile(r"[0-9]{1,15}(?:\.[0-9]{1,6})?")
@@ -134,6 +135,8 @@ def _settlement_amounts(trade: Trade, result: str) -> _SettlementAmounts:
     ledger todavía no acredita si fill_cost representa ingreso o colateral.
     No se sintetizan costes/fees FP a partir de límites o tarifas.
     """
+    if COST_QUARANTINE_NOTE in (trade.notes or ""):
+        raise ValueError("costes observados en cuarentena; settlement bloqueado")
     if result not in ("yes", "no") or trade.side not in ("yes", "no"):
         raise ValueError("resultado/lado desconocido")
     if trade.action not in ("buy", "sell"):

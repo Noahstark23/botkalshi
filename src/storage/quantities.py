@@ -104,24 +104,48 @@ def open_quantity(row: "Trade") -> Fraction:
     return value
 
 
+def validate_order_identity(row: "Trade", order: object) -> None:
+    """Los campos de correlación presentes deben pertenecer a la misma intención."""
+    if not isinstance(order, dict):
+        raise ValueError("respuesta de orden inválida")
+    for field in ("client_order_id", "ticker", "side", "action"):
+        if field in order and order[field] != getattr(row, field):
+            raise ValueError(f"{field} contradictorio")
+    order_id = order.get("order_id")
+    if order_id is not None:
+        if not isinstance(order_id, str) or not order_id:
+            raise ValueError("order_id inválido")
+        if row.kalshi_order_id is not None and row.kalshi_order_id != order_id:
+            raise ValueError("order_id contradictorio")
+
+
 def hold_uncertain_order(coid: str, order: object) -> None:
     """Conserva fill como piso sin reducir reserva; pausa durable ante orden no terminal."""
+    from sqlalchemy import text
     from sqlmodel import select
 
     from src.math.quantities import api_count
     from src.monitoring.health import BotState
     from src.storage.models import Trade, engage_kill_switch, get_session
+    from src.storage.order_costs import record_order_fill
 
     reason = f"Orden {coid} sin evidencia terminal; requiere reconciliación"
     BotState.is_paused = True
     BotState.pause_reason = reason
     engage_kill_switch(reason)
     with get_session() as session:
+        session.exec(text("BEGIN IMMEDIATE"))
         row = session.exec(select(Trade).where(Trade.client_order_id == coid)).one()
         if row.status != "pending":
             raise ValueError("evidencia incierta sobre fila ya finalizada")
+        validate_order_identity(row, order)
         fill = api_count(order, "fill_count")
         if fill is not None and fill <= requested_quantity(row):
-            record_fill(row, fill)
+            if row.strategy == "motor_2_consensus":
+                record_order_fill(row, fill, order, legacy_estimates=True)
+            else:
+                record_fill(row, fill)
+            if order.get("order_id"):
+                row.kalshi_order_id = order["order_id"]
             session.add(row)
             session.commit()

@@ -5,8 +5,8 @@ no se construye un cliente HTTP y los sockets están bloqueados. Los Settings
 locales mantienen trading/ejecución apagados: se ejercitan directamente los
 componentes con dobles, no los gates ni el ciclo completo de ProductionRunner.
 El reinicio reemplaza instancias/conexiones SQLite, no es un proceso SO nuevo.
-M2 conserva su contabilidad estimada de límite/fee; sólo los costes M5 aportados
-por el doble representan evidencia observada dentro de esta simulación.
+M2 estima cuando el doble no aporta importes; ambos motores conservan los totales
+cuando están presentes. Toda evidencia monetaria es ficticia en esta simulación.
 """
 
 from __future__ import annotations
@@ -435,8 +435,9 @@ async def test_ambiguous_create_keeps_budget_and_never_reposts_on_restart(isolat
     assert confirmed_fill(row_for(ticker)) == Fraction(1, 2)
     assert open_risk_cents(row_for(ticker)) == 20
     assert await SettlementPoller(source).settle_once() == 1
-    expected = Fraction("0.2900" if motor == "M2" else "0.303999")
-    assert Fraction(row_for(ticker).pnl_usd_fp) == expected
+    assert Fraction(row_for(ticker).pnl_usd_fp) == Fraction("0.303999")
+    assert row_for(ticker).fill_cost_usd_fp == "0.195000"
+    assert row_for(ticker).fees_usd_fp == "0.001001"
     assert RiskManager()._get_current_exposure_usd() == 0
     assert await reconcile() and await SettlementPoller(source).settle_once() == 0
     assert commitments() == original and daily() == 42
