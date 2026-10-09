@@ -116,6 +116,12 @@ class Trade(SQLModel, table=True):
     pnl_usd_fp: str | None = Field(default=None, max_length=40)
     fill_cost_usd_fp: str | None = Field(default=None, max_length=40)
     fees_usd_fp: str | None = Field(default=None, max_length=40)
+    # Últimos acumulados observados y sus cantidades. Sobreviven a respuestas
+    # sin dinero; no representan el coste actual ni se suman a las reservas.
+    observed_cost_floor_usd_fp: str | None = Field(default=None, max_length=40)
+    observed_cost_floor_count_fp: str | None = Field(default=None, max_length=32)
+    observed_fee_floor_usd_fp: str | None = Field(default=None, max_length=40)
+    observed_fee_floor_count_fp: str | None = Field(default=None, max_length=32)
     # Las porciones contables conservan el origen; nunca crean presupuesto nuevo.
     commitment_origin_id: str | None = Field(default=None, max_length=100)
 
@@ -609,6 +615,10 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("trades", "count_fp", "VARCHAR(32)"),
     ("trades", "fill_cost_usd_fp", "VARCHAR(40)"),
     ("trades", "fees_usd_fp", "VARCHAR(40)"),
+    ("trades", "observed_cost_floor_usd_fp", "VARCHAR(40)"),
+    ("trades", "observed_cost_floor_count_fp", "VARCHAR(32)"),
+    ("trades", "observed_fee_floor_usd_fp", "VARCHAR(40)"),
+    ("trades", "observed_fee_floor_count_fp", "VARCHAR(32)"),
     ("trades", "commitment_origin_id", "VARCHAR(100)"),
     ("portfolio_positions", "count_fp", "VARCHAR(32)"),
     ("trades", "pnl_usd_fp", "VARCHAR(40)"),

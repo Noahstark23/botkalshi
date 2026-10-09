@@ -6,11 +6,11 @@ transacción. El fallback legacy es opt-in y nunca crea importes FP observados.
 
 import re
 from fractions import Fraction
-from math import ceil
+from math import ceil, floor
 
 from src.math.fees import kalshi_fee_cents
-from src.math.quantities import api_count
-from src.storage.quantities import confirmed_fill, record_fill
+from src.math.quantities import api_count, contract_count, fixed_count
+from src.storage.quantities import ORDER_COST_HISTORY_FIELDS, confirmed_fill, record_fill
 
 COST_QUARANTINE_NOTE = "fill_cost_quarantined"
 _MONEY = re.compile(r"[0-9]{1,15}(?:\.[0-9]{1,6})?")
@@ -60,6 +60,62 @@ def _quarantine(row, count: Fraction) -> None:
     row.notes = f"{COST_QUARANTINE_NOTE} | {original}".strip(" |")[:500]
 
 
+def _money(value: object, count: Fraction, *, positive: bool) -> Fraction:
+    if not isinstance(value, str) or not _MONEY.fullmatch(value):
+        raise ValueError("importe persistido inválido")
+    amount = Fraction(value)
+    if amount > count or (positive and amount == 0):
+        raise ValueError("importe incompatible con cantidad observada")
+    return amount
+
+
+def _check_floor(
+    baseline: tuple[Fraction, Fraction] | None, value: Fraction, count: Fraction
+) -> None:
+    if baseline is not None:
+        old_amount, old_count = baseline
+        if count < old_count or value < old_amount or (count == old_count and value != old_amount):
+            raise ValueError("importe acumulado regresivo o contradictorio")
+
+
+def _load_floor(row, kind: str, previous: Fraction | None) -> tuple[Fraction, Fraction] | None:
+    """Valida la historia y migra en memoria sólo FP ligado a un fill confirmado."""
+    amount = getattr(row, f"observed_{kind}_floor_usd_fp", None)
+    quantity = getattr(row, f"observed_{kind}_floor_count_fp", None)
+    baseline = None
+    if amount is not None or quantity is not None:
+        parsed = contract_count(quantity) if isinstance(quantity, str) else None
+        if parsed is None or parsed <= 0 or previous is None or parsed > previous:
+            raise ValueError("cantidad del piso monetario inválida")
+        baseline = (_money(amount, parsed, positive=kind == "cost"), parsed)
+    current = getattr(row, "fill_cost_usd_fp" if kind == "cost" else "fees_usd_fp", None)
+    if kind == "cost" and row.action != "buy" and (baseline is not None or current is not None):
+        raise ValueError("coste SELL no acredita ingresos")
+    if current is not None:
+        if previous is None or previous <= 0:
+            raise ValueError("importe sin cantidad confirmada previa")
+        value = _money(current, previous, positive=kind == "cost")
+        if (
+            kind == "fee"
+            and row.fees_cents is not None
+            and (
+                type(row.fees_cents) is not int
+                or row.fees_cents not in (floor(value * 100), ceil(value * 100))
+            )
+        ):
+            raise ValueError("fee persistida contradice espejo legacy")
+        _check_floor(baseline, value, previous)
+        baseline = (value, previous)
+    return baseline
+
+
+def _store_floor(row, kind: str, baseline: tuple[Fraction, Fraction] | None) -> None:
+    if baseline is not None:
+        amount, quantity = baseline
+        setattr(row, f"observed_{kind}_floor_usd_fp", _usd(amount))
+        setattr(row, f"observed_{kind}_floor_count_fp", fixed_count(quantity))
+
+
 def record_order_fill(
     row, count: Fraction | int, order: object, *, legacy_estimates: bool = False
 ) -> None:
@@ -74,13 +130,27 @@ def record_order_fill(
     La ausencia de datos no activa cuarentena por sí sola ni inventa cero.
     """
     previous = confirmed_fill(row)
-    had_costs = row.fill_cost_usd_fp is not None or row.fees_usd_fp is not None
+    had_costs = (
+        row.fill_cost_usd_fp is not None
+        or row.fees_usd_fp is not None
+        or any(getattr(row, field, None) is not None for field in ORDER_COST_HISTORY_FIELDS)
+    )
     record_fill(row, count)
     count = confirmed_fill(row)
     assert count is not None
     if COST_QUARANTINE_NOTE in (row.notes or ""):
         _quarantine(row, count)
         return
+    try:
+        cost_floor = _load_floor(row, "cost", previous)
+        fee_floor = _load_floor(row, "fee", previous)
+    except ValueError:
+        _quarantine(row, count)
+        return
+    # La evidencia previa válida sobrevive incluso a un payload nuevo contradictorio.
+    # Ambos pares se validan antes de escribir; no se repara historia corrupta.
+    _store_floor(row, "cost", cost_floor)
+    _store_floor(row, "fee", fee_floor)
     compatible = isinstance(order, dict) and api_count(order, "fill_count") == count
     if not compatible:
         if previous == count:
@@ -93,22 +163,20 @@ def record_order_fill(
             raise ValueError("fee excede cantidad ejecutada")
         if gross is not None and (gross > count or (count > 0 and gross == 0)):
             raise ValueError("coste incompatible con cantidad ejecutada")
-        for field, value in (("fees_usd_fp", fees), ("fill_cost_usd_fp", gross)):
-            old = getattr(row, field, None)
-            if old is None:
-                continue
-            if not isinstance(old, str) or not _MONEY.fullmatch(old):
-                raise ValueError("importe persistido inválido")
-            if value is not None and (
-                value < Fraction(old) or (previous == count and value != Fraction(old))
-            ):
-                raise ValueError("importe acumulado regresivo o contradictorio")
+        if fees is not None:
+            _check_floor(fee_floor, fees, count)
+        if gross is not None and row.action == "buy":
+            _check_floor(cost_floor, gross, count)
     except ValueError:
         _quarantine(row, count)
         return
     # ACK sin fill no acredita un coste de posición ni una comisión observada.
     if count == 0:
         fees = gross = None
+    if fees is not None:
+        _store_floor(row, "fee", (fees, count))
+    if gross is not None and row.action == "buy":
+        _store_floor(row, "cost", (gross, count))
     row.fees_usd_fp = _usd(fees) if fees is not None else None
     # Espejo legacy conservador: la verdad subcentavo permanece en la columna FP.
     row.fees_cents = ceil(fees * 100) if fees is not None else None

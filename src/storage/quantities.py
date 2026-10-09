@@ -6,6 +6,13 @@ from typing import TYPE_CHECKING
 
 from src.math.quantities import contract_count, fixed_count
 
+ORDER_COST_HISTORY_FIELDS = (
+    "observed_cost_floor_usd_fp",
+    "observed_cost_floor_count_fp",
+    "observed_fee_floor_usd_fp",
+    "observed_fee_floor_count_fp",
+)
+
 if TYPE_CHECKING:
     from src.storage.models import Trade
 
@@ -93,7 +100,14 @@ def filled_fields(count: Fraction | int) -> dict:
 
 def resize_filled(row: "Trade", count: Fraction | int) -> None:
     """Split contable explícito; a diferencia del acumulado de una orden puede disminuir."""
-    for key, value in filled_fields(count).items():
+    fields = filled_fields(count)
+    before = confirmed_fill(row)
+    if before is not None and Fraction(fields["filled_count_fp"]) < before:
+        # El remanente es una porción contable, no el acumulado de la orden.
+        # Terminalizar el mismo fill parcial no descarta su historia observada.
+        for key in ORDER_COST_HISTORY_FIELDS:
+            setattr(row, key, None)
+    for key, value in fields.items():
         setattr(row, key, value)
 
 

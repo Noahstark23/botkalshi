@@ -71,6 +71,10 @@ async def test_ack_to_settlement_conserves_actual_totals(result, pnl, cents):
     assert (row.fill_cost_usd_fp, row.fees_usd_fp) == ("0.107525", "0.000125")
     assert row.fill_price_cents is None and row.fees_cents == 1
     assert row.count_fp == "0.25" and confirmed_fill(row) == Fraction(1, 4)
+    assert row.observed_cost_floor_usd_fp == "0.107525"
+    assert row.observed_cost_floor_count_fp == "0.25"
+    assert row.observed_fee_floor_usd_fp == "0.000125"
+    assert row.observed_fee_floor_count_fp == "0.25"
     assert await SettlementPoller(Resolved(result)).settle_once() == 1
     row = _trade()
     assert row.pnl_usd_fp == pnl and row.pnl_cents == cents

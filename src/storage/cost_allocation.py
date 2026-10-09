@@ -6,6 +6,7 @@ from fractions import Fraction
 from math import ceil, floor
 
 from src.math.fees import kalshi_fee_cents
+from src.storage.order_costs import COST_QUARANTINE_NOTE
 from src.storage.quantities import open_quantity
 
 _USD = re.compile(r"\d{1,15}(?:\.\d{1,6})?")
@@ -41,6 +42,8 @@ class EntryAllocation:
 
 def allocate_entry(row, closed: Fraction) -> EntryAllocation:
     """No muta el ledger. Conserva costes observados y espejos legacy coherentes."""
+    if COST_QUARANTINE_NOTE in (row.notes or ""):
+        raise ValueError("costes de entrada en cuarentena; requiere conciliación")
     available = open_quantity(row)
     if not 0 < closed <= available:
         raise ValueError("porción fuera del BUY atribuible")

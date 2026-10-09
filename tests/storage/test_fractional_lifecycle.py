@@ -231,6 +231,7 @@ def test_fp_null_legacy_and_v2_fractional_exit_payload():
 @pytest.mark.parametrize("engine", ["reduction", "m3"])
 def test_partial_close_conserves_observed_costs_and_fee_mirrors(engine):
     from src.risk.manager import RiskManager
+    from src.storage.quantities import ORDER_COST_HISTORY_FIELDS
 
     buy("1.00")
     with models.get_session() as session:
@@ -238,6 +239,10 @@ def test_partial_close_conserves_observed_costs_and_fee_mirrors(engine):
         row.fill_cost_usd_fp = "0.800000"
         row.fees_usd_fp = "0.010000"
         row.fill_price_cents = row.price_cents = 80
+        row.observed_cost_floor_usd_fp = "0.800000"
+        row.observed_cost_floor_count_fp = "1.00"
+        row.observed_fee_floor_usd_fp = "0.010000"
+        row.observed_fee_floor_count_fp = "1.00"
         session.add(row)
         session.commit()
     if engine == "reduction":
@@ -253,12 +258,34 @@ def test_partial_close_conserves_observed_costs_and_fee_mirrors(engine):
     assert closed.fill_cost_usd_fp == "0.200000" and closed.fees_usd_fp == "0.002500"
     assert sum(Fraction(r.fill_cost_usd_fp) for r in buys) == Fraction(".80")
     assert sum(Fraction(r.fees_usd_fp) for r in buys) == Fraction(".01")
+    assert all(getattr(r, field) is None for r in buys for field in ORDER_COST_HISTORY_FIELDS)
     assert RiskManager._entry_costs(remaining, Fraction(3, 4)) == (
         Fraction(60),
         Fraction(3, 4),
         False,
     )
     assert Fraction(closed.pnl_usd_fp) == Fraction("-.0125")  # entry .25c + exit 1c
+
+
+@pytest.mark.parametrize("engine", ["reduction", "m3"])
+def test_quarantined_entry_cannot_lose_marker_via_split(engine):
+    from src.storage.order_costs import COST_QUARANTINE_NOTE
+
+    buy("1.00")
+    with models.get_session() as session:
+        row = session.exec(select(models.Trade)).one()
+        row.notes = COST_QUARANTINE_NOTE
+        session.add(row)
+        session.commit()
+    if engine == "reduction":
+        persist_reduction("buy", "close", Fraction(1, 4), 80)
+    before = [row.model_dump() for row in rows()]
+    with pytest.raises(ValueError, match="cuarentena"):
+        if engine == "reduction":
+            finalize_reduction("close", Fraction(1, 4))
+        else:
+            Motor3ExitExecutor(AsyncMock())._settle_originals("T", "yes", 80, Fraction(1, 4))
+    assert [row.model_dump() for row in rows()] == before
 
 
 @pytest.mark.parametrize("engine", ["reduction", "m3"])

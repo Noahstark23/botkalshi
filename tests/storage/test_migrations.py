@@ -125,3 +125,32 @@ def test_fractional_columns_preserve_legacy_fills_and_are_idempotent(tmp_path):
     assert position == (7, None)
     assert "inventory_fp" in _columns(engine, "mm_quotes")
     assert "inventory_abs_fp" in _columns(engine, "mm_funnel_snapshots")
+
+
+def test_money_history_migration_preserves_rows_without_inventing_observations(tmp_path):
+    from src.storage.quantities import ORDER_COST_HISTORY_FIELDS
+
+    engine, settings = _sqlite_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE trades (id INTEGER PRIMARY KEY, filled_count_fp TEXT, "
+            "fill_cost_usd_fp TEXT, fees_usd_fp TEXT)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO trades (filled_count_fp,fill_cost_usd_fp,fees_usd_fp) "
+            "VALUES ('0.25','0.100000','0.001000')"
+        )
+    with patch("src.storage.models.get_settings", return_value=settings):
+        models.apply_migrations(engine)
+        columns_once = _columns(engine, "trades")
+        models.apply_migrations(engine)
+    assert columns_once == _columns(engine, "trades")
+    assert set(ORDER_COST_HISTORY_FIELDS) <= columns_once
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql("SELECT * FROM trades").mappings().one()
+    assert (row["filled_count_fp"], row["fill_cost_usd_fp"], row["fees_usd_fp"]) == (
+        "0.25",
+        "0.100000",
+        "0.001000",
+    )
+    assert all(row[field] is None for field in ORDER_COST_HISTORY_FIELDS)

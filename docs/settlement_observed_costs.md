@@ -42,7 +42,7 @@ la cantidad de la fila a su porción ejecutada. Los campos de identidad presente
 deben corresponder a la intención; GET los revalida bajo el bloqueo de escritura.
 
 M2 conserva su fallback legacy sólo si la respuesta no contiene ninguna de las
-cuatro claves monetarias, no había FP previos y no hay cuarentena. Los FP siguen
+cuatro claves monetarias, no había FP previos ni pisos monetarios y no hay cuarentena. Los FP siguen
 vacíos: el settlement no etiqueta esa estimación como coste observado. Una cantidad
 nueva sin importes nunca hereda los totales de una cantidad anterior.
 
@@ -54,10 +54,48 @@ su pausa ante esos ACK; GET los mantiene inconclusos y settlement los rechaza.
 Un ACK terminal cero pasa por el mismo escritor y no puede borrar un fill positivo
 guardado mientras se esperaba esa respuesta.
 
-Límite: la comparación monetaria utiliza el FP previo disponible. Si una respuesta
-sin datos ya lo eliminó, no se conserva otro piso monetario histórico. La cuarentena
-durable cubre contradicciones detectadas; no sustituye un archivo completo de fills.
-SELL continúa sin interpretación acreditada de ingresos/collateral.
+Cada total tiene su último piso observado y su cantidad asociada:
+`observed_cost_floor_usd_fp` / `observed_cost_floor_count_fp` y
+`observed_fee_floor_usd_fp` / `observed_fee_floor_count_fp`. Los pares son
+independientes: una respuesta puede actualizar la comisión sin aportar coste.
+Ausencia o cuarentena no borran la historia. A igual cantidad el importe debe ser
+idéntico; a mayor cantidad nunca puede disminuir. Los pisos no son costes del
+acumulado actual y no se suman a posiciones, reservas o PnL.
+
+Las columnas nuevas son nullable y la migración no inventa observaciones para
+filas históricas. Un FP previo válido sólo inicia su piso con la cantidad ya
+confirmada, nunca con el intent solicitado. Los pares incompletos o contradictorios
+requieren revisión. Un split contable reduce la cantidad confirmada y elimina los
+pisos de la orden original en el remanente; los importes se reparten conservando
+su total y la hija no hereda pisos de otra cantidad. Terminalizar el mismo fill
+parcial conserva su historia. Una entrada en cuarentena no puede repartirse ni
+cerrarse mediante M3 o reducción: toda la transacción queda sin aplicar.
+
+Esto no reconstruye importes borrados antes de instalar el cambio ni sustituye un
+archivo completo de fills. SELL continúa sin interpretación acreditada de ingresos/collateral.
+
+## Salidas anticipadas y reducciones
+
+El finalizador compartido de M2/M3 y el de reducciones conservan una comisión
+SELL exacta sólo si `fees_usd_fp` está validada, su espejo es coherente y su
+cantidad confirmada coincide con toda la venta que se cierra. Una comisión
+presente pero inválida o ligada a otra cantidad rechaza la transacción; no se
+sustituye por la fórmula. El reparto FIFO conserva microUSD y deja el residuo
+en el último tramo. Ausencia de FP conserva la fórmula histórica como estimación.
+
+El precio de esas salidas sigue siendo el límite, no un precio ejecutado
+acreditado. Tanto el SELL como los BUY donde se escribe el PnL llevan
+`exit_accounting_estimated exit_price=limit`, más `exit_fee=observed_fp` o
+`exit_fee=formula`. El lector debe conservar esta distinción aunque todos los
+costes de entrada sean observados. `fill_cost_usd_fp` de SELL no se interpreta
+como ingreso ni reemplaza al precio. No se añadió consulta de fills ni captura
+automática nueva de datos SELL a partir del ACK.
+
+Los finalizadores validan antes de cerrar, escriben bajo una sola transacción y
+aceptan un replay coincidente sin repartir ni liquidar nuevamente. La atribución
+`reduction_for=` de órdenes pendientes permanece intacta. No se reescriben
+cierres históricos; este contrato se prueba con datos ficticios en
+`tests/integration/test_exit_accounting_provenance.py`.
 
 Campos contrastados con la [documentación oficial de órdenes de Kalshi](https://docs.kalshi.com/api-reference/orders/get-order).
 La documentación del formato no equivale a observar un fill conectado de este candidato.
@@ -81,3 +119,9 @@ las respuestas sin importes siguen etiquetadas como estimaciones. Los tests de
 ACK cero tardío, identidad y recuperación sin reenvío. Pasar estos escenarios no prueba
 fills conectados, conciliación de una cuenta, ventaja económica ni instalación
 del candidato. No habilita ejecución real.
+
+`tests/storage/test_order_cost_history.py` cubre ausencias intermedias, regresiones
+posteriores, pisos independientes, filas legacy, reapertura SQLite, cuarentena y
+splits. `test_migrations.py` comprueba migración repetible sin modificar importes
+históricos; `test_fractional_lifecycle.py` comprueba conservación en ambas salidas
+y rechazo atómico de una entrada en cuarentena.

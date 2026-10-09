@@ -27,7 +27,7 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from fractions import Fraction
-from math import floor
+from math import ceil, floor
 from typing import ClassVar
 
 from loguru import logger
@@ -54,6 +54,7 @@ from src.storage.quantities import (
     requested_quantity,
     resize_filled,
 )
+from src.storage.reductions import estimated_exit_note, validated_exit_fee
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
 
 STRATEGY = "motor_3_clv"
@@ -401,6 +402,13 @@ class Motor3ExitExecutor:
             sell = s.exec(select(Trade).where(Trade.client_order_id == coid)).first()
             if sell is None:
                 raise ValueError("intent de salida ausente")
+            if (
+                sell.ticker != ticker
+                or sell.side != side
+                or sell.action != "sell"
+                or sell.price_cents != price
+            ):
+                raise ValueError("atribución o precio de salida contradice intent persistido")
             if sell.status == "settled":
                 if fill_count != open_quantity(sell) or (
                     order_id is not None
@@ -408,21 +416,32 @@ class Motor3ExitExecutor:
                     and order_id != sell.kalshi_order_id
                 ):
                     raise ValueError("replay de salida contradice el ledger")
+                validated_exit_fee(sell, fill_count)
                 return  # Reconciliación repetida después de reiniciar: no volver a cerrar BUYs.
             if fill_count > requested_quantity(sell):
                 raise ValueError("fill de salida excede intent")
             observed = confirmed_fill(sell)
             if observed is not None and fill_count < observed:
                 raise ValueError("fill de salida regresivo")
-            self._settle_originals(ticker, side, price, fill_count, session=s)
+            exit_fee, observed_fee = validated_exit_fee(sell, fill_count)
+            self._settle_originals(
+                ticker,
+                side,
+                price,
+                fill_count,
+                session=s,
+                observed_exit_fee_cents=exit_fee if observed_fee else None,
+            )
             resize_filled(sell, fill_count)
             sell.status = "settled"
             sell.fill_price_cents = price
-            sell.fees_cents = kalshi_fee_cents(fill_count, price)
+            sell.fees_cents = ceil(exit_fee)
             sell.kalshi_order_id = order_id
             sell.filled_at = now
             sell.settled_at = now
-            sell.notes = f"{sell.notes or ''} clv_exit_filled".strip()[:500]
+            sell.notes = estimated_exit_note(
+                sell.notes, "clv_exit_filled", observed_fee=observed_fee
+            )
             s.add(sell)
             s.commit()  # SELL y splits BUY juntos: ningún crash deja el ledger a medias.
 
@@ -531,7 +550,14 @@ class Motor3ExitExecutor:
             logger.exception("motor3.exit.preventive_pause_failed")
 
     def _settle_originals(
-        self, ticker: str, side: str, exit_price: int, filled_count: int | Fraction, *, session=None
+        self,
+        ticker: str,
+        side: str,
+        exit_price: int,
+        filled_count: int | Fraction,
+        *,
+        session=None,
+        observed_exit_fee_cents: Fraction | None = None,
     ) -> None:
         """
         Cierra las patas BUY originales (Motor 2/REST) que este exit liquidó (FIFO por
@@ -560,7 +586,7 @@ class Motor3ExitExecutor:
                 # Fee del EXIT asignada por tramo ACUMULATIVO (deuda auditoría 2026-07-01):
                 # sumar ceil(fee(closed)) por pata sobre-cobraba hasta (n_patas−1)¢ y no
                 # cuadraba con la fila SELL. cumfee(k)−cumfee(k_prev) suma EXACTO el fee
-                # real del fill total.
+                # calculada total (estimada cuando no existe fee FP observada).
                 closed_so_far = 0
                 for b in buys:
                     if remaining <= 0:
@@ -570,9 +596,19 @@ class Motor3ExitExecutor:
                     buy_price = b.fill_price_cents or b.price_cents
                     quantity = open_quantity(b)
                     closed = min(quantity, remaining)
-                    exit_fee_tramo = kalshi_fee_cents(
-                        closed_so_far + closed, exit_price
-                    ) - kalshi_fee_cents(closed_so_far, exit_price)
+                    if observed_exit_fee_cents is None:
+                        exit_fee_tramo = kalshi_fee_cents(
+                            closed_so_far + closed, exit_price
+                        ) - kalshi_fee_cents(closed_so_far, exit_price)
+                    else:
+                        # Prorrateo de la fee TOTAL observada; microUSD acumulados
+                        # conservan el residuo para el último tramo del FIFO.
+                        units = observed_exit_fee_cents * 10_000
+                        exit_fee_tramo = Fraction(
+                            floor(units * (closed_so_far + closed) / filled_count)
+                            - floor(units * closed_so_far / filled_count),
+                            10_000,
+                        )
                     allocation = allocate_entry(b, closed)
                     pnl = (
                         closed * exit_price
@@ -588,7 +624,11 @@ class Motor3ExitExecutor:
                         b.pnl_cents = floor(pnl)
                         for field, value in allocation.closed_fields.items():
                             setattr(b, field, value)
-                        b.notes = f"{b.notes or ''} closed_by_clv".strip()[:500]
+                        b.notes = estimated_exit_note(
+                            b.notes,
+                            "closed_by_clv",
+                            observed_fee=observed_exit_fee_cents is not None,
+                        )
                         s.add(b)
                     else:
                         # Partial: reduce el original (remanente sigue abierto) + hija settled.
@@ -613,7 +653,11 @@ class Motor3ExitExecutor:
                                 pnl_cents=floor(pnl),
                                 pnl_usd_fp=usd_text(pnl / 100),
                                 **allocation.closed_fields,
-                                notes="closed_by_clv split",
+                                notes=estimated_exit_note(
+                                    None,
+                                    "closed_by_clv split",
+                                    observed_fee=observed_exit_fee_cents is not None,
+                                ),
                             )
                         )
                     remaining -= closed
