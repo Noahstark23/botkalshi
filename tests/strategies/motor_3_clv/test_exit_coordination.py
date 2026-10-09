@@ -25,6 +25,7 @@ from sqlmodel import select
 from src.storage.models import PortfolioPosition, Trade, get_session
 from src.strategies.motor_3_clv.engine import Motor3Engine
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 TICKER = "KXCOORD"
 
@@ -45,6 +46,7 @@ def _client(*, bid_cents: int = 60, fill_count: int = 10) -> MagicMock:
     c.place_order = AsyncMock(
         return_value={"order": {"remaining_count": 0, "order_id": "o", "fill_count": fill_count}}
     )
+    wire_exit_fills(c, [("yes", fill_count, bid_cents, {4: 7, 10: 17}[fill_count])])
     return c
 
 

@@ -589,6 +589,10 @@ class Settings(BaseSettings):
         default=False,
         description="RESERVADO F2+: en F1 no existe executor. En producción, True falla el boot (fail-loud, no un no-op engañoso).",
     )
+    MOTOR_MM_DEMO_READONLY_ENABLED: bool = Field(
+        default=False,
+        description="Validación Demo exclusivamente shadow; jamás habilita ejecutores.",
+    )
     MOTOR_MM_SERIES: str = Field(
         default="KXMLBGAME",
         description="CSV de series admitidas en la cohorte M5; F1-v2 comienza solo con MLB",
@@ -1277,13 +1281,31 @@ class Settings(BaseSettings):
         cero quotes indefinidamente y ninguna señal operacional de que el experimento no
         existía. F1 es cero órdenes, pero sus datos sí deben ser reproducibles.
         """
+        if self.MOTOR_MM_DEMO_READONLY_ENABLED:
+            prohibited = (
+                "TRADING_ENABLED",
+                "MOTOR_1_EXECUTION_ENABLED",
+                "MOTOR_2_ENTRY_EXECUTION_ENABLED",
+                "MOTOR_2_EXECUTION_ENABLED",
+                "MOTOR_3_EXECUTION_ENABLED",
+                "MOTOR_REST_EXECUTION_ENABLED",
+                "MOTOR_MM_EXECUTION_ENABLED",
+            )
+            if self.KALSHI_ENV != "demo" or any(getattr(self, name) for name in prohibited):
+                raise ValueError(
+                    "MOTOR_MM_DEMO_READONLY_ENABLED exige Demo, TRADING=false y toda ejecución OFF"
+                )
         if not self.MOTOR_MM_ENABLED:
             if self.MOTOR_MM_EXECUTION_ENABLED:
                 raise ValueError("MOTOR_MM_EXECUTION_ENABLED=true requiere MOTOR_MM_ENABLED=true")
             return self
 
         problems: list[str] = []
-        if not self.MOTOR_MM_EXECUTION_ENABLED and self.KALSHI_ENV != "production":
+        if (
+            not self.MOTOR_MM_EXECUTION_ENABLED
+            and self.KALSHI_ENV != "production"
+            and not self.MOTOR_MM_DEMO_READONLY_ENABLED
+        ):
             problems.append("KALSHI_ENV=production (F1 mide el book real; ejecución sigue OFF)")
         if not self.MOTOR_2_SPORTSBOOK_ENABLED:
             problems.append("MOTOR_2_SPORTSBOOK_ENABLED=true")

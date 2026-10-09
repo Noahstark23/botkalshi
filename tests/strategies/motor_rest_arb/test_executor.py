@@ -17,6 +17,7 @@ import pytest
 
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.strategies.motor_rest_arb.executor import LegState, RestExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 
 def _opp(count: int = 5) -> ArbOpportunity:
@@ -44,7 +45,7 @@ def _filled_resp(count: int = 5, coid: str | None = None) -> dict:
             "order_id": "OID",
             "fill_count": count,
             "remaining_count": 0,
-            "client_order_id": coid or "",
+            **({"client_order_id": coid} if coid else {}),
         }
     }
 
@@ -74,6 +75,7 @@ async def test_asymmetric_fill_triggers_rollback():
     client = AsyncMock()
     # Secuenciado: hard=no FILL primero, barata=yes KILL; luego el rollback (sell no) llena.
     client.place_order = AsyncMock(side_effect=[_filled_resp(), _killed_resp(), _filled_resp()])
+    wire_exit_fills(client, [("no", 5, 1, 1)])
     ex = RestExecutor(client)
 
     out = await ex.execute(_opp())
@@ -352,6 +354,7 @@ async def test_fill_plus_kill409_rolls_back_immediately_no_reconcile():
     )
     # Secuenciado: hard=no FILL, barata=yes KILL-409; el rollback (sell) de la pata NO llena.
     client.place_order = AsyncMock(side_effect=[_filled_resp(), kill_409, _filled_resp()])
+    wire_exit_fills(client, [("no", 5, 1, 1)])
     ex = RestExecutor(client)
 
     out = await ex.execute(_opp())

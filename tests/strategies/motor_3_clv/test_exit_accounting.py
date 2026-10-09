@@ -19,6 +19,7 @@ from sqlmodel import select
 from src.math.fees import kalshi_fee_cents
 from src.storage.models import PortfolioPosition, Trade, get_session
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 TICKER = "KXACCT"
 
@@ -30,6 +31,7 @@ def _client(*, fill_count: int) -> MagicMock:
         return_value={"order": {"remaining_count": 0, "order_id": "o", "fill_count": fill_count}}
     )
     c.get_orders = AsyncMock(return_value={"orders": []})
+    wire_exit_fills(c, [("yes", fill_count, 60, {4: 7, 10: 17}[fill_count])])
     return c
 
 
@@ -89,7 +91,10 @@ async def test_exit_fee_allocated_cumulatively_across_legs():
 
     rows = _rows()
     assert all(r.status == "settled" and r.closed_by_clv for r in rows)
-    total_pnl = sum(r.pnl_cents for r in rows)
+    from fractions import Fraction
+
+    # El espejo cents se redondea por BUY; el agregado exacto vive en FP.
+    total_pnl = sum(Fraction(r.pnl_usd_fp) * 100 for r in rows)
     expected = (
         10 * (60 - 45)
         - kalshi_fee_cents(10, 60)  # fee del exit EXACTA (no suma de ceils por pata)

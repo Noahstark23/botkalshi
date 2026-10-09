@@ -15,6 +15,7 @@ from src.monitoring.health import BotState
 from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import RiskEvent, Trade, get_session
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 # =====================================================
@@ -144,10 +145,13 @@ async def test_partial_fill_triggers_rollback(executor, mock_client, binary_opp)
     mock_client.place_order.side_effect = [
         {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) fills
         Exception("network error"),  # YES (fácil) buy fails
-        {"order": {"remaining_count": 0, "fill_count": 10}},  # NO rollback sell fills
+        {
+            "order": {"remaining_count": 0, "order_id": "sell-observed", "fill_count": 10}
+        },  # NO rollback sell fills
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[44, 8], [43, 5]], "yes": []}}
 
+    wire_exit_fills(mock_client, [("no", 10, 44, 18)])
     with patch(
         "src.strategies.motor_1_arbitrage.executor.get_settings",
         return_value=_mock_settings(trading_enabled=True),

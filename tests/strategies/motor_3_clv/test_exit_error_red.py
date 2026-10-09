@@ -24,6 +24,7 @@ from sqlmodel import select
 import src.storage.models as models
 from src.storage.models import PortfolioPosition, Trade, get_session, kill_switch_engaged
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 TICKER = "KXRED"
 
@@ -61,6 +62,7 @@ def _client(*, place=None, place_exc=None, orders=None) -> MagicMock:
             or {"order": {"remaining_count": 0, "order_id": "o", "fill_count": 10}}
         )
     c.get_orders = AsyncMock(return_value={"orders": orders or []})
+    wire_exit_fills(c, [("yes", 10, 60, 17)])
     return c
 
 
@@ -158,7 +160,16 @@ async def test_reconcile_executed_settles_without_reselling():
     _seed_buy(count=10)
     coid = await _leave_pending_intent()
 
-    client = _client(orders=[{"client_order_id": coid, "status": "executed", "fill_count": 10}])
+    client = _client(
+        orders=[
+            {
+                "client_order_id": coid,
+                "order_id": "o-recovered",
+                "status": "executed",
+                "fill_count": 10,
+            }
+        ]
+    )
     ex = _ex(client)
     out = await ex.exit_position(_pos())
 

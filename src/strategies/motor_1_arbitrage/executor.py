@@ -27,7 +27,11 @@ from src.storage.models import (
     engage_kill_switch,
     get_session,
 )
-from src.storage.order_reconciliation import reconcile_pending_orders
+from src.storage.order_reconciliation import (
+    capture_terminal_sell_execution,
+    reconcile_pending_orders,
+    validate_pending_sell_response,
+)
 from src.storage.quantities import hold_uncertain_order, quantity_fields, resize_filled
 from src.storage.reductions import finalize_reduction, persist_reduction
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
@@ -496,11 +500,19 @@ class ArbitrageExecutor:
                         time_in_force="immediate_or_cancel",
                     )
                     order = resp.get("order", resp) if isinstance(resp, dict) else {}
+                    validate_pending_sell_response(rollback_coid, order)
                     sold = terminal_fill(order, remaining, placement=True)
                     if sold is None:
                         hold_uncertain_order(rollback_coid, order)
                         raise ValueError("fill de rollback desconocido")
-                    finalize_reduction(rollback_coid, sold, order.get("order_id"))
+                    execution = None
+                    if sold > 0:
+                        execution = await capture_terminal_sell_execution(
+                            self.client, rollback_coid, order, placement=True
+                        )
+                    finalize_reduction(
+                        rollback_coid, sold, order.get("order_id"), execution=execution
+                    )
                     if sold <= 0:
                         logger.warning(
                             f"rollback: IOC sin fill para {leg.market_ticker} ({leg.side}) — "
@@ -509,9 +521,7 @@ class ArbitrageExecutor:
                         await asyncio.sleep(1)
                         continue
                     sold = min(sold, remaining)
-                    # SOLO lo confirmado libera posición y realiza pérdida. Precio contable:
-                    # el bid leído (el IOC a 1¢ cruza desde el mejor bid; para sizes chicos es
-                    # el precio efectivo — se anota como estimación en notes).
+                    # Sólo fills completos con precio y fee observados liquidan el BUY.
                     remaining -= sold
                     # Log AFIRMATIVO del éxito (sonda 2026-08-11): este era el ÚNICO
                     # desenlace silencioso del rollback — el operador tenía que inferir
@@ -519,7 +529,7 @@ class ArbitrageExecutor:
                     # se afirma, no se deduce.
                     logger.info(
                         f"rollback: VENDIDO {sold}x {leg.market_ticker} ({leg.side}) "
-                        f"@~{current_bid}¢ — pérdida realizada en DB "
+                        "con precio/fees de fills — resultado realizado en DB "
                         f"(quedan {remaining}, attempt {attempt + 1})"
                     )
                     if remaining > 0:

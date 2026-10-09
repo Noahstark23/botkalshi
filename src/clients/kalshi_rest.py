@@ -562,6 +562,7 @@ class KalshiRestClient:
         *,
         limit: int = 100,
         ticker: str | None = None,
+        order_id: str | None = None,
         cursor: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,
@@ -571,6 +572,8 @@ class KalshiRestClient:
         params: dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if order_id:
+            params["order_id"] = order_id
         if cursor:
             params["cursor"] = cursor
         if min_ts is not None:
@@ -580,6 +583,15 @@ class KalshiRestClient:
         if subaccount is not None:
             params["subaccount"] = subaccount
         return await self._request("GET", "/portfolio/fills", params=params)
+
+    async def get_historical_fills(
+        self, *, ticker: str, subaccount: int = 0, limit: int = 100, cursor: str | None = None
+    ) -> dict:
+        """Archivo de fills; no admite filtro por order_id, se filtra tras paginar."""
+        params = {"ticker": ticker, "subaccount": subaccount, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/historical/fills", params=params)
 
     async def get_settlements(
         self,

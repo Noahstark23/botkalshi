@@ -72,7 +72,8 @@ parcial conserva su historia. Una entrada en cuarentena no puede repartirse ni
 cerrarse mediante M3 o reducción: toda la transacción queda sin aplicar.
 
 Esto no reconstruye importes borrados antes de instalar el cambio ni sustituye un
-archivo completo de fills. SELL continúa sin interpretación acreditada de ingresos/collateral.
+archivo completo de fills. El campo `fill_cost_usd_fp` de SELL continúa sin una
+interpretación acreditada de ingresos/colateral.
 
 ## Salidas anticipadas y reducciones
 
@@ -83,19 +84,95 @@ presente pero inválida o ligada a otra cantidad rechaza la transacción; no se
 sustituye por la fórmula. El reparto FIFO conserva microUSD y deja el residuo
 en el último tramo. Ausencia de FP conserva la fórmula histórica como estimación.
 
-El precio de esas salidas sigue siendo el límite, no un precio ejecutado
-acreditado. Tanto el SELL como los BUY donde se escribe el PnL llevan
+En llamadas contables legacy al finalizador sin evidencia `execution`, el precio
+de esas salidas sigue siendo el límite.
+Tanto el SELL como los BUY donde se escribe el PnL llevan
 `exit_accounting_estimated exit_price=limit`, más `exit_fee=observed_fp` o
 `exit_fee=formula`. El lector debe conservar esta distinción aunque todos los
 costes de entrada sean observados. `fill_cost_usd_fp` de SELL no se interpreta
-como ingreso ni reemplaza al precio. No se añadió consulta de fills ni captura
-automática nueva de datos SELL a partir del ACK.
+como ingreso ni reemplaza al precio. Un ACK por sí solo no acredita ese ingreso.
 
 Los finalizadores validan antes de cerrar, escriben bajo una sola transacción y
 aceptan un replay coincidente sin repartir ni liquidar nuevamente. La atribución
 `reduction_for=` de órdenes pendientes permanece intacta. No se reescriben
 cierres históricos; este contrato se prueba con datos ficticios en
 `tests/integration/test_exit_accounting_provenance.py`.
+
+## Captura exacta de una salida conocida por GET
+
+`src/storage/exit_reconciliation.py::reconcile_known_exit(client, client_order_id)`
+es una entrada contable explícita para un SELL pendiente con `kalshi_order_id`.
+Lee la orden, comprueba identidad/subcuenta/dirección y una cantidad terminal
+positiva. Después recorre las colecciones recientes e históricas de fills.
+Jamás coloca, cancela o repite órdenes; un intent sin identificador no inicia red.
+No levanta pausas y no reescribe cierres históricos estimados.
+
+`exit_capture.collect_exit_execution` admite como máximo cinco páginas de 100
+filas por colección y 20 segundos. Un cursor ausente, repetido, truncamiento,
+fallo HTTP o filas fuera de ámbito impide cerrar. El archivo histórico se filtra
+localmente por orden, porque su endpoint no admite `order_id`.
+
+`exit_fills.summarize_exit_fills` comprueba IDs únicos, alias concordantes,
+subcuenta explícita, dirección, cantidad terminal igual a la suma de fills,
+precios explícitos del contrato vendido y `fee_cost`. Duplicados idénticos entre
+colecciones cuentan una vez; un conflicto rechaza todo. El mapping canónico es
+SELL YES → `outcome_side=no, book_side=ask`, SELL NO → `yes,bid`. Se toma el
+precio explícito YES o NO correspondiente; no se deriva un precio faltante.
+
+Los finalizadores aceptan `execution=ExitFillSummary` y revalidan contra el SELL
+dentro de `BEGIN IMMEDIATE`. Guardan `sale_proceeds_usd_fp` separado del ambiguo
+`fill_cost_usd_fp`, más `exit_fill_evidence_sha256` y comisión exacta. El promedio
+en centavos se escribe sólo cuando es entero: el total y la cantidad conservan
+la verdad subcentavo. El hash identifica datos normalizados, no es una firma del
+exchange ni reemplaza un archivo completo de fills.
+
+Los ingresos y fees se reparten FIFO en microUSD conservando el residuo. Tanto
+SELL como BUY cerrados llevan `exit_execution_observed exit_price=fills
+exit_fee=fills`; cada BUY declara `pnl_basis=observed` sólo si también existen
+ambos costes exactos de entrada. En otro caso declara `estimated_entry`.
+Una comisión previamente contradictoria no se rehabilita. Errores tras procesar
+una primera entrada revierten toda la transacción. Un replay idéntico no vuelve
+a liquidar; un replay diferente se rechaza.
+
+Los caminos async de salida M2/M3, rollback M1/REST y recuperación compartida
+exigen ahora esa captura antes de liquidar una venta terminal positiva. Antes
+de esperar GET conservan de forma durable el identificador y la cantidad
+confirmada, con los pisos monetarios asociados a sus cantidades originales.
+Un fallo mantiene la venta pendiente y la pausa; no cierra con el límite ni
+reenvía la venta. Cero fills terminal conserva su tratamiento separado.
+Los finalizadores sync admiten todavía llamadas legacy explícitas sin
+`execution`, etiquetadas como estimadas; esa compatibilidad no es un fallback
+del nuevo recorrido async.
+
+La deduplicación de reducciones pendientes usa ticker, lado y estrategia dentro
+del bloqueo de escritura. Una nota de cuarentena que desplace `reduction_for=`
+no puede habilitar otra liquidación de esa misma exposición. Se conserva la
+posición original hasta acreditar la salida; la regresión está en
+`tests/storage/test_reduction_pending_identity.py`.
+
+Las respuestas de cero fills también validan los campos de identidad presentes,
+dirección y subcuenta antes de liberar un intent: ACK M1/REST/M3 y recuperación
+compartida/M3. Una contradicción conserva el pendiente y pausa; las omisiones
+legacy siguen compatibles. La recuperación M3 exige una sola coincidencia del
+client ID. Las regresiones están en `test_exit_zero_identity.py` y
+`test_exit_zero_ack_identity.py`.
+
+La salida M3 comunica el ingreso y la comisión observados. `sell_price_cents`
+sólo contiene el promedio cuando es entero; el total y la cantidad conservan
+el promedio fraccionario. Si falta captura contable, comunica cantidad confirmada
+con `exit_accounting_pending` y precio desconocido, sin afirmar el límite como
+precio ejecutado. Estas rutas se prueban en `test_async_exit_capture.py`.
+
+El IOC Demo pendiente carece de identificador de orden y sigue fuera de este
+reconciliador; este cambio no demuestra su rechazo ni autoriza su reenvío.
+
+Referencias primarias: [fills recientes](https://docs.kalshi.com/api-reference/portfolio/get-fills),
+[fills históricos](https://docs.kalshi.com/api-reference/historical/get-historical-fills),
+[dirección de órdenes](https://docs.kalshi.com/getting_started/order_direction) y
+[redondeo de comisiones](https://docs.kalshi.com/getting_started/fee_rounding).
+Se rechaza un ingreso por fill no representable en microUSD; no se redondea para
+presentarlo como observado. Las pruebas puras y de integración están en
+`tests/storage/test_exit_fills.py` y `tests/integration/test_exit_fill_capture.py`.
 
 Campos contrastados con la [documentación oficial de órdenes de Kalshi](https://docs.kalshi.com/api-reference/orders/get-order).
 La documentación del formato no equivale a observar un fill conectado de este candidato.

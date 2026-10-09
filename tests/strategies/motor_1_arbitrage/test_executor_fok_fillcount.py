@@ -28,6 +28,7 @@ from src.monitoring.health import BotState
 from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import Trade, get_session
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 # =====================================================
@@ -216,9 +217,12 @@ async def test_hard_partial_fill_rolls_back_without_sending_easy(executor, mock_
         {
             "order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 6}
         },  # NO (dura) parcial 6/10
-        {"order": {"remaining_count": 0, "fill_count": 6}},  # sell del rollback de la dura
+        {
+            "order": {"remaining_count": 0, "order_id": "sell-observed", "fill_count": 6}
+        },  # sell del rollback de la dura
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
+    wire_exit_fills(mock_client, [("no", 6, 43, 11)])
     with _patched():
         assert await executor.execute(binary_opp) is False
 
@@ -242,10 +246,13 @@ async def test_rollback_settles_row_with_realized_pnl(executor, mock_client, bin
     mock_client.place_order.side_effect = [
         {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("no easy"),  # YES (fácil) falla
-        {"order": {"remaining_count": 0, "fill_count": 10}},  # sell del rollback de NO
+        {
+            "order": {"remaining_count": 0, "order_id": "sell-observed", "fill_count": 10}
+        },  # sell del rollback de NO
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
+    wire_exit_fills(mock_client, [("no", 10, 43, 18)])
     with _patched():
         await executor.execute(binary_opp)
 
@@ -254,7 +261,7 @@ async def test_rollback_settles_row_with_realized_pnl(executor, mock_client, bin
     assert no_row.status == "settled"
     assert no_row.pnl_cents == expected
     assert no_row.settled_at is not None and no_row.settled_at.tzinfo is None  # naive UTC
-    assert "rollback_sell~43c" in (no_row.notes or "")
+    assert "exit_execution_observed" in (no_row.notes or "")
 
 
 @pytest.mark.asyncio
@@ -264,11 +271,14 @@ async def test_rollback_partial_sell_splits_row(executor, mock_client, binary_op
     mock_client.place_order.side_effect = [
         {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("no easy"),  # YES (fácil) falla
-        {"order": {"remaining_count": 0, "fill_count": 4}},  # sell parcial
-        {"order": {"remaining_count": 0, "fill_count": 6}},  # sell del remanente
+        {"order": {"remaining_count": 0, "order_id": "sell-four", "fill_count": 4}},  # sell parcial
+        {
+            "order": {"remaining_count": 0, "order_id": "sell-six", "fill_count": 6}
+        },  # sell del remanente
     ]
     mock_client.get_orderbook.return_value = {"orderbook": {"no": [[43, 10]], "yes": []}}
 
+    wire_exit_fills(mock_client, [("no", 4, 43, 7), ("no", 6, 43, 11)])
     with _patched():
         await executor.execute(binary_opp)
 

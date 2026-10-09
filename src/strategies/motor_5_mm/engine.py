@@ -153,6 +153,7 @@ class Motor5Engine:
         fees_as_maker: bool = False,
         jump_retreat_cents: float = 5.0,
         exchange_environment: str = "demo",
+        demo_readonly_validation: bool = False,
         fair_min_books: int = 1,
         fair_max_book_age_min: float | None = None,
         fair_odds_regions: str = "",
@@ -182,13 +183,19 @@ class Motor5Engine:
         # Retiro por salto (blindaje del maker): 0 = off.
         self._jump_retreat = jump_retreat_cents
         self._exchange_environment = exchange_environment
+        self._demo_readonly_validation = demo_readonly_validation
+        if demo_readonly_validation:
+            if exchange_environment != "demo" or trading_enabled:
+                raise ValueError("M5 Demo read-only exige entorno Demo y trading_enabled=False")
+            # Nunca mezclar observaciones Demo con la métrica/cohorte de producción.
+            self.F1_METRIC_VERSION = "demo-readonly-v1-bbo-depth"
         self._fair_min_books = fair_min_books
         self._fair_max_book_age_min = fair_max_book_age_min
         self._fair_odds_regions = fair_odds_regions
         self._fair_sport_keys_config = fair_sport_keys_config
         self._fair_cache_ttl_sec = fair_cache_ttl_sec
         if self._fees_as_maker and not trading_enabled:
-            if self._exchange_environment != "production":
+            if self._exchange_environment != "production" and not demo_readonly_validation:
                 raise ValueError("M5 F1 shadow auditable exige exchange_environment=production")
             if self._size != 1:
                 raise ValueError("M5 F1 shadow auditable exige quote_size_contracts=1")
@@ -440,7 +447,13 @@ class Motor5Engine:
             )
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        mode = "F2 LIVE (demo)" if self._trading_enabled else "F1 SHADOW — CERO órdenes"
+        mode = (
+            "DEMO READ-ONLY — SHADOW, CERO órdenes"
+            if self._demo_readonly_validation
+            else "F2 LIVE (demo)"
+            if self._trading_enabled
+            else "F1 SHADOW — CERO órdenes"
+        )
         logger.info(
             f"[MOTOR 5] arrancado {mode}. "
             f"max_tickers={self._max_tickers} half_spread={self._half_spread}c "

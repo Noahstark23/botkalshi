@@ -286,6 +286,7 @@ class ProductionRunner:
                 fees_as_maker=self.settings.MOTOR_MM_FEES_AS_MAKER,
                 jump_retreat_cents=self.settings.MOTOR_MM_JUMP_RETREAT_CENTS,
                 exchange_environment=self.settings.KALSHI_ENV,
+                demo_readonly_validation=self.settings.MOTOR_MM_DEMO_READONLY_ENABLED,
                 fair_min_books=self.settings.MOTOR_2_MIN_BOOKS,
                 fair_max_book_age_min=(self.settings.MOTOR_2_MAX_BOOK_AGE_MIN or None),
                 fair_odds_regions=self.settings.ODDS_API_REGIONS,

@@ -37,6 +37,10 @@ from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import api_count, fixed_count, terminal_fill
 from src.storage.models import Trade, engage_kill_switch, get_session
+from src.storage.order_reconciliation import (
+    capture_terminal_sell_execution,
+    validate_pending_sell_response,
+)
 from src.storage.quantities import (
     confirmed_fill,
     filled_fields,
@@ -484,11 +488,17 @@ class RestExecutor:
                     time_in_force="immediate_or_cancel",
                 )
                 order = resp.get("order", resp) if isinstance(resp, dict) else {}
+                validate_pending_sell_response(coid, order)
                 sold = terminal_fill(order, remaining, placement=True)
                 if sold is None:
                     hold_uncertain_order(coid, order)
                     return False  # Pending preservado: el próximo intento podría revender.
-                finalize_reduction(coid, sold, order.get("order_id"))
+                execution = None
+                if sold > 0:
+                    execution = await capture_terminal_sell_execution(
+                        self.client, coid, order, placement=True
+                    )
+                finalize_reduction(coid, sold, order.get("order_id"), execution=execution)
                 remaining -= sold
                 if remaining == 0:
                     return True

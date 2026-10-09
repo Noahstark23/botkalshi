@@ -29,6 +29,7 @@ from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_1_arbitrage.engine import Motor1Engine
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 
@@ -111,7 +112,9 @@ async def test_rollback_exitoso_loguea_vendido():
     client.place_order.side_effect = [
         {"order": {"remaining_count": 0, "order_id": "k-no", "fill_count": 10}},  # NO (dura) llena
         Exception("fail"),  # YES (fácil) falla
-        {"order": {"remaining_count": 0, "fill_count": 10}},  # rollback IOC llena
+        {
+            "order": {"remaining_count": 0, "order_id": "sell-observed", "fill_count": 10}
+        },  # rollback IOC llena
     ]
     client.get_orderbook.return_value = {"orderbook": {"no": [[44, 10]], "yes": []}}
     rm = MagicMock(spec=RiskManager)
@@ -121,6 +124,7 @@ async def test_rollback_exitoso_loguea_vendido():
     wire_reservation_fake(rm)
     executor = ArbitrageExecutor(client, rm)
 
+    wire_exit_fills(client, [("no", 10, 44, 18)])
     lineas: list[str] = []
     sink = logger.add(lambda m: lineas.append(str(m)), level="INFO")
     try:
@@ -134,4 +138,4 @@ async def test_rollback_exitoso_loguea_vendido():
 
     vendidos = [ln for ln in lineas if "rollback: VENDIDO" in ln]
     assert len(vendidos) == 1
-    assert "10x" in vendidos[0] and "@~44¢" in vendidos[0]  # count y precio contable
+    assert "10x" in vendidos[0] and "precio/fees de fills" in vendidos[0]  # count y precio contable

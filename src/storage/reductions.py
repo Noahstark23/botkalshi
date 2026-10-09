@@ -10,6 +10,8 @@ from sqlmodel import select
 
 from src.math.fees import kalshi_fee_cents
 from src.storage.cost_allocation import allocate_entry, usd_text
+from src.storage.exit_capture import apply_exit_execution, exit_execution_note
+from src.storage.exit_fills import ExitFillSummary
 from src.storage.models import Trade, _naive_utc_now, get_session
 from src.storage.order_costs import COST_QUARANTINE_NOTE
 from src.storage.quantities import (
@@ -75,7 +77,18 @@ def persist_reduction(original_coid: str, coid: str, count, price: int) -> None:
         ):
             raise ValueError("rollback fuera de la cantidad abierta atribuible")
         note = f"{REDUCTION_PREFIX}{original_coid}"
-        if s.exec(select(Trade).where(Trade.status == "pending", Trade.notes == note)).first():
+        # Una marca de cuarentena puede anteponerse a notes. La incertidumbre
+        # pertenece a la exposición, no al formato de una nota de atribución.
+        # Bloquear también otra liquidación de la misma posición hasta conciliar.
+        if s.exec(
+            select(Trade).where(
+                Trade.status == "pending",
+                Trade.action == "sell",
+                Trade.ticker == original.ticker,
+                Trade.side == original.side,
+                Trade.strategy == original.strategy,
+            )
+        ).first():
             raise ValueError("rollback anterior sin resolver; prohibido revender")
         s.add(
             Trade(
@@ -93,7 +106,9 @@ def persist_reduction(original_coid: str, coid: str, count, price: int) -> None:
         s.commit()
 
 
-def finalize_reduction(coid: str, sold, order_id: str | None = None) -> None:
+def finalize_reduction(
+    coid: str, sold, order_id: str | None = None, *, execution: ExitFillSummary | None = None
+) -> None:
     with get_session() as s:
         s.exec(text("BEGIN IMMEDIATE"))
         sell = s.exec(select(Trade).where(Trade.client_order_id == coid)).one()
@@ -105,6 +120,8 @@ def finalize_reduction(coid: str, sold, order_id: str | None = None) -> None:
             ):
                 raise ValueError("replay de rollback contradice fill/identidad persistidos")
             if sold > 0:
+                if execution is not None:
+                    apply_exit_execution(sell, execution, sold, order_id)
                 validated_exit_fee(sell, sold)
             return
         if not (sell.notes or "").startswith(
@@ -129,8 +146,12 @@ def finalize_reduction(coid: str, sold, order_id: str | None = None) -> None:
             raise ValueError("venta excede la cantidad abierta de su BUY")
         price = buy.fill_price_cents or buy.price_cents
         allocation = allocate_entry(buy, sold)
+        if execution is not None:
+            apply_exit_execution(sell, execution, sold, order_id)
         exit_fee, observed_fee = validated_exit_fee(sell, sold)
-        pnl = sold * sell.price_cents - allocation.gross_cents - allocation.fee_cents - exit_fee
+        gross = execution.gross_usd * 100 if execution is not None else sold * sell.price_cents
+        pnl = gross - allocation.gross_cents - allocation.fee_cents - exit_fee
+        entry_observed = buy.fill_cost_usd_fp is not None and buy.fees_usd_fp is not None
         now = _naive_utc_now()
         if sold == available:
             closed = buy
@@ -157,19 +178,32 @@ def finalize_reduction(coid: str, sold, order_id: str | None = None) -> None:
         closed.pnl_cents = floor(pnl)
         for field, value in allocation.closed_fields.items():
             setattr(closed, field, value)
-        closed.notes = estimated_exit_note(
-            closed.notes, f"rollback_sell~{sell.price_cents}c", observed_fee=observed_fee
-        )
+        if execution is not None:
+            closed.notes = exit_execution_note(
+                closed.notes, "rollback_filled", entry_observed=entry_observed
+            )
+        else:
+            closed.notes = estimated_exit_note(
+                closed.notes, f"rollback_sell~{sell.price_cents}c", observed_fee=observed_fee
+            )
         resize_filled(sell, sold)
         sell.status = "settled"
         sell.closed_by_clv = True
-        sell.fill_price_cents = sell.price_cents
+        average = Fraction(gross, sold)
+        sell.fill_price_cents = int(average) if average.denominator == 1 else None
         sell.fees_cents = ceil(exit_fee)
         sell.kalshi_order_id = order_id
         sell.filled_at = sell.settled_at = now
         # El prefijo de atribución se consume antes de esta marca terminal;
         # mientras la respuesta es incierta notes permanece reduction_for=<coid>.
-        sell.notes = estimated_exit_note(sell.notes, "rollback_filled", observed_fee=observed_fee)
+        if execution is not None:
+            sell.notes = exit_execution_note(
+                sell.notes, "rollback_filled", entry_observed=entry_observed
+            )
+        else:
+            sell.notes = estimated_exit_note(
+                sell.notes, "rollback_filled", observed_fee=observed_fee
+            )
         s.add(closed)
         s.add(sell)
         s.commit()

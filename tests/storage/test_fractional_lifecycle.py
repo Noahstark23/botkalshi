@@ -28,6 +28,7 @@ from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.poller import PortfolioPoller
 from src.strategies.motor_rest_arb.executor import RestExecutor
 from src.strategies.motor_rest_arb.settlement import _leg_pnl_cents
+from tests.exit_fill_fixtures import wire_exit_fills
 from tests.strategies.motor_2_consensus.test_executor_sizing_fill import (
     _FakeClient,
     _FakeRisk,
@@ -327,9 +328,15 @@ async def test_m3_partial_exit_preserves_remainder_and_replay(isolated):
     client = AsyncMock()
     client.get_orderbook.return_value = {"orderbook": {"yes": [[60, 10]], "no": []}}
     client.place_order.return_value = {
-        "order": {"remaining_count": 0, "fill_count": None, "fill_count_fp": "0.10"}
+        "order": {
+            "remaining_count": 0,
+            "order_id": "m3-partial",
+            "fill_count": None,
+            "fill_count_fp": "0.10",
+        }
     }
     pos = models.PortfolioPosition(ticker="T", side="yes", **quantity_fields(Fraction(1, 4)))
+    wire_exit_fills(client, [("yes", Fraction("0.10"), 60, 1)])
     ex = Motor3ExitExecutor(client)
     result = await ex.exit_position(pos)
     assert result.filled_count == Fraction(1, 10)
@@ -475,6 +482,7 @@ async def test_restart_after_split_never_restores_original_cumulative_fill():
             },
         ]
     }
+    wire_exit_fills(client, [("yes", Fraction("0.15"), 50, 1)])
     await reconcile_pending_orders(client, strategies=("motor_1_arbitrage",))
     await reconcile_pending_orders(client, strategies=("motor_1_arbitrage",))
     buys = [r for r in rows() if r.action == "buy"]
@@ -518,9 +526,17 @@ async def test_restart_reconciles_cancelled_order_with_fraction_instead_of_zero(
 async def test_rest_fok_partial_only_rolls_back_confirmed_remainders():
     client = AsyncMock()
     client.place_order.side_effect = [
-        {"order": {"remaining_count": 0, "fill_count": None, "fill_count_fp": n}}
+        {
+            "order": {
+                "remaining_count": 0,
+                "order_id": f"order-{n}",
+                "fill_count": None,
+                "fill_count_fp": n,
+            }
+        }
         for n in ("0.25", "0.10", "0.15")
     ]
+    wire_exit_fills(client, [("no", Fraction("0.10"), 1, 1), ("no", Fraction("0.15"), 1, 1)])
     outcome = await RestExecutor(client).execute(_opp())
     assert not outcome.filled and outcome.rollback_filled
     calls = [c.kwargs for c in client.place_order.call_args_list]

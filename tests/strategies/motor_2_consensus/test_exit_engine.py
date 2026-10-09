@@ -21,6 +21,7 @@ from src.math.fees import kalshi_fee_cents
 from src.storage.models import Trade, get_session
 from src.strategies.motor_2_consensus.exit_engine import Motor2ExitEngine
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 
 def _orderbook(side: str, bid_cents: int) -> dict:
@@ -200,6 +201,7 @@ async def test_execution_marks_closed_by_clv_and_pnl():
     client.place_order = AsyncMock(
         return_value={"order": {"remaining_count": 0, "order_id": "ord-1", "fill_count": count}}
     )
+    wire_exit_fills(client, [("yes", 10, 62, 17)])
 
     eng = Motor2ExitEngine(trading_enabled=True, take_profit_enabled=True, tp_threshold=62)
     eng._client = client

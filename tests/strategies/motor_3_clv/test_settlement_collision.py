@@ -16,6 +16,7 @@ from src.storage.models import Trade, get_session
 from src.strategies.motor_2_consensus.executor import STRATEGY as M2_STRATEGY
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_rest_arb.settlement import SettlementPoller
+from tests.exit_fill_fixtures import wire_exit_fills
 
 
 def _seed_buy(ticker="KXC", side="yes", count=10, fill_price=40, strategy=M2_STRATEGY) -> str:
@@ -47,6 +48,7 @@ def _exec_with_fill(orderbook_side_levels, fill_count) -> Motor3ExitExecutor:
     client.place_order = AsyncMock(
         return_value={"order": {"remaining_count": 0, "order_id": "o1", "fill_count": fill_count}}
     )
+    wire_exit_fills(client, [("yes", fill_count, 60, {4: 7, 10: 17}[fill_count])])
     return Motor3ExitExecutor(client)
 
 

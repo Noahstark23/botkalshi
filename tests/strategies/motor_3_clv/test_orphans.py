@@ -18,6 +18,7 @@ from src.storage.models import PortfolioPosition, Trade, get_session
 from src.strategies.motor_3_clv.engine import Motor3Engine
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from src.strategies.motor_3_clv.orphans import arb_id_of, motor1_orphan_buys
+from tests.exit_fill_fixtures import wire_exit_fills
 
 TICKER = "KXMLBGAME-26JUL061845HOUWSH-HOU"
 
@@ -169,6 +170,7 @@ async def test_executor_sells_and_settles_only_orphans():
         return_value={"order": {"remaining_count": 0, "order_id": "k1", "fill_count": 21}}
     )
 
+    wire_exit_fills(client, [("yes", 21, 15, 19)])
     ex = Motor3ExitExecutor(client, include_motor1_orphans=True)
     pos = _position(count=433)
     outcome = await ex.exit_position(pos)

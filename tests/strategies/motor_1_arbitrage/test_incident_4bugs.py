@@ -20,6 +20,7 @@ from src.risk.manager import RiskManager, TradeDecision
 from src.storage.models import PortfolioPosition, RiskEvent, get_session, kill_switch_engaged
 from src.strategies.motor_1_arbitrage.event_exposure import EventExposureTracker, event_ticker_of
 from src.strategies.motor_1_arbitrage.executor import ArbitrageExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 from tests.strategies.motor_1_arbitrage._reservation_fakes import wire_reservation_fake
 
 EVENT = "KXMLBGAME-26JUL061845HOUWSH"
@@ -282,6 +283,7 @@ async def test_bug3_successful_rollback_does_not_pause(executor, mock_client):
             )
         )
         session.commit()
+    wire_exit_fills(mock_client, [("yes", 10, 17, 10)])
     with patch(
         "src.strategies.motor_1_arbitrage.executor.alert_risk_event", new_callable=AsyncMock
     ):

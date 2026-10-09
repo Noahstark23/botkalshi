@@ -33,6 +33,7 @@ import src.storage.models as models
 from src.clients.kalshi_rest import KalshiClientError
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.strategies.motor_rest_arb.executor import LegState, RestExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 _FOK_KILL_CODE = "fill_or_kill_insufficient_resting_volume"
 
@@ -214,6 +215,7 @@ async def test_route_fill_plus_rollback_ok():
     client = HarnessClient()
     client.buy = {"no": _create_order_fill(), "yes": _kill_409()}  # hard=no llena, barata=yes KILL
     client.sell_result = _create_order_fill()  # el sell de rollback llena
+    wire_exit_fills(client, [("no", 5, 1, 1)])
     outcome = await RestExecutor(client).execute(_opp())
 
     assert outcome.filled is False
@@ -229,7 +231,7 @@ async def test_route_fill_plus_rollback_ok():
     assert trades["no"].status == "settled"
     assert trades["no"].pnl_cents is not None and trades["no"].pnl_cents < 0
     assert trades["no"].settled_at is not None
-    assert "rollback_sell~1c" in (trades["no"].notes or "")
+    assert "exit_execution_observed" in (trades["no"].notes or "")
     assert trades["yes"].status == "cancelled"
 
 
@@ -266,6 +268,7 @@ async def test_route_error_red_reconciles_to_filled():
     client.reconcile_status = "executed"  # get_orders dice que la pata SÍ llenó
     client.reconcile_position = 5  # get_positions confirma posición abierta
     client.sell_result = _create_order_fill()  # el rollback de las patas expuestas cierra
+    wire_exit_fills(client, [("no", 5, 1, 1), ("yes", 5, 1, 1)])
     outcome = await RestExecutor(client).execute(_opp())
 
     # results = [hard(no)=FILL, barata(yes)=ERROR_RED] → ese es el orden de leg_states.

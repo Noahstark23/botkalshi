@@ -154,3 +154,5 @@ def test_money_history_migration_preserves_rows_without_inventing_observations(t
         "0.001000",
     )
     assert all(row[field] is None for field in ORDER_COST_HISTORY_FIELDS)
+    assert row["sale_proceeds_usd_fp"] is None
+    assert row["exit_fill_evidence_sha256"] is None

@@ -1,8 +1,8 @@
 """Recorridos offline reales: ejecución, SQLite, fills parciales y recuperación.
 
-El transporte es ficticio y cada DB es temporal. Los importes M1/REST basados
-en precios límite/bid y fórmula de fees son contabilidad estimada, no fills
-de precio observados ni prueba de rentabilidad. No se construye cliente HTTP.
+El transporte es ficticio y cada DB es temporal. Los BUY conservan estimaciones
+legacy; los SELL aportan fills GET sintéticos explícitos (44c, fee 1c por orden).
+No es evidencia del proveedor ni de rentabilidad. No se construye cliente HTTP.
 """
 
 from __future__ import annotations
@@ -175,6 +175,31 @@ class PartialTransport:
     async def get_orders(self, **kwargs):
         return {"orders": list(self.orders.values())}
 
+    async def get_fills(self, *, order_id, ticker, subaccount, limit, **kwargs):
+        assert subaccount == 0 and limit == 100 and not kwargs
+        order = next(o for o in self.orders.values() if o["order_id"] == order_id)
+        assert order["ticker"] == ticker and order["action"] == "sell"
+        return {
+            "fills": [
+                {
+                    "fill_id": f"fill-{order_id}",
+                    "order_id": order_id,
+                    "ticker": ticker,
+                    "side": order["side"],
+                    "action": "sell",
+                    "subaccount_number": 0,
+                    "count_fp": order["fill_count_fp"],
+                    f"{order['side']}_price_dollars": "0.44",
+                    "fee_cost": "0.01",
+                }
+            ],
+            "cursor": "",
+        }
+
+    async def get_historical_fills(self, **kwargs):
+        assert "order_id" not in kwargs
+        return {"fills": [], "cursor": ""}
+
 
 async def test_m1_partial_roundtrip_keeps_original_budget_after_restart(sandbox):
     client = PartialTransport()
@@ -187,7 +212,7 @@ async def test_m1_partial_roundtrip_keeps_original_budget_after_restart(sandbox)
     assert sum((confirmed_fill(t) for t in closed), Fraction()) == Fraction(3, 4)
     assert sum(t.fees_cents for t in closed) == 2
     assert sum(t.fees_cents for t in rows if t.action == "sell") == 2
-    # Exact arithmetic of the engine's disclosed bid-price accounting estimate.
+    # Entrada legacy estimada; salida GET sintética de .75 a 44c, dos fees de 1c.
     assert sum((Fraction(t.pnl_usd_fp) for t in closed), Fraction()) == Fraction(-475, 10000)
     assert sum(t.pnl_cents for t in closed) == -6  # Per-row floor is conservative.
     assert risk._get_current_exposure_usd() == 0

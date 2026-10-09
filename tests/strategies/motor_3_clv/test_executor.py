@@ -14,6 +14,7 @@ import pytest
 import src.storage.models as models
 from src.storage.models import PortfolioPosition
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
+from tests.exit_fill_fixtures import wire_exit_fills
 
 
 def _pos(side: str = "yes", count: int = 10) -> PortfolioPosition:
@@ -47,6 +48,19 @@ def _client(orderbook: dict, *, place_resp: dict | None = None) -> MagicMock:
     c = MagicMock()
     c.get_orderbook = AsyncMock(return_value=orderbook)
     c.place_order = AsyncMock(return_value=place_resp)
+    if place_resp and place_resp.get("order", {}).get("fill_count", 0) > 0:
+        order = place_resp["order"]
+        side = "yes" if orderbook["orderbook"].get("yes") else "no"
+        from fractions import Fraction
+
+        price = max(
+            int(Fraction(p) * 100) if isinstance(p, str) else p
+            for p, _ in orderbook["orderbook"][side]
+        )
+        fee = {(10, 60): 17, (4, 60): 7, (5, 40): 9, (10, 5): 4, (10, 1): 1}[
+            (order["fill_count"], price)
+        ]
+        wire_exit_fills(c, [(side, order["fill_count"], price, fee)])
     return c
 
 
@@ -87,7 +101,7 @@ async def test_no_side_uses_no_price():
     """Posición NO → vende el lado 'no' al bid del 'no' (no_price)."""
     c = _client(
         {"orderbook": {"yes": [], "no": [["0.40", "30"]]}},
-        place_resp={"order": {"remaining_count": 0, "fill_count": 5}},
+        place_resp={"order": {"remaining_count": 0, "order_id": "no-exit", "fill_count": 5}},
     )
     _seed_open_buy(side="no", count=5)
     ex = Motor3ExitExecutor(c)
@@ -103,7 +117,9 @@ async def test_lock_released_after_exit_allows_reattempt():
     tick puede reintentar el remanente. Si no se liberara, la salida quedaría trabada."""
     c = _client(
         {"orderbook": {"yes": [["0.60", "50"]], "no": []}},
-        place_resp={"order": {"remaining_count": 0, "fill_count": 4}},  # parcial: vende 4 de 10
+        place_resp={
+            "order": {"remaining_count": 0, "order_id": "partial-exit", "fill_count": 4}
+        },  # parcial: vende 4 de 10
     )
     _seed_open_buy(side="yes", count=10)
     ex = Motor3ExitExecutor(c)
