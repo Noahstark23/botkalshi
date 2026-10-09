@@ -141,7 +141,7 @@ def hold_uncertain_order(coid: str, order: object) -> None:
         validate_order_identity(row, order)
         fill = api_count(order, "fill_count")
         if fill is not None and fill <= requested_quantity(row):
-            if row.strategy == "motor_2_consensus":
+            if row.strategy == "motor_2_consensus" and row.action == "buy":
                 record_order_fill(row, fill, order, legacy_estimates=True)
             else:
                 record_fill(row, fill)
