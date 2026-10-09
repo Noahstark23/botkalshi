@@ -34,12 +34,15 @@ from scripts import demo_runner_readiness as base  # noqa: E402
 
 SERVICES = base.REQUIRED_SERVICES | {"motor2_shadow", "motor2_exits", "motor5_mm", "position_marks"}
 SERIES = "KXMLBGAME"
+COHORTS = {"KXMLBGAME": "baseball_mlb", "KXNFLGAME": "americanfootball_nfl"}
 METRIC = "demo-readonly-v1-bbo-depth"
 EXTRA_BLOCKS = {"SNAPSHOT_PREFLIGHT", "WORKER_ERROR", "UNEXPECTED_FINANCIAL_LEDGER"}
 
 
 @dataclass
 class Evidence(base.Evidence):
+    series: str = SERIES
+    event_ticker: str | None = None
     m2_cycles: int = 0
     m2_exit_cycles: int = 0
     m5_cycles: int = 0
@@ -48,6 +51,10 @@ class Evidence(base.Evidence):
     shadow_quotes: int = 0
     shadow_fills: int = 0
     financial_rows: int = 0
+    m2_events_matched: int = 0
+    m2_reject_names: int = 0
+    m2_reject_no_fair: int = 0
+    m5_skip_fee_policy: int = 0
     ledger_checked: bool = False
     snapshot_sha256: str | None = None
     snapshot_fetched_at: str | None = None
@@ -58,9 +65,11 @@ class Evidence(base.Evidence):
 
     def http(self, method, url):
         parsed = urlsplit(str(url))
-        if parsed.path == f"/trade-api/v2/series/{SERIES}":
+        if parsed.path == f"/trade-api/v2/series/{self.series}":
             # Reutiliza TODOS los guards host/método/presupuesto, sin ampliar otros paths.
-            super().http(method, parsed._replace(path=f"/trade-api/v2/markets/{SERIES}").geturl())
+            super().http(
+                method, parsed._replace(path=f"/trade-api/v2/markets/{self.series}").geturl()
+            )
             return "series"
         return super().http(method, url)
 
@@ -78,7 +87,13 @@ class Evidence(base.Evidence):
             financial_ledger_empty=self.ledger_checked and self.financial_rows == 0,
         )
         value.update(
-            schema="demo-multi-readiness-v1",
+            schema="demo-multi-readiness-v2",
+            selection={
+                "series": self.series,
+                "sport_key": COHORTS[self.series],
+                "event_ticker": self.event_ticker,
+                "discovery": "explicit_event" if self.event_ticker else "catalog_first_page",
+            },
             scope="bounded_M1_M2_M5_shadow_with_local_snapshot",
             mode="HYBRID_READ_ONLY",
             status="HYBRID_READ_ONLY" if all(checks.values()) else "INCOMPLETE",
@@ -107,16 +122,22 @@ class Evidence(base.Evidence):
             shadow_quotes=self.shadow_quotes,
             shadow_fills=self.shadow_fills,
             financial_rows=self.financial_rows,
+            m2_events_matched=self.m2_events_matched,
+            m2_reject_names=self.m2_reject_names,
+            m2_reject_no_fair=self.m2_reject_no_fair,
+            m5_skip_fee_policy=self.m5_skip_fee_policy,
         )
         return value
 
 
 async def prepare_snapshot(source: Path, workdir: Path, evidence: Evidence) -> Path:
     """Copia exactamente una versión acotada, sin alterar ninguna fecha del payload."""
-    from src.clients.odds_snapshot import OddsSnapshotClient, _timestamp
+    from src.clients.odds_snapshot import SPORT_FILES, OddsSnapshotClient, _timestamp
 
     client = OddsSnapshotClient(source)
-    raw = client._read("odds-latest.json")
+    sport = COHORTS[evidence.series]
+    filename = SPORT_FILES[sport]
+    raw = client._read(filename)
     evidence.snapshot_sha256 = hashlib.sha256(raw).hexdigest()
     # Sólo metadata tipada. El parser completo sigue siendo obligatorio después;
     # conservar hash/edad permite explicar rechazo sin publicar el contenido.
@@ -127,11 +148,11 @@ async def prepare_snapshot(source: Path, workdir: Path, evidence: Evidence) -> P
         evidence.snapshot_age_seconds = math.ceil((datetime.now(UTC) - fetched).total_seconds())
     destination = workdir / "snapshot"
     destination.mkdir(mode=0o700)
-    path = destination / "odds-latest.json"
+    path = destination / filename
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as stream:
         stream.write(raw)
-    snapshot = await OddsSnapshotClient(destination).read_snapshot("baseball_mlb")
+    snapshot = await OddsSnapshotClient(destination).read_snapshot(sport)
     if not snapshot.events:
         raise ValueError("SNAPSHOT_WITHOUT_USABLE_EVENTS")
     evidence.snapshot_fetched_at = snapshot.fetched_at.isoformat()
@@ -143,9 +164,10 @@ async def prepare_snapshot(source: Path, workdir: Path, evidence: Evidence) -> P
     return destination
 
 
-def configure(workdir: Path, credentials: Path, health_port: int, snapshot: Path):
+def configure(workdir: Path, credentials: Path, health_port: int, snapshot: Path, series=SERIES):
     from src.utils.config import get_settings, reset_settings_for_testing
 
+    sport = COHORTS[series]
     base.configure(workdir, credentials, health_port)
     os.environ.update(
         EXPERIMENT_DYNAMIC_MULTI_ENABLED="true",
@@ -167,17 +189,18 @@ def configure(workdir: Path, credentials: Path, health_port: int, snapshot: Path
         UNREALIZED_STOP_ENABLED="true",
         ODDS_SHARED_SNAPSHOT_DIR=str(snapshot),
         ODDS_SHARED_SNAPSHOT_MAX_AGE_SEC="600",
-        ODDS_API_SPORT_KEYS="baseball_mlb",
+        ODDS_API_SPORT_KEYS=sport,
         ODDS_API_REGIONS="us",
         MOTOR_2_SPORTSBOOK_ENABLED="true",
-        MOTOR2_SERIES=SERIES,
+        MOTOR2_SERIES=series,
+        DISCOVERY_EXTRA_SERIES=series,
         MOTOR_2_MIN_BOOKS="3",
         MOTOR_2_MAX_BOOK_AGE_MIN="15",
         MOTOR_2_BURST_INTERVAL_SEC="0",
         MOTOR_2_ONE_BET_PER_EVENT="true",
         MOTOR_MM_ENABLED="true",
         MOTOR_MM_DEMO_READONLY_ENABLED="true",
-        MOTOR_MM_SERIES=SERIES,
+        MOTOR_MM_SERIES=series,
         MOTOR_MM_MAX_TICKERS="2",
         MOTOR_MM_EXPERIMENT_ID="demo-readonly-hybrid",
         MOTOR_MM_FAIR_TTL_SEC="360",
@@ -223,7 +246,7 @@ def instrumentation(evidence: Evidence):
     FairValueBook.clear()
     with (
         patch.object(base, "REQUIRED_SERVICES", SERVICES),
-        base.runner_instrumentation(evidence, SERIES),
+        base.runner_instrumentation(evidence, evidence.series, event_ticker=evidence.event_ticker),
         patch.object(Motor2ShadowPoller, "poll_once", wrapper(originals[0], "m2_cycles")),
         patch.object(Motor2ExitEngine, "_tick", wrapper(originals[1], "m2_exit_cycles")),
         patch.object(Motor5Engine, "_tick", wrapper(originals[2], "m5_cycles")),
@@ -240,8 +263,10 @@ async def run_runner(seconds: float, evidence: Evidence):
     from sqlmodel import func, select
 
     from src.storage.models import (
+        MMFunnelSnapshot,
         MMQuote,
         MMShadowFill,
+        Motor2FunnelSnapshot,
         PortfolioPosition,
         RiskCommitment,
         Trade,
@@ -259,13 +284,20 @@ async def run_runner(seconds: float, evidence: Evidence):
             evidence.shadow_fills = session.exec(
                 select(func.count()).select_from(MMShadowFill)
             ).one()
+            for attr, column in (
+                ("m2_events_matched", Motor2FunnelSnapshot.events_matched),
+                ("m2_reject_names", Motor2FunnelSnapshot.reject_names),
+                ("m2_reject_no_fair", Motor2FunnelSnapshot.reject_no_fair),
+                ("m5_skip_fee_policy", MMFunnelSnapshot.skip_fee_policy),
+            ):
+                setattr(evidence, attr, session.exec(select(func.sum(column))).one() or 0)
         evidence.ledger_checked = True
         if evidence.financial_rows:
             evidence.blocked["UNEXPECTED_FINANCIAL_LEDGER"] += 1
     return evidence.report()
 
 
-def worker(seconds: int, snapshot_dir: Path):
+def worker(seconds: int, snapshot_dir: Path, series=SERIES, event_ticker=None):
     # Aislamiento previo a imports del bot y a cualquier lectura de credenciales.
     credentials = Path.home() / ".config/botkalshi/demo"
     os.environ.clear()
@@ -276,7 +308,7 @@ def worker(seconds: int, snapshot_dir: Path):
 
     Settings.model_config["env_file"] = None
     logger.remove()
-    evidence = Evidence()
+    evidence = Evidence(series=series, event_ticker=event_ticker)
     logger.add(lambda _message: setattr(evidence, "error_seen", True), level="ERROR")
     stdout_fd, stderr_fd = os.dup(1), os.dup(2)
     try:
@@ -298,7 +330,7 @@ def worker(seconds: int, snapshot_dir: Path):
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))
                     port = listener.getsockname()[1]
-                configure(workdir, credentials, port, snapshot)
+                configure(workdir, credentials, port, snapshot, series)
                 with base.network_guards(evidence), instrumentation(evidence):
                     return asyncio.run(run_runner(seconds, evidence))
             except Exception as exc:
@@ -316,12 +348,12 @@ def worker(seconds: int, snapshot_dir: Path):
         os.close(stderr_fd)
 
 
-def checked_report(raw: bytes):
+def checked_report(raw: bytes, series=SERIES, event_ticker=None):
     """Sólo enums/counters/hash/fecha conocidos; ningún texto o payload del worker."""
     if len(raw) > 16384:
         raise ValueError("INVALID_WORKER_REPORT")
     value = json.loads(raw)
-    template = Evidence().report()
+    template = Evidence(series=series, event_ticker=event_ticker).report()
     if type(value) is not dict or set(value) != set(template):
         raise ValueError("INVALID_WORKER_REPORT")
     for key in (
@@ -333,6 +365,7 @@ def checked_report(raw: bytes):
         "source_authenticity_verified",
         "execution_validated",
         "fee_metric",
+        "selection",
     ):
         if type(value[key]) is not type(template[key]) or value[key] != template[key]:
             raise ValueError("INVALID_WORKER_REPORT")
@@ -412,10 +445,19 @@ def main(argv=None):
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--seconds", type=int, default=90)
     parser.add_argument("--snapshot-dir", type=Path)
+    parser.add_argument("--series", choices=sorted(COHORTS), default=SERIES)
+    parser.add_argument(
+        "--event-ticker", help="Un evento Demo explícito; no valida discovery amplio"
+    )
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
     if not 60 <= args.seconds <= 90:
         parser.error("seconds debe estar entre 60 y 90")
+    if args.event_ticker is not None and (
+        not base.TOKEN.fullmatch(args.event_ticker)
+        or not args.event_ticker.startswith(args.series + "-")
+    ):
+        parser.error("event-ticker debe pertenecer a la serie elegida")
     if not args.run and not args.worker:
         print(
             json.dumps(
@@ -430,16 +472,19 @@ def main(argv=None):
                     "credentials_read": False,
                     "snapshot_required": True,
                     "execution_validated": False,
+                    "selection": Evidence(
+                        series=args.series, event_ticker=args.event_ticker
+                    ).report()["selection"],
                 }
             )
         )
         return 0
-    evidence = Evidence()
+    evidence = Evidence(series=args.series, event_ticker=args.event_ticker)
     try:
         if args.snapshot_dir is None or not args.snapshot_dir.is_absolute():
             raise ValueError("ABSOLUTE_SNAPSHOT_REQUIRED")
         if args.worker:
-            result = worker(args.seconds, args.snapshot_dir)
+            result = worker(args.seconds, args.snapshot_dir, args.series, args.event_ticker)
         else:
             if args.report is None or args.report.exists():
                 raise ValueError("FRESH_REPORT_PATH_REQUIRED")
@@ -452,7 +497,11 @@ def main(argv=None):
                 str(args.seconds),
                 "--snapshot-dir",
                 str(args.snapshot_dir),
+                "--series",
+                args.series,
             ]
+            if args.event_ticker:
+                command.extend(["--event-ticker", args.event_ticker])
             completed = subprocess.run(
                 command,
                 env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "TZ": "UTC"},
@@ -462,7 +511,7 @@ def main(argv=None):
                 timeout=args.seconds + 45,
                 check=False,
             )
-            result = checked_report(completed.stdout)
+            result = checked_report(completed.stdout, args.series, args.event_ticker)
             if completed.returncode != (0 if result["status"] == "HYBRID_READ_ONLY" else 1):
                 raise ValueError("WORKER_EXIT_MISMATCH")
     except Exception as exc:

@@ -19,7 +19,7 @@ from tests.scripts import test_demo_runner_readiness as baseline_tests
 isolated_settings = baseline_tests.isolated_settings
 
 
-def document(*, mismatch=False, books=3, age=60):
+def document(*, mismatch=False, books=3, age=60, series=smoke.SERIES):
     now = datetime.now(UTC)
     kickoff = now + timedelta(hours=3)
     teams = (
@@ -27,14 +27,21 @@ def document(*, mismatch=False, books=3, age=60):
         if mismatch
         else ("Philadelphia Phillies", "New York Mets")
     )
+    if series == "KXNFLGAME":
+        teams = (
+            ("Arizona Cardinals", "Detroit Lions")
+            if mismatch
+            else ("Philadelphia Eagles", "Jacksonville Jaguars")
+        )
+    sport = smoke.COHORTS[series]
     return {
         "fetched_at": (now - timedelta(seconds=age)).isoformat(),
-        "sport": "baseball_mlb",
+        "sport": sport,
         "params": {"regions": "us", "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso"},
         "events": [
             {
                 "id": "synthetic-not-provider-data",
-                "sport_key": "baseball_mlb",
+                "sport_key": sport,
                 "commence_time": kickoff.isoformat(),
                 "home_team": teams[0],
                 "away_team": teams[1],
@@ -59,29 +66,34 @@ def document(*, mismatch=False, books=3, age=60):
 
 
 def source_file(tmp_path, payload):
+    from src.clients.odds_snapshot import SPORT_FILES
+
     directory = tmp_path.resolve() / "source"
     directory.mkdir()
-    (directory / "odds-latest.json").write_text(json.dumps(payload))
+    (directory / SPORT_FILES[payload["sport"]]).write_text(json.dumps(payload))
     return directory
 
 
-def configured(isolated_settings):
+def configured(isolated_settings, series=smoke.SERIES):
     credentials, workdir = isolated_settings
-    return smoke.configure(workdir, credentials, 18765, workdir.resolve())
+    return smoke.configure(workdir, credentials, 18765, workdir.resolve(), series)
 
 
-def test_opt_in_validates_real_settings_and_does_not_inherit_execution(isolated_settings):
+@pytest.mark.parametrize("series", smoke.COHORTS)
+def test_opt_in_validates_real_settings_and_does_not_inherit_execution(isolated_settings, series):
     from src.utils.config import Settings
 
     os.environ.update(
         TRADING_ENABLED="true", MOTOR_2_ENTRY_EXECUTION_ENABLED="true", ODDS_API_KEY="never-read"
     )
-    cfg = configured(isolated_settings)
+    cfg = configured(isolated_settings, series)
     assert cfg.KALSHI_ENV == "demo" and cfg.MOTOR_MM_DEMO_READONLY_ENABLED
     assert cfg.EXPERIMENT_DYNAMIC_MULTI_ENABLED and cfg.MOTOR_1_ARBITRAGE_ENABLED
     assert cfg.MOTOR_2_SPORTSBOOK_ENABLED and cfg.MOTOR_MM_ENABLED
     assert not cfg.TRADING_ENABLED and not cfg.MOTOR_2_ENTRY_EXECUTION_ENABLED
     assert not cfg.ODDS_API_KEY and cfg.MOTOR_MM_FAIR_TTL_SEC == 360
+    assert cfg.MOTOR2_SERIES == cfg.MOTOR_MM_SERIES == cfg.DISCOVERY_EXTRA_SERIES == series
+    assert smoke.COHORTS[series] == cfg.ODDS_API_SPORT_KEYS
     assert Settings.model_fields["MOTOR_MM_DEMO_READONLY_ENABLED"].default is False
 
 
@@ -97,12 +109,13 @@ def test_opt_in_validates_real_settings_and_does_not_inherit_execution(isolated_
         "MOTOR_MM_EXECUTION_ENABLED",
     ],
 )
+@pytest.mark.parametrize("series", smoke.COHORTS)
 def test_readonly_flag_rejects_every_execution_independent_of_multi_profile(
-    isolated_settings, flag
+    isolated_settings, flag, series
 ):
     from src.utils.config import Settings
 
-    fields = configured(isolated_settings).model_dump()
+    fields = configured(isolated_settings, series).model_dump()
     fields.update(EXPERIMENT_DYNAMIC_MULTI_ENABLED=False)
     fields[flag] = True
     with pytest.raises(ValidationError):
@@ -122,10 +135,11 @@ def test_readonly_flag_rejects_every_execution_independent_of_multi_profile(
         {"MOTOR_2_SPORTSBOOK_ENABLED": False},
     ],
 )
-def test_demo_opt_in_does_not_relax_f1_data_gates(isolated_settings, changes):
+@pytest.mark.parametrize("series", smoke.COHORTS)
+def test_demo_opt_in_does_not_relax_f1_data_gates(isolated_settings, changes, series):
     from src.utils.config import Settings
 
-    fields = configured(isolated_settings).model_dump()
+    fields = configured(isolated_settings, series).model_dump()
     fields.update(changes)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **fields)
@@ -176,15 +190,19 @@ def test_exact_demo_host_still_required(url):
         smoke.Evidence().http("GET", url)
 
 
-async def test_snapshot_copy_preserves_bytes_and_original_dates(tmp_path):
-    doc = document()
+@pytest.mark.parametrize("series", smoke.COHORTS)
+async def test_snapshot_copy_preserves_bytes_and_original_dates(tmp_path, series):
+    from src.clients.odds_snapshot import SPORT_FILES
+
+    doc = document(series=series)
     source = source_file(tmp_path, doc)
     work = tmp_path.resolve() / "work"
     work.mkdir()
-    evidence = smoke.Evidence()
+    evidence = smoke.Evidence(series=series)
     destination = await smoke.prepare_snapshot(source, work, evidence)
-    raw = (source / "odds-latest.json").read_bytes()
-    assert (destination / "odds-latest.json").read_bytes() == raw
+    filename = SPORT_FILES[smoke.COHORTS[series]]
+    raw = (source / filename).read_bytes()
+    assert (destination / filename).read_bytes() == raw
     assert evidence.snapshot_sha256 == hashlib.sha256(raw).hexdigest()
     assert evidence.snapshot_fetched_at == doc["fetched_at"]
     assert evidence.snapshot_age_seconds >= 60
@@ -228,10 +246,17 @@ def test_report_rejects_secret_text_in_any_extended_field():
 
 @pytest.mark.parametrize(
     "case,accept",
-    [("matching", True), ("mismatch", False), ("insufficient_books", False), ("bad_fee", False)],
+    [
+        ("matching", True),
+        ("mismatch", False),
+        ("insufficient_books", False),
+        ("bad_fee", False),
+        ("quadratic_fee", False),
+    ],
 )
+@pytest.mark.parametrize("series", smoke.COHORTS)
 async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
-    isolated_settings, monkeypatch, tmp_path, case, accept
+    isolated_settings, monkeypatch, tmp_path, case, accept, series
 ):
     """ProductionRunner.run real + HTTP/WS falsos; no es una observación conectada."""
     import websockets
@@ -242,15 +267,24 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
     from src.strategies.motor_1_arbitrage.engine import Motor1Engine
     from src.strategies.motor_5_mm.engine import Motor5Engine
 
-    payload = document(mismatch=case == "mismatch", books=2 if case == "insufficient_books" else 3)
+    payload = document(
+        mismatch=case == "mismatch", books=2 if case == "insufficient_books" else 3, series=series
+    )
     source = source_file(tmp_path, payload)
     credentials, work = isolated_settings
-    evidence = smoke.Evidence()
-    snapshot = await smoke.prepare_snapshot(source, work.resolve(), evidence)
-    smoke.configure(work, credentials, 18765, snapshot)
     kickoff = datetime.fromisoformat(payload["events"][0]["commence_time"])
-    event_id = f"KXMLBGAME-{kickoff:%y%b%d}PHINYM".upper()
-    event = {"event_ticker": event_id, "series_ticker": smoke.SERIES}
+    event_id = f"{series}-{kickoff:%y%b%d}PHINY".upper()
+    # NFL selecciona un evento concreto; MLB conserva la ruta de catálogo acotado.
+    target = event_id if series == "KXNFLGAME" else None
+    evidence = smoke.Evidence(series=series, event_ticker=target)
+    snapshot = await smoke.prepare_snapshot(source, work.resolve(), evidence)
+    smoke.configure(work, credentials, 18765, snapshot, series)
+    event = {"event_ticker": event_id, "series_ticker": series}
+    teams = (
+        (("PHI", "Philadelphia Eagles"), ("JAC", "Jacksonville Jaguars"))
+        if series == "KXNFLGAME"
+        else (("PHI", "Philadelphia Phillies"), ("NYM", "New York Mets"))
+    )
     markets = [
         {
             "ticker": f"{event_id}-{suffix}",
@@ -264,7 +298,7 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
             "yes_ask": 80,
             "no_ask": 80,
         }
-        for suffix, team in (("PHI", "Philadelphia Phillies"), ("NYM", "New York Mets"))
+        for suffix, team in teams
     ]
     requests = []
 
@@ -274,14 +308,17 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
         if path.endswith("/balance"):
             body = {"balance": 20000, "portfolio_value": 0}
         elif path.endswith("/events"):
+            assert target is None, "La selección explícita no debe consumir el catálogo general"
             body = {"events": [event]}
         elif "/events/" in path:
             body = {"event": event, "markets": markets}
         elif "/series/" in path:
             body = {
                 "series": {
-                    "fee_type": "quadratic_with_maker_fees",
-                    "fee_multiplier": 2 if case == "bad_fee" else 0.5,
+                    "fee_type": (
+                        "quadratic" if case == "quadratic_fee" else "quadratic_with_maker_fees"
+                    ),
+                    "fee_multiplier": 2 if case == "bad_fee" else (1 if target else 0.5),
                 }
             }
         elif path.endswith("/orderbook"):
@@ -360,7 +397,10 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
     assert result["counts"]["m5_cycles"] >= 2
     assert result["counts"]["financial_rows"] == 0
     assert result["checks"]["financial_ledger_empty"]
-    assert (result["counts"]["fair_items"] > 0) == (case in {"matching", "bad_fee"})
+    assert (result["counts"]["fair_items"] > 0) == (
+        case in {"matching", "bad_fee", "quadratic_fee"}
+    )
+    assert (result["counts"]["m5_skip_fee_policy"] > 0) == (case in {"bad_fee", "quadratic_fee"})
     assert (result["counts"]["shadow_quotes"] > 0) == accept
     assert result["status"] == ("HYBRID_READ_ONLY" if accept else "INCOMPLETE"), result
     assert not result["execution_validated"] and not result["source_authenticity_verified"]
@@ -368,4 +408,68 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
     assert all(
         request.method == "GET" and request.url.host == smoke.base.HOST for request in requests
     )
-    assert smoke.checked_report(json.dumps(result).encode()) == result
+    assert smoke.checked_report(json.dumps(result).encode(), series, target) == result
+
+
+@pytest.mark.parametrize("case", ["series", "sport", "discovery", "event"])
+def test_nfl_report_must_match_parent_selection(case):
+    event = "KXNFLGAME-26OCT11PHIJAC"
+    report = smoke.Evidence(series="KXNFLGAME", event_ticker=event).report()
+    changed = {
+        "series": ("series", "KXMLBGAME"),
+        "sport": ("sport_key", "baseball_mlb"),
+        "discovery": ("discovery", "catalog_first_page"),
+        "event": ("event_ticker", "KXNFLGAME-OTHER"),
+    }
+    key, value = changed[case]
+    report["selection"][key] = value
+    with pytest.raises(ValueError, match="INVALID_WORKER_REPORT"):
+        smoke.checked_report(json.dumps(report).encode(), "KXNFLGAME", event)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"KALSHI_ENV": "production", "MOTOR_MM_DEMO_READONLY_ENABLED": False},
+        {"ODDS_API_SPORT_KEYS": "americanfootball_ncaaf"},
+        {"MOTOR2_SERIES": "KXNCAAFGAME", "MOTOR_MM_SERIES": "KXNCAAFGAME"},
+    ],
+)
+def test_nfl_exception_is_only_the_explicit_demo_cohort(isolated_settings, change):
+    from src.utils.config import Settings
+
+    fields = configured(isolated_settings, "KXNFLGAME").model_dump()
+    fields.update(change)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **fields)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("event_ticker", "KXNFLGAME-WRONG"), ("series_ticker", "KXMLBGAME")]
+)
+async def test_explicit_event_identity_mismatch_blocks_discovery(monkeypatch, field, value):
+    from unittest.mock import AsyncMock
+
+    from src.clients.kalshi_rest import KalshiRestClient
+
+    target = "KXNFLGAME-26OCT11PHIJAC"
+    event = {"event_ticker": target, "series_ticker": "KXNFLGAME", field: value}
+    getter = AsyncMock(return_value={"event": event})
+    monkeypatch.setattr(KalshiRestClient, "get_event", getter)
+    evidence = smoke.Evidence(series="KXNFLGAME", event_ticker=target)
+    # El wrapper sólo usa get_event; no hay constructor ni transporte aquí.
+    with (
+        smoke.instrumentation(evidence),
+        pytest.raises(PermissionError, match="DISCOVERY_EVENT_IDENTITY_MISMATCH"),
+    ):
+        await KalshiRestClient.list_events(
+            SimpleNamespace(get_event=getter), series_ticker="KXNFLGAME"
+        )
+    assert evidence.blocked["DISCOVERY_EVENT_IDENTITY_MISMATCH"] == 1
+
+
+@pytest.mark.parametrize("event", ["KXMLBGAME-X", "KXNFLGAME-../private", "https://example.org"])
+def test_invalid_target_rejected_before_plan_or_worker(monkeypatch, event):
+    monkeypatch.setattr(smoke, "worker", lambda *a: pytest.fail("no worker expected"))
+    with pytest.raises(SystemExit):
+        smoke.main(["--series", "KXNFLGAME", "--event-ticker", event])

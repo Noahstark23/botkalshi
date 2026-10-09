@@ -94,6 +94,7 @@ BLOCK_CODES = {
     "WS_TRANSPORT_OVERRIDE_BLOCKED",
     "DISCOVERY_EVENT_BOUND_EXCEEDED",
     "DISCOVERY_MARKET_BOUND_EXCEEDED",
+    "DISCOVERY_EVENT_IDENTITY_MISMATCH",
     "EXECUTOR_CONSTRUCTED",
     "UNEXPECTED_TRADE_ROW",
     "EXTERNAL_PRODUCER_CONSTRUCTED",
@@ -442,7 +443,7 @@ def configure(workdir: Path, credentials: Path, health_port: int):
 
 
 @contextlib.contextmanager
-def runner_instrumentation(evidence: Evidence, series: str):
+def runner_instrumentation(evidence: Evidence, series: str, *, event_ticker: str | None = None):
     from src.clients.kalshi_rest import KalshiRestClient
     from src.clients.odds_api import OddsAPIClient
     from src.runner import ProductionRunner
@@ -454,6 +455,11 @@ def runner_instrumentation(evidence: Evidence, series: str):
     tick = Motor1Engine._tick
     start_service = ProductionRunner._start_required_service
 
+    if event_ticker is not None and (
+        not TOKEN.fullmatch(event_ticker) or not event_ticker.startswith(series + "-")
+    ):
+        raise ValueError("INVALID_TARGET_EVENT")
+
     def supervised(runner, name, service):
         async def observed():
             if name not in REQUIRED_SERVICES:
@@ -464,6 +470,19 @@ def runner_instrumentation(evidence: Evidence, series: str):
         return start_service(runner, name, observed)
 
     async def bounded_events(client, **kwargs):
+        if event_ticker is not None:
+            # Selección explícita para Demo: identidad devuelta por GET, jamás
+            # metadata fabricada ni listado de producción. No acredita discovery amplio.
+            payload = await client.get_event(event_ticker)
+            event = payload.get("event") if isinstance(payload, dict) else None
+            if (
+                kwargs.get("series_ticker") != series
+                or not isinstance(event, dict)
+                or event.get("event_ticker") != event_ticker
+                or event.get("series_ticker") != series
+            ):
+                evidence.deny("DISCOVERY_EVENT_IDENTITY_MISMATCH")
+            return {"events": [event], "cursor": ""}
         kwargs["limit"] = 2
         result = await list_events(client, **kwargs)
         if not isinstance(result.get("events"), list) or len(result["events"]) > 2:

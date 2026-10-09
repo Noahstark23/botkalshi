@@ -1219,7 +1219,15 @@ class Settings(BaseSettings):
                 problems.append("TRADING_ENABLED=false (perfil exclusivamente offline/shadow)")
             if not self.ODDS_SHARED_SNAPSHOT_DIR:
                 problems.append("ODDS_SHARED_SNAPSHOT_DIR requerido")
-            if self.MOTOR2_SERIES != "KXMLBGAME" or self.MOTOR_MM_SERIES != "KXMLBGAME":
+            demo_nfl_readonly = (
+                self.KALSHI_ENV == "demo"
+                and self.MOTOR_MM_DEMO_READONLY_ENABLED
+                and self.MOTOR2_SERIES == self.MOTOR_MM_SERIES == "KXNFLGAME"
+                and self.ODDS_API_SPORT_KEYS == "americanfootball_nfl"
+            )
+            if not demo_nfl_readonly and (
+                self.MOTOR2_SERIES != "KXMLBGAME" or self.MOTOR_MM_SERIES != "KXMLBGAME"
+            ):
                 problems.append("MOTOR2_SERIES=MOTOR_MM_SERIES=KXMLBGAME")
             if self.MOTOR_MM_FAIR_TTL_SEC != 360:
                 problems.append("MOTOR_MM_FAIR_TTL_SEC=360")
