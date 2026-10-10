@@ -30,6 +30,13 @@ EXPECTED_BASE_MULTIPLIERS: dict[str, Fraction] = {
     "KXMENWORLDCUP": Fraction(1, 1),
 }
 
+# Captura pública Demo, 10-oct-2026. Sólo para el consumidor de validación sin
+# órdenes. No ampliar las aserciones operativas ni inferirlas desde otro entorno.
+DEMO_READONLY_BASE_MULTIPLIERS = {
+    "KXNFLGAME": Fraction(1),
+    "KXNCAAFGAME": Fraction(1),
+}
+
 
 class UnsupportedSeriesFeeError(RuntimeError):
     """La fee no se pudo demostrar; la única respuesta segura es no cotizar."""
@@ -47,6 +54,15 @@ class EffectiveFeeObservation:
     base_multiplier: Fraction = Fraction(1, 1)
     override_fee_type: str | None = None
     override_multiplier: Fraction | None = None
+
+    @property
+    def maker_multiplier(self) -> Fraction:
+        """Conservar M de la fuente aunque el schedule no cobre a makers."""
+        if self.fee_type == "quadratic":
+            return Fraction(0)
+        if self.fee_type == SUPPORTED_FEE_TYPE:
+            return self.multiplier
+        raise UnsupportedSeriesFeeError("tipo sin modelo maker demostrado")
 
 
 # Alias temporal para callers/tests históricos del branch. El dato ya no es solo serie.
@@ -74,8 +90,12 @@ class SeriesFeePolicy:
         series_ttl_sec: float = 30.0,
         event_ttl_sec: float = 30.0,
         negative_ttl_sec: float = 300.0,
+        demo_readonly_validation: bool = False,
     ) -> None:
+        if type(demo_readonly_validation) is not bool:
+            raise ValueError("demo_readonly_validation debe ser booleano")
         self._client = client
+        self._demo_readonly_validation = demo_readonly_validation
         self._series_ttl_sec = series_ttl_sec
         self._event_ttl_sec = event_ttl_sec
         self._negative_ttl_sec = negative_ttl_sec
@@ -107,7 +127,11 @@ class SeriesFeePolicy:
         return UnsupportedSeriesFeeError(message)
 
     async def _series_schedule(self, series: str, now_mono: float) -> _SeriesSchedule:
-        expected = EXPECTED_BASE_MULTIPLIERS.get(series)
+        expected = (
+            DEMO_READONLY_BASE_MULTIPLIERS
+            if self._demo_readonly_validation
+            else EXPECTED_BASE_MULTIPLIERS
+        ).get(series)
         if expected is None:
             raise UnsupportedSeriesFeeError(f"serie sin aserción de fee: {series}")
         cached = self._series_cache.get(series)
@@ -123,8 +147,11 @@ class SeriesFeePolicy:
         raw = payload.get("series") if isinstance(payload, dict) else None
         if not isinstance(raw, dict):
             raise self._fail(key, now_mono, f"GET /series/{series} sin objeto series")
+        if self._demo_readonly_validation and raw.get("ticker") != series:
+            raise self._fail(key, now_mono, f"identidad de serie Demo inconsistente: {series}")
         fee_type = raw.get("fee_type")
-        if fee_type != SUPPORTED_FEE_TYPE:
+        expected_type = "quadratic" if self._demo_readonly_validation else SUPPORTED_FEE_TYPE
+        if fee_type != expected_type:
             raise self._fail(
                 key, now_mono, f"fee_type base no soportado para {series}: {fee_type!r}"
             )
@@ -195,7 +222,12 @@ class SeriesFeePolicy:
                 f"type={override_type!r}, multiplier={raw_override_multiplier!r}",
             )
         else:
-            if override_type != SUPPORTED_FEE_TYPE:
+            allowed_overrides = (
+                {"quadratic", SUPPORTED_FEE_TYPE}
+                if self._demo_readonly_validation
+                else {SUPPORTED_FEE_TYPE}
+            )
+            if override_type not in allowed_overrides:
                 raise self._fail(
                     key,
                     now_mono,

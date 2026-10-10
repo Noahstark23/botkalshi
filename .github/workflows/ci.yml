@@ -7,6 +7,24 @@ on:
     branches: [main]
 
 jobs:
+  simulator-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install test dependencies
+        run: pip install -e ".[dev]"
+      - name: Lint simulator and isolated test runner
+        run: ruff check infra/digitalocean-shadow/ scripts/test_simulator_isolated.py
+      - name: Verify shared M2 M5 ledger without external network or credentials
+        run: python scripts/test_simulator_isolated.py
+
   test:
     runs-on: ubuntu-latest
     steps:

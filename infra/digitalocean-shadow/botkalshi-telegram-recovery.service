@@ -1,0 +1,60 @@
+[Unit]
+Description=botkalshi confirmed Telegram recovery notification (installation only)
+After=network-online.target botkalshi-research.service botkalshi-assistant.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=botkalshi-telegram
+Group=botkalshi-telegram
+SupplementaryGroups=botkalshi-ai
+WorkingDirectory=/opt/botkalshi/infra/digitalocean-shadow
+LoadCredential=telegram_bot_token:/etc/botkalshi-telegram/telegram_bot_token
+LoadCredential=telegram_chat_id:/etc/botkalshi-telegram/telegram_chat_id
+Environment=TRADING_ENABLED=false
+Environment=MOTOR_MM_EXECUTION_ENABLED=false
+Environment=MOTOR_1_EXECUTION_ENABLED=false
+Environment=MOTOR_2_EXECUTION_ENABLED=false
+Environment=MOTOR_2_ENTRY_EXECUTION_ENABLED=false
+Environment=MOTOR_3_EXECUTION_ENABLED=false
+Environment=MOTOR_REST_EXECUTION_ENABLED=false
+Environment=PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=KALSHI_API_KEY_ID KALSHI_PRIVATE_KEY KALSHI_PRIVATE_KEY_PATH OPENAI_API_KEY BOTKALSHI_OPENAI_MODEL PYTHONOPTIMIZE PYTHONPATH PYTHONHOME PYTHONINSPECT
+ExecStartPre=+/usr/libexec/botkalshi-prepare-integration-access telegram
+ExecStart=/usr/bin/python3 /opt/botkalshi/infra/digitalocean-shadow/telegram_notifier.py --data /var/lib/botkalshi-research --state-data /var/lib/botkalshi-integrations notify --event recovery --force-confirm INSTALLATION_TEST
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+ProcSubset=pid
+KeyringMode=private
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/botkalshi-integrations/telegram
+# Root ExecStartPre refreshes ACL xattrs; the service UID receives only r-- ACLs.
+ReadWritePaths=-/var/lib/botkalshi-research/health.json
+ReadWritePaths=-/var/lib/botkalshi-research/coverage.json
+ReadWritePaths=-/var/lib/botkalshi-research/risk-status.json
+ReadWritePaths=-/var/lib/botkalshi-research/packets/latest.json
+InaccessiblePaths=-/etc/botkalshi-research.env -/etc/botkalshi-assistant.env -/etc/botkalshi-assistant
+UMask=0077
+LimitCORE=0
+MemoryMax=128M
+CPUQuota=25%
+TasksMax=24
+TimeoutStartSec=60
+
+# Not enabled: the installer invokes it once and verifies a new message_id.

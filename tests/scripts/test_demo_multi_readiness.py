@@ -239,6 +239,8 @@ def test_report_rejects_secret_text_in_any_extended_field():
         ("services_started", ["secret"]),
         ("snapshot", {**report["snapshot"], "sha256": "secret"}),
         ("counts", {**report["counts"], "m2_cycles": "secret"}),
+        ("payoff_equivalence_verified", True),
+        ("strategy_readiness", True),
     ):
         with pytest.raises(ValueError):
             smoke.checked_report(json.dumps({**report, key: replacement}).encode())

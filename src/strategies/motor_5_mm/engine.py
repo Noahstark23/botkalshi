@@ -44,6 +44,7 @@ from loguru import logger
 from sqlmodel import col, or_, select
 
 from src.clients.kalshi_rest import KalshiRestClient
+from src.math.fees import kalshi_maker_fee_cents
 from src.math.quantities import fixed_count, signed_fixed_count
 from src.monitoring.health import BotState
 from src.risk.exposure import contract_risk_cents, exposure_count
@@ -154,6 +155,7 @@ class Motor5Engine:
         jump_retreat_cents: float = 5.0,
         exchange_environment: str = "demo",
         demo_readonly_validation: bool = False,
+        demo_football_fee_validation: bool = False,
         fair_min_books: int = 1,
         fair_max_book_age_min: float | None = None,
         fair_odds_regions: str = "",
@@ -183,12 +185,27 @@ class Motor5Engine:
         # Retiro por salto (blindaje del maker): 0 = off.
         self._jump_retreat = jump_retreat_cents
         self._exchange_environment = exchange_environment
+        if (
+            type(demo_readonly_validation) is not bool
+            or type(demo_football_fee_validation) is not bool
+        ):
+            raise ValueError("modos de validación Demo deben ser booleanos")
         self._demo_readonly_validation = demo_readonly_validation
+        self._demo_football_fee_validation = demo_football_fee_validation
         if demo_readonly_validation:
             if exchange_environment != "demo" or trading_enabled:
                 raise ValueError("M5 Demo read-only exige entorno Demo y trading_enabled=False")
             # Nunca mezclar observaciones Demo con la métrica/cohorte de producción.
             self.F1_METRIC_VERSION = "demo-readonly-v1-bbo-depth"
+        if demo_football_fee_validation:
+            if not demo_readonly_validation or not fees_as_maker:
+                raise ValueError("tarifas fútbol Demo exigen modo read-only y modelo maker")
+            if client_factory is KalshiRestClient:
+                raise ValueError("tarifas fútbol Demo exigen cliente de lectura explícito")
+            if self._allowed_series not in ({"KXNFLGAME"}, {"KXNCAAFGAME"}):
+                raise ValueError("tarifas fútbol Demo exigen una serie de fútbol revisada")
+            # Opt-in local adicional: no está conectado al runner ni a env vars.
+            self.F1_METRIC_VERSION = "demo-readonly-v2-fee-schedule"
         self._fair_min_books = fair_min_books
         self._fair_max_book_age_min = fair_max_book_age_min
         self._fair_odds_regions = fair_odds_regions
@@ -379,14 +396,17 @@ class Motor5Engine:
         limite = datetime.now(UTC) - timedelta(seconds=600)
         try:
             with get_session() as s:
-                filas = list(
-                    s.exec(
-                        select(MMShadowFill).where(
-                            MMShadowFill.created_at >= limite,
-                            MMShadowFill.markout2_cents.is_(None),  # type: ignore[union-attr]
-                        )
-                    )
+                statement = select(MMShadowFill).where(
+                    MMShadowFill.created_at >= limite,
+                    MMShadowFill.markout2_cents.is_(None),  # type: ignore[union-attr]
                 )
+                if self._demo_readonly_validation:
+                    statement = statement.where(
+                        MMShadowFill.exchange_environment == "demo",
+                        MMShadowFill.metric_version == self.F1_METRIC_VERSION,
+                        MMShadowFill.experiment_id == self._experiment_id,
+                    )
+                filas = list(s.exec(statement))
         except Exception as exc:
             logger.exception("motor5.rehidratar_markouts_error")
             raise Motor5DataIntegrityError("no se pudo rehidratar la cola de markouts") from exc
@@ -430,6 +450,21 @@ class Motor5Engine:
         except Exception as exc:
             raise Motor5DataIntegrityError("no se pudo rehidratar el inventario shadow") from exc
         for row in rows:
+            multiplier = row.fee_multiplier or 1
+            if self._demo_football_fee_validation:
+                if (
+                    row.exchange_environment != "demo"
+                    or row.fee_type not in {"quadratic", "quadratic_with_maker_fees"}
+                    or row.fee_multiplier is None
+                ):
+                    raise Motor5DataIntegrityError("fill Demo sin procedencia de fee válida")
+                if row.fee_type == "quadratic":
+                    multiplier = 0
+                expected_fee = kalshi_maker_fee_cents(
+                    row.count, row.price_cents, fee_multiplier=multiplier
+                )
+                if row.fee_model != "maker" or row.fee_effective_cents != expected_fee:
+                    raise Motor5DataIntegrityError("fill Demo con fee distinta a su procedencia")
             self._inventory.apply_fill(
                 ShadowFill(
                     ticker=row.ticker,
@@ -438,7 +473,7 @@ class Motor5Engine:
                     count=row.count,
                     rule=row.rule,
                 ),
-                fee_multiplier=row.fee_multiplier or 1,
+                fee_multiplier=multiplier,
             )
         if rows:
             logger.info(
@@ -469,7 +504,9 @@ class Motor5Engine:
                 self._rehidratar_inventory()
             async with self._client_factory() as client:
                 self._client = client
-                self._fee_policy = SeriesFeePolicy(client)
+                self._fee_policy = SeriesFeePolicy(
+                    client, demo_readonly_validation=self._demo_football_fee_validation
+                )
                 original: BaseException | None = None
                 try:
                     if self._trading_enabled:
@@ -878,7 +915,7 @@ class Motor5Engine:
                     fee_observation = await self._fee_policy.observe(
                         ticker, event_ticker=fv.event_ticker
                     )
-                    fee_multiplier = fee_observation.multiplier
+                    fee_multiplier = fee_observation.maker_multiplier
                     if (
                         prev is not None
                         and self._executor is None
@@ -1202,7 +1239,15 @@ class Motor5Engine:
             observable_count_cap=self.F1_OBSERVABLE_FILL_CAP,
         )
         for fill in fills:
-            multiplier = fee_observation.multiplier if fee_observation is not None else 1
+            multiplier = (
+                (
+                    fee_observation.maker_multiplier
+                    if self._fees_as_maker
+                    else fee_observation.multiplier
+                )
+                if fee_observation is not None
+                else 1
+            )
             projected_inventory = self._inventory.net(fill.ticker) + (
                 fill.count if fill.side == "buy" else -fill.count
             )
@@ -1725,7 +1770,11 @@ class Motor5Engine:
                     fee_model="maker" if self._fees_as_maker else "taker",
                     fee_effective_cents=(
                         kalshi_maker_fee_cents(
-                            fill.count, fill.price_cents, fee_multiplier=multiplier
+                            fill.count,
+                            fill.price_cents,
+                            fee_multiplier=(
+                                fee_observation.maker_multiplier if fee_observation else multiplier
+                            ),
                         )
                         if self._fees_as_maker
                         else kalshi_fee_cents(

@@ -95,8 +95,13 @@ _SERIES_SPORT_PREFIXES: dict[str, tuple[str, ...]] = {
     "KXNBA": ("basketball",),
     "KXNHLGAME": ("icehockey",),
     "KXNHL": ("icehockey",),
-    "KXNFLGAME": ("americanfootball",),
-    "KXNFL": ("americanfootball",),
+}
+# NFL y NCAA comparten deporte, pero no participantes ni contratos. Igualdad de
+# liga completa: un prefijo americanfootball_* mezclaría sus cuotas silenciosamente.
+_FOOTBALL_SERIES_LEAGUES = {
+    "KXNFLGAME": "americanfootball_nfl",
+    "KXNFL": "americanfootball_nfl",
+    "KXNCAAFGAME": "americanfootball_ncaaf",
 }
 _unknown_series_logged: set[str] = set()
 
@@ -107,6 +112,8 @@ def series_sport_compatible(event_key: str, sport_key: str) -> bool:
     llegó del universo configurado sin mapa de deporte = onboarding incompleto — sin el
     gate, los aliases de ciudad cruzan deportes y fabrican edges fantasma."""
     prefix = event_key.split("-", 1)[0]
+    if prefix in _FOOTBALL_SERIES_LEAGUES:
+        return sport_key == _FOOTBALL_SERIES_LEAGUES[prefix]
     sports = _SERIES_SPORT_PREFIXES.get(prefix)
     if sports is None:
         if prefix not in _unknown_series_logged:
@@ -131,7 +138,15 @@ def start_time_et(commence_time: datetime) -> datetime:
 
 # Alias conocidos (clave = nombre YA normalizado por normalize_name → valor canónico).
 # Resuelve discrepancias Odds API ↔ Kalshi sin matchear por error. Curada y extensible.
-TEAM_ALIASES: dict[str, str] = {
+#
+# SCOPE POR DEPORTE (2026-10-09): los alias de ciudad/apodo son de MLB y la tabla era
+# GLOBAL — "Boston" de un partido NBA canonizaba a "boston red sox" y "Giants" de NFL a
+# "san francisco giants". El gate series_sport_compatible impedía el cruce de deporte,
+# pero dejaba a NBA/NFL/NHL estructuralmente inmatcheables (nunca se puede agregar
+# "boston" → celtics a una tabla donde "boston" ya es Red Sox). Ahora: genéricos
+# (empate, selecciones) para todo deporte; los de MLB SOLO con sport_key baseball_*.
+# `TEAM_ALIASES` sigue siendo la unión (contrato legacy de canonical_name sin sport).
+_GENERIC_ALIASES: dict[str, str] = {
     # Empate (1X2)
     "tie": "draw",
     "empate": "draw",
@@ -159,13 +174,15 @@ TEAM_ALIASES: dict[str, str] = {
     "korea dpr": "north korea",
     "dpr korea": "north korea",
     "china pr": "china",
+}
+
+_MLB_ALIASES: dict[str, str] = {
     # === MLB (2026) — Kalshi usa nombre CORTO (ciudad/abrev), The Odds API el FULL
     # "Ciudad Equipo". Mapea el corto canónico → full canónico (el full ya canoniza a sí
     # mismo, sin entrada). Ciudades compartidas: Kalshi desambigua con sufijo (m/y, c/ws,
     # a/d) → claves DISTINTAS → imposible cruzar Mets↔Yankees con el matcher de igualdad
-    # exacta de conjuntos. ⚠️ Alias ciudad→equipo MLB-scoped: si se onboarda otro deporte con
-    # las mismas ciudades (NBA Celtics/Lakers...), revisar (idealmente alias por deporte);
-    # hoy Motor 2 corre 1 sport_key a la vez, así que es seguro.
+    # exacta de conjuntos. Esta tabla SOLO se aplica con sport_key baseball_* (ver
+    # _aliases_for); otro deporte necesita su PROPIA tabla, nunca entradas acá.
     "arizona": "arizona diamondbacks",
     "atlanta": "atlanta braves",
     # Athletics: la franquicia dejó Oakland (Sacramento 2025-27 → Las Vegas); The Odds
@@ -285,7 +302,44 @@ TEAM_ALIASES: dict[str, str] = {
     "wsh": "washington nationals",
     "was": "washington nationals",
     "nationals": "washington nationals",
+    # Variantes con ciudad que normalize_name deja sin resolver (2026-10-09): cada una
+    # es UN equipo; sin ellas el set no matcheaba (fail-closed, pero feed perdido).
+    "oakland as": "athletics",
+    "arizona dbacks": "arizona diamondbacks",
+    "los angeles angels of anaheim": "los angeles angels",
 }
+
+TEAM_ALIASES: dict[str, str] = {**_GENERIC_ALIASES, **_MLB_ALIASES}
+
+# Nombres comprobados en las capturas Demo NFL/NCAAF del 9–10 de octubre.
+# Cobertura deliberadamente parcial; no se extrapolan apodos ni ciudades a otras
+# ligas, y el comportamiento histórico sin sport_key conserva sólo sus aliases.
+_FOOTBALL_ALIASES = {
+    "americanfootball_nfl": {
+        "philadelphia": "philadelphia eagles",
+        "jacksonville": "jacksonville jaguars",
+    },
+    "americanfootball_ncaaf": {
+        "alabama": "alabama crimson tide",
+        "georgia": "georgia bulldogs",
+        "notre dame": "notre dame fighting irish",
+        "stanford": "stanford cardinal",
+        "florida st": "florida state seminoles",
+        "florida state": "florida state seminoles",
+        "louisville": "louisville cardinals",
+    },
+}
+
+
+def _aliases_for(sport_key: str | None) -> dict[str, str]:
+    """Aliases por deporte; NFL/NCAAF requieren liga exacta. None conserva legacy."""
+    if sport_key is None:
+        return TEAM_ALIASES
+    if sport_key.startswith("baseball"):
+        return TEAM_ALIASES
+    if sport_key in _FOOTBALL_ALIASES:
+        return {**_GENERIC_ALIASES, **_FOOTBALL_ALIASES[sport_key]}
+    return _GENERIC_ALIASES
 
 
 def normalize_name(name: str) -> str:
@@ -303,17 +357,23 @@ def normalize_name(name: str) -> str:
     return s
 
 
-def canonical_name(name: str) -> str:
-    """Nombre canónico: normalización base + resolución de alias (alias gana si existe)."""
+def canonical_name(name: str, sport_key: str | None = None) -> str:
+    """Nombre canónico: normalización base + alias DEL DEPORTE (alias gana si existe).
+
+    sport_key=None conserva el comportamiento histórico (tabla completa)."""
     base = normalize_name(name)
-    return TEAM_ALIASES.get(base, base)
+    return _aliases_for(sport_key).get(base, base)
 
 
-def _canonical_set(names: Sequence[str]) -> set[str]:
-    return {canonical_name(n) for n in names}
+def _canonical_set(names: Sequence[str], sport_key: str | None = None) -> set[str]:
+    return {canonical_name(n, sport_key) for n in names}
 
 
-def outcomes_match(kalshi_outcomes: Sequence[str], odds_outcomes: Sequence[str]) -> bool:
+def outcomes_match(
+    kalshi_outcomes: Sequence[str],
+    odds_outcomes: Sequence[str],
+    sport_key: str | None = None,
+) -> bool:
     """
     True solo si ambos lados describen el MISMO conjunto de outcomes.
 
@@ -325,8 +385,8 @@ def outcomes_match(kalshi_outcomes: Sequence[str], odds_outcomes: Sequence[str])
     if len(kalshi_outcomes) != len(odds_outcomes):
         return False  # cardinalidad (ej. Kalshi gana/pierde vs Odds gana/empata/pierde)
 
-    k_set = _canonical_set(kalshi_outcomes)
-    o_set = _canonical_set(odds_outcomes)
+    k_set = _canonical_set(kalshi_outcomes, sport_key)
+    o_set = _canonical_set(odds_outcomes, sport_key)
     # Si canonizar colapsó duplicados, hay ambigüedad → descartar (fail-safe).
     if len(k_set) != len(kalshi_outcomes) or len(o_set) != len(odds_outcomes):
         return False
@@ -334,14 +394,16 @@ def outcomes_match(kalshi_outcomes: Sequence[str], odds_outcomes: Sequence[str])
 
 
 def match_outcomes(
-    kalshi_outcomes: Sequence[str], odds_outcomes: Sequence[str]
+    kalshi_outcomes: Sequence[str],
+    odds_outcomes: Sequence[str],
+    sport_key: str | None = None,
 ) -> dict[str, str] | None:
     """
     Si los conjuntos matchean, devuelve el emparejamiento {outcome_kalshi → outcome_odds}
     (nombres ORIGINALES, para que el detector recupere el precio de cada lado).
     None si no matchean (cardinalidad, ambigüedad o conjunto distinto).
     """
-    if not outcomes_match(kalshi_outcomes, odds_outcomes):
+    if not outcomes_match(kalshi_outcomes, odds_outcomes, sport_key):
         return None
-    odds_by_canon = {canonical_name(o): o for o in odds_outcomes}
-    return {k: odds_by_canon[canonical_name(k)] for k in kalshi_outcomes}
+    odds_by_canon = {canonical_name(o, sport_key): o for o in odds_outcomes}
+    return {k: odds_by_canon[canonical_name(k, sport_key)] for k in kalshi_outcomes}

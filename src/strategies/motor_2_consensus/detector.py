@@ -44,6 +44,7 @@ from src.strategies.motor_2_consensus.matcher import (
     series_sport_compatible,
     start_time_et,
 )
+from src.strategies.motor_2_consensus.team_identity import event_ticker_contradictions
 
 MIN_EDGE_PCT = 0.03  # 3pp neto post-comisión
 SIZING_MAX_PCT = 5.0  # cap duro de exposición por trade (% del capital activo)
@@ -119,7 +120,7 @@ def _h2h_outcome_names(odds_event: OddsEvent) -> list[str]:
         for mk in bk.markets:
             if mk.key == "h2h" and mk.outcomes:
                 names = [o.name for o in mk.outcomes]
-                key = frozenset(canonical_name(n) for n in names)
+                key = frozenset(canonical_name(n, odds_event.sport_key) for n in names)
                 sets_vistos[key] += 1
                 primero_por_set.setdefault(key, names)
     if not sets_vistos:
@@ -155,7 +156,7 @@ def _consensus_fair_probs(
     # consenso solo con el set COMPLETO e IDÉNTICO (deuda auditoría 2026-07-01: agregar
     # outcomes sueltos de casas parciales normalizaba el no-vig sobre el conjunto
     # equivocado → fair inflado, p.ej. 1X2 sin Draw daba A=0.60/B=0.40 vs ~0.50/0.33/0.17).
-    reference = {canonical_name(n) for n in _h2h_outcome_names(odds_event)}
+    reference = {canonical_name(n, odds_event.sport_key) for n in _h2h_outcome_names(odds_event)}
     if len(reference) < 2:
         return {}
     probs_por_outcome: dict[str, list[float]] = {}
@@ -181,7 +182,7 @@ def _consensus_fair_probs(
             for o in mk.outcomes:
                 # Cuota inválida → el set de esta casa queda incompleto → se descarta abajo.
                 with contextlib.suppress(ValueError):
-                    probs[canonical_name(o.name)] = implied_prob(o.price)
+                    probs[canonical_name(o.name, odds_event.sport_key)] = implied_prob(o.price)
             if set(probs) != reference:
                 skipped_books += 1
                 continue  # set distinto/incompleto → esta casa NO entra al consenso
@@ -311,6 +312,8 @@ def find_signals(
       - reject_date: candidatos por nombres pero ninguno en la fecha del event_key (serie).
       - reject_ambiguous: >1 candidato sin desambiguar (doubleheader) → descarta.
       - reject_started: el candidato correcto ya arrancó (in-play) → descarta.
+      - reject_ticker_team: el código del ticker (…-NYM) contradice al yes_sub_title del
+        market → descarta el evento entero (team_identity).
       - skip_out_of_horizon / skip_multi_outcome: PRE-funnel — el evento ni compite
         (fecha sin cobertura del feed / >3 outcomes inmatchable contra h2h).
     La clasificación por overlap solo considera candidatos del MISMO día ET que el
@@ -331,6 +334,7 @@ def find_signals(
             reject_date=0.0,  # candidato(s) por nombres pero ninguno en la fecha del event_key
             reject_ambiguous=0.0,  # >1 candidato sin desambiguar (doubleheader/serie) → descarta
             reject_started=0.0,  # el candidato correcto ya arrancó (Kalshi in-play) → descarta
+            reject_ticker_team=0.0,  # código del ticker contradice al yes_sub_title → descarta
             skip_out_of_horizon=0.0,  # la fecha del event_key ni siquiera está en el feed de odds
             skip_multi_outcome=0.0,  # evento Kalshi >3 outcomes: inmatchable contra feed h2h
             reject_high_edge=0.0,  # señal sobre el techo de ejecución (anti-fantasma)
@@ -366,7 +370,6 @@ def find_signals(
                 diag["skip_out_of_horizon"] = diag.get("skip_out_of_horizon", 0.0) + 1.0
             continue
         k_names = [q.outcome_name for q in ke.outcomes]
-        k_canon = {canonical_name(n) for n in k_names}
         matched = False
         best_overlap = -1
         best_reason = "absent"
@@ -394,7 +397,8 @@ def find_signals(
                 # diagnóstico; key sin fecha → sin restricción (legacy).
                 parsed_key is None or start_time_et(oe.commence_time).date() == parsed_key[0]
             ):
-                o_canon = {canonical_name(n) for n in odds_names}
+                k_canon = {canonical_name(n, oe.sport_key) for n in k_names}
+                o_canon = {canonical_name(n, oe.sport_key) for n in odds_names}
                 # Rastrear el oe pre-match MÁS CERCANO (mayor overlap) para diagnosticar el rechazo.
                 overlap = len(k_canon & o_canon)
                 if overlap > best_overlap:
@@ -409,7 +413,7 @@ def find_signals(
                     else:
                         best_reason = "no_fair"  # set igual → si no matchea/no fair, es esto
             # Regla del matcher: cardinalidad + conjuntos exactos. None → no es el partido.
-            if match_outcomes(k_names, odds_names) is None:
+            if match_outcomes(k_names, odds_names, oe.sport_key) is None:
                 continue
             candidates.append(oe)
 
@@ -417,6 +421,14 @@ def find_signals(
         # tomaba el PRIMER candidato pre-match: en una serie MLB de 3-4 juegos del mismo
         # par, el evento Kalshi del miércoles apostaba contra la línea del martes).
         chosen, select_reject = _select_candidate(ke.event_key, candidates, now)
+        # Identidad por TICKER (2026-10-09): el fair se publica por market_ticker usando el
+        # yes_sub_title como llave; si el código del ticker (…-NYM) contradice al nombre,
+        # el fair de un equipo terminaría en el ticker de otro. Contradicción POSITIVA →
+        # el evento entero se descarta (código desconocido NO bloquea; ver team_identity).
+        if chosen is not None and event_ticker_contradictions(
+            [(q.market_ticker, q.outcome_name) for q in ke.outcomes]
+        ):
+            chosen, select_reject = None, "ticker_team"
         if chosen is not None:
             fair_metadata: dict[str, object] = {}
             fair = _consensus_fair_probs(
@@ -436,7 +448,7 @@ def find_signals(
                 # luego colapsados a UNA apuesta direccional (_collapse_event_signals).
                 event_signals: list[ConsensusSignal] = []
                 for q in ke.outcomes:
-                    cn = canonical_name(q.outcome_name)
+                    cn = canonical_name(q.outcome_name, chosen.sport_key)
                     fp = fair.get(cn)
                     if fp is None:
                         continue

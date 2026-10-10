@@ -197,6 +197,7 @@ class Motor2ShadowPoller:
             f"rej_date={int(diag.get('reject_date', 0))} "
             f"rej_ambig={int(diag.get('reject_ambiguous', 0))} "
             f"rej_started={int(diag.get('reject_started', 0))} "
+            f"rej_ticker={int(diag.get('reject_ticker_team', 0))} "
             f"rej_high={int(diag.get('reject_high_edge', 0))} "
             f"skip_horizon={int(diag.get('skip_out_of_horizon', 0))} "
             f"skip_multi={int(diag.get('skip_multi_outcome', 0))} "
