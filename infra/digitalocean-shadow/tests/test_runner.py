@@ -110,6 +110,18 @@ class SubcentDollarBookReader:
 
 
 class RunnerSafetyTests(unittest.TestCase):
+    def setUp(self):
+        # La colección de pytest puede preceder este test por más de 180 s.
+        # Renovar sólo el reloj del fixture, no el umbral del verificador real.
+        now = datetime.now(UTC)
+        module = sys.modules[__name__]
+        self.enterContext(patch.object(module, "COLLECTION_NOW", now))
+        self.enterContext(
+            patch.object(
+                module, "CLOSE_TIME", (now + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+            )
+        )
+
     def test_collector_still_rejects_kalshi_credentials(self):
         with self.assertRaises(runner.collector.ResearchError):
             runner.collector.safety_check({"KALSHI_API_KEY_ID": "should-fail"})
@@ -162,7 +174,7 @@ class RunnerSafetyTests(unittest.TestCase):
                     risk,
                     now=datetime.now(UTC),
                 )
-                self.assertEqual(result["technical_status"], "VERIFIED")
+                self.assertEqual(result["technical_status"], "VERIFIED", result)
                 self.assertEqual(result["cycle_id"], packet["packet_id"])
                 self.assertFalse(result["execution_authorized"])
             finally:

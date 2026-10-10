@@ -1,4 +1,4 @@
-"""Exportación unidireccional de cuatro snapshots públicos, sin HTTP ni credenciales.
+"""Exportación unidireccional de snapshots públicos permitidos, sin HTTP ni credenciales.
 
 Artefacto local para análisis de datos; no instala timers/servicios ni arma motores.
 

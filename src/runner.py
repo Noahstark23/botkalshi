@@ -249,6 +249,8 @@ class ProductionRunner:
         BotState.motor5_task_running = True
         try:
             await asyncio.sleep(20)  # dejar que init_db / boot terminen
+            if self._stop_event.is_set():
+                return
             from src.strategies.motor_5_mm.engine import Motor5Engine
             from src.strategies.motor_5_mm.fill_feed import MMFillFeed
 
@@ -268,7 +270,16 @@ class ProductionRunner:
                     fill_feed.attach(self._capture.ws)
                 else:
                     logger.warning("motor5: sin data_capture → fill feed WS no adjuntado")
+            demo_options = {}
+            if self.settings.MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED:
+                from src.clients.kalshi_demo_readonly import KalshiDemoReadOnlyClient
+
+                demo_options = {
+                    "client_factory": KalshiDemoReadOnlyClient,
+                    "demo_football_fee_validation": True,
+                }
             await Motor5Engine(
+                **demo_options,
                 max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
                 series_csv=self.settings.MOTOR_MM_SERIES,
                 experiment_label=self.settings.MOTOR_MM_EXPERIMENT_ID,

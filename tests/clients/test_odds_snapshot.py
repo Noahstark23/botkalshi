@@ -19,6 +19,7 @@ NOW = datetime(2026, 10, 8, 18, tzinfo=UTC)
 FILES = {
     "baseball_mlb": "odds-latest.json",
     "americanfootball_nfl": "odds-americanfootball_nfl-latest.json",
+    "americanfootball_ncaaf": "odds-americanfootball_ncaaf-latest.json",
     "basketball_nba": "odds-basketball_nba-latest.json",
     "icehockey_nhl": "odds-icehockey_nhl-latest.json",
 }

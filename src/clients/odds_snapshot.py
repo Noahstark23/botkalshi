@@ -23,6 +23,7 @@ from src.clients.odds_api import Bookmaker, Market, OddsEvent, Outcome
 SPORT_FILES = {
     "baseball_mlb": "odds-latest.json",
     "americanfootball_nfl": "odds-americanfootball_nfl-latest.json",
+    "americanfootball_ncaaf": "odds-americanfootball_ncaaf-latest.json",
     "basketball_nba": "odds-basketball_nba-latest.json",
     "icehockey_nhl": "odds-icehockey_nhl-latest.json",
 }

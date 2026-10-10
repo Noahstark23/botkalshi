@@ -39,10 +39,28 @@ def mock_runner_settings():
         s.MOTOR_2_SPORTSBOOK_ENABLED = False
         s.MOTOR_3_CLV_ENABLED = False
         s.MOTOR_REST_ENABLED = False
+        s.MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED = False
         s.HEALTH_HOST = "0.0.0.0"
         s.HEALTH_PORT = 8080
         m.return_value = s
         yield s
+
+
+@pytest.mark.asyncio
+async def test_motor5_shutdown_during_startup_does_not_construct_engine(mock_runner_settings):
+    mock_runner_settings.MOTOR_MM_ENABLED = True
+    runner = ProductionRunner()
+
+    async def stop_during_delay(_):
+        runner._stop_event.set()
+
+    with (
+        patch("src.runner.asyncio.sleep", new=stop_during_delay),
+        patch("src.strategies.motor_5_mm.engine.Motor5Engine") as engine,
+    ):
+        await runner._run_motor5_mm()
+    engine.assert_not_called()
+    assert not BotState.motor5_task_running
 
 
 @pytest.mark.asyncio

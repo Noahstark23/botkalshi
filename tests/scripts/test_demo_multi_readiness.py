@@ -8,6 +8,7 @@ import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -33,7 +34,13 @@ def document(*, mismatch=False, books=3, age=60, series=smoke.SERIES):
             if mismatch
             else ("Philadelphia Eagles", "Jacksonville Jaguars")
         )
-    sport = smoke.COHORTS[series]
+    if series == "KXNCAAFGAME":
+        teams = (
+            ("Stanford Cardinal", "Notre Dame Fighting Irish")
+            if mismatch
+            else ("Georgia Bulldogs", "Alabama Crimson Tide")
+        )
+    sport = smoke.SPORT_BY_SERIES[series]
     return {
         "fetched_at": (now - timedelta(seconds=age)).isoformat(),
         "sport": sport,
@@ -74,9 +81,75 @@ def source_file(tmp_path, payload):
     return directory
 
 
-def configured(isolated_settings, series=smoke.SERIES):
+def configured(isolated_settings, series=smoke.SERIES, *, football_fees=False):
     credentials, workdir = isolated_settings
-    return smoke.configure(workdir, credentials, 18765, workdir.resolve(), series)
+    return smoke.configure(
+        workdir, credentials, 18765, workdir.resolve(), series, football_fees=football_fees
+    )
+
+
+@pytest.mark.parametrize("series", smoke.FOOTBALL_COHORTS)
+def test_football_profile_and_report_are_distinct(isolated_settings, series):
+    from src.utils.config import Settings
+
+    cfg = configured(isolated_settings, series, football_fees=True)
+    assert cfg.MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED
+    assert cfg.MOTOR2_SERIES == cfg.MOTOR_MM_SERIES == series
+    assert smoke.FOOTBALL_COHORTS[series] == cfg.ODDS_API_SPORT_KEYS
+    assert Settings.model_fields["MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED"].default is False
+    report = smoke.Evidence(series=series, football_fees=True).report()
+    raw = json.dumps(report).encode()
+    assert smoke.checked_report(raw, series=series, football_fees=True) == report
+    assert report["fee_metric"] == smoke.FOOTBALL_METRIC
+    assert not report["strategy_readiness"] and not report["execution_validated"]
+    with pytest.raises(ValueError):
+        smoke.checked_report(raw, series=series)
+
+
+@pytest.mark.parametrize("series", smoke.FOOTBALL_COHORTS)
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"KALSHI_ENV": "production"},
+        {"MOTOR_MM_DEMO_READONLY_ENABLED": False},
+        {"EXPERIMENT_DYNAMIC_MULTI_ENABLED": False},
+        {"MOTOR_MM_ENABLED": False},
+        {"MOTOR2_SERIES": "KXMLBGAME"},
+        {"MOTOR_MM_SERIES": "KXMLBGAME"},
+        {"ODDS_API_SPORT_KEYS": "americanfootball_nfl,americanfootball_ncaaf"},
+        *[
+            {name: True}
+            for name in (
+                "TRADING_ENABLED",
+                "MOTOR_1_EXECUTION_ENABLED",
+                "MOTOR_2_ENTRY_EXECUTION_ENABLED",
+                "MOTOR_2_EXECUTION_ENABLED",
+                "MOTOR_3_EXECUTION_ENABLED",
+                "MOTOR_REST_EXECUTION_ENABLED",
+                "MOTOR_MM_EXECUTION_ENABLED",
+            )
+        ],
+    ],
+)
+def test_football_profile_rejects_other_modes(isolated_settings, series, changes):
+    from src.utils.config import Settings
+
+    fields = configured(isolated_settings, series, football_fees=True).model_dump()
+    fields.update(changes)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **fields)
+
+
+@pytest.mark.parametrize(
+    "series,football_fees", [("KXNCAAFGAME", False), ("KXMLBGAME", True), ("KXNFLGAME", "yes")]
+)
+def test_invalid_cohort_before_reading_credentials(monkeypatch, tmp_path, series, football_fees):
+    def forbidden(*args):
+        pytest.fail("credentials must not be read")
+
+    monkeypatch.setattr(smoke.base, "configure", forbidden)
+    with pytest.raises(ValueError, match="INVALID_READONLY_COHORT"):
+        smoke.configure(tmp_path, tmp_path, 18765, tmp_path, series, football_fees=football_fees)
 
 
 @pytest.mark.parametrize("series", smoke.COHORTS)
@@ -220,15 +293,60 @@ async def test_expired_or_future_snapshot_fails_before_credentials_or_network(tm
     assert not evidence.snapshot_checked and not evidence.http_attempts
 
 
-def test_default_plan_does_not_load_snapshots_or_credentials(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["--series", "KXNFLGAME", "--football-fees"],
+        ["--series", "KXNCAAFGAME", "--football-fees"],
+    ],
+)
+def test_default_plan_does_not_load_snapshots_or_credentials(monkeypatch, capsys, argv):
     monkeypatch.setattr(smoke, "worker", lambda *args: pytest.fail("worker not allowed"))
     monkeypatch.setattr(
         subprocess, "run", lambda *args, **kwargs: pytest.fail("subprocess not allowed")
     )
-    assert smoke.main([]) == 0
+    assert smoke.main(argv) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["status"] == "PLAN_ONLY" and not plan["credentials_read"]
     assert not plan["execution_validated"]
+
+
+@pytest.mark.parametrize("series", smoke.FOOTBALL_COHORTS)
+def test_parent_passes_football_mode_and_verifies_worker_report(
+    monkeypatch, tmp_path, capsys, series
+):
+    report = smoke.Evidence(series=series, football_fees=True).report()
+    commands = []
+
+    def child(command, **kwargs):
+        commands.append(command)
+        assert "--football-fees" in command
+        assert command[command.index("--series") + 1] == series
+        assert "-I" in command
+        assert set(kwargs["env"]) == {"PATH", "PYTHONNOUSERSITE", "TZ"}
+        return SimpleNamespace(stdout=json.dumps(report).encode(), returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", child)
+    output = tmp_path / "report.json"
+    assert (
+        smoke.main(
+            [
+                "--run",
+                "--series",
+                series,
+                "--football-fees",
+                "--snapshot-dir",
+                str(tmp_path.resolve()),
+                "--report",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert len(commands) == 1
+    assert json.loads(output.read_text()) == report
+    assert json.loads(capsys.readouterr().out) == report
 
 
 def test_report_rejects_secret_text_in_any_extended_field():
@@ -256,9 +374,12 @@ def test_report_rejects_secret_text_in_any_extended_field():
         ("quadratic_fee", False),
     ],
 )
-@pytest.mark.parametrize("series", smoke.COHORTS)
+@pytest.mark.parametrize(
+    "series,football_fees",
+    [(s, False) for s in smoke.COHORTS] + [(s, True) for s in smoke.FOOTBALL_COHORTS],
+)
 async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
-    isolated_settings, monkeypatch, tmp_path, case, accept, series
+    isolated_settings, monkeypatch, tmp_path, case, accept, series, football_fees
 ):
     """ProductionRunner.run real + HTTP/WS falsos; no es una observación conectada."""
     import websockets
@@ -275,18 +396,23 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
     source = source_file(tmp_path, payload)
     credentials, work = isolated_settings
     kickoff = datetime.fromisoformat(payload["events"][0]["commence_time"])
-    event_id = f"{series}-{kickoff:%y%b%d}PHINY".upper()
+    pair = {"KXMLBGAME": "PHINY", "KXNFLGAME": "PHIJAC", "KXNCAAFGAME": "UGAALA"}[series]
+    # El ticker usa fecha ET; cerca de medianoche UTC puede ser otro día.
+    event_day = kickoff.astimezone(ZoneInfo("America/New_York"))
+    event_id = f"{series}-{event_day:%y%b%d}{pair}".upper()
     # NFL selecciona un evento concreto; MLB conserva la ruta de catálogo acotado.
-    target = event_id if series == "KXNFLGAME" else None
-    evidence = smoke.Evidence(series=series, event_ticker=target)
+    target = event_id if series in smoke.FOOTBALL_COHORTS else None
+    evidence = smoke.Evidence(series=series, event_ticker=target, football_fees=football_fees)
     snapshot = await smoke.prepare_snapshot(source, work.resolve(), evidence)
-    smoke.configure(work, credentials, 18765, snapshot, series)
+    smoke.configure(work, credentials, 18765, snapshot, series, football_fees=football_fees)
     event = {"event_ticker": event_id, "series_ticker": series}
     teams = (
         (("PHI", "Philadelphia Eagles"), ("JAC", "Jacksonville Jaguars"))
         if series == "KXNFLGAME"
         else (("PHI", "Philadelphia Phillies"), ("NYM", "New York Mets"))
     )
+    if series == "KXNCAAFGAME":
+        teams = (("UGA", "Georgia Bulldogs"), ("ALA", "Alabama Crimson Tide"))
     markets = [
         {
             "ticker": f"{event_id}-{suffix}",
@@ -317,8 +443,11 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
         elif "/series/" in path:
             body = {
                 "series": {
+                    "ticker": series,
                     "fee_type": (
-                        "quadratic" if case == "quadratic_fee" else "quadratic_with_maker_fees"
+                        "quadratic"
+                        if football_fees or case == "quadratic_fee"
+                        else "quadratic_with_maker_fees"
                     ),
                     "fee_multiplier": 2 if case == "bad_fee" else (1 if target else 0.5),
                 }
@@ -386,13 +515,14 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
     monkeypatch.setattr(websockets, "connect", fake_connect)
     monkeypatch.setattr(asyncio, "sleep", accelerated_sleep)
     monkeypatch.setattr(Motor1Engine, "LOOP_INTERVAL_SEC", 0.005)
-    monkeypatch.setattr(Motor5Engine, "LOOP_INTERVAL_SEC", 0.12)
+    # Dar margen al arranque TLS/SQLite bajo carga sin consumir el presupuesto GET.
+    monkeypatch.setattr(Motor5Engine, "LOOP_INTERVAL_SEC", 0.35)
     monkeypatch.setattr(ProductionRunner, "_run_health_server", local_health)
     with (
         smoke.base.network_guards(evidence, allowed_ips={"192.0.2.1"}),
         smoke.instrumentation(evidence),
     ):
-        result = await smoke.run_runner(1.5, evidence)
+        result = await smoke.run_runner(5, evidence)
     assert result["services_started"] == sorted(smoke.SERVICES), result
     assert result["counts"]["m2_cycles"] == 1
     assert result["counts"]["m2_exit_cycles"] > 0
@@ -402,15 +532,24 @@ async def test_real_runner_demo_snapshot_to_m2_fair_to_m5_shadow(
     assert (result["counts"]["fair_items"] > 0) == (
         case in {"matching", "bad_fee", "quadratic_fee"}
     )
-    assert (result["counts"]["m5_skip_fee_policy"] > 0) == (case in {"bad_fee", "quadratic_fee"})
+    assert (result["counts"]["m5_skip_fee_policy"] > 0) == (
+        case == "bad_fee" or case == "quadratic_fee" and not football_fees
+    )
+    accept = accept or (case == "quadratic_fee" and football_fees)
     assert (result["counts"]["shadow_quotes"] > 0) == accept
     assert result["status"] == ("HYBRID_READ_ONLY" if accept else "INCOMPLETE"), result
     assert not result["execution_validated"] and not result["source_authenticity_verified"]
-    assert result["mode"] == "HYBRID_READ_ONLY" and result["fee_metric"] == smoke.METRIC
+    assert result["mode"] == "HYBRID_READ_ONLY"
+    assert result["fee_metric"] == (smoke.FOOTBALL_METRIC if football_fees else smoke.METRIC)
     assert all(
         request.method == "GET" and request.url.host == smoke.base.HOST for request in requests
     )
-    assert smoke.checked_report(json.dumps(result).encode(), series, target) == result
+    assert (
+        smoke.checked_report(
+            json.dumps(result).encode(), series, target, football_fees=football_fees
+        )
+        == result
+    )
 
 
 @pytest.mark.parametrize("case", ["series", "sport", "discovery", "event"])

@@ -49,7 +49,7 @@ async def run(directories, **kwargs):
     return await export.export_snapshots(*directories, clock=lambda: NOW, **kwargs)
 
 
-async def test_only_four_public_snapshots_are_exported_and_readable(directories):
+async def test_only_allowlisted_public_snapshots_are_exported_and_readable(directories):
     source, destination = directories
     (source / "simulation-bank.sqlite3").write_bytes(b"DO_NOT_COPY_PRIVATE_DB")
     (source / "odds-api-key").write_text("DO_NOT_COPY_FAKE_KEY")
@@ -230,7 +230,7 @@ async def test_atomic_publish_fsyncs_files_and_directory_and_cleans_temporary(
 
     monkeypatch.setattr(os, "fsync", track)
     assert (await run(directories))["status"] == "OK"
-    assert synced.count(True) == synced.count(False) == 4
+    assert synced.count(True) == synced.count(False) == len(FILES)
     assert not list(directories[1].glob(".odds-export-*"))
 
 

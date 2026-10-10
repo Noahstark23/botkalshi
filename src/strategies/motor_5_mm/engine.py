@@ -204,7 +204,7 @@ class Motor5Engine:
                 raise ValueError("tarifas fútbol Demo exigen cliente de lectura explícito")
             if self._allowed_series not in ({"KXNFLGAME"}, {"KXNCAAFGAME"}):
                 raise ValueError("tarifas fútbol Demo exigen una serie de fútbol revisada")
-            # Opt-in local adicional: no está conectado al runner ni a env vars.
+            # Opt-in adicional del runner sólo Demo; su factory no expone órdenes.
             self.F1_METRIC_VERSION = "demo-readonly-v2-fee-schedule"
         self._fair_min_books = fair_min_books
         self._fair_max_book_age_min = fair_max_book_age_min

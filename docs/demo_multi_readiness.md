@@ -17,7 +17,8 @@ WS, 30 comandos WS, 5.000 frames y 20 mercados. El padre tiene timeout adicional
 y verifica un esquema cerrado del informe antes de guardarlo.
 
 Los datos de Odds provienen de un directorio local explícito. Se copia una sola
-versión de `odds-latest.json` (MLB) o `odds-americanfootball_nfl-latest.json` (NFL),
+versión de `odds-latest.json` (MLB), `odds-americanfootball_nfl-latest.json` (NFL)
+o `odds-americanfootball_ncaaf-latest.json` (NCAA),
 con sus bytes y fechas originales, a la carpeta
 temporal del worker. La frescura máxima del archivo y de sus libros es 600s;
 el fair de M5 mantiene TTL de 360s. Un archivo copiado recientemente puede estar
@@ -34,9 +35,36 @@ python -I scripts/demo_multi_readiness.py --run --seconds 90 \
 `--series KXNFLGAME` permite una cohorte NFL exclusivamente en Demo de lectura.
 La excepción conserva los topes del perfil conjunto, exige el deporte exacto
 `americanfootball_nfl` y mantiene apagadas todas las ejecuciones. El perfil
-conjunto de producción continúa limitado a MLB. Universitario no está incorporado
-al matcher ni a los snapshots locales: su presencia en el catálogo no acredita
-compatibilidad con M2/M5.
+conjunto de producción continúa limitado a MLB.
+
+Desde el candidato del 10 de octubre, `--football-fees` permite probar las tarifas
+NFL/NCAA de Demo ya soportadas por `SeriesFeePolicy`. Requiere exactamente
+`--series KXNFLGAME` o `--series KXNCAAFGAME`, con el deporte correspondiente.
+NCAA requiere este argumento; no puede heredar NFL ni usar el archivo de MLB.
+El runner conecta un cliente independiente `KalshiDemoReadOnlyClient` para M5:
+sólo cuatro rutas GET, host Demo fijo, sin métodos de órdenes, reintentos,
+proxies ni redirecciones. Cada respuesta tiene límite de 2 MB y 5 segundos;
+el presupuesto HTTP global del harness sigue siendo 60 intentos.
+
+Esta ruta exige además `MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED=true` en el entorno
+temporal creado por el harness. Su valor por defecto es falso. Settings rechaza
+producción, cualquier ejecución, perfil conjunto deshabilitado o ligas mezcladas.
+No es una configuración para un servicio permanente: es una validación acotada.
+El informe usa esquema `demo-multi-readiness-v3` y métrica
+`demo-readonly-v2-fee-schedule`. El padre rechaza informes de otra modalidad.
+
+Estos comandos sólo muestran el plan, sin red ni credenciales:
+
+```sh
+python -I scripts/demo_multi_readiness.py --series KXNFLGAME --football-fees
+python -I scripts/demo_multi_readiness.py --series KXNCAAFGAME --football-fees
+```
+
+Para el ensayo conectado de lectura se necesitan snapshot fresco y evento Demo
+coherente. Las reglas/versiones contractuales continúan siendo un control aparte;
+el informe mantiene `payoff_equivalence_verified=false`,
+`strategy_readiness=false` y `execution_validated=false` incluso si completa
+el recorrido. Las propuestas shadow no son órdenes ni beneficio observado.
 
 Opcionalmente, `--event-ticker KXNFLGAME-26OCT11PHIJAC` limita el ensayo a un
 evento identificado previamente en Demo. Se obtiene su metadata por GET y se
@@ -79,6 +107,9 @@ los rechazos por fecha, casas, fees y restricciones de ejecución. Son evidencia
 offline y se contabilizan por separado del ensayo conectado anterior.
 
 ## Cohorte NFL del 9 de octubre de 2026, 17:35 UTC
+
+Observación histórica, anterior al cableado de tarifas Demo de fútbol y a la
+corrección del matcher por deporte. No describe el estado actual del código.
 
 Se seleccionó `KXNFLGAME-26OCT11PHIJAC`, identificado en el catálogo público Demo.
 La prueba de 90s arrancó los siete servicios, obtuvo nueve GET HTTP 200,

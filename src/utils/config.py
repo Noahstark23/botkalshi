@@ -593,6 +593,10 @@ class Settings(BaseSettings):
         default=False,
         description="Validación Demo exclusivamente shadow; jamás habilita ejecutores.",
     )
+    MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED: bool = Field(
+        default=False,
+        description="Validación acotada NFL/NCAAF Demo con puerto GET-only; exige perfil conjunto sin órdenes.",
+    )
     MOTOR_MM_SERIES: str = Field(
         default="KXMLBGAME",
         description="CSV de series admitidas en la cohorte M5; F1-v2 comienza solo con MLB",
@@ -1225,7 +1229,14 @@ class Settings(BaseSettings):
                 and self.MOTOR2_SERIES == self.MOTOR_MM_SERIES == "KXNFLGAME"
                 and self.ODDS_API_SPORT_KEYS == "americanfootball_nfl"
             )
-            if not demo_nfl_readonly and (
+            demo_college_readonly = (
+                self.KALSHI_ENV == "demo"
+                and self.MOTOR_MM_DEMO_READONLY_ENABLED
+                and self.MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED
+                and self.MOTOR2_SERIES == self.MOTOR_MM_SERIES == "KXNCAAFGAME"
+                and self.ODDS_API_SPORT_KEYS == "americanfootball_ncaaf"
+            )
+            if not (demo_nfl_readonly or demo_college_readonly) and (
                 self.MOTOR2_SERIES != "KXMLBGAME" or self.MOTOR_MM_SERIES != "KXMLBGAME"
             ):
                 problems.append("MOTOR2_SERIES=MOTOR_MM_SERIES=KXMLBGAME")
@@ -1289,6 +1300,21 @@ class Settings(BaseSettings):
         cero quotes indefinidamente y ninguna señal operacional de que el experimento no
         existía. F1 es cero órdenes, pero sus datos sí deben ser reproducibles.
         """
+        football_sports = {
+            "KXNFLGAME": "americanfootball_nfl",
+            "KXNCAAFGAME": "americanfootball_ncaaf",
+        }
+        if self.MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED and (
+            not self.MOTOR_MM_DEMO_READONLY_ENABLED
+            or not self.EXPERIMENT_DYNAMIC_MULTI_ENABLED
+            or not self.MOTOR_MM_ENABLED
+            or self.MOTOR2_SERIES != self.MOTOR_MM_SERIES
+            or self.MOTOR_MM_SERIES not in football_sports
+            or football_sports.get(self.MOTOR_MM_SERIES) != self.ODDS_API_SPORT_KEYS
+        ):
+            raise ValueError(
+                "Tarifas fútbol Demo requieren perfil conjunto read-only y una liga exacta"
+            )
         if self.MOTOR_MM_DEMO_READONLY_ENABLED:
             prohibited = (
                 "TRADING_ENABLED",
@@ -1338,6 +1364,8 @@ class Settings(BaseSettings):
         else:
             series = next(iter(mm_series))
             required_prefixes = _M5_SERIES_SPORT_PREFIXES.get(series)
+            if self.MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED:
+                required_prefixes = (football_sports[series],)
             if required_prefixes is None:
                 problems.append(f"serie {series} sin onboarding M2/M5 validado")
             else:

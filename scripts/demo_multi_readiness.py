@@ -35,7 +35,10 @@ from scripts import demo_runner_readiness as base  # noqa: E402
 SERVICES = base.REQUIRED_SERVICES | {"motor2_shadow", "motor2_exits", "motor5_mm", "position_marks"}
 SERIES = "KXMLBGAME"
 COHORTS = {"KXMLBGAME": "baseball_mlb", "KXNFLGAME": "americanfootball_nfl"}
+FOOTBALL_COHORTS = {"KXNFLGAME": "americanfootball_nfl", "KXNCAAFGAME": "americanfootball_ncaaf"}
+SPORT_BY_SERIES = {**COHORTS, **FOOTBALL_COHORTS}
 METRIC = "demo-readonly-v1-bbo-depth"
+FOOTBALL_METRIC = "demo-readonly-v2-fee-schedule"
 EXTRA_BLOCKS = {"SNAPSHOT_PREFLIGHT", "WORKER_ERROR", "UNEXPECTED_FINANCIAL_LEDGER"}
 
 
@@ -43,6 +46,7 @@ EXTRA_BLOCKS = {"SNAPSHOT_PREFLIGHT", "WORKER_ERROR", "UNEXPECTED_FINANCIAL_LEDG
 class Evidence(base.Evidence):
     series: str = SERIES
     event_ticker: str | None = None
+    football_fees: bool = False
     m2_cycles: int = 0
     m2_exit_cycles: int = 0
     m5_cycles: int = 0
@@ -62,6 +66,9 @@ class Evidence(base.Evidence):
     snapshot_events: int = 0
     snapshot_checked: bool = False
     error_type: str | None = None
+
+    def __post_init__(self):
+        validate_cohort(self.series, self.football_fees)
 
     def http(self, method, url):
         parsed = urlsplit(str(url))
@@ -87,10 +94,10 @@ class Evidence(base.Evidence):
             financial_ledger_empty=self.ledger_checked and self.financial_rows == 0,
         )
         value.update(
-            schema="demo-multi-readiness-v2",
+            schema="demo-multi-readiness-v3" if self.football_fees else "demo-multi-readiness-v2",
             selection={
                 "series": self.series,
-                "sport_key": COHORTS[self.series],
+                "sport_key": SPORT_BY_SERIES[self.series],
                 "event_ticker": self.event_ticker,
                 "discovery": "explicit_event" if self.event_ticker else "catalog_first_page",
             },
@@ -102,7 +109,7 @@ class Evidence(base.Evidence):
             payoff_equivalence_verified=False,
             strategy_readiness=False,
             execution_validated=False,
-            fee_metric=METRIC,
+            fee_metric=FOOTBALL_METRIC if self.football_fees else METRIC,
             error_type=self.error_type,
             snapshot={
                 "kind": "LOCAL_SNAPSHOT_UNVERIFIED",
@@ -132,12 +139,19 @@ class Evidence(base.Evidence):
         return value
 
 
+def validate_cohort(series, football_fees):
+    if type(football_fees) is not bool or series not in (
+        FOOTBALL_COHORTS if football_fees else COHORTS
+    ):
+        raise ValueError("INVALID_READONLY_COHORT")
+
+
 async def prepare_snapshot(source: Path, workdir: Path, evidence: Evidence) -> Path:
     """Copia exactamente una versión acotada, sin alterar ninguna fecha del payload."""
     from src.clients.odds_snapshot import SPORT_FILES, OddsSnapshotClient, _timestamp
 
     client = OddsSnapshotClient(source)
-    sport = COHORTS[evidence.series]
+    sport = SPORT_BY_SERIES[evidence.series]
     filename = SPORT_FILES[sport]
     raw = client._read(filename)
     evidence.snapshot_sha256 = hashlib.sha256(raw).hexdigest()
@@ -166,10 +180,19 @@ async def prepare_snapshot(source: Path, workdir: Path, evidence: Evidence) -> P
     return destination
 
 
-def configure(workdir: Path, credentials: Path, health_port: int, snapshot: Path, series=SERIES):
+def configure(
+    workdir: Path,
+    credentials: Path,
+    health_port: int,
+    snapshot: Path,
+    series=SERIES,
+    *,
+    football_fees=False,
+):
     from src.utils.config import get_settings, reset_settings_for_testing
 
-    sport = COHORTS[series]
+    validate_cohort(series, football_fees)  # Antes de leer credenciales.
+    sport = SPORT_BY_SERIES[series]
     base.configure(workdir, credentials, health_port)
     os.environ.update(
         EXPERIMENT_DYNAMIC_MULTI_ENABLED="true",
@@ -202,6 +225,7 @@ def configure(workdir: Path, credentials: Path, health_port: int, snapshot: Path
         MOTOR_2_ONE_BET_PER_EVENT="true",
         MOTOR_MM_ENABLED="true",
         MOTOR_MM_DEMO_READONLY_ENABLED="true",
+        MOTOR_MM_DEMO_FOOTBALL_FEES_ENABLED=str(football_fees).lower(),
         MOTOR_MM_SERIES=series,
         MOTOR_MM_MAX_TICKERS="2",
         MOTOR_MM_EXPERIMENT_ID="demo-readonly-hybrid",
@@ -299,7 +323,9 @@ async def run_runner(seconds: float, evidence: Evidence):
     return evidence.report()
 
 
-def worker(seconds: int, snapshot_dir: Path, series=SERIES, event_ticker=None):
+def worker(
+    seconds: int, snapshot_dir: Path, series=SERIES, event_ticker=None, *, football_fees=False
+):
     # Aislamiento previo a imports del bot y a cualquier lectura de credenciales.
     credentials = Path.home() / ".config/botkalshi/demo"
     os.environ.clear()
@@ -310,7 +336,7 @@ def worker(seconds: int, snapshot_dir: Path, series=SERIES, event_ticker=None):
 
     Settings.model_config["env_file"] = None
     logger.remove()
-    evidence = Evidence(series=series, event_ticker=event_ticker)
+    evidence = Evidence(series=series, event_ticker=event_ticker, football_fees=football_fees)
     logger.add(lambda _message: setattr(evidence, "error_seen", True), level="ERROR")
     stdout_fd, stderr_fd = os.dup(1), os.dup(2)
     try:
@@ -332,7 +358,7 @@ def worker(seconds: int, snapshot_dir: Path, series=SERIES, event_ticker=None):
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))
                     port = listener.getsockname()[1]
-                configure(workdir, credentials, port, snapshot, series)
+                configure(workdir, credentials, port, snapshot, series, football_fees=football_fees)
                 with base.network_guards(evidence), instrumentation(evidence):
                     return asyncio.run(run_runner(seconds, evidence))
             except Exception as exc:
@@ -350,12 +376,14 @@ def worker(seconds: int, snapshot_dir: Path, series=SERIES, event_ticker=None):
         os.close(stderr_fd)
 
 
-def checked_report(raw: bytes, series=SERIES, event_ticker=None):
+def checked_report(raw: bytes, series=SERIES, event_ticker=None, *, football_fees=False):
     """Sólo enums/counters/hash/fecha conocidos; ningún texto o payload del worker."""
     if len(raw) > 16384:
         raise ValueError("INVALID_WORKER_REPORT")
     value = json.loads(raw)
-    template = Evidence(series=series, event_ticker=event_ticker).report()
+    template = Evidence(
+        series=series, event_ticker=event_ticker, football_fees=football_fees
+    ).report()
     if type(value) is not dict or set(value) != set(template):
         raise ValueError("INVALID_WORKER_REPORT")
     for key in (
@@ -449,12 +477,21 @@ def main(argv=None):
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--seconds", type=int, default=90)
     parser.add_argument("--snapshot-dir", type=Path)
-    parser.add_argument("--series", choices=sorted(COHORTS), default=SERIES)
+    parser.add_argument("--series", choices=sorted(SPORT_BY_SERIES), default=SERIES)
+    parser.add_argument(
+        "--football-fees",
+        action="store_true",
+        help="Tarifas NFL/NCAAF Demo, cliente GET-only; ninguna ejecución",
+    )
     parser.add_argument(
         "--event-ticker", help="Un evento Demo explícito; no valida discovery amplio"
     )
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
+    try:
+        validate_cohort(args.series, args.football_fees)
+    except ValueError:
+        parser.error("football-fees requiere NFL/NCAAF; NCAA requiere este opt-in")
     if not 60 <= args.seconds <= 90:
         parser.error("seconds debe estar entre 60 y 90")
     if args.event_ticker is not None and (
@@ -476,19 +513,30 @@ def main(argv=None):
                     "credentials_read": False,
                     "snapshot_required": True,
                     "execution_validated": False,
+                    "football_fees": args.football_fees,
                     "selection": Evidence(
-                        series=args.series, event_ticker=args.event_ticker
+                        series=args.series,
+                        event_ticker=args.event_ticker,
+                        football_fees=args.football_fees,
                     ).report()["selection"],
                 }
             )
         )
         return 0
-    evidence = Evidence(series=args.series, event_ticker=args.event_ticker)
+    evidence = Evidence(
+        series=args.series, event_ticker=args.event_ticker, football_fees=args.football_fees
+    )
     try:
         if args.snapshot_dir is None or not args.snapshot_dir.is_absolute():
             raise ValueError("ABSOLUTE_SNAPSHOT_REQUIRED")
         if args.worker:
-            result = worker(args.seconds, args.snapshot_dir, args.series, args.event_ticker)
+            result = worker(
+                args.seconds,
+                args.snapshot_dir,
+                args.series,
+                args.event_ticker,
+                football_fees=args.football_fees,
+            )
         else:
             if args.report is None or args.report.exists():
                 raise ValueError("FRESH_REPORT_PATH_REQUIRED")
@@ -506,6 +554,8 @@ def main(argv=None):
             ]
             if args.event_ticker:
                 command.extend(["--event-ticker", args.event_ticker])
+            if args.football_fees:
+                command.append("--football-fees")
             completed = subprocess.run(
                 command,
                 env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "TZ": "UTC"},
@@ -515,7 +565,9 @@ def main(argv=None):
                 timeout=args.seconds + 45,
                 check=False,
             )
-            result = checked_report(completed.stdout, args.series, args.event_ticker)
+            result = checked_report(
+                completed.stdout, args.series, args.event_ticker, football_fees=args.football_fees
+            )
             if completed.returncode != (0 if result["status"] == "HYBRID_READ_ONLY" else 1):
                 raise ValueError("WORKER_EXIT_MISMATCH")
     except Exception as exc:
