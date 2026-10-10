@@ -34,8 +34,36 @@ el fair de M2 ni habilita M5. No hay cambios en ejecutores, flags ni producción
 
 Las fuentes y sus hashes están en el informe local de evidencias. Las cuotas
 regionales `us` archivadas no contienen el vínculo a estado/versión contractual.
-De once casas por partido con cuotas, dos tienen fichas ampliadas por liga, una
-sigue parcial y ocho no revisadas. Eso no demuestra equivalencia ni ventaja.
+La ampliación investigó las once casas: hay nueve fichas parciales para NFL y
+ocho para NCAA. Eso no demuestra equivalencia ni ventaja. Se conservan estos
+alcances, sin extrapolar reglas de otros tipos de apuesta:
+
+- [BetOnline](https://help.betonline.ag/en/articles/185191-football-rules) y
+  [LowVig](https://help.lowvig.ag/en/articles/204902-football-rules): incluyen OT,
+  requieren 55 minutos y conservan fecha y sede previstas. La regla de 48h que
+  aparece al final pertenece a fútbol australiano. Empate de moneyline queda
+  desconocido; teasers y props no lo resuelven. LowVig se leyó con el lector web;
+  la descarga directa dio 403 y no se inventó un hash de bytes archivados.
+- [Bovada](https://www.bovada.lv/help/common-faq/football-betting-rules): incluye
+  OT y considera oficial tras 50 minutos. La tolerancia de 48h no precisa allí
+  si significa empezar o completar; no se iguala a la ventana de Kalshi.
+- [BetUS](https://www.betus.com.pa/rules/sportsbook/football/): incluye OT,
+  exige fecha/sede originales y 55 minutos, salvo apuestas ya resueltas. Disputas
+  posteriores que cambian el resultado no alteran la liquidación descrita.
+- [BetMGM, ayuda NFL](https://sports.betmgm.com/en/blog/nfl/what-happens-in-nfl-betting-for-a-tie-game-bm06/):
+  devolución por empate en moneyline 2-way. No completa un contrato estatal ni
+  se hereda a NCAA.
+- [BetRivers NY](https://ny.betrivers.com/?page=eula&tos=SPORTSBOOKRULES),
+  documento 13-ene-2026 leído en el DOM público: OT incluida, devolución en empate,
+  semana jueves–miércoles; exige menos de cinco minutos restantes, con excepción
+  NCAA de duración abreviada acordada y resultados ya determinados. Se leyeron
+  también cancelación, forfeit, correcciones y replay. Fuente visible sin copia
+  de bytes original; estado y versión de la cuota siguen sin verificar.
+- [MyBookie](https://www.mybookie.ag/sportsbook-rules/) remite a reglas específicas
+  de deporte; su norma general no basta para establecer moneyline americano.
+  [Caesars Indiana](https://www.caesars.com/content/dam/uin/house-rules/uin-winners-circle-house-rules.pdf)
+  es una referencia de 2022, no evidencia de la versión aplicable a estas cuotas.
+  Ambas conservan estado no revisado contractualmente y motivo explícito.
 
 ## Captura de liquidación en el simulador
 

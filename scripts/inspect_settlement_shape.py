@@ -25,7 +25,6 @@ un evento cuyo kickoff ya pasó.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 
 from src.clients.kalshi_rest import KalshiRestClient

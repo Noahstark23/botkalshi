@@ -151,6 +151,90 @@ FANDUEL_NJ = RuleProfile(
 )
 FANDUEL_NJ_NCAAF = replace(FANDUEL_NJ, league="ncaaf", postponement=None)
 
+# Referencias parciales: los párrafos sobre teasers, props o fútbol australiano
+# NO completan el empate de moneyline americano. No hay equivalencia por omisión.
+BETONLINE_FOOTBALL = RuleProfile(
+    source_url="https://help.betonline.ag/en/articles/185191-football-rules",
+    jurisdiction="SITE_UNSPECIFIED",
+    overtime="included",
+    draw=None,
+    postponement="scheduled_date_and_original_venue_required",
+    cancellation=None,
+    suspension="before_55min_no_action",
+    league="nfl",
+    phase="regular_season",
+    market_period="full_game_2way",
+    source_sha256="e8d2b66f6a4f2d6609bdf7d5cb532fb2705aac3c0c610696339b9f0ec6470222",
+)
+LOWVIG_FOOTBALL = replace(
+    BETONLINE_FOOTBALL,
+    source_url="https://help.lowvig.ag/en/articles/204902-football-rules",
+    # Lectura web disponible; descarga directa 403. No reutilizar hash de otra casa.
+    source_sha256=None,
+)
+BOVADA_FOOTBALL = RuleProfile(
+    source_url="https://www.bovada.lv/help/common-faq/football-betting-rules",
+    jurisdiction="SITE_UNSPECIFIED",
+    overtime="included",
+    draw=None,
+    # 'Played within 48h' no precisa inicio vs final: no igualar al inicio de Kalshi.
+    postponement="played_within_48h_start_or_completion_unspecified",
+    cancellation=None,
+    suspension="official_after_50min",
+    league="nfl",
+    phase="regular_season",
+    market_period="full_game_2way",
+    source_sha256="04c0a49c6785309983cea31e69d062aa941086bdfba6f5f76859167d87d04060",
+)
+BETUS_FOOTBALL = RuleProfile(
+    source_url="https://www.betus.com.pa/rules/sportsbook/football/",
+    jurisdiction="SITE_UNSPECIFIED",
+    overtime="included",
+    draw=None,
+    postponement="scheduled_date_and_original_venue_required",
+    cancellation=None,
+    suspension="before_55min_refund_except_already_graded",
+    result_corrections="ignore_later_team_disputes_altering_final_result",
+    league="nfl",
+    phase="regular_season",
+    market_period="full_game_2way",
+    source_sha256="7ec122e138eef4d243cc8420600e113fa7147e3393934e64521908c018a47423",
+)
+BETMGM_NFL_HELP = RuleProfile(
+    source_url="https://sports.betmgm.com/en/blog/nfl/what-happens-in-nfl-betting-for-a-tie-game-bm06/",
+    jurisdiction="US_UNSPECIFIED",
+    overtime=None,
+    draw="refund_stake",
+    postponement=None,
+    cancellation=None,
+    league="nfl",  # Ayuda NFL, no contrato estatal ni evidencia para NCAA.
+    phase="regular_season",
+    market_period="full_game_2way",
+    source_sha256="af9fb64c301077fe78898aad02634d1e35fc854c58920aea8861b7965f7dd7cf",
+)
+BETRIVERS_NY = RuleProfile(
+    source_url="https://ny.betrivers.com/?page=eula&tos=SPORTSBOOKRULES",
+    jurisdiction="NY",
+    overtime="included",
+    draw="refund_stake",  # B.2.8 define moneyline; C.2.1 incluye overtime.
+    postponement="completed_in_week_thursday_wednesday_unless_determined",
+    cancellation="refund_stake",
+    suspension="less_than_5min_remaining_unless_determined",
+    forfeit_before_start="refund_stake",
+    venue_reversal=None,  # Depende de efecto material sobre cuotas y sede neutral.
+    result_corrections="first_official_result_except_clear_verifiable_error",
+    replay_from_start="refund_unless_outcome_already_determined",
+    league="nfl",
+    phase="regular_season",
+    market_period="full_game_2way",
+    # Documento 13-ene-2026 leído en DOM público; bytes de origen no archivados.
+)
+BETRIVERS_NY_NCAAF = replace(
+    BETRIVERS_NY,
+    league="ncaaf",
+    suspension="less_than_5min_remaining_unless_determined_or_agreed_shortened_ncaa_game",
+)
+
 SPORTSBOOK_PROFILES = {
     ("fanatics", "nfl"): FANATICS_MA,
     ("fanatics", "ncaaf"): FANATICS_MA_NCAAF,
@@ -158,6 +242,33 @@ SPORTSBOOK_PROFILES = {
     ("fanduel", "ncaaf"): FANDUEL_NJ_NCAAF,
     ("draftkings", "nfl"): DRAFTKINGS_MONEYLINE_HELP,
     ("draftkings", "ncaaf"): DRAFTKINGS_MONEYLINE_HELP,
+    ("betmgm", "nfl"): BETMGM_NFL_HELP,
+    ("betrivers", "nfl"): BETRIVERS_NY,
+    ("betrivers", "ncaaf"): BETRIVERS_NY_NCAAF,
+}
+for _key, _profile in (
+    ("betonlineag", BETONLINE_FOOTBALL),
+    ("lowvig", LOWVIG_FOOTBALL),
+    ("bovada", BOVADA_FOOTBALL),
+    ("betus", BETUS_FOOTBALL),
+):
+    SPORTSBOOK_PROFILES[(_key, "nfl")] = _profile
+    SPORTSBOOK_PROFILES[(_key, "ncaaf")] = replace(_profile, league="ncaaf")
+
+# Investigar una fuente no equivale a haber establecido el contrato aplicable.
+SOURCE_REVIEW_GAPS = {
+    "mybookieag": {
+        "reference_url": "https://www.mybookie.ag/sportsbook-rules/",
+        "reason": "SPORT_SPECIFIC_MONEYLINE_RULES_NOT_ESTABLISHED",
+    },
+    "williamhill_us": {
+        "reference_url": "https://www.caesars.com/content/dam/uin/house-rules/uin-winners-circle-house-rules.pdf",
+        "reason": "ONLY_HISTORICAL_INDIANA_REFERENCE_2022_CURRENT_VERSION_UNVERIFIED",
+    },
+    "betmgm": {
+        "reference_url": BETMGM_NFL_HELP.source_url,
+        "reason": "NFL_HELP_DOES_NOT_ESTABLISH_NCAAF_RULES",
+    },
 }
 
 # Revisión explícita del texto EXACTO capturado en Demo el 10-oct-2026. Nunca se
@@ -234,6 +345,8 @@ def review_capture_rules(payload, odds):
                 "reviewed_jurisdiction": profile.jurisdiction if profile else None,
                 "reviewed_league": profile.league if profile else None,
                 "source_sha256": profile.source_sha256 if profile else None,
+                "source_bytes_archived": bool(profile and profile.source_sha256),
+                "source_research_gap": SOURCE_REVIEW_GAPS.get(key) if profile is None else None,
                 "quote_jurisdiction": None,
                 **result,
                 "fair_or_signal_authorized": False,

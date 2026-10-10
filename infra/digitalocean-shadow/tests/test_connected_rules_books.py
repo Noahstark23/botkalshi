@@ -128,6 +128,78 @@ def test_fixed_point_depth_is_not_truncated_and_no_fill_is_inferred():
     assert not result["exchange_sequence_verified"]
 
 
+@pytest.mark.parametrize("league,reviewed_count", [("nfl", 9), ("ncaaf", 8)])
+def test_expanded_book_reviews_preserve_scope_provenance_and_disabled_fair(
+    monkeypatch, league, reviewed_count
+):
+    payload, _, odds = fixtures.fixture(league)
+    monkeypatch.setattr(
+        rules,
+        "REVIEWED_RULE_HASHES",
+        {
+            m["ticker"]: hashlib.sha256(
+                (m["rules_primary"] + "\n" + m["rules_secondary"]).encode()
+            ).hexdigest()
+            for m in payload["markets"]
+        },
+    )
+    odds["bookmakers"] = [
+        {"key": key}
+        for key in (
+            "draftkings",
+            "williamhill_us",
+            "fanduel",
+            "betmgm",
+            "bovada",
+            "betus",
+            "mybookieag",
+            "betonlineag",
+            "lowvig",
+            "betrivers",
+            "fanatics",
+        )
+    ]
+    report = rules.review_capture_rules(payload, odds)
+    rows = {r["bookmaker"]: r for r in report["bookmakers"]}
+    assert sum(r["review_status"] != "UNREVIEWED" for r in rows.values()) == reviewed_count
+    for row in rows.values():
+        assert not row["fair_or_signal_authorized"] and not row["execution_authorized"]
+        if row["review_status"] != "UNREVIEWED":
+            assert "QUOTE_RULE_JURISDICTION_UNVERIFIED" in row["blockers"]
+    for key in ("lowvig", "betrivers"):
+        assert rows[key]["source_url"]
+        assert rows[key]["source_sha256"] is None
+        assert not rows[key]["source_bytes_archived"]
+    for key in ("mybookieag", "williamhill_us"):
+        assert rows[key]["source_research_gap"]["reference_url"]
+        assert rows[key]["review_status"] == "UNREVIEWED"
+    assert "QUOTE_RULE_VERSION_UNVERIFIED" in report["blockers"]
+    if league == "ncaaf":
+        assert rows["betmgm"]["source_research_gap"]["reason"].startswith("NFL_HELP")
+
+
+@pytest.mark.parametrize("key", ["betonlineag", "lowvig", "betus", "bovada"])
+@pytest.mark.parametrize("league", ["nfl", "ncaaf"])
+def test_unreviewed_moneyline_draw_never_inherits_teaser_prop_or_australian_rules(key, league):
+    profile = rules.SPORTSBOOK_PROFILES[(key, league)]
+    result = rules.compare_rules(profile, profile, quote_jurisdiction=profile.jurisdiction)
+    assert "draw" in result["missing_dimensions"]
+    assert not result["fair_or_signal_authorized"]
+    if key in ("betonlineag", "lowvig", "betus"):
+        assert profile.postponement == "scheduled_date_and_original_venue_required"
+        assert "48" not in profile.postponement
+
+
+def test_duration_and_ncaa_shortening_exceptions_are_not_erased():
+    assert rules.BOVADA_FOOTBALL.suspension == "official_after_50min"
+    assert "55min" in rules.BETUS_FOOTBALL.suspension
+    assert "less_than_5min" in rules.BETRIVERS_NY.suspension
+    assert "shortened_ncaa" not in rules.BETRIVERS_NY.suspension
+    assert "shortened_ncaa" in rules.BETRIVERS_NY_NCAAF.suspension
+    assert "unspecified" in rules.BOVADA_FOOTBALL.postponement
+    assert ("betmgm", "ncaaf") not in rules.SPORTSBOOK_PROFILES
+
+
 @pytest.mark.parametrize("at", ["2026-10-10T11:59:59Z", "2026-10-10T12:00:11Z"])
 def test_old_or_future_receipt_cannot_be_used(at):
     assert "BOOK_RECEIPT_STALE_OR_FUTURE" in review(book(), at)["blockers"]

@@ -104,7 +104,7 @@ def report(hours: int | None, breakdown: bool) -> int:
         print("     Re-correr este reporte tras una ventana de partidos.")
         return 0
 
-    by_kind = {k: 0 for k in _REST_KINDS}
+    by_kind = dict.fromkeys(_REST_KINDS, 0)
     for r in rows:
         by_kind[r.kind] = by_kind.get(r.kind, 0) + 1
     times = [r.created_at for r in rows if r.created_at]
