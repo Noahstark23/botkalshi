@@ -26,6 +26,7 @@ import football_settlement_review as settlement_review
 import m5_paper_ledger as m5
 import paper_engine
 import paper_replay
+import paper_settlement_snapshot
 import simulation_bank as bank
 from connected_book_review import inspect_book
 
@@ -40,6 +41,15 @@ FIELDS = {
     "m5_observe": {"type", "quote_id", "observation_id", "at", "book"},
     "m5_cancel": {"type", "quote_id", "at"},
     "m5_settle": {"type", "quote_id", "yes_payout_cents"},
+    "settlement_snapshot": {
+        "type",
+        "target",
+        "ticker",
+        "rules_sha256",
+        "market",
+        "observed_at",
+        "quote_id",
+    },
     "football_snapshot": {
         "type",
         "payload",
@@ -84,6 +94,10 @@ def _canonical(event, mode):
         raise StreamError("EVENT_FIELDS_INVALID")
     if (kind == "football_snapshot") != (mode == "CONNECTED_CAPTURE"):
         raise StreamError("EVIDENCE_MODE_CONFLICT")
+    if kind == "settlement_snapshot":
+        # No journaling de una liquidación no final: no deja una línea PENDING
+        # irreversible por confundir determinación/revisión con pago definitivo.
+        paper_settlement_snapshot.review_snapshot(event)
     if kind == "signal" and (
         not isinstance(event.get("signal"), dict) or event["signal"].get("origin") != "M2"
     ):
@@ -107,6 +121,8 @@ def _schema(con):
 
 
 def _dispatch(db, capital, event):
+    if event["type"] == "settlement_snapshot":
+        return paper_settlement_snapshot.apply_to_paper(db, event)
     if event["type"] != "football_snapshot":
         return paper_replay.run(db, capital, [json.dumps(event)])
     hashes = event["source_hashes"]

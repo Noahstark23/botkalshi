@@ -194,9 +194,11 @@ def test_connected_capture_is_recorded_blocked_without_fictional_trade(tmp_path)
     row = result["captures"][0]
     assert row["status"] == "BLOCKED" and row["signals"] == row["fills"] == 0
     assert row["blockers"] == [
+        "CONTRACT_TERMS_VERSION_AT_CAPTURE_UNVERIFIED",
         "KALSHI_RULE_TEXT_NOT_REVIEWED",
         "NO_SPORTSBOOK_QUOTES",
         "NO_USABLE_QUOTES",
+        "QUOTE_RULE_VERSION_UNVERIFIED",
         "SPORTSBOOK_SETTLEMENT_RULES_NOT_PROVIDED",
     ]
     assert result["bank"]["available_usd"] == "100.00"

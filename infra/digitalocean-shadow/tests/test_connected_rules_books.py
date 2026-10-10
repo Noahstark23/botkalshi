@@ -88,6 +88,35 @@ def test_empty_quotes_and_duplicate_bookmaker_never_create_equivalence(monkeypat
         rules.review_capture_rules(payload, odds)
 
 
+@pytest.mark.parametrize("league", ["nfl", "ncaaf"])
+def test_full_reference_terms_close_overtime_and_draw_gaps_without_certifying_feed(
+    monkeypatch, league
+):
+    payload, _, odds = fixtures.fixture(league)
+    monkeypatch.setattr(
+        rules,
+        "REVIEWED_RULE_HASHES",
+        {
+            m["ticker"]: hashlib.sha256(
+                (m["rules_primary"] + "\n" + m["rules_secondary"]).encode()
+            ).hexdigest()
+            for m in payload["markets"]
+        },
+    )
+    odds["bookmakers"] = [{"key": "fanatics"}, {"key": "fanduel"}]
+    report = rules.review_capture_rules(payload, odds)
+    for row in report["bookmakers"]:
+        assert row["dimensions_compared"] == 9
+        assert "overtime" not in row["missing_dimensions"] + row["differences"]
+        assert "draw" in row["differences"]
+        assert "cancellation" in row["differences"]
+        assert row["reviewed_league"] == league
+        assert len(row["source_sha256"]) == 64
+    assert not report["reference_terms_version_at_capture_verified"]
+    assert "QUOTE_RULE_VERSION_UNVERIFIED" in report["blockers"]
+    assert not report["fair_or_signal_authorized"]
+
+
 def test_fixed_point_depth_is_not_truncated_and_no_fill_is_inferred():
     result = review(book())
     assert result["quote_data_usable"]
