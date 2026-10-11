@@ -70,7 +70,10 @@ No reiniciar ni tocar `botkalshi-runtime`, `botkalshi-research` o Coolify.
 
 Referencia de entrega/cursor: [Telegram Bot API getUpdates](https://core.telegram.org/bots/api#getupdates).
 
-Validación del host: systemd255 entrega credenciales descifradas root:grupo-del-servicio
-con modo0440. El lector admite esa combinación exacta; rechaza otro grupo, permisos
-públicos o escritura por grupo. El primer arranque falló antes del polling por una
-validación que sólo admitía0400/0600; se corrigió con regresiones específicas.
+Validación del host: systemd255 entrega credenciales descifradas root:root0440
+con acceso por ACL al usuario del servicio, dentro de un montaje de sólo lectura.
+El lector admite0440 sólo bajo `/run/credentials/<unidad>/telegram-token`, con el
+directorio exacto indicado por systemd y montaje de sólo lectura. Rechaza archivos
+ordinarios0440, escritura por grupo y lectura pública. La primera validación de
+modo y luego la suposición del grupo del servicio fallaron antes de polling. La
+corrección fue comprobada con getMe/getWebhookInfo en el propio host: PREFLIGHT_OK.

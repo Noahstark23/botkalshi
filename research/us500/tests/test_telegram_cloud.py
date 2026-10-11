@@ -12,7 +12,12 @@ from unittest.mock import patch
 
 from us500_control import PaperControl
 from us500_telegram import PaperTelegram, TelegramTransport
-from us500_telegram_cloud import PreflightTransient, load_credential, main
+from us500_telegram_cloud import (
+    PreflightTransient,
+    _systemd_credentials_mount,
+    load_credential,
+    main,
+)
 
 TOKEN = "12345:" + "synthetic-not-a-real-token"
 
@@ -74,12 +79,30 @@ class CloudTests(unittest.TestCase):
             self.read()
         self.assertEqual(self.calls, [])
 
-    def test_systemd_root_service_group_readonly_credential(self):
+    def test_systemd_root_acl_readonly_credential(self):
         metadata = SimpleNamespace(
-            st_mode=0o100440, st_uid=0, st_gid=os.getgid(), st_size=len(TOKEN)
+            st_mode=0o100440, st_uid=0, st_gid=0, st_size=len(TOKEN)
         )
-        with patch("os.fstat", return_value=metadata):
+        with (
+            patch("os.fstat", return_value=metadata),
+            patch("us500_telegram_cloud._systemd_credentials_mount", return_value=True),
+        ):
             self.assertEqual(self.read(), TOKEN)
+
+    def test_group_read_requires_exact_systemd_readonly_mount(self):
+        path = Path("/run/credentials/example.service/telegram-token")
+        with (
+            patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": str(path.parent)}),
+            patch("os.statvfs", return_value=SimpleNamespace(f_flag=os.ST_RDONLY)),
+            patch.object(Path, "is_symlink", return_value=False),
+        ):
+            self.assertTrue(_systemd_credentials_mount(path))
+            self.assertFalse(
+                _systemd_credentials_mount(Path("/tmp/example.service/telegram-token"))
+            )
+            self.assertFalse(_systemd_credentials_mount(path.with_name("other")))
+            with patch("os.statvfs", return_value=SimpleNamespace(f_flag=0)):
+                self.assertFalse(_systemd_credentials_mount(path))
 
     def test_other_group_or_writable_group_is_rejected(self):
         for mode, uid, gid in (
