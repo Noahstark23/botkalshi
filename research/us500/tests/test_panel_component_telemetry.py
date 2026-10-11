@@ -6,7 +6,11 @@ import unittest
 from test_motor_status_readonly import NOW, health, status
 
 from bot_motor_panel import disconnected_detail, overview
-from motor_status_readonly import sanitize_snapshot, status_from_responses
+from motor_status_readonly import (
+    sanitize_snapshot,
+    status_from_responses,
+    unknown_status,
+)
 from runtime_telemetry_contract import RuntimeTelemetry
 
 
@@ -23,6 +27,13 @@ def instrumented():
 
 
 class ComponentPanelTests(unittest.TestCase):
+    def test_unavailable_runtime_does_not_claim_instrumentation_is_absent(self):
+        snapshot = unknown_status(NOW, "UNAVAILABLE")
+        text, _ = disconnected_detail("m6", runtime=snapshot, now_ms=NOW)
+        self.assertIn("sin observación por componente", text)
+        self.assertNotIn("todavía no publica", text)
+        self.assertNotIn("El runtime no expone", text)
+
     def test_old_runtime_remains_usable_and_explicitly_not_instrumented(self):
         snapshot = status_from_responses(health(), status(), now_ms=NOW)
         self.assertTrue(snapshot["fresh"])

@@ -162,7 +162,7 @@ def unknown_status(now_ms, reason="UNAVAILABLE"):
         "motors": {key: {field: None for field in MOTOR_FIELDS} for key in MOTOR_KEYS},
         "activity": unknown_activity(reason),
         "telemetry": None,
-        "telemetry_reason": "NOT_INSTALLED",
+        "telemetry_reason": "UNAVAILABLE",
         "real_controls_available": False,
     }
 

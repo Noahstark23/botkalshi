@@ -34,3 +34,11 @@ Sin mezcla M2/M5/main, órdenes, claves financieras, ni consumo Odds/Jev. Se con
 el ejemplo sintético USD100→98.6643, pérdida ficticia1.3357. Siguen pendientes datos
 completos verificados, costes/términos/permisos aplicables, evaluación independiente,
 conciliación de cuenta y ejecutor real. Ni tests ni recopilación prueban rentabilidad.
+
+## Seguimiento V2.5.1
+
+Se corrigió el diagnóstico cuando /health o /status no responde: ahora dice
+«sin observación», sin afirmar que el runtime carece de instrumentación. La
+lectura válida sin bloque sigue diciendo que todavía no lo publica. Se agregó
+regresión de esa diferencia; 412 pruebas y ambos recorridos pasan, con Ruff y
+formato limpios en evidence/V2_5_1/. El código del recolector no cambió.

@@ -291,7 +291,7 @@ def disconnected_detail(key, *, requested_action=None, runtime=None, now_ms=None
             description += "La bandera de detección de M1 no demuestra ejecución.\n"
         if key == "rest":
             description += "La captura general no demuestra que la tarea REST de arbitraje esté en marcha.\n"
-        if key in ("m6", "m8", "m9") and status["telemetry"] is None:
+        if key in ("m6", "m8", "m9") and status["telemetry_reason"] == "NOT_INSTALLED":
             description += "El runtime no expone configuración ni tarea actual de este observador.\n"
         if key in ACTIVITY_KINDS:
             description += "\n" + _activity(status, key) + "\n"
