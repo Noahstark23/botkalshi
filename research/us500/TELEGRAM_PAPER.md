@@ -1,6 +1,8 @@
 # Menú US500 paper por Telegram
 
-Implementación aislada y revisable. La conexión local del 11 de octubre se documenta en VERIFICACION_V2_1.md. `/motores` y `/us500` muestran **Activar simulación US500**, **Pausar US500** y **Estado**. Sólo controla la simulación US500 de esta carpeta; no cambia flags del bot deportivo ni habilita órdenes reales.
+Implementación aislada y revisable. La conexión local del 11 de octubre se documenta en VERIFICACION_V2_1.md. `/motores`, `/menu` y `/start` abren el panel de todos los motores: M1, M2, M3, M5, M6, REST, M8, M9 y US500. Cada motor tiene su pantalla y navegación de regreso. `/us500` abre directamente **Activar simulación US500**, **Pausar US500** y **Estado**.
+
+**Sólo US500 tiene adaptador conectado**, limitado al permiso de replay local. Los otros ocho motores y el control general muestran «conexión pendiente / estado no consultado». Sus botones están identificados «sin conexión» y responden «No se aplicó ningún cambio». No son interruptores funcionales de esos motores. El panel no lee ni escribe flags del bot remoto y no habilita órdenes reales. El alcance y la integración pendiente están en `PANEL_TODOS_MOTORES.md`.
 
 ## Comportamiento
 

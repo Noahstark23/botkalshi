@@ -16,6 +16,8 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
+from bot_motor_panel import BACK, disconnected_detail, overview
+
 
 class ControlError(ValueError):
     """Stable errors without input payloads or credential values."""
@@ -337,9 +339,10 @@ class PaperControl:
             if not isinstance(message, dict):
                 return None
             actor, chat = message.get("from"), message.get("chat")
-            if message.get("text") not in ("/motores", "/us500"):
+            if message.get("text") not in ("/start", "/menu", "/motores", "/us500"):
                 return None
-            callback_id, action = None, "u5:menu"
+            callback_id = None
+            action = "u5:menu" if message["text"] == "/us500" else "u5:panel"
         if not self._authorized(actor, chat, message):
             return None
         return {
@@ -357,15 +360,16 @@ class PaperControl:
 
     def _menu(self, state):
         return self._message(
-            "US500 — simulación local\nEstado: "
-            + ("activa" if state["enabled"] else "pausada")
-            + ".\nEl control no reactiva una pausa de riesgo ni cierra posiciones.",
+            "US500 — simulación local\nPermiso de replay: "
+            + ("habilitado" if state["enabled"] else "pausado")
+            + ".\nNo inicia una estrategia automática. El control no reactiva una pausa de riesgo ni cierra posiciones.",
             [
                 [{"text": "Activar simulación US500", "callback_data": "u5:enable"}],
                 [
                     {"text": "Pausar US500", "callback_data": "u5:pause"},
                     {"text": "Estado", "callback_data": "u5:status"},
                 ],
+                BACK,
             ],
         )
 
@@ -388,6 +392,25 @@ class PaperControl:
 
     def _action(self, db, parsed, now, state):
         action = parsed["action"]
+        if action == "u5:panel":
+            return [self._message(*overview(bool(state["enabled"])))]
+        if action.startswith("u5:engine:"):
+            detail = disconnected_detail(action[len("u5:engine:") :])
+            if detail is not None:
+                return [self._message(*detail)]
+        if action.startswith("u5:blocked:"):
+            parts = action.split(":")
+            if len(parts) == 4 and parts[3] in ("enable", "pause"):
+                detail = disconnected_detail(parts[2], requested_action=parts[3])
+                if detail is not None:
+                    self._audit(
+                        db,
+                        now,
+                        "REJECT_DISCONNECTED",
+                        "NO_ADAPTER_" + parts[2].upper(),
+                        state["revision"],
+                    )
+                    return [self._message(*detail)]
         if action in ("u5:menu", "u5:status"):
             return [self._menu(state)]
         if action == "u5:pause":
@@ -400,7 +423,8 @@ class PaperControl:
             self._audit(db, now, "PAUSE", "OWNER_PAUSED", revision)
             return [
                 self._message(
-                    "US500 pausado. Se conservan reservas y posiciones; las pausas de riesgo permanecen."
+                    "Permiso de simulación US500 pausado. Se conservan reservas y posiciones; las pausas de riesgo permanecen.",
+                    [[{"text": "Ver US500", "callback_data": "u5:menu"}], BACK],
                 )
             ]
         if action == "u5:enable":
@@ -475,7 +499,16 @@ class PaperControl:
             self._audit(db, now, "ENABLE", "OWNER_CONFIRMED_PAPER", revision)
             return [
                 self._message(
-                    "Simulación US500 habilitada. El motor conserva todos sus controles y pausas de riesgo."
+                    "Permiso de simulación US500 habilitado. No inicia una estrategia automática. El motor conserva todos sus controles y pausas de riesgo.",
+                    [
+                        [
+                            {
+                                "text": "Pausar simulación US500",
+                                "callback_data": "u5:pause",
+                            }
+                        ],
+                        BACK,
+                    ],
                 )
             ]
         return [self._message("Acción desconocida. Usá /us500.")]

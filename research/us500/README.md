@@ -1,6 +1,8 @@
-# US500 V2.1 — simulación, sesiones y control local
+# US500 V2.2 — simulación, sesiones y panel de motores
 
 Candidato de revisión del 11 de octubre de 2026. Circuito implementado: capturas públicas → validación → hipótesis momentum congelada → ejecución ficticia con una captura posterior → ledger persistente → informe y reinicio. Incluye controles de Telegram **para US500 paper**. No contiene transporte de órdenes reales, credenciales Kalshi, integración con el bot deportivo ni cambios de producción.
+
+V2.2 amplía `/motores` con M1, M2, M3, M5, M6, REST, M8 y M9. Sus adaptadores están desconectados y los botones lo declaran; sólo US500 tiene permiso de replay operativo. Ver `PANEL_TODOS_MOTORES.md`. El catálogo no acredita que esos procesos estén encendidos o apagados.
 
 La rama conserva su nombre `codex/us500-paper-v1-20261011`; V2 identifica esta revisión del módulo, no un despliegue. La base V1 `0fd3bf7` y sus evidencias históricas permanecen accesibles en Git. `MANIFIESTO_V2.json` verifica los archivos actuales; `MANIFIESTO_V1.json` describe exclusivamente la entrega anterior.
 
@@ -29,6 +31,7 @@ El recorrido original continúa dando USD100 → USD98.6643 bajo sus supuestos, 
 | `us500_ledger.py` | Cash, coste acumulado, posición, PnL, fees, reservas y margen hipotético |
 | `us500_runner.py` | Momentum congelado, ejecución ficticia posterior, replay y permiso de control |
 | `us500_control.py` | Dueño/chat exactos, confirmación única, pausa persistente y permisos por evento |
+| `bot_motor_panel.py`, `PANEL_TODOS_MOTORES.md` | Catálogo completo, controles sin conexión identificados y contrato pendiente |
 | `us500_telegram.py`, `us500_telegram_service.py`, `TELEGRAM_PAPER.md` | Transporte, cursor/outbox, supervisor local acotado y pausa al parar/fallar |
 | `run_demo.py`, `run_control_demo.py` | Recorridos offline reproducibles |
 | `VERIFICACION_V2.md`, `VERIFICACION_V2_1.md` | Evidencia histórica y correcciones de la revisión actual |

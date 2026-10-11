@@ -71,14 +71,14 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_commands_offer_only_paper_controls(self):
-        for number, text in enumerate(("/motores", "/us500"), 1):
+        for number, text in enumerate(("/us500",), 1):
             responses = self.send(number, text=text)
             self.assertEqual(responses[0]["method"], "sendMessage")
             self.assertIn("simulación", responses[0]["payload"]["text"])
             buttons = responses[0]["payload"]["reply_markup"]["inline_keyboard"]
             self.assertEqual(
                 [b["callback_data"] for row in buttons for b in row],
-                ["u5:enable", "u5:pause", "u5:status"],
+                ["u5:enable", "u5:pause", "u5:status", "u5:panel"],
             )
         self.assertFalse(self.control.snapshot()["production_control_available"])
 
