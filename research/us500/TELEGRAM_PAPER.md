@@ -21,6 +21,8 @@ El estado del menú informa el permiso del operador, no salud del mercado, activ
 
 El supervisor pausa al arrancar, al finalizar y ante fallos. Escribe estado atómico con heartbeat, PID y códigos saneados. `pause_cause` distingue pausa del ciclo de vida; el código compartido TELEGRAM_UNAVAILABLE en la DB no demuestra una caída de red. Una salida ambigua no se reenvía. No instala servicios ni lanza el runner. El CLI requiere un máximo de ciclos explícito (hasta 10.000). No usarlo como bucle ilimitado ni autoactivar al reiniciar.
 
+El campo aditivo `last_poll_error` conserva un código admitido cuando el poll se detiene; `null` significa que no se observó ese fallo durante la ejecución actual. No contiene mensajes crudos ni reconstruye causas antiguas. El seguimiento posterior encontró el receptor local detenido; ver `DIAGNOSTICO_TELEGRAM.md`. Un menú fijado no demuestra que el receptor siga atendiendo botones.
+
 ## Recorrido sin cuenta ni claves
 
 ```sh

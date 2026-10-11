@@ -138,6 +138,7 @@ class ServiceTests(unittest.TestCase):
         status = service.run(3, 0, threading.Event())
         self.assertEqual(status["phase"], "STOPPED")
         self.assertEqual(status["completed_cycles"], 3)
+        self.assertIsNone(status["last_poll_error"])
         self.assertEqual(self.adapter.calls, 3)
         self.assertEqual(self.credentials_read, 1)
         self.assertEqual(self.transports[0][2], False)
@@ -189,10 +190,129 @@ class ServiceTests(unittest.TestCase):
         status = service.run(10, 0, threading.Event())
         self.assertEqual(status["phase"], "FAILED")
         self.assertIn("POLL_CYCLE_FAILED", status["errors"])
+        self.assertEqual(status["last_poll_error"], "POLL_CYCLE_FAILED")
         self.assertEqual(self.adapter.calls, 1)
         self.assertFalse(self.control.snapshot()["paper_enabled"])
         self.assertTrue(status["paper_pause_confirmed"])
         self.assert_redacted(status, service)
+
+    def test_stopped_timeout_keeps_safe_cause_durable_without_retry(self):
+        self.adapter.result = {
+            "poll_status": "STOPPED",
+            "error": "TELEGRAM_RESPONSE_TIMEOUT",
+            "untrusted_detail": "https://example.test/" + FAKE_SECRET,
+        }
+        self.adapter.hook = lambda _: enable(self.control, at=T + 100)
+        service = self.make_service()
+        status = service.run(10, 0, threading.Event())
+        self.assertEqual(status["last_poll_error"], "TELEGRAM_RESPONSE_TIMEOUT")
+        self.assertEqual(status["errors"], ["POLL_CYCLE_STOPPED"])
+        self.assertEqual(status["completed_cycles"], 1)
+        self.assertEqual(self.adapter.calls, 1)
+        self.assertTrue(self.adapter.closed)
+        self.assertTrue(status["paper_pause_confirmed"])
+        self.assertFalse(self.control.snapshot()["paper_enabled"])
+        self.assertEqual(json.loads(service.status_path.read_text()), status)
+        self.assert_redacted(status, service)
+
+    def test_unknown_poll_error_is_not_copied_even_if_it_looks_like_a_code(self):
+        for index, error in enumerate(
+            ("https://example.test/" + FAKE_SECRET, "PRIVATE_CREDENTIAL_VALUE", "")
+        ):
+            with self.subTest(index=index):
+                adapter = FakeAdapter(result={"poll_status": "STOPPED", "error": error})
+                service = self.make_service(
+                    state_dir=self.root / f"unknown-{index}", adapter=adapter
+                )
+                status = service.run(10, 0, threading.Event())
+                self.assertEqual(
+                    status["last_poll_error"], "CONTROL_OR_TRANSPORT_FAILED"
+                )
+                self.assertTrue(status["paper_pause_confirmed"])
+                self.assertEqual(adapter.calls, 1)
+                self.assertTrue(adapter.closed)
+                saved = service.status_path.read_text()
+                if error:
+                    self.assertNotIn(error, saved)
+                self.assert_redacted(status, service)
+
+    def test_non_string_poll_error_never_invokes_string_conversion(self):
+        class SensitiveObject:
+            def __str__(self):
+                raise AssertionError("must not stringify private value")
+
+            def __repr__(self):
+                raise AssertionError("must not represent private value")
+
+        for index, error in enumerate(
+            (
+                None,
+                [],
+                {"token": FAKE_SECRET},
+                FAKE_SECRET.encode(),
+                429,
+                True,
+                SensitiveObject(),
+            )
+        ):
+            with self.subTest(index=index):
+                adapter = FakeAdapter(result={"poll_status": "STOPPED", "error": error})
+                service = self.make_service(
+                    state_dir=self.root / f"nonstring-{index}", adapter=adapter
+                )
+                status = service.run(10, 0, threading.Event())
+                self.assertEqual(status["last_poll_error"], "INVALID_POLL_ERROR")
+                self.assertEqual(status["errors"], ["POLL_CYCLE_STOPPED"])
+                self.assertEqual(status["phase"], "FAILED")
+                self.assertTrue(status["paper_pause_confirmed"])
+                self.assertEqual(adapter.calls, 1)
+                self.assertTrue(adapter.closed)
+                self.assert_redacted(status, service)
+
+    def test_malformed_poll_result_is_sanitized_and_stops_once(self):
+        class SensitiveStatus:
+            def __eq__(self, other):
+                raise AssertionError("must not compare an untrusted object")
+
+        for index, result in enumerate(
+            (
+                None,
+                [],
+                FAKE_SECRET,
+                {},
+                {"poll_status": None, "error": FAKE_SECRET},
+                {"poll_status": SensitiveStatus()},
+                {"poll_status": FAKE_SECRET},
+            )
+        ):
+            with self.subTest(index=index):
+                adapter = FakeAdapter()
+                adapter.result = result
+                service = self.make_service(
+                    state_dir=self.root / f"malformed-{index}", adapter=adapter
+                )
+                status = service.run(10, 0, threading.Event())
+                self.assertEqual(status["last_poll_error"], "INVALID_POLL_RESULT")
+                self.assertEqual(status["errors"], ["POLL_CYCLE_STOPPED"])
+                self.assertEqual(status["phase"], "FAILED")
+                self.assertTrue(status["paper_pause_confirmed"])
+                self.assertEqual(adapter.calls, 1)
+                self.assertTrue(adapter.closed)
+                self.assert_redacted(status, service)
+
+    def test_new_run_does_not_attribute_an_old_poll_error_to_current_run(self):
+        self.adapter.result = {
+            "poll_status": "STOPPED",
+            "error": "TELEGRAM_RESPONSE_TIMEOUT",
+        }
+        service = self.make_service()
+        failed = service.run(1, 0, threading.Event())
+        self.assertEqual(failed["last_poll_error"], "TELEGRAM_RESPONSE_TIMEOUT")
+        self.adapter.result = {"poll_status": "COMPLETE"}
+        current = service.run(1, 0, threading.Event())
+        self.assertEqual(current["phase"], "STOPPED")
+        self.assertIsNone(current["last_poll_error"])
+        self.assertEqual(json.loads(service.status_path.read_text()), current)
 
     def test_stopped_cycle_and_unknown_outbox_both_fail_closed(self):
         for reason in ("STOPPED", "UNKNOWN"):

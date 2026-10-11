@@ -1,4 +1,4 @@
-# Revisión US500 V2.2 en GitHub
+# Revisión US500 V2.2.1 en GitHub
 
 Rama: `codex/us500-paper-v1-20261011`. Base main: `9bf685d345844d12eb5e46c17aad0bbae5462d72`. V1 está en `0fd3bf74551ca2586add9fa915b54c8d555e073f`; revisar el diff posterior para V2.
 
@@ -12,7 +12,7 @@ python3 run_demo.py --directory /tmp/us500-revision-nueva
 python3 run_control_demo.py --directory /tmp/us500-botones-nueva
 ```
 
-Usar directorios nuevos y no escribir en evidencias históricas. La revisión V2 exige DB nuevas, no migra las V1. La suite local tiene 277 pruebas aprobadas, dos recorridos y Ruff limpio; el nuevo CI debe comprobarse por SHA en GitHub.
+Usar directorios nuevos y no escribir en evidencias históricas. La revisión V2 exige DB nuevas, no migra las V1. La suite local tiene 282 pruebas aprobadas, dos recorridos y Ruff limpio; el nuevo CI debe comprobarse por SHA en GitHub.
 
 Cambios: coste agregado exacto, variation margin/tasas de escenario, capturas→sesiones y presupuesto durable, botones paper con autenticación/confirmación/pausa, permiso por evento y transporte con cursor/outbox. Verificar especialmente las regresiones de omisión del control, capacidades agotadas, IDs de callbacks opacos, respuestas ambiguas y recuperación tras fallo.
 
@@ -25,3 +25,5 @@ Entregable: hallazgos reproducibles con archivo/línea, evidencia consultada, co
 V2.1 corrige los dos hallazgos de Claude sobre HTTPException y coerción numérico/texto en hashes/archivos JSON. Agrega supervisor local con locks y pausas al terminar/fallar. Revisar regresiones de números con exponente, precisión Decimal y conservación de capturas/presupuesto ante protocolo HTTP incompleto. Las fuentes públicas archivadas y sus límites se describen en [FUENTES_ARCHIVADAS](us500/FUENTES_ARCHIVADAS.md).
 
 V2.2 agrega [panel de todos los motores](us500/PANEL_TODOS_MOTORES.md) dentro del mismo receptor. `/motores`, `/menu` y `/start` muestran nueve motores; `/us500` conserva control paper con confirmación. M1/M2/M3/M5/M6/REST/M8/M9 y el control general están desconectados y no mutan nada. No confundir estos botones con una integración funcional al bot remoto. Contrastar permisos, estado del proceso y riesgo por separado; no conectar la futura pausa de entradas al `/admin/pause` heredado, que también bloquea ventas. M2/M5 no se importan ni se combinan en esta rama.
+
+V2.2.1 corrige pérdida del código de error al detenerse el poll. El [diagnóstico](us500/DIAGNOSTICO_TELEGRAM.md) documenta el receptor local FAILED, pausa confirmada y outbox sin ambiguos. La causa histórica no se guardó y no se inventa. `last_poll_error` ahora conserva sólo códigos admitidos, sin reintentos ni datos sensibles. El receptor permanece detenido; el arreglo no equivale a recuperación operativa.

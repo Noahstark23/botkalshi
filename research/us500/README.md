@@ -1,8 +1,10 @@
-# US500 V2.2 — simulación, sesiones y panel de motores
+# US500 V2.2.1 — simulación, sesiones y panel de motores
 
 Candidato de revisión del 11 de octubre de 2026. Circuito implementado: capturas públicas → validación → hipótesis momentum congelada → ejecución ficticia con una captura posterior → ledger persistente → informe y reinicio. Incluye controles de Telegram **para US500 paper**. No contiene transporte de órdenes reales, credenciales Kalshi, integración con el bot deportivo ni cambios de producción.
 
 V2.2 amplía `/motores` con M1, M2, M3, M5, M6, REST, M8 y M9. Sus adaptadores están desconectados y los botones lo declaran; sólo US500 tiene permiso de replay operativo. Ver `PANEL_TODOS_MOTORES.md`. El catálogo no acredita que esos procesos estén encendidos o apagados.
+
+V2.2.1 conserva el código seguro de fallo del poll en el supervisor. El seguimiento encontró detenido el receptor local; no se reanudó en ese seguimiento. El menú visible no acredita disponibilidad del proceso. Ver `DIAGNOSTICO_TELEGRAM.md`.
 
 La rama conserva su nombre `codex/us500-paper-v1-20261011`; V2 identifica esta revisión del módulo, no un despliegue. La base V1 `0fd3bf7` y sus evidencias históricas permanecen accesibles en Git. `MANIFIESTO_V2.json` verifica los archivos actuales; `MANIFIESTO_V1.json` describe exclusivamente la entrega anterior.
 

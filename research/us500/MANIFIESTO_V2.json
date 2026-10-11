@@ -2,6 +2,7 @@
   "baseline_commit": "0fd3bf74551ca2586add9fa915b54c8d555e073f",
   "files": {
     "CONTRATO_Y_LIMITES.md": "9e2f83e2ffcf2b6d2ddd60a24092c774f84624e99822e1f6b532b37e7a4e91bd",
+    "DIAGNOSTICO_TELEGRAM.md": "ed7967026bab754bc5f4f47771c9654971ad9aed20bb0bc80e21e92142097dfb",
     "EJEMPLO_SINTETICO.json": "733ed33578800aa94f2e9048c7767b5267ed22ea343ddc4d1a520b3d5acf60bb",
     "FUENTES_ARCHIVADAS.md": "25a65b75ce916a9f818b367367013f15d9db8b950f0f6cbe98de2c0a2e19b5e5",
     "HISTORICAL_API.md": "391217fc33ce9ba7aa50db87387bc8e7d2edf86359e6f2ecd0cb8d71f6d4e91d",
@@ -9,9 +10,9 @@
     "MANIFIESTO_V1.json": "7622e0fdc6dae633638458e3e2a7ad286c0813e665bbbefebd5e8eb770b66fc8",
     "OBSERVACION_PUBLICA_2026-10-11.json": "ee9d531b0ec0ce50bc3080b7bf8270015a6f18dd50dc3e1f08a490428091e1f7",
     "PANEL_TODOS_MOTORES.md": "a0d97f965ce72d65f4c139c67a312398d9addeacec2baf177909b662bc32cc27",
-    "README.md": "6c23d8cfd7c438e43c038cf60d7202835b6671e1c1f3d93be8240c6e7771a5e3",
+    "README.md": "c6ee4116bcecccdc4fb3eb5dc65464d08eb8f0c81b8ac68a646f44f02e0c4d7c",
     "SESIONES.md": "18017e1479a420fd18c922a4cdd7be7b35748684486e061ceaab491317450937",
-    "TELEGRAM_PAPER.md": "fa1305ce3c7b1791c3cf1aa32a6193d4676d770a5d50e7790a874e699e4e9529",
+    "TELEGRAM_PAPER.md": "b482cd5a7aaeadd1abf290e91b4e27faf26cd6f0f53e57deda7f0142e3cbf671",
     "VERIFICACION_V1.md": "d4e5ef420c37f1f888f29e677eb668865890db1d9bdab56366c6cc6f5c16b4ae",
     "VERIFICACION_V2.md": "81c3e6b5d013c7fb25addb87e1e6e4024257c925f79a601a154166e24f68fcbc",
     "VERIFICACION_V2_1.md": "fe619810103ec123f91022b728b04de521e4de1acc5d883ca28210d4009ca8bc",
@@ -67,7 +68,7 @@
     "tests/test_us500_runner.py": "3b70be4a81cbfed44703d01ac795abaab8ff8d463430d7430f60f594a7eaf83e",
     "tests/test_us500_session.py": "b7ca003276928dd313238e52f5f7bb8a37cd089d92db16e575a27c169880d34c",
     "tests/test_us500_telegram.py": "0463459ff84afd49bdbd088dfe50b62bad27a22f095b6de9aa8978ef56e9d9df",
-    "tests/test_us500_telegram_service.py": "6dedc7d0b78be6cc133582cc731919ad4aa39ce4c9b5693f50294463b25baa86",
+    "tests/test_us500_telegram_service.py": "0b3f1f71c4819e92e2b3ad314c91ad7f57f107475c8286641d27ac3065110c80",
     "us500_control.py": "1e97fff5043bf898e57f71aed6f4bdc97e6c26a904cd0faf42e546bee500d7ab",
     "us500_engine.py": "e275eb896d6812bb231ca7cdc3fd7f02af2a43407b0416569a47549a35ac4821",
     "us500_history.py": "9651a1b8d8e0deb2855860cb21bc832c4ee5959fe757b50cd257098a6a145fcf",
@@ -75,13 +76,13 @@
     "us500_runner.py": "4a5ccb2cfef7affd2ebe081819f01821b9c4f7378e258802fc2f2bf319d9d34b",
     "us500_session.py": "bc2f186baa008043b8b08af2611707b033a541f42989e31f3a442df265f1bf34",
     "us500_telegram.py": "1247543152ac80f34b7c71e443fbd85297cf4268bf4048ec55f5ba8379eeee8a",
-    "us500_telegram_service.py": "63b47a6bb0b579108481eb869f2204ad431a973610216177ed7f062cf5ac3649",
+    "us500_telegram_service.py": "21cde5f845147d9af0ed80b117e3431ceab2ef14dde725182d87044f6b1291e4",
     "verify_offline.py": "083af45ca71d32e76fedeec654dda2a4be54dac3e2670a1131c65cdba87e00fe",
     "verify_package.py": "5c8352d688428467d3ff03ce53fbca9a2f9a9d139a99389c37a233b4bde5212b"
   },
-  "local_tests": 277,
+  "local_tests": 282,
   "paper_only": true,
   "production_control_available": false,
-  "revision_base_commit": "66f0f02a61c95ba7141903c50b5a9fe0d1ffeef0",
-  "version": "us500-v2.2"
+  "revision_base_commit": "a2fdc17d75e01653d78103e94e941f44b633403e",
+  "version": "us500-v2.2.1"
 }

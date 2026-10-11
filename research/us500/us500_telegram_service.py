@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from us500_control import PaperControl
-from us500_telegram import PaperTelegram, TelegramTransport
+from us500_telegram import PaperTelegram, TelegramTransport, _safe_error
 
 SCHEMA = "us500-paper-telegram-service-v1"
 MAX_CYCLES = 10_000
@@ -96,6 +96,7 @@ class TelegramPaperService:
         self._locks = []
         self._adapter = None
         self._directory_identity = None
+        self._last_poll_error = None
 
     def _now(self):
         value = self.clock_ms()
@@ -233,6 +234,9 @@ class TelegramPaperService:
             "control": control,
             "outbox": outbox,
             "errors": list(dict.fromkeys(errors)),
+            # Only a closed-set code observed during this run, never historical
+            # reconstruction or raw adapter payload/exception text.
+            "last_poll_error": self._last_poll_error,
             "paper_pause_confirmed": pause_confirmed,
             "pause_cause": {
                 "STARTING": "SERVICE_STARTUP",
@@ -316,6 +320,7 @@ class TelegramPaperService:
             raise ServiceError("INVALID_STOP_EVENT")
         if self._locks:
             raise ServiceError("SERVICE_ALREADY_RUNNING")
+        self._last_poll_error = None
         completed, errors, pause_confirmed, owns_control = 0, [], False, False
         phase = "STARTING"
         status = None
@@ -363,12 +368,29 @@ class TelegramPaperService:
                     try:
                         result = self._adapter.poll_once(now_ms=self._now())
                     except Exception:
+                        self._last_poll_error = "POLL_CYCLE_FAILED"
                         raise ServiceError("POLL_CYCLE_FAILED") from None
                     completed += 1
                     if (
                         type(result) is not dict
+                        or type(result.get("poll_status")) is not str
                         or result.get("poll_status") != "COMPLETE"
                     ):
+                        if (
+                            type(result) is dict
+                            and type(result.get("poll_status")) is str
+                            and result["poll_status"] == "STOPPED"
+                        ):
+                            code = result.get("error")
+                            # The existing sanitizer accepts exception objects;
+                            # do not invoke str/repr on an untrusted error value.
+                            self._last_poll_error = (
+                                _safe_error(code)
+                                if type(code) is str
+                                else "INVALID_POLL_ERROR"
+                            )
+                        else:
+                            self._last_poll_error = "INVALID_POLL_RESULT"
                         raise ServiceError("POLL_CYCLE_STOPPED")
                     outbox = self._outbox_status()
                     if any(
