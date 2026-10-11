@@ -25,9 +25,11 @@ para evitar reinicios ciegos. Esos incidentes requieren revisión.
 
 Los timeouts y errores transitorios de la consulta `getUpdates` pausan el permiso
 paper y reanudan la lectura con esperas 3/6/12/24/48/60 segundos. Nunca reenvían
-respuestas cuya entrega quedó UNKNOWN. Si quedan respuestas ambiguas o fallidas,
+respuestas cuya entrega quedó UNKNOWN. Si quedan mensajes fallidos o respuestas ambiguas,
 el receptor continúa atendiendo nuevas consultas en DEGRADED, con paper pausado.
-No borra esas evidencias. Una intervención posterior debe resolver el incidente.
+Una excepción es el rechazo explícito del ACK de un botón vencido: se conserva
+como FAILED diagnóstico sin bloquear recepción ni paper; nunca se reintenta.
+Un ACK ambiguo (UNKNOWN) sigue bloqueando. No borra esas evidencias. Una intervención posterior debe resolver el incidente.
 Este proceso no inicia ningún replay; el permiso es sólo una condición de acceso.
 
 La poda transaccional conserva los500 updates más recientes y elimina únicamente

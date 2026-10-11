@@ -202,10 +202,29 @@ class TelegramPaperService:
             raw.get("saved_updates"), 0, 2000
         ):
             raise ServiceError("INVALID_OUTBOX_STATUS")
+        blocking = raw.get("blocking_outbox_counts")
+        if blocking is None:
+            blocking = {
+                key: counts.get(key, 0) for key in ("UNKNOWN", "FAILED", "ATTEMPTED")
+            }
+        if (
+            type(blocking) is not dict
+            or not set(blocking) <= {"UNKNOWN", "FAILED", "ATTEMPTED"}
+            or any(
+                not _integer(value, 0, counts.get(key, 0))
+                for key, value in blocking.items()
+            )
+            or any(
+                blocking.get(key, 0) != counts.get(key, 0)
+                for key in ("UNKNOWN", "ATTEMPTED")
+            )
+        ):
+            raise ServiceError("INVALID_OUTBOX_STATUS")
         return {
             "next_offset": raw["next_offset"],
             "saved_updates": raw["saved_updates"],
             "outbox_counts": counts,
+            "blocking_outbox_counts": blocking,
         }
 
     def _status(self, phase, completed, maximum, interval, errors, pause_confirmed):
@@ -368,7 +387,7 @@ class TelegramPaperService:
                         break
                     if persistent:
                         self._adapter.prune_delivered(keep_updates=500)
-                        counts = self._outbox_status()["outbox_counts"]
+                        counts = self._outbox_status()["blocking_outbox_counts"]
                         unresolved = any(
                             counts.get(key, 0)
                             for key in ("UNKNOWN", "FAILED", "ATTEMPTED")
@@ -431,7 +450,9 @@ class TelegramPaperService:
                     outbox = self._outbox_status()
                     cycle_phase, cycle_errors = "RUNNING", []
                     if any(
-                        outbox["outbox_counts"].get(key, 0)
+                        outbox[
+                            "blocking_outbox_counts" if persistent else "outbox_counts"
+                        ].get(key, 0)
                         for key in ("UNKNOWN", "FAILED", "ATTEMPTED")
                     ):
                         if not persistent:

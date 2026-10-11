@@ -43,7 +43,9 @@ test_wrong_bot_and_unknown_or_existing_webhook_rejected (test_telegram_cloud.Clo
 test_ambiguous_delivery_keeps_receiver_available_but_paper_paused (test_telegram_persistent.PersistentTests.test_ambiguous_delivery_keeps_receiver_available_but_paper_paused) ... ok
 test_backoff_is_capped_and_interruptible (test_telegram_persistent.PersistentTests.test_backoff_is_capped_and_interruptible) ... ok
 test_existing_unknown_cannot_claim_paper_enabled (test_telegram_persistent.PersistentTests.test_existing_unknown_cannot_claim_paper_enabled) ... ok
+test_explicit_callback_rejection_is_diagnostic_not_delivery_uncertainty (test_telegram_persistent.PersistentTests.test_explicit_callback_rejection_is_diagnostic_not_delivery_uncertainty) ... ok
 test_failure_to_pause_recovery_is_fatal (test_telegram_persistent.PersistentTests.test_failure_to_pause_recovery_is_fatal) ... ok
+test_invalid_blocking_count_cannot_hide_corrupt_status (test_telegram_persistent.PersistentTests.test_invalid_blocking_count_cannot_hide_corrupt_status) ... ok
 test_nontransient_rejection_or_invalid_state_does_not_retry (test_telegram_persistent.PersistentTests.test_nontransient_rejection_or_invalid_state_does_not_retry) ... ok
 test_pruning_failure_fails_closed (test_telegram_persistent.PersistentTests.test_pruning_failure_fails_closed) ... ok
 test_transient_poll_failures_backoff_pause_and_recover (test_telegram_persistent.PersistentTests.test_transient_poll_failures_backoff_pause_and_recover) ... ok
@@ -278,8 +280,10 @@ test_restart_new_observation_uses_same_global_budget (test_us500_session.Collect
 test_restart_same_observation_id_returns_saved_snapshot_without_gets (test_us500_session.CollectorTests.test_restart_same_observation_id_returns_saved_snapshot_without_gets) ... ok
 test_tampered_saved_snapshot_is_rejected_on_restart (test_us500_session.CollectorTests.test_tampered_saved_snapshot_is_rejected_on_restart) ... ok
 test_two_allowlisted_gets_with_persistent_budget_and_observed_claim (test_us500_session.CollectorTests.test_two_allowlisted_gets_with_persistent_budget_and_observed_claim) ... ok
+test_ambiguous_callback_ack_still_blocks_and_is_never_retried (test_us500_telegram.PaperTelegramTests.test_ambiguous_callback_ack_still_blocks_and_is_never_retried) ... ok
 test_batch_bound_and_duplicate_delivery_bound (test_us500_telegram.PaperTelegramTests.test_batch_bound_and_duplicate_delivery_bound) ... ok
 test_batch_unsorted_updates_preserve_pause_order (test_us500_telegram.PaperTelegramTests.test_batch_unsorted_updates_preserve_pause_order) ... ok
+test_blocking_view_excludes_only_explicitly_failed_callback_ack (test_us500_telegram.PaperTelegramTests.test_blocking_view_excludes_only_explicitly_failed_callback_ack) ... ok
 test_capacity_failures_pause_enabled_control_without_deleting_history (test_us500_telegram.PaperTelegramTests.test_capacity_failures_pause_enabled_control_without_deleting_history) ... ok
 test_confirmation_enable_pause_and_duplicate_cannot_reactivate (test_us500_telegram.PaperTelegramTests.test_confirmation_enable_pause_and_duplicate_cannot_reactivate) ... ok
 test_conflict_inside_batch_is_rejected_before_external_control_actions (test_us500_telegram.PaperTelegramTests.test_conflict_inside_batch_is_rejected_before_external_control_actions) ... ok
@@ -332,7 +336,7 @@ test_stopped_timeout_keeps_safe_cause_durable_without_retry (test_us500_telegram
 test_unknown_poll_error_is_not_copied_even_if_it_looks_like_a_code (test_us500_telegram_service.ServiceTests.test_unknown_poll_error_is_not_copied_even_if_it_looks_like_a_code) ... ok
 
 ----------------------------------------------------------------------
-Ran 332 tests in 1.278s
+Ran 336 tests in 1.466s
 
 OK
-{"control_smoke": {"actual_orders": 0, "final_cash_usd": "98.6643", "final_position_quantity": "0", "final_reserved_margin_usd": "0", "initial_gate": "PAPER_DISABLED", "ledger_unchanged_while_paused": true, "paper_enabled_at_end": false, "pause_gate": "PAPER_DISABLED", "position_at_pause": "2", "production_control_available": false, "restart_equal": true, "schema": "us500-paper-control-walkthrough-v1", "synthetic": true, "telegram_network_used": false}, "network_denied": true, "restart_smoke": {"actual_orders": 0, "costs_usd": "0.010", "events": 42, "execution_available": false, "fees_usd": "0.1893", "final_cash_usd": "98.6643", "funding_usd": "0", "initial_cash_usd": "100", "net_pnl_usd": "-1.3357", "reserved_margin_usd": "0", "residual_position_quantity": "0", "restart_equal": true, "strategy_validated": false, "synthetic": true}, "tests_run": 332}
+{"control_smoke": {"actual_orders": 0, "final_cash_usd": "98.6643", "final_position_quantity": "0", "final_reserved_margin_usd": "0", "initial_gate": "PAPER_DISABLED", "ledger_unchanged_while_paused": true, "paper_enabled_at_end": false, "pause_gate": "PAPER_DISABLED", "position_at_pause": "2", "production_control_available": false, "restart_equal": true, "schema": "us500-paper-control-walkthrough-v1", "synthetic": true, "telegram_network_used": false}, "network_denied": true, "restart_smoke": {"actual_orders": 0, "costs_usd": "0.010", "events": 42, "execution_available": false, "fees_usd": "0.1893", "final_cash_usd": "98.6643", "funding_usd": "0", "initial_cash_usd": "100", "net_pnl_usd": "-1.3357", "reserved_margin_usd": "0", "residual_position_quantity": "0", "restart_equal": true, "strategy_validated": false, "synthetic": true}, "tests_run": 336}

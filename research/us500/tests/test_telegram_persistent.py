@@ -139,6 +139,23 @@ class PersistentTests(unittest.TestCase):
         self.assertIn("sigue pausada", responses[-1]["payload"]["text"])
         self.assertNotIn("u5:confirm:", json.dumps(responses))
 
+    def test_explicit_callback_rejection_is_diagnostic_not_delivery_uncertainty(self):
+        self.adapter.counts = {"FAILED": 1, "SENT": 2}
+        snapshot = self.adapter.snapshot
+        self.adapter.snapshot = lambda: dict(snapshot(), blocking_outbox_counts={})
+        self.service.run(2, 0, Stop(), persistent=True)
+        self.assertFalse(any(s["phase"] == "DEGRADED" for s in self.saved))
+        self.assertTrue(self.control._transport_available)
+
+    def test_invalid_blocking_count_cannot_hide_corrupt_status(self):
+        snapshot = self.adapter.snapshot
+        self.adapter.snapshot = lambda: dict(
+            snapshot(), blocking_outbox_counts={"UNKNOWN": 1}
+        )
+        result = self.service.run(2, 0, Stop(), persistent=True)
+        self.assertEqual(result["phase"], "FAILED")
+        self.assertTrue(result["paper_pause_confirmed"])
+
     def test_pruning_failure_fails_closed(self):
         self.adapter.prune_delivered = lambda **_: (_ for _ in ()).throw(
             ValueError("PRIVATE")

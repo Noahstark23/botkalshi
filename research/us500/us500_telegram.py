@@ -354,6 +354,17 @@ class PaperTelegram:
                 "SELECT status, count(*) FROM telegram_outbox GROUP BY status"
             )
         )
+        # A rejected button ACK is terminal and remains in history, but does not
+        # make message delivery ambiguous. UNKNOWN/ATTEMPTED always block; a
+        # FAILED sendMessage also blocks. This view never rewrites delivery state.
+        blocking_counts = dict(
+            self._db.execute(
+                "SELECT status, count(*) FROM telegram_outbox "
+                "WHERE status IN ('UNKNOWN', 'ATTEMPTED', 'FAILED') "
+                "AND NOT (status='FAILED' AND method='answerCallbackQuery') "
+                "GROUP BY status"
+            )
+        )
         return {
             "schema": "us500-paper-telegram-v1",
             "mode": "paper",
@@ -362,6 +373,7 @@ class PaperTelegram:
                 "SELECT next_offset FROM telegram_meta WHERE id=1"
             ).fetchone()[0],
             "outbox_counts": counts,
+            "blocking_outbox_counts": blocking_counts,
             "saved_updates": self._db.execute(
                 "SELECT count(*) FROM telegram_updates"
             ).fetchone()[0],

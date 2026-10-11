@@ -240,12 +240,14 @@ class PaperTelegramTests(unittest.TestCase):
         self.transport.send_fault = TelegramRejected("anything unsafe " + FAKE_TOKEN)
         first = self.poll(message(1))
         self.assertEqual(first["outbox_counts"], {"FAILED": 1})
+        self.assertEqual(first["blocking_outbox_counts"], {"FAILED": 1})
         self.transport.send_fault = {
             "ok": True,
             "result": {"message_id": 42, "chat": {"id": 999}},
         }
         second = self.poll(message(2), now=T + 1)
         self.assertEqual(second["outbox_counts"], {"FAILED": 1, "UNKNOWN": 1})
+        self.assertEqual(second["blocking_outbox_counts"], {"FAILED": 1, "UNKNOWN": 1})
         self.transport.send_fault = None
         self.poll(message(1), message(2), now=T + 2)
         self.assertEqual(len(self.transport.sent()), 2)
@@ -474,10 +476,12 @@ class PaperTelegramTests(unittest.TestCase):
         with patch.object(self.transport, "call", reject_callback_only):
             first = self.poll(callback(1, "u5:pause"))
             self.assertEqual(first["outbox_counts"], {"FAILED": 1, "SENT": 1})
+            self.assertEqual(first["blocking_outbox_counts"], {})
             second = self.poll(message(2), now=T + 1)
         self.assertEqual(second["poll_status"], "COMPLETE")
         self.assertEqual(second["next_offset"], 3)
         self.assertEqual(second["outbox_counts"], {"FAILED": 1, "SENT": 2})
+        self.assertEqual(second["blocking_outbox_counts"], {})
         self.assertEqual(
             self.adapter.prune_delivered(keep_updates=1)["deleted_updates"], 0
         )
@@ -485,6 +489,60 @@ class PaperTelegramTests(unittest.TestCase):
         self.poll(callback(1, "u5:pause"), now=T + 2)
         self.assertEqual(len(self.transport.sent()), sent)
         self.assertEqual(self.adapter.snapshot()["outbox_counts"]["FAILED"], 1)
+
+    def test_blocking_view_excludes_only_explicitly_failed_callback_ack(self):
+        statuses = ("SENT", "PENDING", "ATTEMPTED", "UNKNOWN", "FAILED")
+        for identifier, status in enumerate(statuses, 1):
+            self.adapter._persist_update(callback(identifier, "u5:status"), T)
+            self.adapter._db.execute(
+                "UPDATE telegram_outbox SET status=? WHERE update_id=?",
+                (status, identifier),
+            )
+        rows = self.adapter._db.execute(
+            "SELECT * FROM telegram_outbox ORDER BY id"
+        ).fetchall()
+        control = self.control.snapshot()
+        state = self.adapter.snapshot()
+        self.assertEqual(state["outbox_counts"], {status: 2 for status in statuses})
+        self.assertEqual(
+            state["blocking_outbox_counts"],
+            {"ATTEMPTED": 2, "UNKNOWN": 2, "FAILED": 1},
+        )
+        self.assertEqual(
+            self.adapter._db.execute(
+                "SELECT * FROM telegram_outbox ORDER BY id"
+            ).fetchall(),
+            rows,
+        )
+        self.assertEqual(self.control.snapshot(), control)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_ambiguous_callback_ack_still_blocks_and_is_never_retried(self):
+        original = self.transport.call
+
+        def ambiguous_callback_only(method, payload):
+            if method == "answerCallbackQuery":
+                self.transport.calls.append((method, copy.deepcopy(payload)))
+                raise RuntimeError(FAKE_TOKEN)
+            return original(method, payload)
+
+        with patch.object(self.transport, "call", ambiguous_callback_only):
+            first = self.poll(callback(1, "u5:pause"))
+        self.assertEqual(first["outbox_counts"], {"UNKNOWN": 1, "SENT": 1})
+        self.assertEqual(first["blocking_outbox_counts"], {"UNKNOWN": 1})
+        self.adapter.close()
+        self.adapter = PaperTelegram(
+            self.path, control=self.control, transport=self.transport
+        )
+        before = len(self.transport.sent())
+        duplicate = self.poll(callback(1, "u5:pause"), now=T + 1)
+        self.assertEqual(duplicate["blocking_outbox_counts"], {"UNKNOWN": 1})
+        self.assertEqual(len(self.transport.sent()), before)
+        self.assertNotIn(FAKE_TOKEN, json.dumps(duplicate))
+        self.poll(message(2), now=T + 2)
+        self.assertEqual(
+            self.adapter.prune_delivered(keep_updates=1)["deleted_updates"], 0
+        )
 
     def test_existing_database_and_wrong_bot_are_rejected(self):
         before = (self.root / "control.sqlite").read_bytes()
