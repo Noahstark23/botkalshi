@@ -1,6 +1,7 @@
 """Offline ledger invariants. Uses only temporary SQLite and stdlib unittest."""
 
 import copy
+import json
 import tempfile
 import unittest
 from decimal import Decimal, localcontext
@@ -8,7 +9,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from us500_ledger import LedgerError, PaperLedger
-
 
 T = 1791700000000
 
@@ -387,6 +387,287 @@ class LedgerTests(unittest.TestCase):
                 self.reserve("o3")
             self.assertEqual(self.ledger.state(), after_cancel)
             self.assertEqual(self.ledger.apply(last), after_cancel)
+
+    def test_variation_margin_preserves_equity_and_close_never_pays_twice(self):
+        self.mark()
+        self.reserve()
+        self.fill()
+        before = self.mark("110")
+        settled = self.send("variation_margin", settlement_price="105")
+        self.assertEqual(settled["equity_usd"], before["equity_usd"])
+        self.assertEqual(settled["mark_price"], "110")
+        self.assertEqual(settled["last_mark_at_ms"], before["last_mark_at_ms"])
+        self.assertEqual(settled["average_entry_price"], "105")
+        self.assertEqual(settled["realized_pnl_usd"], "10")
+        self.assertEqual(settled["variation_margin_usd"], "10")
+        self.assertEqual(settled["unrealized_pnl_usd"], "10")
+        self.assert_money_identity(settled)
+        self.reserve("close", "sell", "2", "110", True)
+        closed = self.fill("close", "2", "110")
+        self.assertEqual(closed["realized_pnl_usd"], "20")
+        self.assertEqual(closed["variation_margin_usd"], "10")
+        self.assertEqual(Decimal(closed["cash_usd"]), Decimal("1019.58"))
+        self.assertEqual(closed["unrealized_pnl_usd"], "0")
+        self.assert_money_identity(closed)
+
+    def test_short_negative_settlement_restart_and_idempotence(self):
+        self.mark()
+        self.reserve(side="sell")
+        self.fill()
+        before = self.mark("110")
+        event = self.event("variation_margin", settlement_price="105")
+        settled = self.ledger.apply(event)
+        self.assertEqual(settled["equity_usd"], before["equity_usd"])
+        self.assertEqual(settled["variation_margin_usd"], "-10")
+        self.assertEqual(self.ledger.apply(event), settled)
+        self.ledger.close()
+        self.ledger = PaperLedger(self.path, config())
+        self.assertEqual(self.ledger.apply(event), settled)
+        with self.assertRaisesRegex(LedgerError, "EVENT_ID_CONFLICT"):
+            self.ledger.apply({**event, "settlement_price": "106"})
+        self.assertEqual(self.ledger.state(), settled)
+        self.reserve("close", "buy", "2", "110", True)
+        closed = self.fill("close", "2", "110")
+        self.assertEqual(closed["realized_pnl_usd"], "-20")
+        self.assertEqual(Decimal(closed["cash_usd"]), Decimal("979.58"))
+        self.assert_money_identity(closed)
+
+    def test_variation_margin_uses_decimals_without_execution_tick_rounding(self):
+        self.ledger.close()
+        self.ledger = PaperLedger(
+            ":memory:", config(quantity_step="0.01", tick_size="0.0001", fee_bps="0")
+        )
+        self.mark("13.8028")
+        self.reserve(quantity="0.03", limit_price="13.8028")
+        self.fill(quantity="0.03", price="13.8028")
+        before = self.mark("13.804321")
+        settled = self.send("variation_margin", settlement_price="13.803333")
+        self.assertEqual(
+            Decimal(settled["variation_margin_usd"]), Decimal("0.00001599")
+        )
+        self.assertEqual(Decimal(settled["unrealized_pnl_usd"]), Decimal("0.00002964"))
+        self.assertEqual(Decimal(settled["equity_usd"]), Decimal(before["equity_usd"]))
+        self.assert_money_identity(settled)
+
+    def test_variation_margin_partial_fill_keeps_unknown_reserve(self):
+        self.mark()
+        self.reserve(quantity="3")
+        self.fill(quantity="1")
+        before = self.send("unknown", order_id="o1")
+        settled = self.send("variation_margin", settlement_price="105")
+        self.assertEqual(settled["reserved_margin_usd"], before["reserved_margin_usd"])
+        self.assertEqual(settled["position_quantity"], "1")
+        self.assertEqual(settled["equity_usd"], before["equity_usd"])
+        self.assertEqual(settled["orders"]["o1"]["status"], "UNKNOWN")
+        state = self.fill(quantity="1")
+        self.assertEqual(Decimal(state["average_entry_price"]), Decimal("102.5"))
+        self.assertEqual(state["variation_margin_usd"], "5")
+        self.assertEqual(state["orders"]["o1"]["status"], "UNKNOWN")
+        self.assert_money_identity(state)
+
+    def test_repeated_settlement_price_and_flat_settlement_cannot_create_cash(self):
+        before = self.ledger.state()
+        flat = self.send("variation_margin", settlement_price="100")
+        self.assertEqual(flat["cash_usd"], before["cash_usd"])
+        self.assertEqual(flat["average_entry_price"], "0")
+        self.assertIsNone(flat["mark_price"])
+        self.mark()
+        self.reserve()
+        self.fill()
+        first = self.send("variation_margin", settlement_price="105")
+        second = self.send("variation_margin", settlement_price="105")
+        for key in (
+            "cash_usd",
+            "realized_pnl_usd",
+            "variation_margin_usd",
+            "equity_usd",
+        ):
+            self.assertEqual(first[key], second[key])
+        self.assert_money_identity(second)
+
+    def test_settlement_does_not_refresh_risk_mark_or_clear_pause(self):
+        self.mark()
+        self.reserve()
+        self.fill()
+        first = self.event("variation_margin", settlement_price="101")
+        first["at_ms"] = T + 900
+        self.ledger.apply(first)
+        second = self.event("variation_margin", settlement_price="102")
+        second["at_ms"] = T + 1200
+        state = self.ledger.apply(second)
+        self.assertIn("STALE_MARK", state["pause_reasons"])
+        self.assertEqual(state["last_mark_at_ms"], T + 1)
+        self.assertEqual(state["mark_price"], "100")
+        self.assert_money_identity(state)
+
+    def test_live_margin_rates_revalue_positions_and_reserves_but_freeze_config(self):
+        self.mark()
+        self.reserve(quantity="3")
+        self.fill(quantity="1")
+        old_cash = self.ledger.state()["cash_usd"]
+        changed = self.send(
+            "margin_rates", initial_margin_rate="0.2", maintenance_margin_rate="0.1"
+        )
+        self.assertEqual(Decimal(changed["initial_margin_usd"]), Decimal("20"))
+        self.assertEqual(Decimal(changed["maintenance_margin_usd"]), Decimal("10"))
+        self.assertEqual(Decimal(changed["reserved_margin_usd"]), Decimal("40.20"))
+        self.assertEqual(changed["cash_usd"], old_cash)
+        self.assertEqual(self.ledger.config["initial_margin_rate"], Decimal("0.1"))
+        with self.assertRaises(TypeError):
+            self.ledger.config["initial_margin_rate"] = Decimal("1")
+        stored_config = json.loads(
+            self.ledger._db.execute("SELECT config FROM ledger_state").fetchone()[0]
+        )
+        self.assertEqual(stored_config, config())
+        self.assert_money_identity(changed)
+
+    def test_severe_margin_change_pauses_without_liquidation_and_survives_restart(self):
+        self.mark()
+        self.reserve(quantity="40")
+        self.fill(quantity="40")
+        event = self.event(
+            "margin_rates", initial_margin_rate="0.9", maintenance_margin_rate="0.8"
+        )
+        state = self.ledger.apply(event)
+        self.assertIn("INITIAL_MARGIN_BREACH", state["pause_reasons"])
+        self.assertIn("MAINTENANCE_MARGIN_BREACH", state["pause_reasons"])
+        self.assertEqual(state["position_quantity"], "40")
+        self.assertEqual(state["realized_pnl_usd"], "0")
+        self.assertEqual(self.ledger.apply(event), state)
+        self.ledger.close()
+        self.ledger = PaperLedger(self.path, config())
+        self.assertEqual(self.ledger.apply(event), state)
+        lower = self.send(
+            "margin_rates", initial_margin_rate="0.1", maintenance_margin_rate="0.05"
+        )
+        self.assertTrue(lower["paused"])
+        self.assertEqual(lower["position_quantity"], "40")
+        self.assertEqual(Decimal(lower["initial_margin_usd"]), Decimal("400"))
+
+    def test_margin_rate_decrease_never_releases_unknown_reservation(self):
+        self.mark()
+        self.reserve()
+        self.send("unknown", order_id="o1")
+        higher = self.send(
+            "margin_rates", initial_margin_rate="0.3", maintenance_margin_rate="0.2"
+        )
+        lower = self.send(
+            "margin_rates", initial_margin_rate="0.05", maintenance_margin_rate="0.02"
+        )
+        self.assertEqual(higher["reserved_margin_usd"], lower["reserved_margin_usd"])
+        self.assertEqual(Decimal(lower["reserved_margin_usd"]), Decimal("60.20"))
+        self.assertEqual(lower["orders"]["o1"]["status"], "UNKNOWN")
+        self.assertTrue(lower["paused"])
+        self.assert_money_identity(lower)
+
+    def test_invalid_new_event_fields_rates_and_prices_roll_back(self):
+        self.mark()
+        state = self.ledger.state()
+        cases = [
+            self.event("variation_margin", settlement_price="0"),
+            self.event("variation_margin", settlement_price="NaN"),
+            self.event("variation_margin", settlement_price=100),
+            self.event(
+                "margin_rates", initial_margin_rate="0.1", maintenance_margin_rate="0.2"
+            ),
+            self.event(
+                "margin_rates",
+                initial_margin_rate="1.01",
+                maintenance_margin_rate="0.2",
+            ),
+            self.event(
+                "margin_rates", initial_margin_rate="0.1", maintenance_margin_rate="0"
+            ),
+            self.event(
+                "margin_rates", initial_margin_rate=True, maintenance_margin_rate="0.05"
+            ),
+        ]
+        for event in cases:
+            with self.subTest(event=event), self.assertRaises(LedgerError):
+                self.ledger.apply(event)
+            self.assertEqual(self.ledger.state(), state)
+
+    def test_legacy_state_defaults_do_not_rewrite_history_on_read_or_replay(self):
+        self.mark()
+        event = self.event(
+            "reserve",
+            order_id="o1",
+            side="buy",
+            quantity="2",
+            limit_price="100",
+            reduce_only=False,
+        )
+        self.ledger.apply(event)
+        original = self.ledger._db.execute("SELECT state FROM ledger_state").fetchone()[
+            0
+        ]
+        legacy = json.loads(original)
+        for key in (
+            "variation_margin_usd",
+            "last_settlement_price",
+            "last_settlement_at_ms",
+            "initial_margin_rate",
+            "maintenance_margin_rate",
+            "margin_rates_at_ms",
+        ):
+            legacy.pop(key)
+        legacy.pop("position_cost_usd")
+        legacy.pop("cost_basis_source")
+        legacy["orders"]["o1"].pop("reserve_initial_margin_rate")
+        raw_legacy = json.dumps(legacy)
+        self.ledger._db.execute("UPDATE ledger_state SET state=?", (raw_legacy,))
+        self.ledger.close()
+        self.ledger = PaperLedger(self.path, config())
+        read = self.ledger.state()
+        replay = self.ledger.apply(event)
+        self.assertEqual(read, replay)
+        self.assertEqual(read["variation_margin_usd"], "0")
+        self.assertEqual(read["initial_margin_rate"], "0.1")
+        self.assertEqual(read["cost_basis_source"], "LEGACY_AVERAGE_DERIVATION")
+        self.assertEqual(Decimal(read["reserved_margin_usd"]), Decimal("20.20"))
+        self.assertEqual(
+            self.ledger._db.execute("SELECT state FROM ledger_state").fetchone()[0],
+            raw_legacy,
+        )
+
+    def test_recurring_average_cannot_leave_residual_on_full_close(self):
+        for side, close_side, expected in (("buy", "sell", "1"), ("sell", "buy", "-1")):
+            with self.subTest(side=side):
+                self.ledger.close()
+                self.ledger = PaperLedger(":memory:", config(fee_bps="0"))
+                self.mark("2")
+                self.reserve("a", side, "1", "1")
+                self.fill("a", "1", "1")
+                self.reserve("b", side, "2", "2")
+                before = self.fill("b", "2", "2")
+                self.assertEqual(before["position_cost_usd"], "5")
+                self.assertEqual(before["unrealized_pnl_usd"], expected)
+                self.reserve("close", close_side, "3", "2", True)
+                closed = self.fill("close", "3", "2")
+                self.assertEqual(closed["realized_pnl_usd"], expected)
+                self.assertEqual(closed["position_cost_usd"], "0")
+                self.assertEqual(closed["unrealized_pnl_usd"], "0")
+                self.assert_money_identity(closed)
+
+    def test_partial_close_then_variation_releases_exact_remaining_basis(self):
+        self.ledger.close()
+        self.ledger = PaperLedger(":memory:", config(fee_bps="0"))
+        self.mark("2")
+        self.reserve("a", "buy", "1", "1")
+        self.fill("a", "1", "1")
+        self.reserve("b", "buy", "2", "2")
+        self.fill("b", "2", "2")
+        self.reserve("partial", "sell", "1", "2", True)
+        before = self.fill("partial", "1", "2")
+        settled = self.send("variation_margin", settlement_price="2")
+        self.assertEqual(Decimal(settled["realized_pnl_usd"]), Decimal("1"))
+        self.assertEqual(Decimal(settled["equity_usd"]), Decimal(before["equity_usd"]))
+        self.assertEqual(settled["position_cost_usd"], "4")
+        self.reserve("close", "sell", "2", "2", True)
+        closed = self.fill("close", "2", "2")
+        self.assertEqual(Decimal(closed["realized_pnl_usd"]), Decimal("1"))
+        self.assertEqual(Decimal(closed["cash_usd"]), Decimal("1001"))
+        self.assert_money_identity(closed)
 
 
 if __name__ == "__main__":

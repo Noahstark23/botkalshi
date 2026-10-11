@@ -1,6 +1,7 @@
 """Build a visibly synthetic paper-session fixture; never fetches market data."""
 
 from decimal import Decimal
+
 from us500_engine import HOSTS, SCHEMA, body_digest
 
 NOW = 1791744840000

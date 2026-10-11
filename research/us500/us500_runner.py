@@ -19,6 +19,7 @@ from contextlib import closing, contextmanager
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
 
+from us500_control import ControlError, PaperControl
 from us500_engine import (
     DataError,
     body_digest,
@@ -32,6 +33,7 @@ from us500_ledger import LedgerError, PaperLedger
 
 MAX_FRAMES = 4096
 SCHEMA = "us500-paper-session-v1"
+MODEL_REVISION = 2
 
 
 def textnum(value):
@@ -80,12 +82,18 @@ def validate_session(data):
         raise DataError("INVALID_FRAME_COUNT")
     previous = 0
     for frame in frames:
-        if not isinstance(frame, dict) or set(frame) != {
+        required = {
             "at_ms",
             "snapshot",
             "funding_cashflow_usd",
             "infrastructure_cost_usd",
-        }:
+        }
+        optional = {"variation_margin_settlement_price", "margin_rates"}
+        if (
+            not isinstance(frame, dict)
+            or not required <= set(frame)
+            or set(frame) - required - optional
+        ):
             raise DataError("EXPLICIT_INTERVAL_COSTS_REQUIRED")
         at = timestamp(frame["at_ms"])
         if at <= previous:
@@ -94,6 +102,22 @@ def validate_session(data):
         number(frame["funding_cashflow_usd"])
         if number(frame["infrastructure_cost_usd"]) < 0:
             raise DataError("NEGATIVE_INFRASTRUCTURE_COST")
+        if "variation_margin_settlement_price" in frame:
+            number(frame["variation_margin_settlement_price"], positive=True)
+        if "margin_rates" in frame:
+            rates = frame["margin_rates"]
+            if not isinstance(rates, dict) or set(rates) != {
+                "initial_margin_rate",
+                "maintenance_margin_rate",
+            }:
+                raise DataError("INVALID_SCENARIO_MARGIN_RATES")
+            if not (
+                0
+                < number(rates["maintenance_margin_rate"])
+                <= number(rates["initial_margin_rate"])
+                <= 1
+            ):
+                raise DataError("INVALID_SCENARIO_MARGIN_RATES")
     # Validate ledger configuration before opening a persistent file.
     probe = PaperLedger(":memory:", data["ledger"])
     probe.close()
@@ -207,6 +231,13 @@ def build_plan(data):
                 ):
                     raise DataError("FUNDING_WITHOUT_POSITION")
                 state = emit("mark", price=textnum(mark))
+                if "variation_margin_settlement_price" in frame:
+                    state = emit(
+                        "variation_margin",
+                        settlement_price=frame["variation_margin_settlement_price"],
+                    )
+                if "margin_rates" in frame:
+                    state = emit("margin_rates", **frame["margin_rates"])
                 # Explicit signed scenario cash flow, not an estimated venue rate.
                 state = emit("funding", cashflow_usd=frame["funding_cashflow_usd"])
                 state = emit("cost", amount_usd=frame["infrastructure_cost_usd"])
@@ -375,6 +406,7 @@ def _exclusive_database(path):
 def _pin_session(path, data):
     """Pin an append-only input prefix before applying any ledger event."""
     metadata = {k: v for k, v in data.items() if k != "frames"}
+    metadata["_runner_model_revision"] = MODEL_REVISION
     frame_hashes = [body_digest(frame) for frame in data["frames"]]
     if path.exists():
         with closing(
@@ -425,6 +457,8 @@ def _pin_session(path, data):
             ).fetchone()
             if old:
                 prior = json.loads(old[1])
+                if json.loads(old[0]).get("_runner_model_revision") != MODEL_REVISION:
+                    raise DataError("RUNNER_MODEL_VERSION_MISMATCH_USE_NEW_DATABASE")
                 if (
                     json.loads(old[0]) != metadata
                     or len(frame_hashes) < len(prior)
@@ -439,19 +473,94 @@ def _pin_session(path, data):
         connection.close()
 
 
-def replay(data, database):
+def replay(data, database, *, control=None):
+    """Replay offline; an optional operator gate serializes every durable event.
+
+    The same control DB lock protects a pause and an event commit. Once a pause
+    is acknowledged, no later event passes its permit. A pause between reserve
+    and fill retains that reserve; resuming replays those same event IDs.
+    """
     events, report = build_plan(data)
+    if control is not None and Path(database).resolve() == control.path.resolve():
+        raise DataError("CONTROL_AND_LEDGER_DATABASE_MUST_DIFFER")
     with _exclusive_database(database) as path:
-        _pin_session(path, data)
-        book = PaperLedger(path, data["ledger"])
+
+        def initialize(snapshot=None):
+            if path.exists():
+                with closing(
+                    sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+                ) as prior:
+                    if prior.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='us500_control_binding'"
+                    ).fetchone():
+                        if snapshot is None:
+                            raise DataError("BOUND_PAPER_CONTROL_REQUIRED")
+                        old = prior.execute(
+                            "SELECT control_id FROM us500_control_binding WHERE id=1"
+                        ).fetchone()
+                        if not old or old[0] != snapshot["control_id"]:
+                            raise DataError("PAPER_CONTROL_BINDING_CONFLICT")
+            _pin_session(path, data)
+            if snapshot is not None:
+                with closing(sqlite3.connect(path)) as db:
+                    with db:
+                        db.execute(
+                            "CREATE TABLE IF NOT EXISTS us500_control_binding (id INTEGER PRIMARY KEY CHECK(id=1), control_id TEXT NOT NULL)"
+                        )
+                        old = db.execute(
+                            "SELECT control_id FROM us500_control_binding WHERE id=1"
+                        ).fetchone()
+                        if old and old[0] != snapshot["control_id"]:
+                            raise DataError("PAPER_CONTROL_BINDING_CONFLICT")
+                        db.execute(
+                            "INSERT OR IGNORE INTO us500_control_binding VALUES(1, ?)",
+                            (snapshot["control_id"],),
+                        )
+            return PaperLedger(path, data["ledger"])
+
+        if control is None:
+            book = initialize()
+        else:
+            permit = control.with_permit(initialize)
+            if not permit["permitted"]:
+                return {
+                    "schema": "us500-paper-control-report-v1",
+                    "run_id": data["run_id"],
+                    "status": "PAPER_DISABLED",
+                    "events_applied_this_call": 0,
+                    "ledger_not_read": True,
+                    "execution_available": False,
+                    "actual_orders": 0,
+                    "control": control.snapshot(),
+                }
+            book = permit["result"]
+        applied = 0
         try:
             for event in events:
-                book.apply(event)
+                if control is None:
+                    book.apply(event)
+                else:
+                    permit = control.with_permit(lambda _snapshot: book.apply(event))
+                    if not permit["permitted"]:
+                        return {
+                            "schema": "us500-paper-control-report-v1",
+                            "run_id": data["run_id"],
+                            "status": "OPERATOR_PAUSED",
+                            "events_applied_this_call": applied,
+                            "events_include_idempotent_replays": True,
+                            "final_state": book.state(),
+                            "execution_available": False,
+                            "actual_orders": 0,
+                            "control": control.snapshot(),
+                        }
+                applied += 1
             if book.state() != report["final_state"]:
                 raise DataError("PERSISTED_REPLAY_DIVERGENCE")
         finally:
             book.close()
     report["durable_replay_verified"] = True
+    if control is not None:
+        report["control"] = control.snapshot()
     return report
 
 
@@ -460,18 +569,35 @@ def main():
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--control-database", type=Path)
+    parser.add_argument("--owner-user-id", type=int)
+    parser.add_argument("--owner-chat-id", type=int)
     args = parser.parse_args()
     try:
         if args.output.exists() or args.output.is_symlink():
             raise DataError("OUTPUT_ALREADY_EXISTS")
-        result = replay(decode(args.input.read_bytes()), args.database)
+        control_args = (args.control_database, args.owner_user_id, args.owner_chat_id)
+        if any(v is not None for v in control_args) and any(
+            v is None for v in control_args
+        ):
+            raise DataError("ALL_CONTROL_ARGUMENTS_REQUIRED")
+        control = (
+            PaperControl(
+                args.control_database,
+                owner_user_id=args.owner_user_id,
+                owner_chat_id=args.owner_chat_id,
+            )
+            if args.control_database is not None
+            else None
+        )
+        result = replay(decode(args.input.read_bytes()), args.database, control=control)
         save_new(args.output, result)
-    except (DataError, LedgerError, OSError, sqlite3.Error) as exc:
+    except (DataError, LedgerError, ControlError, OSError, sqlite3.Error) as exc:
         print(
             json.dumps(
                 {
                     "error": str(exc)
-                    if isinstance(exc, (DataError, LedgerError))
+                    if isinstance(exc, (DataError, LedgerError, ControlError))
                     else "LOCAL_IO_ERROR",
                     "execution_available": False,
                 }
@@ -482,7 +608,7 @@ def main():
         json.dumps(
             {
                 "saved": str(args.output),
-                "durable_replay_verified": True,
+                "durable_replay_verified": result.get("durable_replay_verified", False),
                 "execution_available": False,
             }
         )

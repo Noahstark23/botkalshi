@@ -1,77 +1,70 @@
-# US500 V1 — motor financiero de simulación local
+# US500 V2 — simulación, sesiones y control local
 
-Entrega del 11 de octubre de 2026. Esta versión completa el circuito local: datos públicos → validación → hipótesis determinista → ejecución ficticia → contabilidad persistente → informe y replay tras reinicio. Está separado de M2/M5 y no importa BotKalshi, cuentas, configuración global ni secretos. No contiene un transporte de órdenes reales. `execution_available=false` es un hecho del código, no un flag que active trading.
+Candidato de revisión del 11 de octubre de 2026. Circuito implementado: capturas públicas → validación → hipótesis momentum congelada → ejecución ficticia con una captura posterior → ledger persistente → informe y reinicio. Incluye controles de Telegram **para US500 paper**. No contiene transporte de órdenes reales, credenciales Kalshi, integración con el bot deportivo ni cambios de producción.
 
-## Ejecutarlo
+La rama conserva su nombre `codex/us500-paper-v1-20261011`; V2 identifica esta revisión del módulo, no un despliegue. La base V1 `0fd3bf7` y sus evidencias históricas permanecen accesibles en Git. `MANIFIESTO_V2.json` verifica los archivos actuales; `MANIFIESTO_V1.json` describe exclusivamente la entrega anterior.
 
-Python 3.10 o posterior, biblioteca estándar. No hay dependencias de ejecución. Desde esta carpeta, usá una ruta nueva:
+## Verificación reproducible
 
-```sh
-python3 -m unittest discover -s tests -v
-python3 run_demo.py --directory mi-prueba-us500
-```
-
-El demo genera diez capturas sintéticas, procesa un prefijo, continúa con el resto, reinicia y comprueba igualdad completa. Conserva el input, reportes, SQLite y resumen. No sobrescribe carpetas existentes.
-
-Para repetir una sesión archivada sobre su misma DB:
+Python 3.10–3.14, biblioteca estándar. Desde `research/us500`:
 
 ```sh
-python3 us500_runner.py --input mi-prueba-us500/SESSION_SYNTHETIC.json --database mi-prueba-us500/paper.sqlite3 --output mi-prueba-us500/REPLAY_ADICIONAL.json
+python3 verify_package.py
+python3 verify_offline.py
+python3 run_demo.py --directory /tmp/us500-v2-demo-nuevo
+python3 run_control_demo.py --directory /tmp/us500-v2-botones-nuevo
 ```
 
-Los mismos eventos no vuelven a afectar cash/posición. Una sesión puede extenderse agregando frames; cambiar parámetros, truncar o alterar el prefijo se rechaza. No se admite reutilizar bases históricas ni enlaces simbólicos.
+Elegí directorios nuevos: no se sobrescriben. `verify_offline.py` ejecuta toda la suite y ambos recorridos con DNS y conexiones/envíos de sockets bloqueados. El workflow `.github/workflows/us500-paper.yml` incluye el módulo explícitamente en CI; no instala el bot, consume secretos, construye despliegues ni envía órdenes.
 
-Captura puntual de ficha/libro públicos:
-
-```sh
-python3 us500_engine.py capture --environment public --output observacion-nueva.json
-```
-
-Históricos públicos, con tiempos epoch UTC en milisegundos elegidos explícitamente:
-
-```sh
-python3 us500_history.py capture-history --environment public --resource trades --start-ms 1791742829661 --end-ms 1791746429661 --max-pages 1 --output trades-nuevos.json
-python3 us500_history.py verify --input trades-nuevos.json --output revision-historico.json
-```
-
-Ese rango corresponde al ensayo archivado, no a una solicitud automática del momento actual. Recursos: `trades`, `candles` (un minuto), `funding`. Demo usa su propio host/ticker. La captura consulta datos públicos; no accede a ninguna cuenta ni demuestra habilitación de Perps. Cada cliente tiene presupuesto de peticiones, sin reintentos. Timeout de socket no equivale a plazo total garantizado.
+El recorrido original continúa dando USD100 → USD98.6643 bajo sus supuestos, sin posición ni reservas al terminar. El recorrido de botones prueba activación confirmada → posición ficticia → pausa → bloqueo de continuación → reactivación confirmada → cierre ficticio/reinicio → pausa final. No contacta Telegram.
 
 ## Componentes
 
 | Archivo | Función |
 |---|---|
-| `us500_engine.py` | Captura pública, normalización, aritmética de escenarios y procedencia |
-| `us500_history.py` | Paginación/ventanas históricas, hashes crudos y canónicos, cobertura y huecos |
-| `us500_ledger.py` | Posición firmada, PnL, costes, margen hipotético, reservas y SQLite transaccional |
-| `us500_runner.py` | Regla congelada, ejecución ficticia en observación posterior, límites y replay durable |
-| `example_session.py`, `run_demo.py` | Fixture sintético reproducible y ensayo de continuidad |
-| `tests/` | Pruebas offline; no necesitan claves ni servicios externos |
-| `CONTRATO_Y_LIMITES.md` | Fuentes oficiales, unidades y diferencias frente al exchange |
-| `HISTORICAL_API.md` | Contrato de ingestión y significado de cobertura |
-| `evidence/` | Logs, lectura pública puntual y resultados ficticios |
+| `us500_engine.py` | Ficha/libro públicos, unidades, hashes, validación y escenarios |
+| `us500_history.py` | Trades, velas y funding paginados; cobertura e integridad |
+| `us500_session.py`, `SESIONES.md` | Ensamble de capturas/costes y colector con presupuesto durable |
+| `us500_ledger.py` | Cash, coste acumulado, posición, PnL, fees, reservas y margen hipotético |
+| `us500_runner.py` | Momentum congelado, ejecución ficticia posterior, replay y permiso de control |
+| `us500_control.py` | Dueño/chat exactos, confirmación única, pausa persistente y permisos por evento |
+| `us500_telegram.py`, `TELEGRAM_PAPER.md` | Transporte explícito, cursor/outbox, respuestas ambiguas y operación del menú |
+| `run_demo.py`, `run_control_demo.py` | Recorridos offline reproducibles |
+| `VERIFICACION_V2.md` | Qué se verificó y qué queda abierto |
 
-`INVESTIGACION_Y_PLAN.md` y `OBSERVACION_PUBLICA_2026-10-11.json` se conservaron desde v0.1: son documentos históricos. Este README y VERIFICACION_V1.md describen el estado nuevo. El paquete portable anterior tampoco se modifica.
+## Modelo y continuidad
 
-## Regla y modelo de ejecución
+`momentum-v1` compara midpoints separados por `lookback-1` observaciones. No se optimizó con los ejemplos. Una señal sólo puede usar un libro solicitado después de la observación que la generó. Reversión: cerrar primero; abrir el sentido contrario requiere otra observación. Spread, paso, tick, datos, nocional y margen limitan cada propuesta.
 
-`momentum-v1` compara el midpoint actual con el de `lookback-1` observaciones atrás. Por encima/debajo de un umbral explícito propone una posición larga/corta de cantidad configurada; dentro de la banda propone cero. No se optimizaron parámetros con los ejemplos. No es una recomendación de inversión ni una regla validada económicamente.
+Los fills hipotéticos recorren profundidad visible, aplican slippage adverso y redondean al tick. El remanente se cancela bajo un supuesto IOC local. No se reproducen cola, latencia, liquidez futura ni resultado de una orden desconocida del exchange. UNKNOWN en el ledger pausa y conserva reservas hasta un evento terminal explícito.
 
-Una señal sólo puede usar liquidez de una captura solicitada después de la observación que la generó. Reusar una captura o superponer su intervalo bloquea la sesión. Una reversión primero cierra y sólo una observación posterior puede abrir el otro sentido. Spread, tick, paso de cantidad, datos, margen y nocional limitan cada propuesta. Las cantidades corresponden a unidades API; el nocional es cantidad por precio, sin multiplicar `contract_size` de nuevo.
+El nocional es cantidad API × precio, sin multiplicar otra vez el tamaño del contrato. El coste agregado de posición es la base contable; el precio promedio es informativo. Así, cerrar posiciones con promedios periódicos no usa un promedio redondeado como fuente del PnL. Cash = inicial + realizado − fees + funding − costes; equity agrega PnL latente.
 
-Las ejecuciones hipotéticas recorren profundidad visible, agregan slippage adverso y redondean al tick. Si falta profundidad, el modelo produce fill parcial y cancela ficticiamente el resto (supuesto IOC local). No predice colas maker, latencia ni desaparición de liquidez. El ledger también permite representar UNKNOWN: pausa y conserva la reserva hasta un evento terminal explícito. No extrapolar la cancelación ficticia a una orden real desconocida.
+Cada frame requiere funding y coste de infraestructura explícitos. Se admiten dos campos opcionales:
 
-El ledger cobra fees supuestas por fill, redondeadas hacia arriba; reserva suficiente para fragmentos mínimos. Cash = inicial + PnL realizado − fees + funding − infraestructura. Equity agrega PnL latente. Funding es obligatorio por intervalo, incluso si se asume cero; no se estima desde un promedio de primas ni se cobra si no hay posición. Un pago distinto de cero con posición cero se rechaza.
+```json
+{
+  "variation_margin_settlement_price": "13.05",
+  "margin_rates": {
+    "initial_margin_rate": "0.90",
+    "maintenance_margin_rate": "0.45"
+  }
+}
+```
 
-El mark de liquidación se valida separado del midpoint; puede estar fuera del tick negociable. Márgenes inicial/mantenimiento son porcentajes hipotéticos constantes de nocional, **no el cálculo dependiente del riesgo del exchange**. Ante breach, gap o UNKNOWN se pausa de forma durable y se informa exposición residual. No hay fill ficticio automático de liquidación ni reanudación automática. El cierre al final del archivo tampoco se fabrica. Los cambios de margen intrasesión y ciclos reales de variation margin no están implementados.
+Estos campos se agregan al frame que ya contiene captura, tiempo y costes. Orden: mark → variation margin opcional → tasas opcionales → funding → costes → eventual ejecución ficticia. Variation margin realiza el PnL y rebasa el coste, conserva equity al mismo mark y no refresca su antigüedad. `variation_margin_usd` está **incluido** en `realized_pnl_usd`; no se suma dos veces. Tasas: `0 < mantenimiento <= inicial <= 1`. Un aumento revalúa reservas; una bajada no libera reservas abiertas/UNKNOWN. Todos son eventos idempotentes con parámetros de escenario; no constituyen el modelo de liquidación Kalshi ni condiciones verificadas de cuenta.
 
-Cada replay primero construye el plan completo en memoria y después lo aplica con IDs idempotentes. La DB fija configuración y hashes del prefijo antes de contabilizar; un lock excluye escritores simultáneos del runner. La inicialización del manifiesto es atómica; las mutaciones del ledger son transacciones SQLite. Máximos: 4.096 frames, 100.000 eventos por DB, 8.192 órdenes totales y 20 páginas por captura histórica; llegar al límite no elimina historia ni libera reservas.
+Ante breach, gap o UNKNOWN queda una pausa durable, sin fill inventado de liquidación ni cierre automático al final del archivo. Habilitar paper por Telegram no borra esas pausas. La pausa operativa detiene eventos futuros; conserva posición y reservas existentes.
 
-## Alcance de cierre
+La DB fija configuración, versión del modelo y hashes del prefijo. Puede extenderse una sesión, sin alterar su historia. Las bases del runner V1 se rechazan antes de escribir: V2 necesita una DB nueva y no migra implícitamente contabilidad histórica. No descartar una base con exposición residual; conservarla y revisar su conciliación con la versión que la creó. Los mismos eventos V2 se reejecutan sin duplicar dinero. Una base vinculada a un control exige ese mismo control incluso al invocar el CLI directamente.
 
-La versión V1 queda terminada **como motor local de simulación y evaluación**, con una regla reproducible y contabilidad de futuros. La lectura pública realizada devolvió mercado cerrado e históricos vacíos para la hora consultada. No existe aún una muestra de estrategia independiente ni una sesión observada completa para medir resultados económicos.
+Límites: 4.096 frames, 100.000 eventos, 8.192 órdenes ficticias por ledger; no se borra historia para volver a habilitar capacidad. El colector público reserva GET antes de enviarlos y conserva el presupuesto al reiniciar; un cierre del mercado detiene la captura antes de consultar el libro.
 
-Antes de una integración real quedan por verificar: habilitación propia Perps, parámetros de cuenta, especificación contractual vigente, libro/marks/funding durante sesiones abiertas y evaluación fuera de muestra. El ejecutor real, WebSocket autenticado, conciliación de cuenta y liquidación del venue quedan fuera de esta entrega. No se presenta como motor listo para dinero real.
+## Estado y pendientes externos
 
-Jev es opcional para contrastar afirmaciones con documentos; no participa en señales, cálculos ni ejecución. Se aplicó la skill TypeSafe al diseño, pero no se hicieron llamadas al servicio ni se implementó un adaptador Jev en este paquete. The Odds API no aporta datos para este futuro financiero.
+V2 completa las piezas locales anteriores y su integración offline. La consulta pública nueva devolvió HTTP200 y mercado cerrado; se registró 1 GET y pausa. No aporta una sesión abierta ni resultados prospectivos.
 
-La rama `codex/live-readiness-20261006` en `c1431286…` contiene el candidato anterior M2/M5. **US500 V1 se entrega en ZIP aparte; todavía no está en esa rama.** No hubo otro push, PR, merge, despliegue, acceso a producción ni consumo de cuotas Odds/Jev durante esta implementación.
+Quedan abiertos: permisos Perps de la cuenta, condiciones contractuales y económicas aplicables, datos completos de sesiones abiertas, evaluación independiente, conciliación de cuenta y ejecutor real. La comunicación real del menú tampoco se ha instalado o comprobado en Telegram. No hay evidencia de rentabilidad ni declaración de preparación para dinero real.
+
+Jev no decide señales ni mueve dinero; no se consumió Jev ni Odds durante V2. M2/M5 siguen en su rama separada y fuera de esta integración. Los documentos y logs V1 se conservan como históricos, no como prueba de la nueva revisión.

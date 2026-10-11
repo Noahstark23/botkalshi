@@ -7,7 +7,7 @@ from pathlib import Path
 
 def main():
     root = Path(__file__).resolve().parent
-    manifest = json.loads((root / "MANIFIESTO_V1.json").read_text())
+    manifest = json.loads((root / "MANIFIESTO_V2.json").read_text())
     for relative, expected in manifest["files"].items():
         path = root / relative
         if path.is_symlink() or root not in path.resolve().parents:

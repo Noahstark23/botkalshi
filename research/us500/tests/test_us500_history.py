@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import us500_history as history
-from us500_engine import DataError, MAX_BYTES, save_new
+from us500_engine import MAX_BYTES, DataError, save_new
 
 START = 1791744840000
 END = START + 120000

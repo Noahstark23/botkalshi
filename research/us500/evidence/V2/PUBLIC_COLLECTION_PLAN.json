@@ -1,0 +1,10 @@
+{
+  "collection_id": "us500-v2-once-20261011",
+  "environment": "public",
+  "max_gets": 2,
+  "observation_id": "observation-001",
+  "credentials": false,
+  "orders": false,
+  "automatic_retries": false,
+  "purpose": "Verify bounded collector against public market metadata; no session or profitability claim."
+}

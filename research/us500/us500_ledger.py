@@ -1,7 +1,8 @@
 """Durable local ledger for hypothetical linear futures, never venue accounting.
 
 No sockets, credentials, production imports, external orders, or liquidation fills.
-Cash changes only by realized PnL, explicit fees, signed funding, and explicit cost.
+Cash changes only by realized PnL (including variation settlement), explicit fees,
+signed funding, and explicit cost. Settlement does not replace the risk mark.
 Margin rates and fee rounding are assumptions supplied by the caller.
 """
 
@@ -10,9 +11,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
+from decimal import ROUND_CEILING, Decimal, InvalidOperation, localcontext
 from pathlib import Path
-
+from types import MappingProxyType
 
 MAX_EVENTS = 100_000
 MAX_ORDERS = 8_192
@@ -45,6 +46,8 @@ _FIELDS = {
     "funding": {"cashflow_usd"},
     "cost": {"amount_usd"},
     "pause": {"reason"},
+    "variation_margin": {"settlement_price"},
+    "margin_rates": {"initial_margin_rate", "maintenance_margin_rate"},
 }
 
 
@@ -71,6 +74,11 @@ def _canonical(value: dict) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _margin_rates(initial: Decimal, maintenance: Decimal) -> None:
+    if not 0 < maintenance <= initial <= 1:
+        raise LedgerError("INVALID_MARGIN_RATES")
+
+
 def _check_config(config: dict) -> dict:
     if type(config) is not dict or set(config) != _CONFIG:
         raise LedgerError("INVALID_CONFIG_FIELDS")
@@ -79,13 +87,7 @@ def _check_config(config: dict) -> dict:
         checked[key] = _decimal(config[key], nonnegative=True)
     if any(checked[key] <= 0 for key in _CONFIG - {"max_gap_ms", "fee_bps"}):
         raise LedgerError("NONPOSITIVE_CONFIG")
-    if (
-        not 0
-        < checked["maintenance_margin_rate"]
-        <= checked["initial_margin_rate"]
-        <= 1
-    ):
-        raise LedgerError("INVALID_MARGIN_RATES")
+    _margin_rates(checked["initial_margin_rate"], checked["maintenance_margin_rate"])
     if checked["fee_bps"] > 10000:
         raise LedgerError("INVALID_FEE_RATE")
     if checked["quantity_step"] < Decimal("0.01") or checked["quantity_step"] % Decimal(
@@ -110,12 +112,16 @@ class PaperLedger:
     is created. All other events represent supplied facts, including while paused.
     cancel means an authoritative simulated terminal cancellation, not a request.
     No resume event exists; pauses are durable. UNKNOWN never releases a reserve.
+    variation_margin rebases cost basis and moves the same PnL into cash; its
+    subtotal is already included in realized_pnl_usd. The independent risk mark
+    and its freshness are unchanged. margin_rates updates hypothetical live
+    requirements; open-order reservations retain their highest observed rate.
     """
 
     def __init__(self, path: str | Path, config: dict):
         with localcontext() as ctx:
             ctx.prec = 80
-            self.config = _check_config(config)
+            self.config = MappingProxyType(_check_config(config))
         self._config_json = _canonical(config)
         self._db = sqlite3.connect(str(path), isolation_level=None, timeout=5)
         self._db.execute("PRAGMA foreign_keys=ON")
@@ -140,7 +146,15 @@ class PaperLedger:
                     "cash_usd": config["initial_cash_usd"],
                     "position_quantity": "0",
                     "average_entry_price": "0",
+                    "position_cost_usd": "0",
+                    "cost_basis_source": "ACCUMULATED_CASHFLOWS",
                     "realized_pnl_usd": "0",
+                    "variation_margin_usd": "0",
+                    "last_settlement_price": None,
+                    "last_settlement_at_ms": None,
+                    "initial_margin_rate": config["initial_margin_rate"],
+                    "maintenance_margin_rate": config["maintenance_margin_rate"],
+                    "margin_rates_at_ms": None,
                     "fees_usd": "0",
                     "funding_usd": "0",
                     "costs_usd": "0",
@@ -175,7 +189,32 @@ class PaperLedger:
         row = self._db.execute("SELECT state FROM ledger_state WHERE id=1").fetchone()
         if row is None:
             raise LedgerError("MISSING_LEDGER_STATE")
-        return json.loads(row[0])
+        state = json.loads(row[0])
+        # Additive compatibility for existing v1 ledgers. Reading/replaying an
+        # old event does not rewrite the DB or create an accounting event.
+        state.setdefault("variation_margin_usd", "0")
+        state.setdefault("last_settlement_price", None)
+        state.setdefault("last_settlement_at_ms", None)
+        state.setdefault(
+            "initial_margin_rate", _text(self.config["initial_margin_rate"])
+        )
+        state.setdefault(
+            "maintenance_margin_rate", _text(self.config["maintenance_margin_rate"])
+        )
+        state.setdefault("margin_rates_at_ms", None)
+        if "position_cost_usd" not in state:
+            # Old ledgers retained only a rounded average: preserve that evidence
+            # explicitly rather than claim to recover the lost exact cashflows.
+            state["position_cost_usd"] = _text(
+                abs(Decimal(state["position_quantity"]))
+                * Decimal(state["average_entry_price"])
+            )
+            state["cost_basis_source"] = "LEGACY_AVERAGE_DERIVATION"
+        for order in state["orders"].values():
+            order.setdefault(
+                "reserve_initial_margin_rate", _text(self.config["initial_margin_rate"])
+            )
+        return state
 
     def _fee(self, notional: Decimal) -> Decimal:
         quantum = self.config["fee_quantum_usd"]
@@ -191,7 +230,7 @@ class PaperLedger:
         margin = (
             Decimal(0)
             if order["reduce_only"]
-            else notional * self.config["initial_margin_rate"]
+            else notional * Decimal(order["reserve_initial_margin_rate"])
         )
         # Every minimum-size partial fill may round its fee upward separately.
         # Reserve that worst case, not just one rounding for the whole order.
@@ -203,11 +242,15 @@ class PaperLedger:
 
     def _metrics(self, state: dict) -> dict:
         position = Decimal(state["position_quantity"])
-        average = Decimal(state["average_entry_price"])
+        cost = Decimal(state["position_cost_usd"])
         mark = Decimal(state["mark_price"]) if state["mark_price"] is not None else None
         if position and mark is None:
             raise LedgerError("POSITION_WITHOUT_MARK")
-        unrealized = position * (mark - average) if position else Decimal(0)
+        unrealized = (
+            (abs(position) * mark - cost) * (1 if position > 0 else -1)
+            if position
+            else Decimal(0)
+        )
         notional = abs(position) * mark if position else Decimal(0)
         equity = Decimal(state["cash_usd"]) + unrealized
         reserved = sum(
@@ -222,17 +265,17 @@ class PaperLedger:
             ),
             Decimal(0),
         )
-        initial_margin = notional * self.config["initial_margin_rate"]
+        initial_margin = notional * Decimal(state["initial_margin_rate"])
         return {
             "unrealized_pnl_usd": _text(unrealized),
             "equity_usd": _text(equity),
-            "position_cost_usd": _text(abs(position) * average),
+            "position_cost_usd": _text(cost),
             "notional_usd": _text(notional),
             "open_order_notional_usd": _text(open_notional),
             "reserved_margin_usd": _text(reserved),
             "initial_margin_usd": _text(initial_margin),
             "maintenance_margin_usd": _text(
-                notional * self.config["maintenance_margin_rate"]
+                notional * Decimal(state["maintenance_margin_rate"])
             ),
             "available_margin_usd": _text(equity - initial_margin - reserved),
             "net_pnl_usd": _text(equity - self.config["initial_cash_usd"]),
@@ -312,6 +355,21 @@ class PaperLedger:
             result["amount_usd"] = _decimal(event["amount_usd"], nonnegative=True)
         if kind == "pause":
             _id(event["reason"])
+        if kind == "variation_margin":
+            # A settlement mark is not an executable limit/fill price.
+            result["settlement_price"] = _decimal(
+                event["settlement_price"], positive=True
+            )
+        if kind == "margin_rates":
+            result["initial_margin_rate"] = _decimal(
+                event["initial_margin_rate"], positive=True
+            )
+            result["maintenance_margin_rate"] = _decimal(
+                event["maintenance_margin_rate"], positive=True
+            )
+            _margin_rates(
+                result["initial_margin_rate"], result["maintenance_margin_rate"]
+            )
         return result
 
     def _reserve(self, state: dict, event: dict) -> str | None:
@@ -350,6 +408,7 @@ class PaperLedger:
                 max(event["limit_price"], Decimal(state["mark_price"]))
             ),
             "status": "OPEN",
+            "reserve_initial_margin_rate": state["initial_margin_rate"],
         }
         metrics = self._metrics(state)
         if not event["reduce_only"] and self._reservation(order) > Decimal(
@@ -382,24 +441,38 @@ class PaperLedger:
         ):
             raise LedgerError("FILL_VIOLATES_LIMIT")
         old = Decimal(state["position_quantity"])
-        average = Decimal(state["average_entry_price"])
+        cost = Decimal(state["position_cost_usd"])
         signed = qty if order["side"] == "buy" else -qty
         if order["reduce_only"] and (old * signed >= 0 or qty > abs(old)):
             raise LedgerError("FILL_VIOLATES_REDUCE_ONLY")
         new = old + signed
         realized = Decimal(0)
         if not old or old * signed > 0:
-            average = (abs(old) * average + qty * price) / abs(new)
+            cost += qty * price
+            average = cost / abs(new)
+            if not old:
+                state["cost_basis_source"] = "ACCUMULATED_CASHFLOWS"
         else:
             closed = min(abs(old), qty)
-            realized = closed * (price - average) * (1 if old > 0 else -1)
+            # A recurring average (e.g. 5/3) must not turn a fully closed $1
+            # gain into 0.999... . Release the exact remaining basis at close.
+            closed_cost = cost if closed == abs(old) else cost * closed / abs(old)
+            realized = (closed * price - closed_cost) * (1 if old > 0 else -1)
             if not new:
                 average = Decimal(0)
+                cost = Decimal(0)
+                state["cost_basis_source"] = "ACCUMULATED_CASHFLOWS"
             elif old * new < 0:
                 average = price
+                cost = abs(new) * price
+                state["cost_basis_source"] = "ACCUMULATED_CASHFLOWS"
+            else:
+                cost -= closed_cost
+                average = cost / abs(new)
         fee = self._fee(qty * price)
         state["position_quantity"] = _text(new)
         state["average_entry_price"] = _text(average)
+        state["position_cost_usd"] = _text(cost)
         state["realized_pnl_usd"] = _text(Decimal(state["realized_pnl_usd"]) + realized)
         state["fees_usd"] = _text(Decimal(state["fees_usd"]) + fee)
         state["cash_usd"] = _text(Decimal(state["cash_usd"]) + realized - fee)
@@ -448,6 +521,41 @@ class PaperLedger:
             state["cash_usd"] = _text(Decimal(state["cash_usd"]) - amount)
         elif kind == "pause":
             self._pause(state, "MANUAL:" + event["reason"])
+        elif kind == "variation_margin":
+            position = Decimal(state["position_quantity"])
+            new_cost = abs(position) * event["settlement_price"]
+            amount = (
+                (new_cost - Decimal(state["position_cost_usd"]))
+                * (1 if position > 0 else -1)
+                if position
+                else Decimal(0)
+            )
+            state["cash_usd"] = _text(Decimal(state["cash_usd"]) + amount)
+            state["realized_pnl_usd"] = _text(
+                Decimal(state["realized_pnl_usd"]) + amount
+            )
+            state["variation_margin_usd"] = _text(
+                Decimal(state["variation_margin_usd"]) + amount
+            )
+            state["average_entry_price"] = (
+                _text(event["settlement_price"]) if position else "0"
+            )
+            state["position_cost_usd"] = _text(new_cost)
+            state["cost_basis_source"] = "EXPLICIT_VARIATION_SETTLEMENT"
+            state["last_settlement_price"] = _text(event["settlement_price"])
+            state["last_settlement_at_ms"] = event["at_ms"]
+        elif kind == "margin_rates":
+            state["initial_margin_rate"] = _text(event["initial_margin_rate"])
+            state["maintenance_margin_rate"] = _text(event["maintenance_margin_rate"])
+            state["margin_rates_at_ms"] = event["at_ms"]
+            for order in state["orders"].values():
+                if order["status"] in {"OPEN", "PARTIAL", "UNKNOWN"}:
+                    order["reserve_initial_margin_rate"] = _text(
+                        max(
+                            Decimal(order["reserve_initial_margin_rate"]),
+                            event["initial_margin_rate"],
+                        )
+                    )
         return None
 
     def apply(self, event: dict) -> dict:

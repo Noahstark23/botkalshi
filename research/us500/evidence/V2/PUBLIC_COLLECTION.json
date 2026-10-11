@@ -1,0 +1,100 @@
+{
+  "schema": "us500-public-collection-v1",
+  "collection_id": "us500-v2-once-20261011",
+  "environment": "public",
+  "max_gets": 2,
+  "status": "PAUSED",
+  "stop_reason": "COLLECTION_MARKET_CLOSED",
+  "reserved_gets": 1,
+  "remaining_gets": 1,
+  "captures": [
+    {
+      "observation_id": "observation-001",
+      "status": "FAILED",
+      "snapshot": null,
+      "snapshot_sha256": null,
+      "reason": "COLLECTION_MARKET_CLOSED"
+    }
+  ],
+  "requests": [
+    {
+      "request_id": 1,
+      "observation_id": "observation-001",
+      "resource": "market",
+      "status": "RESPONSE_SAVED",
+      "observation": {
+        "body": {
+          "market": {
+            "ask": "922337203685477.5807",
+            "asset_class": "Indices",
+            "bid": "13.7449",
+            "contract_size": "0.001000",
+            "exchange_index": 1,
+            "fractional_trading_enabled": false,
+            "leverage_estimate": "13.7398",
+            "leverage_estimates": {
+              "1000": "13.7398",
+              "10000": "13.7398",
+              "100000": "13.7398",
+              "1000000": "13.7398"
+            },
+            "liquidation_mark_price": {
+              "price": "13.7536",
+              "ts_ms": 1791744609975
+            },
+            "long_leverage_estimates": {
+              "1000": "15.3233",
+              "10000": "15.3233",
+              "100000": "15.3233",
+              "1000000": "15.3233"
+            },
+            "market_id": "01a0fdae-d5b7-7985-8692-e07ae79d623f",
+            "market_version": 1,
+            "open_interest": "120572.00",
+            "open_interest_notional_value_dollars": "1659348.035600",
+            "price": "13.7623",
+            "reference_price": {
+              "price": "13.7507",
+              "ts_ms": 1791577200000
+            },
+            "schedule": {
+              "is_open": false,
+              "next_close_ts": null,
+              "next_open_ts": 1791756000
+            },
+            "settlement_mark_price": {
+              "price": "13.7621",
+              "ts_ms": 1791747965589
+            },
+            "short_leverage_estimates": {
+              "1000": "13.7398",
+              "10000": "13.7398",
+              "100000": "13.7398",
+              "1000000": "13.7398"
+            },
+            "status": "active",
+            "tick_size": "0.0001",
+            "ticker": "KXUS500PERP",
+            "title": "US500",
+            "underlying_multiplier": "1.000000",
+            "volume": "1588246.00",
+            "volume_24h": "422081.00",
+            "volume_24h_notional_value_dollars": "5786777.635500",
+            "volume_notional_value_dollars": "21797275.885900"
+          }
+        },
+        "canonical_body_sha256": "21e0b53323f67e66cfcdb81dc25f2efc346e2301fc9b5e165e0a87ed7c2d8f5f",
+        "http_status": 200,
+        "raw_sha256": "af29017d5fb325dfd336c3495aa27d50a5e807d16cf906fb6b1291c4a3fee9b3",
+        "received_at_ms": 1791747967074,
+        "requested_at_ms": 1791747966785,
+        "url": "https://external-api.kalshi.com/trade-api/v2/margin/markets/KXUS500PERP"
+      },
+      "reason": null
+    }
+  ],
+  "source_authenticity_verified": false,
+  "strategy_validated": false,
+  "execution_available": false,
+  "attempt_error": "COLLECTION_MARKET_CLOSED"
+}

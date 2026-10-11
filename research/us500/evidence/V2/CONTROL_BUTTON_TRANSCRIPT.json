@@ -1,0 +1,55 @@
+{
+  "synthetic": true,
+  "messages": [
+    {
+      "text": "US500 — simulación local\nEstado: pausada.\nEl control no reactiva una pausa de riesgo ni cierra posiciones.",
+      "buttons": [
+        [
+          "Activar simulación US500"
+        ],
+        [
+          "Pausar US500",
+          "Estado"
+        ]
+      ]
+    },
+    {
+      "text": "Confirmá activar únicamente la simulación local US500. La confirmación vence pronto y se usa una vez.",
+      "buttons": [
+        [
+          "Confirmar simulación US500"
+        ],
+        [
+          "Cancelar y pausar"
+        ]
+      ]
+    },
+    {
+      "text": "Simulación US500 habilitada. El motor conserva todos sus controles y pausas de riesgo.",
+      "buttons": []
+    },
+    {
+      "text": "US500 pausado. Se conservan reservas y posiciones; las pausas de riesgo permanecen.",
+      "buttons": []
+    },
+    {
+      "text": "Confirmá activar únicamente la simulación local US500. La confirmación vence pronto y se usa una vez.",
+      "buttons": [
+        [
+          "Confirmar simulación US500"
+        ],
+        [
+          "Cancelar y pausar"
+        ]
+      ]
+    },
+    {
+      "text": "Simulación US500 habilitada. El motor conserva todos sus controles y pausas de riesgo.",
+      "buttons": []
+    },
+    {
+      "text": "US500 pausado. Se conservan reservas y posiciones; las pausas de riesgo permanecen.",
+      "buttons": []
+    }
+  ]
+}

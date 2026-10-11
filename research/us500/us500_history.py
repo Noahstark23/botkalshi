@@ -21,10 +21,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from us500_engine import (
-    DataError,
     HOSTS,
     MAX_BYTES,
     MAX_PRICE,
+    DataError,
     body_digest,
     decode,
     number,
