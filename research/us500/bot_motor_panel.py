@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from motor_status_readonly import sanitize_snapshot, unknown_status
+from motor_status_readonly import ACTIVITY_KINDS, sanitize_snapshot, unknown_status
 
 
 @dataclass(frozen=True)
@@ -136,6 +136,29 @@ def _global(status):
     )
 
 
+def _activity(status, key=None):
+    activity = status["activity"]
+    if not activity["available"]:
+        reason = {
+            "STALE": "datos vencidos",
+            "INVALID": "respuesta inválida",
+            "NOT_CONNECTED": "fuente sin conectar",
+            "UNAVAILABLE": "consulta no disponible",
+        }.get(activity["reason"], "sin dato vigente")
+        return f"Actividad registrada: desconocida ({reason}). No indica apagado."
+    keys = (key,) if key is not None else tuple(ACTIVITY_KINDS)
+    counts = " · ".join(f"{name.upper()}: {activity['counts'][name]}" for name in keys)
+    end = datetime.fromtimestamp(
+        activity["generated_at_ms"] / 1000, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return (
+        f"Registros de señales: {counts}.\n"
+        f"Ventana: desde {activity['cutoff_utc']} 00:00 UTC hasta {end}.\n"
+        f"Consulta agregada hace {activity['age_ms'] // 1000} s; frecuencia máxima: una cada 5 min.\n"
+        "Cero registros no significa apagado; registros no prueban ejecución."
+    )
+
+
 def overview(enabled, *, runtime=None, now_ms=None):
     """Configured flags and reported tasks are separate; none grants control."""
     status = _snapshot(runtime, now_ms)
@@ -169,6 +192,8 @@ def overview(enabled, *, runtime=None, now_ms=None):
         + _global(status)
         + "\n\n"
         + "\n".join(lines)
+        + "\n\n"
+        + _activity(status)
         + "\n\nUS500: permiso de simulación "
         + ("habilitado" if enabled else "pausado")
         + ".\nConfiguración no demuestra ejecución. Sólo M5 expone tarea en marcha."
@@ -183,7 +208,7 @@ def disconnected_detail(key, *, requested_action=None, runtime=None, now_ms=None
     status = _snapshot(runtime, now_ms)
     if key == "all":
         title = "Estado general del bot"
-        description = _global(status)
+        description = _global(status) + "\n\n" + _activity(status)
         contract = "Las banderas configuradas no prueban que haya operaciones ni tareas ejecutándose."
     else:
         motor = _BY_KEY.get(key)
@@ -218,9 +243,9 @@ def disconnected_detail(key, *, requested_action=None, runtime=None, now_ms=None
         if key == "rest":
             description += "La captura general no demuestra que la tarea REST de arbitraje esté en marcha.\n"
         if key in ("m6", "m8", "m9"):
-            description += (
-                "El runtime no expone una señal específica de este observador.\n"
-            )
+            description += "El runtime no expone configuración ni tarea actual de este observador.\n"
+        if key in ACTIVITY_KINDS:
+            description += "\n" + _activity(status, key) + "\n"
         description += "\n" + motor.description
         contract = motor.pause_contract
     acknowledgement = ""

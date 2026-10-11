@@ -24,6 +24,7 @@ from us500_engine import (
     DataError,
     body_digest,
     decode,
+    instrument_metadata,
     normalize,
     number,
     save_new,
@@ -81,6 +82,33 @@ def validate_session(data):
     if not isinstance(frames, list) or not 1 <= len(frames) <= MAX_FRAMES:
         raise DataError("INVALID_FRAME_COUNT")
     previous = 0
+    assembly = data.get("assembly")
+    if "assembly" in data:
+        if (
+            not isinstance(assembly, dict)
+            or set(assembly)
+            != {
+                "schema",
+                "instrument_metadata",
+                "instrument_metadata_sha256",
+                "synthetic_input",
+                "observation_claim",
+                "funding_and_costs",
+            }
+            or not isinstance(assembly.get("instrument_metadata"), dict)
+            or assembly.get("schema") != "us500-session-assembly-v1"
+            or type(assembly.get("synthetic_input")) is not bool
+            or assembly.get("funding_and_costs")
+            != "explicit_caller_inputs_not_account_statements"
+            or assembly.get("instrument_metadata_sha256")
+            != body_digest(assembly.get("instrument_metadata"))
+        ):
+            raise DataError("INVALID_SESSION_ASSEMBLY")
+        claim = (
+            "synthetic" if assembly["synthetic_input"] else "observed_unverified_origin"
+        )
+        if assembly.get("observation_claim") != claim:
+            raise DataError("INVALID_SESSION_ASSEMBLY")
     for frame in frames:
         required = {
             "at_ms",
@@ -98,6 +126,18 @@ def validate_session(data):
         at = timestamp(frame["at_ms"])
         if at <= previous:
             raise DataError("NONINCREASING_FRAME_TIME")
+        snapshot = frame.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise DataError("MALFORMED_SESSION_SNAPSHOT")
+        evidence = snapshot.get("session_interval_cost_evidence")
+        if assembly is not None or "session_interval_cost_evidence" in snapshot:
+            _validate_interval_evidence(frame, evidence, previous or at)
+        if assembly is not None:
+            if (
+                instrument_metadata(snapshot) != assembly["instrument_metadata"]
+                or snapshot.get("synthetic") is not assembly["synthetic_input"]
+            ):
+                raise DataError("SESSION_ASSEMBLY_METADATA_MISMATCH")
         previous = at
         number(frame["funding_cashflow_usd"])
         if number(frame["infrastructure_cost_usd"]) < 0:
@@ -130,6 +170,32 @@ def validate_session(data):
     return data
 
 
+def _validate_interval_evidence(frame, evidence, previous_at):
+    required = {
+        "from_ms",
+        "at_ms",
+        "funding_cashflow_usd",
+        "infrastructure_cost_usd",
+        "provenance_note",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        raise DataError("INTERVAL_COST_EVIDENCE_REQUIRED")
+    if (
+        timestamp(evidence["from_ms"]) != previous_at
+        or timestamp(evidence["at_ms"]) != frame["at_ms"]
+        or number(evidence["funding_cashflow_usd"])
+        != number(frame["funding_cashflow_usd"])
+        or number(evidence["infrastructure_cost_usd"])
+        != number(frame["infrastructure_cost_usd"])
+    ):
+        raise DataError("INTERVAL_COST_EVIDENCE_MISMATCH")
+    if (
+        not isinstance(evidence["provenance_note"], str)
+        or not 1 <= len(evidence["provenance_note"]) <= 1000
+    ):
+        raise DataError("INTERVAL_COST_PROVENANCE_REQUIRED")
+
+
 def frame_observation(frame, config, identity):
     obs = normalize(frame["snapshot"], at_ms=frame["at_ms"])
     if not obs["payload_integrity_checked"]:
@@ -146,6 +212,7 @@ def frame_observation(frame, config, identity):
             "fractional_trading_enabled",
         )
     )
+    current += (instrument_metadata(frame["snapshot"], allow_legacy_synthetic=True),)
     if identity is not None and identity != current:
         raise DataError("INSTRUMENT_CHANGED_DURING_SESSION")
     if number(config["tick_size"]) != obs["tick_size"]:
@@ -368,6 +435,32 @@ def build_plan(data):
         "actual_fills": 0,
         "strategy_validated": False,
         "independent_settled_samples": 0,
+        "input_provenance": {
+            "synthetic_frames_declared": sum(
+                f["snapshot"].get("synthetic") is True for f in data["frames"]
+            ),
+            "observed_frames_declared": sum(
+                f["snapshot"].get("synthetic") is False for f in data["frames"]
+            ),
+            "source_authenticity_verified": False,
+            "complete_market_session_verified": False,
+            "independence_verified": False,
+            "requested_frames": len(data["frames"]),
+            "processed_frames": len(reports),
+            "valid_observation_frames": sum(
+                r["status"] != "DATA_BLOCKED" for r in reports
+            ),
+            "max_input_gap_ms": max(
+                (
+                    b["at_ms"] - a["at_ms"]
+                    for a, b in zip(data["frames"], data["frames"][1:])
+                ),
+                default=0,
+            ),
+            "first_input_at_ms": data["frames"][0]["at_ms"],
+            "last_input_at_ms": data["frames"][-1]["at_ms"],
+            "assembly_cost_evidence_checked": "assembly" in data,
+        },
         "hypothesis": strategy,
         "economic_path_complete_under_explicit_assumptions": economic_complete,
         "venue_liquidation_replicated": False,

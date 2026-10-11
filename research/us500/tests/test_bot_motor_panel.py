@@ -11,7 +11,7 @@ from unittest.mock import patch
 from test_us500_control import CHAT, NOW, OWNER, confirmation, update
 
 from bot_motor_panel import MOTORS, disconnected_detail, overview
-from motor_status_readonly import status_from_responses
+from motor_status_readonly import activity_from_response, status_from_responses
 from us500_control import PaperControl
 from us500_telegram import _payload
 
@@ -344,6 +344,37 @@ class MotorPanelTests(unittest.TestCase):
         self.with_provider(provider)
         text = self.send(text="/motores")[-1]["payload"]["text"]
         self.assertIn("Actualizado:", text)
+
+    def test_recorded_activity_renders_window_without_claiming_running(self):
+        from test_motor_status_readonly import edges
+
+        def provider(*, now_ms):
+            value = self.runtime(now_ms)
+            value["activity"] = activity_from_response(
+                edges(now_ms, {"ofi": {"unit": "zscore", "rows_total": 12}}),
+                now_ms=now_ms,
+            )
+            return value
+
+        self.with_provider(provider)
+        overview_text = self.send(text="/motores")[-1]["payload"]["text"]
+        self.assertIn(
+            "Registros de señales: M6: 0 · REST: 0 · M8: 12 · M9: 0", overview_text
+        )
+        self.assertIn("desde 2026-10-10 00:00 UTC hasta", overview_text)
+        self.assertNotIn("24 horas", overview_text)
+        self.assertIn("Cero registros no significa apagado", overview_text)
+        for key, count in (("m6", 0), ("rest", 0), ("m8", 12), ("m9", 0)):
+            text = self.send(action="u5:engine:" + key)[-1]["payload"]["text"]
+            self.assertIn(f"Registros de señales: {key.upper()}: {count}", text)
+            self.assertIn("Configurado: desconocido", text)
+            self.assertIn("Tarea reportada: desconocida", text)
+
+    def test_activity_failure_does_not_hide_current_configuration(self):
+        self.with_provider(lambda *, now_ms: self.runtime(now_ms))
+        text = self.send(text="/motores")[-1]["payload"]["text"]
+        self.assertIn("M1: detección configurada sí", text)
+        self.assertIn("Actividad registrada: desconocida", text)
 
 
 if __name__ == "__main__":

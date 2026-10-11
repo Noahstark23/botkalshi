@@ -49,3 +49,10 @@ continua del receptor sin Mac, estados de sólo lectura del runtime y permiso pa
 US500. Las descripciones anteriores del panel desconectado/local son históricas.
 No incorpora activación real ni ejecutor automático. M6/M8/M9/REST carecen de señal
 específica en el API actual; el panel lo declara como desconocido.
+
+## Actualización V2.4
+
+M6/REST/M8/M9 ya tienen lectura de actividad registrada desde el endpoint existente
+`/stats/edges?days=1`, con ventana y antigüedad. Esto no añade estado de tarea o
+configuración donde el runtime no lo expone. Ver `TELEGRAM_CLOUD.md`. No hay
+controles de activación real ni lectura de credenciales financieras.

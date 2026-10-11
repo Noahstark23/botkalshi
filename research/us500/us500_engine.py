@@ -170,6 +170,49 @@ def body_digest(body: dict) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def instrument_metadata(snapshot, *, allow_legacy_synthetic=False):
+    try:
+        market = snapshot["observations"]["market"]["body"]["market"]
+        # Las fixtures V1 sintéticas pueden omitir todo el bloque de identidad.
+        # Una omisión parcial o una captura declarada observada nunca lo permite.
+        keys = {"market_id", "market_version", "exchange_index", "asset_class"}
+        if (
+            allow_legacy_synthetic
+            and snapshot.get("synthetic") is True
+            and not keys.intersection(market)
+        ):
+            return None
+        identifier = market["market_id"]
+        if not isinstance(identifier, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", identifier
+        ):
+            raise DataError("MARKET_ID_REQUIRED")
+        version, index = market["market_version"], market["exchange_index"]
+        if (
+            type(version) is not int
+            or version < 1
+            or type(index) is not int
+            or not 0 <= index < 2**31
+        ):
+            raise DataError("INVALID_MARKET_VERSION_OR_EXCHANGE")
+        if market["asset_class"] != "Indices":
+            raise DataError("US500_INDEX_METADATA_REQUIRED")
+        return {
+            "environment": snapshot["environment"],
+            "ticker": snapshot["ticker"],
+            "market_id": identifier,
+            "market_version": version,
+            "exchange_index": index,
+            "asset_class": "Indices",
+            "tick_size": market["tick_size"],
+            "contract_size": market["contract_size"],
+            "underlying_multiplier": market["underlying_multiplier"],
+            "fractional_trading_enabled": market["fractional_trading_enabled"],
+        }
+    except (KeyError, TypeError, IndexError) as exc:
+        raise DataError("INSTRUMENT_METADATA_REQUIRED") from exc
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise DataError("REDIRECT_REJECTED")
@@ -438,6 +481,10 @@ def simulate_round_trip(
             raise DataError("INCOMPATIBLE_SCENARIO_SNAPSHOTS")
     if direction not in ("long", "short"):
         raise DataError("INVALID_DIRECTION")
+    if instrument_metadata(entry, allow_legacy_synthetic=True) != instrument_metadata(
+        exit_snapshot, allow_legacy_synthetic=True
+    ):
+        raise DataError("INSTRUMENT_CHANGED")
     qty = number(quantity, positive=True)
     if qty % Decimal("0.01"):
         raise DataError("OFF_API_QUANTITY_STEP")

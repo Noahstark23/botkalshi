@@ -30,6 +30,7 @@ from us500_engine import (
     DataError,
     body_digest,
     decode,
+    instrument_metadata,
     json_text,
     normalize,
     number,
@@ -118,40 +119,6 @@ def _snapshot_times(snapshot):
         raise DataError("MALFORMED_SESSION_SNAPSHOT") from exc
 
 
-def _metadata(snapshot):
-    try:
-        market = snapshot["observations"]["market"]["body"]["market"]
-        identifier = market["market_id"]
-        if not isinstance(identifier, str) or not re.fullmatch(
-            r"[A-Za-z0-9_-]{1,128}", identifier
-        ):
-            raise DataError("MARKET_ID_REQUIRED")
-        version, index = market["market_version"], market["exchange_index"]
-        if (
-            type(version) is not int
-            or version < 1
-            or type(index) is not int
-            or not 0 <= index < 2**31
-        ):
-            raise DataError("INVALID_MARKET_VERSION_OR_EXCHANGE")
-        if market["asset_class"] != "Indices":
-            raise DataError("US500_INDEX_METADATA_REQUIRED")
-        return {
-            "environment": snapshot["environment"],
-            "ticker": snapshot["ticker"],
-            "market_id": identifier,
-            "market_version": version,
-            "exchange_index": index,
-            "asset_class": "Indices",
-            "tick_size": market["tick_size"],
-            "contract_size": market["contract_size"],
-            "underlying_multiplier": market["underlying_multiplier"],
-            "fractional_trading_enabled": market["fractional_trading_enabled"],
-        }
-    except (KeyError, TypeError, IndexError) as exc:
-        raise DataError("INSTRUMENT_METADATA_REQUIRED") from exc
-
-
 def _check_mark(snapshot, at):
     try:
         mark = snapshot["observations"]["market"]["body"]["market"][
@@ -183,7 +150,7 @@ def _valid_snapshot(snapshot):
         if snapshot.get(claim, False) is not False:
             raise DataError("UNSUPPORTED_SNAPSHOT_AUTHORITY_CLAIM")
     _check_mark(snapshot, at)
-    metadata = _metadata(snapshot)
+    metadata = instrument_metadata(snapshot)
     return earliest, at, observation, metadata
 
 
@@ -571,7 +538,9 @@ class SessionCollector:
                     _, prior_at = _snapshot_times(prior_snapshot)
                     if earliest <= prior_at or at <= prior_at:
                         raise DataError("REUSED_OR_OVERLAPPING_CAPTURE")
-                    if _metadata(prior_snapshot) != _metadata(snapshot):
+                    if instrument_metadata(prior_snapshot) != instrument_metadata(
+                        snapshot
+                    ):
                         raise DataError("INSTRUMENT_METADATA_CHANGED")
                 with connection:
                     connection.execute(

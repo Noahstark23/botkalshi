@@ -82,3 +82,12 @@ continua del receptor sin Mac, estados de sólo lectura del runtime y permiso pa
 US500. Las descripciones anteriores del panel desconectado/local son históricas.
 No incorpora activación real ni ejecutor automático. M6/M8/M9/REST carecen de señal
 específica en el API actual; el panel lo declara como desconocido.
+
+## Actualización V2.4 — trazabilidad y actividad registrada
+
+Ver `VERIFICACION_V2_4.md` y `EVALUACION_INDEPENDIENTE.md`. El replay directo ya
+contrasta identidad contractual completa y los importes con la evidencia del
+ensamblador. El reporte separa procedencia declarada y cobertura; no certifica
+autenticidad ni independencia. Telegram incorpora conteos de señales de
+M6/REST/M8/M9 mediante el endpoint existente, con ventana UTC y caché. Sus tareas
+y flags no expuestos siguen desconocidos. No se añadió activación real.

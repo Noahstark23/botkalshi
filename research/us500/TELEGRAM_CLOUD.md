@@ -79,3 +79,16 @@ directorio exacto indicado por systemd y montaje de sólo lectura. Rechaza archi
 ordinarios0440, escritura por grupo y lectura pública. La primera validación de
 modo y luego la suposición del grupo del servicio fallaron antes de polling. La
 corrección fue comprobada con getMe/getWebhookInfo en el propio host: PREFLIGHT_OK.
+
+## Actividad registrada (V2.4)
+
+`/stats/edges?days=1` se consulta sólo después de autenticar al dueño y obtener
+un estado válido. Por instancia de receptor se admite como máximo una consulta
+agregada cada300s, incluyendo fallos. La caché se revalida por fecha y caducidad;
+no conserva un dato anterior después de un fallo. Un reinicio comienza una caché
+nueva. Ventana: inicio UTC del día anterior hasta la fecha de generación.
+
+M6/REST/M8/M9 muestran cantidad de registros de linemove/multi_outcome/ofi/spillover.
+No indican tareas activas, flags ni órdenes: esos campos continúan desconocidos.
+Cero filas puede incluir ausencia de señales o retención; no demuestra apagado.
+No se consulta /stats/daily ni se escanean archivos/DBs desde el receptor.

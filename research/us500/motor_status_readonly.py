@@ -8,14 +8,25 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 SCHEMA = "bot-runtime-readonly-v1"
 MAX_BYTES = 65536
 TIMEOUT_SECONDS = 2
 MAX_AGE_MS = 30000
 MAX_FUTURE_MS = 5000
+ACTIVITY_TTL_SECONDS = 300
+ACTIVITY_SCHEMA = "motor-recorded-activity-v1"
+ACTIVITY_KINDS = {
+    "m6": ("linemove", "desconocido"),
+    "rest": ("multi_outcome", "pct"),
+    "m8": ("ofi", "zscore"),
+    "m9": ("spillover", "cents"),
+}
+MAX_ACTIVITY_COUNT = 1_000_000_000
 MOTOR_KEYS = ("m1", "m2", "m3", "m5", "m6", "rest", "m8", "m9")
 FLAG_KEYS = (
     "trading_enabled",
@@ -40,6 +51,97 @@ def _bool(value):
     return value if type(value) is bool else None
 
 
+def unknown_activity(reason="UNAVAILABLE"):
+    return {
+        "schema": ACTIVITY_SCHEMA,
+        "available": False,
+        "reason": reason
+        if type(reason) is str and reason in _REASONS
+        else "UNAVAILABLE",
+        "generated_at_ms": None,
+        "cutoff_utc": None,
+        "age_ms": None,
+        "counts": {key: None for key in ACTIVITY_KINDS},
+    }
+
+
+def sanitize_activity(value, *, now_ms):
+    """Validate recorded-signal counts; zero never means an engine is disabled."""
+    if type(value) is not dict or value.get("schema") != ACTIVITY_SCHEMA:
+        return unknown_activity("INVALID")
+    if value.get("available") is not True:
+        return unknown_activity(value.get("reason"))
+    generated = value.get("generated_at_ms")
+    if not _time(now_ms) or not _time(generated):
+        return unknown_activity("INVALID")
+    age = now_ms - generated
+    if age > ACTIVITY_TTL_SECONDS * 1000:
+        return unknown_activity("STALE")
+    if age < -MAX_FUTURE_MS:
+        return unknown_activity("INVALID")
+    cutoff = value.get("cutoff_utc")
+    expected = (
+        datetime.fromtimestamp(generated / 1000, timezone.utc) - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    if (
+        type(cutoff) is not str
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cutoff)
+        or cutoff != expected
+    ):
+        return unknown_activity("INVALID")
+    counts = value.get("counts")
+    if type(counts) is not dict or not set(ACTIVITY_KINDS) <= set(counts):
+        return unknown_activity("INVALID")
+    if any(
+        type(counts[key]) is not int or not 0 <= counts[key] <= MAX_ACTIVITY_COUNT
+        for key in ACTIVITY_KINDS
+    ):
+        return unknown_activity("INVALID")
+    return {
+        "schema": ACTIVITY_SCHEMA,
+        "available": True,
+        "reason": "FRESH",
+        "generated_at_ms": generated,
+        "cutoff_utc": cutoff,
+        "age_ms": max(0, age),
+        "counts": {key: counts[key] for key in ACTIVITY_KINDS},
+    }
+
+
+def activity_from_response(value, *, now_ms):
+    """Only fixed /stats/edges?days=1 kinds; no values, PnL or raw server text."""
+    if (
+        type(value) is not dict
+        or type(value.get("days_requested")) is not int
+        or value["days_requested"] != 1
+    ):
+        return unknown_activity("INVALID")
+    kinds = value.get("by_kind")
+    if type(kinds) is not dict:
+        return unknown_activity("INVALID")
+    counts = {}
+    for key, (kind, unit) in ACTIVITY_KINDS.items():
+        if kind not in kinds:
+            # Complete successful grouped query with no kind means zero rows in
+            # this window. It provides no evidence of running or configuration.
+            counts[key] = 0
+            continue
+        block = kinds[kind]
+        if type(block) is not dict or block.get("unit") != unit:
+            return unknown_activity("INVALID")
+        counts[key] = block.get("rows_total")
+    return sanitize_activity(
+        {
+            "schema": ACTIVITY_SCHEMA,
+            "available": True,
+            "generated_at_ms": _iso_ms(value.get("generated_at")),
+            "cutoff_utc": value.get("cutoff"),
+            "counts": counts,
+        },
+        now_ms=now_ms,
+    )
+
+
 def unknown_status(now_ms, reason="UNAVAILABLE"):
     """Never retain last-known true flags when a new observation is unavailable."""
     return {
@@ -55,6 +157,7 @@ def unknown_status(now_ms, reason="UNAVAILABLE"):
         "environment": None,
         "flags": {key: None for key in FLAG_KEYS},
         "motors": {key: {field: None for field in MOTOR_FIELDS} for key in MOTOR_KEYS},
+        "activity": unknown_activity(reason),
         "real_controls_available": False,
     }
 
@@ -112,6 +215,7 @@ def sanitize_snapshot(value, *, now_ms):
         if key in ("m6", "m8", "m9", "rest"):
             result["motors"][key] = {field: None for field in MOTOR_FIELDS}
     result["motors"]["m1"]["execution_configured"] = None
+    result["activity"] = sanitize_activity(value.get("activity"), now_ms=now_ms)
     return result
 
 
@@ -182,9 +286,12 @@ class RuntimeStatusReader:
 
     def __init__(self, *, connection_factory=None):
         self._factory = connection_factory or http.client.HTTPConnection
+        self._activity_lock = threading.Lock()
+        self._activity_last_attempt = None
+        self._activity_cache = unknown_activity()
 
     def _get(self, path):
-        if path not in ("/health", "/status"):
+        if path not in ("/health", "/status", "/stats/edges?days=1"):
             raise ValueError("RUNTIME_RESOURCE_BLOCKED")
         connection = None
         deadline = time.monotonic() + TIMEOUT_SECONDS
@@ -215,13 +322,37 @@ class RuntimeStatusReader:
                 except Exception:
                     pass
 
+    def _activity(self, now_ms):
+        with self._activity_lock:
+            now = time.monotonic()
+            if self._activity_last_attempt is not None:
+                elapsed = now - self._activity_last_attempt
+                if elapsed < 0:
+                    return unknown_activity("INVALID")
+                if elapsed < ACTIVITY_TTL_SECONDS:
+                    return sanitize_activity(self._activity_cache, now_ms=now_ms)
+            # Budget failures as well as successes; owner refresh spam must not
+            # repeatedly run the aggregate. Never fall back to an older success.
+            self._activity_last_attempt = now
+            self._activity_cache = unknown_activity()
+            try:
+                self._activity_cache = activity_from_response(
+                    self._get("/stats/edges?days=1"), now_ms=now_ms
+                )
+            except Exception:
+                self._activity_cache = unknown_activity()
+            return sanitize_activity(self._activity_cache, now_ms=now_ms)
+
     def __call__(self, *, now_ms):
         if not _time(now_ms):
             return unknown_status(now_ms, "INVALID")
         try:
             health = self._get("/health")
             status = self._get("/status")
-            return status_from_responses(health, status, now_ms=now_ms)
+            result = status_from_responses(health, status, now_ms=now_ms)
         except Exception:
             # Runtime bodies and exception details may include sensitive data.
             return unknown_status(now_ms, "UNAVAILABLE")
+        if result["fresh"]:
+            result["activity"] = self._activity(now_ms)
+        return result
