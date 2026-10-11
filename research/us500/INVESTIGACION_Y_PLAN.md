@@ -1,5 +1,7 @@
 # US500: investigación y preparación del motor
 
+> Documento histórico de v0.1, anterior a V1/V2. Las referencias a conectores, simulador o estrategia todavía no implementados describen ese corte. Para el estado vigente ver README.md y VERIFICACION_V2_1.md.
+
 Fecha de corte: 2026-10-11. Tres agentes investigaron producto, API y arquitectura; el agente principal contrastó fuentes y construyó este núcleo local. Diciembre queda fuera de alcance por indicación posterior de Noel.
 
 ## Producto identificado

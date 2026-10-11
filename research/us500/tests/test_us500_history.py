@@ -3,6 +3,7 @@
 import base64
 import copy
 import hashlib
+import http.client
 import json
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import us500_history as history
-from us500_engine import MAX_BYTES, DataError, save_new
+from us500_engine import MAX_BYTES, DataError, json_text, save_new
 
 START = 1791744840000
 END = START + 120000
@@ -91,6 +92,29 @@ class Transport:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class InterruptedResponse(Response):
+    def __init__(self, error):
+        super().__init__({})
+        self.error = error
+        self.closed = False
+
+    def read(self, count):
+        self.read_sizes.append(count)
+        raise self.error
+
+    def __exit__(self, *args):
+        self.closed = True
+        return False
+
+
+def protocol_errors():
+    return (
+        http.client.IncompleteRead(b"private-partial-body", 12),
+        http.client.BadStatusLine("private-status-line"),
+        http.client.LineTooLong("private-header"),
+    )
 
 
 class HistoryTests(unittest.TestCase):
@@ -257,6 +281,74 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
         self.assertEqual(result["capture_stop_reason"], "HISTORY_HTTP_429")
         self.assertNotIn("secret", json.dumps(result))
+
+    def test_protocol_errors_preserve_previous_page_and_consume_failed_attempt(self):
+        first = {"trades": [trade()], "cursor": "next"}
+        for phase in ("open", "read"):
+            for error in protocol_errors():
+                with self.subTest(phase=phase, error=type(error).__name__):
+                    failure = error if phase == "open" else InterruptedResponse(error)
+                    result, transport = self.capture([first, failure], maximum=3)
+                    self.assertEqual(len(transport.calls), 2)
+                    self.assertEqual(result["requests_made"], 2)
+                    self.assertEqual(len(result["pages"]), 1)
+                    self.assertEqual(result["pages"][0]["body"], first)
+                    self.assertEqual(
+                        json.loads(base64.b64decode(result["pages"][0]["raw_base64"])),
+                        first,
+                    )
+                    self.assertEqual(
+                        result["capture_stop_reason"], "HISTORY_HTTP_PROTOCOL_ERROR"
+                    )
+                    self.assertTrue(result["analysis"]["valid_evidence"])
+                    self.assertEqual(result["analysis"]["record_count"], 1)
+                    self.assertFalse(result["analysis"]["retrieval_complete"])
+                    self.assertNotIn("private", json_text(result))
+                    if phase == "read":
+                        self.assertTrue(failure.closed)
+                        self.assertEqual(failure.read_sizes, [MAX_BYTES + 1])
+
+    def test_cli_protocol_error_saves_partial_evidence_and_returns_two(self):
+        for error in protocol_errors():
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "partial.json"
+                transport = Transport(
+                    [
+                        Response({"trades": [trade()], "cursor": "next"}),
+                        InterruptedResponse(error),
+                    ]
+                )
+                reader = history.PublicHistoryReader("public", 3, transport)
+                args = [
+                    "us500_history.py",
+                    "capture-history",
+                    "--resource",
+                    "trades",
+                    "--start-ms",
+                    str(START),
+                    "--end-ms",
+                    str(END),
+                    "--output",
+                    str(path),
+                ]
+                with (
+                    patch("sys.argv", args),
+                    patch.object(history, "PublicHistoryReader", return_value=reader),
+                    patch("builtins.print"),
+                ):
+                    self.assertEqual(history.main(), 2)
+                saved = history.load_history(path)
+                self.assertEqual(
+                    saved["capture_stop_reason"], "HISTORY_HTTP_PROTOCOL_ERROR"
+                )
+                self.assertEqual(saved["requests_made"], 2)
+                self.assertEqual(len(saved["pages"]), 1)
+                self.assertFalse(history.analyze_history(saved)["retrieval_complete"])
+                self.assertEqual(len(transport.calls), 2)
+                self.assertNotIn("private", path.read_text())
 
     def test_bad_duplicate_nonfinite_and_oversized_json_are_incomplete(self):
         for raw in (

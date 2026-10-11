@@ -2,12 +2,14 @@
 
 import copy
 import fcntl
+import http.client
 import json
 import sqlite3
 import tempfile
 import unittest
 import urllib.error
 from contextlib import closing
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -99,6 +101,28 @@ class Transport:
         if isinstance(value, BaseException):
             raise value
         return value
+
+
+class InterruptedResponse(Response):
+    def __init__(self, error):
+        super().__init__({})
+        self.error = error
+        self.closed = False
+
+    def read(self, size):
+        raise self.error
+
+    def __exit__(self, *args):
+        self.closed = True
+        return False
+
+
+def protocol_errors():
+    return (
+        http.client.IncompleteRead(b"private-partial-body", 12),
+        http.client.BadStatusLine("private-status-line"),
+        http.client.LineTooLong("private-header"),
+    )
 
 
 def transport_and_clock(snapshots):
@@ -458,6 +482,171 @@ class CollectorTests(OfflineTests):
         self.assertEqual(len(transport.calls), 1)
         self.assertNotIn("private-error", json.dumps(report))
         self.assertEqual(report["requests"][0]["status"], "FAILED")
+
+    def test_protocol_error_pauses_immediately_and_preserves_previous_responses(self):
+        for phase in ("open", "read"):
+            for previous_capture in (False, True):
+                for error in protocol_errors():
+                    with (
+                        self.subTest(
+                            phase=phase,
+                            previous=previous_capture,
+                            error=type(error).__name__,
+                        ),
+                        tempfile.TemporaryDirectory() as directory,
+                    ):
+                        journal = Path(directory) / "collection.sqlite"
+                        transport, clock = transport_and_clock(
+                            observed_shape_fixture(2)["snapshots"]
+                        )
+                        failure = (
+                            error if phase == "open" else InterruptedResponse(error)
+                        )
+                        failure_index = 3 if previous_capture else 0
+                        transport.responses[failure_index] = failure
+                        collector = session.SessionCollector(
+                            journal,
+                            collection_id="protocol-test",
+                            max_gets=8,
+                            transport=transport,
+                            clock_ms=clock,
+                        )
+                        if previous_capture:
+                            first = collector.capture_next("complete")
+                        with self.assertRaisesRegex(
+                            DataError, "^COLLECTION_HTTP_PROTOCOL_ERROR$"
+                        ):
+                            collector.capture_next("failed")
+                        used = failure_index + 1
+                        # Read SQLite directly: export/restart recovery must not be
+                        # what changes an escaped exception into a paused capture.
+                        with closing(sqlite3.connect(journal)) as connection:
+                            self.assertEqual(
+                                connection.execute(
+                                    "SELECT status,reason,reserved_gets FROM us500_collection_meta"
+                                ).fetchone(),
+                                ("PAUSED", "COLLECTION_HTTP_PROTOCOL_ERROR", used),
+                            )
+                            self.assertEqual(
+                                connection.execute(
+                                    "SELECT status,reason FROM us500_capture WHERE observation_id='failed'"
+                                ).fetchone(),
+                                ("FAILED", "COLLECTION_HTTP_PROTOCOL_ERROR"),
+                            )
+                            states = connection.execute(
+                                "SELECT status,reason FROM us500_request ORDER BY request_id"
+                            ).fetchall()
+                            self.assertEqual(
+                                states[:-1], [("RESPONSE_SAVED", None)] * failure_index
+                            )
+                            self.assertEqual(
+                                states[-1], ("FAILED", "COLLECTION_HTTP_PROTOCOL_ERROR")
+                            )
+                        self.assertEqual(len(transport.calls), used)
+                        report = collector.export()
+                        self.assertEqual(report["reserved_gets"], used)
+                        self.assertEqual(report["remaining_gets"], 8 - used)
+                        self.assertNotIn("private", json.dumps(report))
+                        if previous_capture:
+                            self.assertEqual(report["captures"][0]["snapshot"], first)
+                            self.assertIsNotNone(report["requests"][2]["observation"])
+                        if phase == "read":
+                            self.assertTrue(failure.closed)
+                        idle = Transport([])
+                        resumed = session.SessionCollector(
+                            journal,
+                            collection_id="protocol-test",
+                            max_gets=8,
+                            transport=idle,
+                        )
+                        for identifier in ("failed", "new"):
+                            with self.assertRaisesRegex(
+                                DataError, "COLLECTION_STOPPED"
+                            ):
+                                resumed.capture_next(identifier)
+                        self.assertEqual(resumed.export(), report)
+                        self.assertEqual(idle.calls, [])
+
+    def test_capture_cli_protocol_error_saves_partial_and_returns_two(self):
+        for index, error in enumerate(protocol_errors()):
+            with self.subTest(error=type(error).__name__):
+                journal = self.path.with_name(f"cli-{index}.sqlite")
+                output = self.path.with_name(f"partial-{index}.json")
+                transport, clock = transport_and_clock(
+                    observed_shape_fixture(1)["snapshots"]
+                )
+                transport.responses[1] = InterruptedResponse(error)
+                collector = session.SessionCollector(
+                    journal,
+                    collection_id="cli-test",
+                    max_gets=8,
+                    transport=transport,
+                    clock_ms=clock,
+                )
+                args = [
+                    "session",
+                    "capture-one",
+                    "--journal",
+                    str(journal),
+                    "--collection-id",
+                    "cli-test",
+                    "--observation-id",
+                    "failed",
+                    "--output",
+                    str(output),
+                ]
+                with (
+                    patch("sys.argv", args),
+                    patch.object(session, "SessionCollector", return_value=collector),
+                    patch("builtins.print"),
+                ):
+                    self.assertEqual(session.main(), 2)
+                report = session.load_package(output)
+                self.assertEqual(
+                    report["attempt_error"], "COLLECTION_HTTP_PROTOCOL_ERROR"
+                )
+                self.assertEqual(report["status"], "PAUSED")
+                self.assertEqual(report["reserved_gets"], 2)
+                self.assertEqual(
+                    [r["status"] for r in report["requests"]],
+                    ["RESPONSE_SAVED", "FAILED"],
+                )
+                self.assertIsNotNone(report["requests"][0]["observation"])
+                self.assertEqual(len(transport.calls), 2)
+                self.assertNotIn("private", output.read_text())
+
+    def test_decimal_response_preserves_numeric_type_across_journal_and_export(self):
+        transport, clock = transport_and_clock(observed_shape_fixture(1)["snapshots"])
+        market = transport.responses[0]
+        # Exact JSON number, not a string and not a binary float round-trip.
+        marker = b'"diagnostic_numeric":0.123456789012345678901234567890123456789,'
+        market.body = b"{" + marker + market.body[1:]
+        collector = self.collector(transport, clock)
+        captured = collector.capture_next("numeric")
+        expected = Decimal("0.123456789012345678901234567890123456789")
+        self.assertEqual(
+            captured["observations"]["market"]["body"]["diagnostic_numeric"], expected
+        )
+        idle = Transport([])
+        resumed = self.collector(idle)
+        saved = resumed.capture_next("numeric")
+        self.assertEqual(saved, captured)
+        self.assertIsInstance(
+            saved["observations"]["market"]["body"]["diagnostic_numeric"], Decimal
+        )
+        exported = resumed.export()
+        self.assertEqual(
+            exported["requests"][0]["observation"]["body"]["diagnostic_numeric"],
+            expected,
+        )
+        output = self.path.with_name("numeric.json")
+        session.save_new(output, exported)
+        loaded = session.load_package(output)
+        self.assertIsInstance(
+            loaded["requests"][0]["observation"]["body"]["diagnostic_numeric"], Decimal
+        )
+        self.assertEqual(loaded, exported)
+        self.assertEqual(idle.calls, [])
 
     def test_crash_after_reservation_is_unknown_and_never_retried_after_restart(self):
         transport = Transport([SystemExit("injected crash")])

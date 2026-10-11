@@ -1,5 +1,7 @@
 # US500 V1 — contrato, unidades y límites del modelo local
 
+> Revisión histórica V1. Actualización documental V2.1: ver FUENTES_ARCHIVADAS.md para copias primarias con hashes y límites. El tarifario devolvió HTTP429 al archivarlo; las tasas comerciales mencionadas abajo no quedaron verificadas por esa captura y no deben tratarse como tarifas vigentes de una cuenta.
+
 Fecha de revisión: 11 de octubre de 2026. Alcance: documentación pública oficial y revisión de archivos locales. No se consultaron cuentas, claves, balances, permisos privados ni endpoints de mercado durante esta revisión; no se enviaron órdenes.
 
 Este documento define el contrato de aceptación de un motor financiero **paper local**. Aprobarlo acredita comportamiento del software bajo sus entradas y supuestos. No acredita habilitación de Perps, reproducción exacta del margen del exchange, fills reales, ventaja económica ni preparación de producción.

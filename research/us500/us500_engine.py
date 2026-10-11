@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import re
 import time
@@ -76,21 +77,95 @@ def decode(raw: bytes) -> dict:
     return result
 
 
+def json_text(value, *, sort_keys=False, indent=None, ensure_ascii=True) -> str:
+    """Serialize typed JSON, retaining Decimal numbers exactly as numbers.
+
+    Text, integers, booleans and null keep the standard encoder's representation.
+    Floats use their exact repr as a Decimal; tuples are arrays, as in json.dumps.
+    Decimal integer values include a point so decode retains Decimal and signed
+    zero. Unsupported objects and non-string keys are rejected, never coerced.
+    """
+    if type(sort_keys) is not bool or type(ensure_ascii) is not bool:
+        raise DataError("INVALID_JSON_SERIALIZATION")
+    if indent is not None and (type(indent) is not int or not 0 <= indent <= 16):
+        raise DataError("INVALID_JSON_SERIALIZATION")
+    active = set()
+
+    def encode(item, depth):
+        kind = type(item)
+        if item is None:
+            return "null"
+        if kind is bool:
+            return "true" if item else "false"
+        if kind is str:
+            return json.dumps(item, ensure_ascii=ensure_ascii)
+        if kind is int:
+            return str(item)
+        if kind is float:
+            # Use the same exact decimal token before and after decode; Python's
+            # float encoder uses a different exponent spelling from Decimal.
+            return encode(Decimal(repr(item)), depth)
+        if kind is Decimal:
+            if not item.is_finite():
+                raise DataError("INVALID_JSON_SERIALIZATION")
+            token = str(item)
+            return token if "." in token or "E" in token else token + ".0"
+        if kind not in (dict, list, tuple) or id(item) in active:
+            raise DataError("INVALID_JSON_SERIALIZATION")
+        active.add(id(item))
+        try:
+            if kind is dict:
+                if any(type(key) is not str for key in item):
+                    raise DataError("INVALID_JSON_SERIALIZATION")
+                keys = sorted(item) if sort_keys else item
+                colon = ": " if indent is not None else ":"
+                parts = [
+                    json.dumps(key, ensure_ascii=ensure_ascii)
+                    + colon
+                    + encode(item[key], depth + 1)
+                    for key in keys
+                ]
+                left, right = "{", "}"
+            else:
+                parts = [encode(part, depth + 1) for part in item]
+                left, right = "[", "]"
+            if not parts:
+                return left + right
+            if indent is None:
+                return left + ",".join(parts) + right
+            prefix = " " * (indent * (depth + 1))
+            return (
+                left
+                + "\n"
+                + prefix
+                + (",\n" + prefix).join(parts)
+                + "\n"
+                + " " * (indent * depth)
+                + right
+            )
+        finally:
+            active.remove(id(item))
+
+    try:
+        result = encode(value, 0)
+        result.encode("utf-8")
+        return result
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise DataError("INVALID_JSON_SERIALIZATION") from exc
+
+
 def save_new(path: Path, value: dict) -> None:
-    # Exclusive create: never replace existing evidence or a symlink target.
-    with path.open("x", encoding="utf-8") as output:
-        json.dump(
-            value, output, indent=2, ensure_ascii=False, default=str, allow_nan=False
-        )
-        output.write("\n")
+    # Validate the complete document before exclusive creation, so invalid
+    # objects cannot leave partial evidence behind or become valid text inputs.
+    encoded = (json_text(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    with path.open("xb") as output:
+        output.write(encoded)
 
 
 def body_digest(body: dict) -> str:
     try:
-        canonical = json.dumps(
-            body, sort_keys=True, separators=(",", ":"), default=str, allow_nan=False
-        ).encode("utf-8")
-    except (TypeError, ValueError, RecursionError) as exc:
+        canonical = json_text(body, sort_keys=True).encode("utf-8")
+    except DataError as exc:
         raise DataError("INVALID_CANONICAL_BODY") from exc
     return hashlib.sha256(canonical).hexdigest()
 
@@ -136,8 +211,8 @@ class PublicReader:
             code = exc.code
             exc.close()
             raise DataError(f"HTTP_{code}") from None
-        except (OSError, urllib.error.URLError) as exc:
-            raise DataError("PUBLIC_DATA_UNAVAILABLE") from exc
+        except (OSError, urllib.error.URLError, http.client.HTTPException):
+            raise DataError("PUBLIC_DATA_UNAVAILABLE") from None
         return {
             "url": url,
             "http_status": status,
@@ -457,7 +532,7 @@ def main() -> int:
                 data["entry"], data["exit"], **data["assumptions"]
             )
         save_new(args.output, result)
-    except (DataError, OSError, KeyError, TypeError) as exc:
+    except (DataError, OSError, KeyError, TypeError, http.client.HTTPException) as exc:
         print(
             json.dumps(
                 {

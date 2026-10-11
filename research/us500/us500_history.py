@@ -10,6 +10,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import http.client
 import json
 import re
 import time
@@ -291,6 +292,8 @@ class PublicHistoryReader:
             code = exc.code
             exc.close()
             raise DataError(f"HISTORY_HTTP_{code}") from None
+        except http.client.HTTPException:
+            raise DataError("HISTORY_HTTP_PROTOCOL_ERROR") from None
         except (OSError, urllib.error.URLError):
             raise DataError("HISTORY_NETWORK_UNAVAILABLE") from None
         return {

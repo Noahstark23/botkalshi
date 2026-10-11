@@ -10,6 +10,7 @@ import argparse
 import copy
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from us500_engine import (
     DataError,
     body_digest,
     decode,
+    json_text,
     normalize,
     number,
     save_new,
@@ -63,9 +65,7 @@ def _id(value):
 
 def _json(value):
     try:
-        return json.dumps(
-            value, sort_keys=True, separators=(",", ":"), default=str, allow_nan=False
-        )
+        return json_text(value, sort_keys=True)
     except (TypeError, ValueError, RecursionError) as exc:
         raise DataError("INVALID_SESSION_JSON") from exc
 
@@ -479,6 +479,8 @@ class SessionCollector:
             }
         except urllib.error.HTTPError as exc:
             error = DataError(f"COLLECTION_HTTP_{exc.code}")
+        except http.client.HTTPException:
+            error = DataError("COLLECTION_HTTP_PROTOCOL_ERROR")
         except (OSError, urllib.error.URLError):
             error = DataError("COLLECTION_NETWORK_ERROR")
         except DataError as exc:

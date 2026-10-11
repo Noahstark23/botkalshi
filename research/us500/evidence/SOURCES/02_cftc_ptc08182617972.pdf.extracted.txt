@@ -1,0 +1,1308 @@
+--- PAGE 1 ---
+ KalshiEX LLC 
+ August 18, 2026 
+ SUBMITTED VIA CFTC PORTAL 
+ Secretary of the Commission 
+ Office of the Secretariat 
+ U.S. Commodity Futures Trading Commission 
+ Three Lafayette Centre 
+ 1155 21st Street, N.W. 
+ Washington, D.C. 20581 
+ Re:  KalshiEX  LLC  –  Commission  Regulation  40.3(a),  Voluntary  submission  of 
+ new  products  for  Commission  review  and  approval  regarding  the  Initial  Listing 
+ of the US500 Futures Contract 
+ Dear Sir or Madam, 
+ Pursuant  to  Section  5c(c)  of  the  Commodity  Exchange  Act  and  Section  40.3(a)  of  the  regulations 
+ of  the  Commodity  Futures  Trading  Commission,  KalshiEX  LLC  (Kalshi),  a  designated  contract 
+ market  (DCM)  registered  with  the  Commission,  hereby  voluntarily  submits  the  US500  contract 
+ (the  Contract)  for  Commission  review  and  approval.  The  Exchange  intends  to  list  the  Contract 
+ on  a  continuous  basis.  The  Exchange  intends  to  list  this  Contract  shortly  following  approval  by 
+ the Commission. 
+ Along with this letter, Kalshi submits the following documents: 
+ ●  A concise explanation and analysis of the Contract; 
+ ●  Certification; 
+ ●  Appendix A with the Contract’s Terms and Conditions; 
+ ●  Appendix B with enhanced trading prohibitions applicable to the Contract; 
+ ●  Appendix C with further considerations regarding the Contract; 
+ ●  Appendix D with information regarding the Source Agency for the Contract; 
+ ●  Appendix E describing the Contract’s compliance with the Core Principles; 
+ ●  Appendix F with further information on the Contract’s compliance with the Core Principles; 
+ ●  Confidential Appendix G with the Exchange’s agreement with the Source Agency; and 
+ ●  A request for FOIA confidential treatment. 
+ If you have any questions, please do not hesitate to contact me. 
+ Sincerely, 
+ Xavier Sottile 
+ Head of Markets 
+ KalshiEX LLC 
+ xsottile@kalshi.com 
+ KalshiEX LLC 
+
+--- PAGE 2 ---
+ KalshiEX LLC 
+ KalshiEX LLC 
+ Official Product Name:  US500 
+ Rulebook:  US500 
+ Summary:  MerQube US Large Cap Index Perpetual Future 
+ August 18, 2026 
+ CONCISE EXPLANATION AND ANALYSIS OF THE PRODUCT AND ITS 
+ COMPLIANCE WITH APPLICABLE PROVISIONS OF THE ACT, INCLUDING CORE 
+ PRINCIPLES AND THE COMMISSION’S REGULATIONS THEREUNDER 
+ Pursuant  to  Commission  Regulation  40.3(a)(4),  the  following  is  a  concise  explanation  and 
+ analysis  of  the  product  and  its  compliance  with  the  Act,  including  the  relevant  Core  Principles 
+ (discussed in Appendices E and F), and the Commission’s regulations thereunder. 
+ I.  Introduction 
+ The  US500  Contract  is  a  perpetual  futures  contract  on  the  MerQube  US  Large  Cap  Index 
+ (Bloomberg:  MQ5C;  Reuters:  .MQ5C),  a  broad-based  securities  index  composed  of  the 
+ 500  largest  companies  listed  and  domiciled  in  the  United  States,  weighted  by 
+ float-adjusted market capitalization and administered by MerQube. 
+ What  is  a  perpetual  future?  A  perpetual  future  is  a  cash-settled  futures  contract  with  no 
+ fixed  expiration  or  delivery  date.  Rather  than  converging  to  a  deliverable  cash  price  on  a 
+ stated  settlement  day,  it  remains  economically  tethered  to  a  continuously  observed 
+ reference  through  a  periodic  funding  mechanism:  at  regular  intervals,  holders  of  the  side 
+ trading  at  a  premium  to  the  reference  pay  holders  of  the  side  trading  at  a  discount,  so  that 
+ any  divergence  between  the  contract’s  mark  and  the  underlying  reference  generates  an 
+ offsetting  carrying  cost  that  draws  the  two  back  into  alignment.  The  instrument  therefore 
+ functions  as  an  indefinitely  renewing  near-dated  future,  allowing  a  participant  to  hold  a 
+ position  open  for  as  long  as  the  underlying  exposure  persists  without  rolling  from  one 
+ expiration to the next. 
+ Why  are  these  important?  Perpetual  futures  have  become  the  dominant  form  of 
+ derivative  and  a  principal  locus  of  price  discovery  in  the  markets  in  which  they  have 
+ emerged,  yet  that  activity  has  historically  occurred  almost  entirely  on  offshore, 
+ unregulated  venues.  Listing  a  perpetual  on  a  CFTC-registered  DCM  brings  this 
+ economically  significant  activity  into  a  regulated  environment  featuring  trade 
+ surveillance,  know-your-customer  verification,  risk-based  margin,  central  clearing,  and 
+ disciplinary  procedures  consistent  with  the  CEA,  protecting  U.S.  participants  and 
+ preserving  U.S.  price  discovery  rather  than  ceding  both  abroad.  For  investors  whose 
+ exposure  to  the  broad  U.S.  equity  market  is  itself  continuous  and  indefinite—asset 
+ managers  and  institutional  investors  maintaining  long-horizon  exposure  to  U.S.  large-cap 
+ equities,  funds  tracking  or  benchmarked  to  a  broad  large-cap  index,  participants 
+ managing  ongoing  equity-beta  exposure,  and  dealers  warehousing  equity-index  risk  from 
+ client  facilitation—a  perpetual  is  structurally  superior  to  a  strip  of  dated  futures:  it 
+ eliminates  roll  cost  and  roll-date  basis  risk,  tracks  the  reference  more  tightly  through  the 
+ funding  mechanism,  and  concentrates  liquidity  in  a  single  instrument  rather  than 
+ fragmenting  it  across  expirations.  Listing  a  regulated  domestic  perpetual  thus  directly 
+ KalshiEX LLC 
+
+--- PAGE 3 ---
+ KalshiEX LLC 
+ advances  the  Commission’s  stated  objective  of  onshoring  novel  derivatives  products  that 
+ developed offshore due to regulatory uncertainty.  1 
+ Perpetuals  are  an  especially  natural  fit  for  a  broad  equity  market  index.  Of  the 
+ things  on  which  a  derivative  can  be  written,  a  broad  equity  market  index  is  among  the 
+ most  natural  candidates  for  a  perpetual,  indefinitely  renewing  structure,  because  the 
+ exposure  it  represents—participation  in  a  diversified  basket  of  the  market’s  largest 
+ companies—is  itself  continuous  and  has  no  terminal  date.  There  is  always  a  prevailing 
+ level  of  the  U.S.  large-cap  market;  the  economic  variable  does  not  mature,  expire,  or 
+ settle  on  a  delivery  day.  The  Underlying  is  the  level  of  the  index  itself—not  a  dated 
+ delivery  price—so,  unlike  a  dated  equity  index  future,  it  does  not  carry  a  fixed  expiration 
+ to  which  it  must  converge,  roll  down  a  basis  to  that  expiration,  or  require  participants  to 
+ migrate  from  one  listed  month  to  the  next.  A  perpetual  on  that  index  therefore  mirrors  the 
+ economic  reality  of  continuous,  long-horizon  equity  exposure  far  more  closely  than  the 
+ existing  exchange-traded  tools  for  taking  or  hedging  it.  Dated  equity  index  futures,  such 
+ as  the  quarterly  E-mini  contracts  on  major  U.S.  large-cap  benchmarks,  must  be  rolled 
+ every  calendar  quarter,  incurring  roll  cost,  roll-date  basis  risk,  and  the  operational  burden 
+ of  managing  the  front-month-to-back-month  transition.  The  Contract  collapses  that 
+ maintenance  into  a  single,  continuously  held  instrument  that  tracks  the  current  index  level 
+ without  any  roll.  Where  a  participant’s  information  instead  lives  in  the  term 
+ structure—calendar  spreads,  the  path  of  expected  dividends  and  financing  to  specific 
+ tenors,  or  date-certain  settlement  needs—dated  equity  index  instruments  remain  valuable, 
+ so that the perpetual and dated structures are complementary rather than substitutes. 
+ The  funding  mechanism  has  a  well-defined  economic  interpretation  for  an  equity 
+ index.  Because  the  Contract  synthesizes  a  continuously  held,  financed  position  in  the 
+ underlying  large-cap  basket,  its  equilibrium  funding  is  not  zero  but  reflects  the  net  cost  of 
+ carrying  that  position—the  short-term  financing  rate  on  the  capital  required  to  hold  the 
+ basket,  less  the  dividend  yield  accruing  to  the  constituent  securities.  Because  the 
+ Underlying  is  a  price-return  index,  which  excludes  reinvested  dividends,  a  holder  of  the 
+ Contract  does  not  itself  receive  the  dividends  paid  by  the  constituents;  the  funding 
+ mechanism  is  accordingly  the  perpetual  analog  of  the  cost-of-carry  basis  embedded  in  a 
+ dated  equity  index  future,  passing  this  financing-minus-dividend  differential  between  the 
+ two  sides  at  each  Periodic  Transfer  so  as  to  keep  the  Contract’s  traded  level  tethered  to 
+ the  index.  For  prevailing  financing  rates  and  dividend  yields  this  per-period  carry  is 
+ small—on  the  order  of  the  net  carry  accruing  over  a  single  day,  a  small  fraction  of  one 
+ percent  of  the  index  level.  The  Contract’s  deadband  is  accordingly  set  below  the  typical 
+ per-period  carry,  so  that  it  filters  microstructure  noise  without  suppressing  the  genuine 
+ carry,  while  the  clamp  is  set  far  above  it  and  functions  as  a  manipulation  and  tail-risk 
+ backstop rather than a routine constraint. 
+ The  Contract  trades  on  the  twenty-four-hour,  five-day  schedule  of  the  U.S. 
+ equity-index  futures  market,  while  its  funding  mechanics  are  anchored  to  the 
+ real-time  level  of  the  Index  during  regular  U.S.  equity  trading  hours.  The  Underlying 
+ Price  Index  is  the  level  of  the  Index  as  calculated  and  disseminated  by  the  Source  Agency 
+ 1  Remarks of CFTC Chairman Michael Selig, The Next Phase of Project Crypto: Unleashing Innovation for the New 
+ Frontier of Finance (Jan. 29, 2026), https://www.cftc.gov/PressRoom/SpeechesTestimony/opaselig1. 
+ KalshiEX LLC 
+
+--- PAGE 4 ---
+ KalshiEX LLC 
+ in  real  time  during  regular  trading  hours  on  each  Index  Business  Day  —  from  the  9:30 
+ A.M.  Eastern  open  to  the  4:00  P.M.  Eastern  close  of  regular  trading  —  from  the  prices  of 
+ the  constituent  securities  on  their  primary  listing  exchanges.  The  Index  is  not  calculated 
+ outside  regular  trading  hours,  on  weekends,  or  on  reference  market  holidays.  The 
+ Contract's  methodology  accordingly  computes  a  per-minute  Premium  for  every 
+ one-minute  interval  during  which  the  Index  is  being  calculated  and  the  feed  is  current, 
+ and  derives  a  single  daily  Funding  Rate  —  the  equally  weighted  mean  of  those  Premiums 
+ —  at  a  Periodic  Transfer  Time  coinciding  with  the  4:00  P.M.  close.  No  Premium  is 
+ computed,  and  no  Funding  Rate  payment  is  derived,  from  any  period  during  which  the 
+ Index  is  not  being  calculated;  in  such  periods  the  most  recent  published  level  remains  in 
+ effect.  This  is  the  same  principle  applied  across  the  Exchange's  perpetual  suite:  Premiums 
+ are  computed  whenever,  and  only  when,  the  underlying  reference  market  is  open  and 
+ priced  —  approximately  the  six  and  one-half  hours  of  regular  equity  trading  for  this 
+ Contract.  Because  the  Index's  constituents  do  not  trade  overnight,  confining  funding 
+ measurement  to  regular  hours  leaves  no  unfunded  price  discovery.  The  Source  Agency 
+ separately  publishes  an  official  closing  level  of  the  Index  struck  from  official  closing 
+ prices,  which  the  Exchange  uses  as  a  daily  validation  benchmark  for  the  real-time  series, 
+ as described in Appendix D. 
+ The  Contract  is  a  futures  contract  on  a  broad-based  security  index,  within  the 
+ Commission’s  exclusive  jurisdiction.  The  Underlying  is  a  security  index  and  therefore 
+ an  “excluded  commodity”  under  Section  1a(19)  of  the  CEA.  2  Because  the  Index  is  a 
+ broad-based  security  index—and  not  a  narrow-based  security  index—the  Contract  is  not 
+ a  “security  future”  or  “security  futures  product,”  and  its  listing  and  trading  fall  within  the 
+ Commission’s  exclusive  jurisdiction  under  Section  2(a)(1)(C)  of  the  CEA,  rather  than  the 
+ jurisdiction  the  Commission  shares  with  the  Securities  and  Exchange  Commission  over 
+ futures  on  single  securities  and  narrow-based  security  indices.  3  As  set  forth  in  Appendix 
+ E,  the  Contract  satisfies  each  of  the  three  requirements  of  Section  2(a)(1)(C)(ii)  of  the 
+ CEA:  it  is  settled  exclusively  in  cash;  it  is  not  readily  susceptible  to  manipulation,  nor  to 
+ being  used  to  manipulate  any  underlying  security;  and  the  Index  is  not  a  narrow-based 
+ security  index.  4  The  Index  fails  each  of  the  four  disqualifying  criteria  of  Section  1a(35)  of 
+ the  CEA  by  a  wide  margin:  it  comprises  five  hundred  component  securities;  no  single 
+ component  exceeds  approximately  seven  percent  of  its  weight;  its  five  highest-weighted 
+ components  together  account  for  approximately  one-quarter  of  its  weight;  and  the 
+ 4  7 U.S.C. § 2(a)(1)(C)(ii). A futures contract on a group or index of securities may be traded subject to the 
+ Commission’s exclusive jurisdiction where (I) settlement is effected in cash or by means other than the transfer or 
+ receipt of any security; (II) the contract is not readily susceptible to manipulation of its price, nor to being used to 
+ manipulate the price of any underlying security or option thereon; and (III) the group or index of securities is not a 
+ narrow-based security index. See also id. § 2(a)(1)(C)(iv) (prohibiting the offer of such a contract except as 
+ permitted under clause (ii) or as a security futures product). 
+ 3  See 7 U.S.C. § 1a(45) (defining “security future” as a contract of sale for future delivery of a single security or of a 
+ narrow-based security index, and excluding a contract on a broad-based security index); id. § 1a(35) (defining 
+ “narrow-based security index”). Futures on single securities and narrow-based security indices are “security futures 
+ products” subject to the joint jurisdiction of the Commission and the Securities and Exchange Commission; futures 
+ on broad-based security indices are within the Commission’s exclusive jurisdiction. 
+ 2  7 U.S.C. § 1a(19) (defining “excluded commodity” to include, among other things, an interest rate, exchange rate, 
+ currency, security, security index, or other financial or macroeconomic index or measure). A broad-based security 
+ index is a “security index” within this definition. 
+ KalshiEX LLC 
+
+--- PAGE 5 ---
+ KalshiEX LLC 
+ aggregate  dollar  value  of  the  average  daily  trading  volume  of  the  component  securities 
+ comprising  its  lowest-weighted  quartile  exceeds  the  applicable  statutory  threshold  by 
+ orders  of  magnitude.  5  The  Exchange  will  monitor  the  composition  of  the  Index  on  an 
+ ongoing  basis  and,  consistent  with  Section  1a(35)(B)  of  the  CEA  and  the  joint  rules  of  the 
+ Commissions  thereunder,  will  apply  the  applicable  tolerance  period  and,  should  the  Index 
+ cease  to  be  broad-based  beyond  that  period,  treat  the  Contract  in  accordance  with  those 
+ rules. 
+ Further  information  about  the  Contract,  including  an  analysis  of  its  risk  mitigation  and 
+ price  basing  utility,  as  well  as  additional  considerations  related  to  the  Contract,  is 
+ included in Appendices C, D and E and Appendix F. 
+ General  Contract  Terms  and  Conditions:  As  outlined  in  Rule  5.16  of  the  Rulebook, 
+ trading  shall  be  available  at  all  times  the  Contract  is  open  as  specified  in  Appendix  A, 
+ outside  of  any  maintenance  windows,  which  will  be  announced  in  advance  by  the 
+ Exchange.  Members  will  be  charged  fees  in  accordance  with  Rule  3.13  of  the  Rulebook. 
+ Fees,  if  they  are  charged,  are  charged  in  such  amounts  as  may  be  revised  from  time  to 
+ time  to  be  reflected  on  the  Exchange’s  Website.  The  Source  Agency  for  the  Contract  is 
+ MerQube,  the  administrator  and  calculation  agent  of  the  Index,  and  a  new  Source  Agency 
+ can  be  added  via  a  Part  40  amendment.  All  instructions  on  how  to  access  the  Underlying 
+ are  non-binding  and  are  provided  for  convenience  only  and  are  not  part  of  the  binding 
+ Terms  and  Conditions  of  the  Contract.  They  may  be  clarified  at  any  time.  Furthermore, 
+ the  Contract  is  a  cash-settled  futures  contract  with  no  fixed  expiration  date.  The  Contract 
+ is  quoted  in  Index  points;  each  Contract  has  a  notional  value  equal  to  the  level  of  the 
+ Index  multiplied  by  the  Contract  Multiplier  of  US$1.00  per  Index  point,  and  a  one-point 
+ change  in  the  Index  level  corresponds  to  a  fixed  US$1.00  change  in  value  per  Contract. 
+ Each  Contract  represents  a  continuous  obligation  to  make  or  receive  cash  payments  based 
+ on  changes  in  the  Contract’s  mark  and  periodic  funding  payments.  Positions  are  marked 
+ to  market  on  a  continuous  basis,  and  margin  is  collected  and  paid  in  accordance  with  the 
+ Exchange’s  margin  methodology.  During  the  time  that  trading  on  the  Contract  is  open, 
+ Members  are  able  to  adjust  their  positions  and  trade  freely.  Members  may  enter  and  exit 
+ positions  at  any  time  during  trading  hours  by  executing  offsetting  trades.  A  Member 
+ holding  a  long  position  profits  when  the  Index  level  rises  and  incurs  losses  when  it  falls;  a 
+ Member  holding  a  short  position  is  affected  in  the  opposite  manner.  To  maintain 
+ convergence  with  the  Underlying,  the  Contract  employs  a  periodic  funding  mechanism 
+ whereby  long  and  short  holders  exchange  funding  payments  based  on  the  difference 
+ between  the  Contract’s  mark  and  the  Underlying  Price  Index,  as  specified  in  Appendix  A. 
+ A  Member’s  gain  or  loss  at  any  point  is  equal  to  the  change  in  the  Contract’s  mark  since 
+ the  position  was  established,  multiplied  by  the  Contract  Multiplier,  plus  or  minus  net 
+ funding  payments  received  or  paid.  Settlement  of  all  payments  is  made  in  cash;  no 
+ physical delivery occurs. 
+ 5  7 U.S.C. § 1a(35)(A). A security index is narrow-based if it meets any of four criteria: (i) it has nine or fewer 
+ component securities; (ii) any component comprises more than 30% of the index’s weighting; (iii) the five 
+ highest-weighted components comprise more than 60% of the index’s weighting; or (iv) the lowest-weighted 
+ components accounting in the aggregate for 25% of the index’s weighting have an aggregate dollar value of average 
+ daily trading volume of less than $50 million (or, for an index with 15 or more components, $30 million). An index 
+ meeting none of these criteria is broad-based. 
+ KalshiEX LLC 
+
+--- PAGE 6 ---
+ KalshiEX LLC 
+ CERTIFICATIONS PURSUANT TO SECTION 5c OF THE COMMODITY EXCHANGE 
+ ACT, 7 U.S.C. § 7A-2 AND COMMODITY FUTURES TRADING COMMISSION RULE 
+ 40.3, 17 C.F.R. § 40.3 
+ Based on the above analysis, the Exchange certifies that: 
+ ❏   This  submission  (other  than  those  appendices  for  which  confidential  treatment  has  been 
+ requested)  has  been  concurrently  posted  on  the  Exchange’s  website  at 
+ https://kalshi.com/regulatory/filings  . 
+ Should  you  have  any  questions  concerning  the  above,  please  contact  the  exchange  at 
+ ProductFilings@kalshi.com  . 
+ ______________________ 
+ By: Xavier Sottile 
+ Title: Head of Markets 
+ Date: August 18, 2026 
+ KalshiEX LLC 
+
+
+--- PAGE 7 ---
+ KalshiEX LLC 
+ Attachments: 
+ Appendix A - Contract Terms and Conditions 
+ Appendix B - Trading Prohibitions 
+ Appendix C - Further Considerations 
+ Appendix D - Source Agency 
+ Appendix E - Compliance with Core Principles 
+ Appendix F  - Additional Compliance with Core Principles 
+ Appendix G - (Confidential) - Agreement with MerQube 
+ KalshiEX LLC 
+
+--- PAGE 8 ---
+ KalshiEX LLC 
+ APPENDIX A – CONTRACT TERMS AND CONDITIONS 
+ Official Product Name:  US500 
+ Rulebook:  US500 
+ KalshiEX LLC 
+
+--- PAGE 9 ---
+ KalshiEX LLC 
+ US500 
+ Scope:  These rules shall apply to this Contract. 
+ Underlying:  The Underlying for this Contract is the  MerQube US Large Cap Index (Bloomberg: 
+ MQ5C; Reuters: .MQ5C), a broad-based, float-market-capitalization-weighted, price-return 
+ securities index composed of the 500 largest companies listed and domiciled in the United 
+ States, as calculated and administered by MerQube. The Contract is quoted in Index points. A 
+ long position in the Contract increases in value when the level of the Index rises and decreases in 
+ value when the level of the Index falls; a short position is affected in the opposite manner. 
+ Underlying Price Index:  For a given time t, the Underlying  Price Index (UPIt) is the most 
+ recent level of the Index as calculated and disseminated in real time by the Source Agency. 
+ During any period in which the Source Agency reports the Index as not being calculated 
+ (including outside regular U.S. equity trading hours, on days that are not Index Business Days, 
+ and during any suspension of calculation), or reports the feed as stale or unavailable, the 
+ Underlying Price Index shall be the last level published while calculation was live. Whether the 
+ Index is being calculated, and whether the feed is current, is determined as reported by the 
+ Source Agency. 
+ Type:  The type of Contract is a Perpetual Futures  Contract. 
+ Source Agency:  The Source Agency is MerQube. MerQube  is the Index Sponsor, Index 
+ Administrator, and Index Calculation Agent for the Index, and MerQube UK Limited is the 
+ Benchmark Administrator for the MerQube US Index Series under the United Kingdom 
+ Benchmarks Regulation. MerQube calculates and disseminates the level of the Index in real time 
+ during regular U.S. equity trading hours on each Index Business Day, from the prices of the 
+ constituent securities on their primary listing exchanges, and separately calculates and publishes 
+ an official closing level of the Index for each Index Business Day from the official closing prices 
+ of the constituent securities, in each case subject to MerQube's automated validation and 
+ quality-control procedures. The real-time series and the official closing level are computed under 
+ the same methodology, constituent set, and divisor. Appendix D describes the Source Agency in 
+ detail. A new Source Agency may be added or substituted via a Part 40 amendment. 
+ Trading Hours:  The Contract trades continuously from  6:00 P.M. Eastern Time on Sunday to 
+ 5:00 P.M. Eastern Time on Friday, throughout the lifetime of the Contract, subject to any trading 
+ halt or maintenance window imposed by the Exchange. This schedule corresponds to the weekly 
+ trading session of the U.S. equity-index futures market: like the E-mini equity-index futures 
+ listed on CME, the Contract trades continuously through each weekday and overnight and is 
+ closed over the weekend, when the U.S. equity market and its futures market are closed; the 
+ Contract trades continuously through each weekday session without a daily maintenance halt. 
+ Funding and settlement, however, are keyed to the Index, which is calculated only during regular 
+ trading hours on Index Business Days; accordingly, Premiums are computed only during such 
+ hours, and Periodic Transfers, Funding Rate determinations, and Settlement Price determinations 
+ occur only on Index Business Days, as provided below. An “Index Business Day” is a day on 
+ which the primary U.S. securities exchanges on which the Index’s constituents are listed—the 
+ KalshiEX LLC 
+
+--- PAGE 10 ---
+ KalshiEX LLC 
+ New York Stock Exchange, Nasdaq, and Cboe BZX—are open for regular trading and the Index 
+ is scheduled to be calculated. 
+ Contract Multiplier:  US$1.00 per Index point. Each  Contract has a notional value equal to the 
+ level of the Index multiplied by US$1.00. 
+ Price Quotation:  Prices for the Contract are quoted  in Index points (e.g., 8360.00). 
+ Minimum Tick:  The Minimum Tick size for this Contract  shall be 0.05 Index points. 
+ Tick Value:  A one-tick price movement equals  $0.05  per Contract  , calculated as the Minimum 
+ Tick multiplied by the Contract Multiplier (0.05 × US$1.00 = $0.05). 
+ Minimum Unit:  The minimum unit of trading is one ten-thousandth  of one Contract, unless 
+ otherwise specified in a Contract’s terms and conditions or on the Contract’s market page. 
+ Position Accountability Level:  $25,000,000 mark-to-market  position value (in the case of a 
+ short position, the equivalent long position value is considered). 
+ Position Limits:  The Contract is subject to the Position  Accountability Level set forth herein 
+ and to the position accountability framework of the Exchange Rulebook. Because the Underlying 
+ is a broad-based security index — an excluded commodity under Section 1a(19) of the CEA — 
+ the Contract is not subject to federal speculative position limits under 17 CFR Part 150, which 
+ applies to physical-commodity contracts linked to the core referenced futures contracts 
+ enumerated in Regulation 150.2(d); the Contract is cash-settled, has no delivery obligation, and 
+ has no expiration and therefore no spot month. The Exchange may, consistent with Commission 
+ standards and applicable filing requirements, supplement this accountability framework with 
+ exchange-set position limits as open interest develops. 
+ Periodic Transfer Criterion:  At each Periodic Transfer  Time, the Funding Rate is computed as 
+ defined below. If the Funding Rate is zero, no Periodic Transfer is made. If the Funding Rate is 
+ positive, long-side holders must contribute an amount equal to the Funding Rate multiplied by 
+ the Settlement Price at the Periodic Transfer Time, multiplied by the Contract Multiplier 
+ (US$1.00 per Index point), to short-side holders, for each Contract held. If the Funding Rate is 
+ negative, short-side holders must contribute an amount equal to the absolute value of the 
+ Funding Rate multiplied by the Settlement Price at the Periodic Transfer Time, multiplied by the 
+ Contract Multiplier (US$1.00 per Index point), to long-side holders, for each Contract held. 
+ Revisions to the Underlying made after any Periodic Transfer Time will not be accounted for in 
+ determining the applicable Periodic Transfer. 
+ Periodic Transfer Time:  The Periodic Transfer Time  is 4:00 P.M. Eastern Time on each Index 
+ Business Day or, on any Index Business Day on which the primary U.S. securities exchanges 
+ close early, the scheduled early close of regular trading. No Periodic Transfer, Funding Rate 
+ determination, or Settlement Price determination occurs on a day that is not an Index Business 
+ Day; in that case the most recent Settlement Price and published Index level remain in effect 
+ until the next Index Business Day. Each Funding Period runs from the immediately preceding 
+ Periodic Transfer Time to the current Periodic Transfer Time. 
+ KalshiEX LLC 
+
+--- PAGE 11 ---
+ KalshiEX LLC 
+ Premium Index:  For each minute during which the Source Agency reports the Index as being 
+ calculated and the feed as current, the Exchange computes a per-minute Premium as follows: 
+ Premium(t) = ( Perpetual Price(t) − Reference Price(t) ) / Reference Price(t) 
+ where Perpetual Price(t) is the volume-weighted average price of the Contract during the 
+ applicable one-minute interval; if no trades in the Contract occurred during that interval, the 
+ Premium for that interval is undefined and shall be excluded from the Funding Rate calculation; 
+ and Reference Price(t) is the time-weighted average of the Underlying Price Index over the 
+ applicable one-minute interval. 
+ Funding Rate:  Let Premium(1), Premium(2), …, Premium(N)  be the per-minute Premiums 
+ computed during the Funding Period, where N is the number of one-minute intervals during the 
+ Funding Period for which a Premium was computed (excluding any interval excluded under 
+ Reference Market Closed Periods, Reference Market Halts and Feed Outages, or any other 
+ provision herein, and any interval during which no trades in the Contract occurred). The Funding 
+ Rate shall equal the Weighted Average Premium Index (WAPI) of those per-minute Premiums, 
+ computed by weighting each Premium equally: Funding Rate = ( Σ from k=1 to N of Premium(k) 
+ ) / N. For the avoidance of doubt, this is an equally weighted (simple) average of the computed 
+ per-minute Premiums: each Premium computed during the Funding Period receives identical 
+ weight regardless of its chronological position, and no Premium is weighted by recency. If N is 
+ zero, the Funding Rate shall be zero. The Funding Rate is subject to the following adjustments: 
+ (a) Deadband: If the absolute value of the Funding Rate falls below 0.002%, the Funding 
+ Rate shall be set to zero. 
+ (b) Clamp: If the absolute value of the Funding Rate exceeds 2.00%, the Funding Rate 
+ shall be clamped to +2.00% or −2.00%, as applicable (the "Maximum Funding 
+ Magnitude"). 
+ Reference Market Closed Periods:  The Index is calculated  only during regular U.S. equity 
+ trading hours on Index Business Days. During any period in which the Index is not being 
+ calculated — including outside regular trading hours on Index Business Days, over the weekend, 
+ on Exchange holidays, and on any other day that is not an Index Business Day — no per-minute 
+ Premiums are computed and no Funding Rate payment is derived from price action, and the most 
+ recent Settlement Price and published Index level remain in effect. The Contract continues to 
+ trade during its weekday trading session throughout such periods; the exclusion operates at the 
+ level of the Funding Rate computation, not as a close in trading. For this purpose, whether the 
+ Index is being calculated is determined as reported by the Source Agency. 
+ Reference Market Halts and Feed Outages:  During any  period in which the Source Agency 
+ suspends or defers calculation of the Index (including in connection with a market-wide trading 
+ halt or a Market Disruption Event under the Index methodology), or reports the feed as stale or 
+ unavailable, no Premiums shall be computed for the duration, and the Funding Period shall 
+ exclude all such one-minute intervals. The Weighted Average Premium Index used to compute 
+ the Funding Rate shall be calculated solely over the one-minute intervals during which the Index 
+ KalshiEX LLC 
+
+--- PAGE 12 ---
+ KalshiEX LLC 
+ was being calculated and the feed was current. The Contract continues to trade during its 
+ weekday trading session throughout any such period. 
+ Reference Market Scheduled Early Closes and Holidays:  On any Index Business Day on 
+ which the primary U.S. securities exchanges close early (for example, on certain days adjacent to 
+ public holidays), the Funding Period in progress shall run to the scheduled early close, and the 
+ corresponding Periodic Transfer Time and Settlement Price shall be determined as of that early 
+ close. In all cases the Contract continues to trade on the Exchange. 
+ Clearing:  The Contracts will be centrally cleared  by Kalshi Klear LLC (Klear or the 
+ Clearinghouse), a derivatives clearing organization registered with the Commission, as central 
+ counterparty. 
+ Settlement Price:  For the purposes of calculating  variation margin and Periodic Transfer 
+ obligations, the Settlement Price as of the Periodic Transfer Time on each Index Business Day 
+ shall be determined according to the following tiered methodology, applied in order: 
+ Tier 1 (Trade VWAP).  If one or more trades in the  Contract occur during the sixty 
+ (60) seconds immediately preceding the Periodic Transfer Time (the “Settlement 
+ Period”), the Settlement Price shall be the volume-weighted average price of those 
+ trades, adjusted to exclude outliers via a median-based Mean Absolute Difference 
+ (MAD) filter; the Exchange reserves the right to exercise discretion to exclude other 
+ outlier or manipulative transactions. Transactions occurring precisely at the Periodic 
+ Transfer Time are excluded. 
+ For purposes of Tiers 2 and 3, sixty (60) Observation Points are defined at exactly N 
+ seconds before the Periodic Transfer Time for each integer N from 1 to 60. An 
+ Observation Point is “two-sided” if both a prevailing best bid and a prevailing best 
+ ask rest on the order book at that instant, and its Midpoint is the arithmetic mean of 
+ the two. 
+ Tier 2 (Sampled Midpoint Average).  If no trades in  the Contract occur during the 
+ Settlement Period and at least one Observation Point is two-sided, the Settlement 
+ Price shall be the arithmetic mean of the Midpoints at all two-sided Observation 
+ Points. 
+ Tier 3 (Index Net Change).  If no trades in the Contract  occur during the Settlement 
+ Period and no Observation Point is two-sided, the Settlement Price shall equal the 
+ prior Settlement Price plus the net change in the Underlying Price Index between the 
+ prior Periodic Transfer Time and the current Periodic Transfer Time. 
+ If a Settlement Price cannot be determined under any of the foregoing Tiers, the Exchange 
+ may determine the Settlement Price pursuant to Rule 7.1 of the Rulebook. 
+ Initial and Maintenance Margin:  Initial margin and  maintenance margin requirements for the 
+ Contract shall be calculated using the Exchange’s risk-based margin methodology. 
+ Trading Halts:  The Exchange may halt trading in the  Contract in its discretion or in connection 
+ with an Emergency as defined in Rule 2.8 of the Rulebook. Because the Contract trades 
+ KalshiEX LLC 
+
+--- PAGE 13 ---
+ KalshiEX LLC 
+ continuously during its weekday trading session, an intraday halt in the U.S. equity markets, a 
+ weekday that is not an Index Business Day, or a suspension of the calculation of the Index does 
+ not by itself halt trading in the Contract during that session; rather, no Premiums are computed 
+ and the affected one-minute intervals are excluded from the Funding Rate, as provided above. 
+ Over the weekend, the Contract does not trade, as set forth under Trading Hours. The Exchange 
+ may, however, halt or otherwise constrain trading in the Contract where trading in a significant 
+ portion of the Index’s constituent securities is halted or where the Exchange determines that the 
+ Contract’s price is no longer reliably tethered to the prevailing value of the Index’s constituents. 
+ Last Trading Date:  As this is a Perpetual Futures  Contract, it has no Last Trading Date. 
+ Expiration Date:  As this is a Perpetual Futures Contract,  it has no Expiration Date. 
+ Expiration Time:  As this is a Perpetual Futures Contract,  it has no Expiration Time. 
+ Pre-Trade Risk Controls:  The Exchange may impose pre-trade  risk controls, including price 
+ banding, order size limits, and position exposure limits, to ensure orderly trading and mitigate 
+ market disruption risk. During regular trading hours, the Exchange may, in particular, apply 
+ dynamic price bands that constrain the Contract's traded price by reference to the real-time 
+ Underlying Price Index and the prevailing prices of the Index's constituent securities. Outside 
+ regular trading hours, when the Index is not calculated and the constituents do not trade, bands 
+ reference the Contract's own market and the most recently published Index level, calibrated to 
+ permit legitimate repricing on new information while constraining dislocations. 
+ Market Integrity:  The Exchange may, at its sole discretion,  initiate the Market Outcome 
+ Review Process pursuant to Rule 7.1 of the Rulebook. If a Funding Rate or Settlement Price 
+ cannot be determined, the Exchange has the right to determine payouts or margin requirements 
+ pursuant to Rule 7.1 of the Rulebook. If the Funding Rate cannot be determined for a given 
+ Funding Period (including because no Premium was computed during the Funding Period), the 
+ Funding Rate shall be set to zero. The Exchange will monitor the performance of the Funding 
+ Rate in keeping the Contract economically tethered to the Underlying Price Index and may 
+ amend the Funding Rate methodology in accordance with applicable Exchange rules and 
+ Commission filing requirements. Any such amendment shall apply prospectively only and shall 
+ not alter the Funding Rate or any Periodic Transfer obligation for any Funding Period ending 
+ prior to the amendment’s effective date. In the event of an Emergency, as defined in Rule 2.8 of 
+ the Rulebook, the Exchange may take such actions as it deems necessary and appropriate, 
+ including but not limited to adjusting the Maximum Funding Magnitude, modifying margin 
+ requirements, or imposing additional risk controls, in accordance with the procedures set forth in 
+ Rule 2.8. 
+ KalshiEX LLC 
+
+--- PAGE 14 ---
+ KalshiEX LLC 
+ APPENDIX B – TRADING PROHIBITIONS 
+ In  addition  to  the  general  prohibition  against  trading  on  material  nonpublic  information,  the 
+ Exchange  will  institute  additional  prohibitions  for  trading  the  Contract.  Persons  under  18  years 
+ of  age  are  not  permitted  to  create  Kalshi  accounts.  The  following  individuals  will  be  prohibited 
+ from trading: 
+ ●  Officers,  directors,  and  employees  of  MerQube,  Inc.  and  MerQube  UK  Limited,  in  their 
+ capacity  as  Index  Sponsor,  Index  Administrator,  Index  Calculation  Agent,  or  Benchmark 
+ Administrator  of  the  Index,  to  the  extent  such  persons  have  access  to  non-public 
+ information  regarding  the  composition,  calculation,  or  operation  of  the  Index  or  the 
+ Underlying Price Index 
+ ●  Persons  with  access  to  non-public  information  concerning  the  official  closing  prices  used 
+ to  calculate  the  Index,  or  concerning  pending  additions  to,  deletions  from,  or 
+ reweightings  of  the  Index’s  constituents,  in  advance  of  their  public  dissemination,  to  the 
+ extent  such  information  could  be  used  to  anticipate  or  influence  movements  in  the 
+ Underlying Price Index 
+ ●  Members  of  the  MerQube  Index  Oversight  Committee,  and  personnel  of  the  Source 
+ Agency’s  index-calculation,  data-validation,  and  benchmark-administration  functions, 
+ with  advance  knowledge  of  methodology  changes,  constituent  or  weighting  changes,  or 
+ operational changes that could materially affect the Index 
+ ●  Persons  involved  in  the  constituent  selection,  rebalancing,  or  corporate-action  processing 
+ for  the  Index  with  advance  knowledge  of  changes  that  could  materially  affect  the  Index 
+ or its composition 
+ ●  Third-party  vendors,  auditors,  and  reviewers  currently  engaged  in  supplying  constituent 
+ price  data  to,  or  in  auditing  or  assuring,  the  Source  Agency’s  calculation  methodology, 
+ data inputs, or benchmark-administration controls 
+ ●  Immediate  family  members  (parents,  siblings,  spouses,  domestic  partners)  and  household 
+ members of all persons listed above 
+ KalshiEX LLC 
+
+--- PAGE 15 ---
+ KalshiEX LLC 
+ APPENDIX C – FURTHER CONSIDERATIONS 
+ The  US500  Contract  serves  critical  risk  mitigation  functions  for  a  broad  range  of  market 
+ participants  with  bona  fide  economic  exposure  to  the  U.S.  large-cap  equity  market.  The  U.S. 
+ equity  market  is  the  largest  and  most  liquid  equity  market  in  the  world,  and  the  500  companies 
+ that  constitute  the  Index  represent  the  large-capitalization  segment  of  that  market,  with  an 
+ aggregate  market  capitalization  in  the  tens  of  trillions  of  U.S.  dollars  and  daily  share-trading 
+ volume  in  the  constituents  measured  in  the  hundreds  of  billions  of  U.S.  dollars.  6  Broad  exposure 
+ to  the  U.S.  large-cap  equity  market  is  continuous,  indefinite  in  duration,  and  pervasive  across  the 
+ economy—held  by  pension  plans,  insurers,  mutual  funds,  and  individual  investors  as  the  core  of 
+ long-horizon  portfolios—making  it  an  especially  natural  reference  for  a  perpetual,  indefinitely 
+ renewing instrument. 
+ A  wide  range  of  participants  carry  continuous,  indefinite-duration  exposure  to  the  U.S.  large-cap 
+ equity  market  that  a  perpetual  futures  contract  is  uniquely  suited  to  hedge  or  express.  Asset 
+ managers  and  institutional  investors  maintain  long-horizon  exposure  to  broad  equity  beta;  funds 
+ and  separately  managed  accounts  track  or  are  benchmarked  to  a  broad  large-cap  index;  pension 
+ plans  and  insurers  hold  strategic  equity  allocations  that  must  be  adjusted  and  hedged  on  an 
+ ongoing  basis;  and  dealers  warehouse  equity-index  risk  arising  from  client  facilitation.  For  each 
+ of  these  participants  the  relevant  exposure  is  ongoing  and  indefinite,  not  date-certain,  so  a 
+ continuously  held  instrument  that  tracks  the  prevailing  level  of  the  Index  without  a  quarterly  roll 
+ maps more closely to the economic exposure than a strip of dated equity index futures. 
+ The  perpetual  structure,  combined  with  the  funding  mechanism  that  maintains  convergence  with 
+ the  Underlying,  makes  the  Contract  functionally  superior  to  dated  alternatives  for  participants 
+ whose  equity  exposure  is  itself  continuous  or  indefinite  in  duration.  As  with  perpetuals  generally, 
+ the  Contract  eliminates  the  need  to  roll  positions  from  one  expiration  to  the  next—the  dominant 
+ exchange-traded  equity-index  hedging  instrument,  the  quarterly  E-mini  future  on  a  major  U.S. 
+ large-cap  benchmark,  must  be  rolled  every  calendar  quarter,  incurring  roll  cost  and  roll-date 
+ basis  risk—trades  with  a  much  smaller  basis  to  the  reference  through  the  funding  mechanism, 
+ and  allows  liquidity  to  be  concentrated  in  a  single  instrument  rather  than  fragmented  across 
+ expirations.  Because  the  Underlying  is  the  level  of  the  Index  itself,  the  Contract  does  not  carry  a 
+ fixed  expiration  to  which  it  must  converge,  so  a  holder  is  not  exposed  to  the  roll  and 
+ calendar-basis  effects  inherent  in  holding  a  dated  contract.  Where  a  participant’s  information 
+ instead  lives  in  the  term  structure—calendar  spreads,  the  path  of  expected  dividends  and 
+ financing  to  specific  tenors,  or  date-certain  settlement  needs—dated  equity  index  instruments 
+ remain valuable, so that the perpetual and dated structures are complementary. 
+ Perpetual  and  other  continuously  traded  instruments  also  provide  substantial  price  discovery  and 
+ transparency  benefits  that  serve  the  public  interest.  Price  discovery  in  U.S.  large-cap  equities 
+ today  is  the  product  of  the  continuous  interaction  of  the  deepest  and  most  liquid  equity  market  in 
+ the  world  and  the  regulated  exchange-traded  equity  index  futures  market:  the  E-mini  futures  on 
+ major  U.S.  large-cap  benchmarks  trade  under  CFTC  oversight  and  are  among  the  most  actively 
+ 6  The U.S. equity market is the largest and most liquid equity market in the world. The 500 constituents of the Index 
+ represent its large-capitalization segment, with an aggregate float-adjusted market capitalization in the tens of 
+ trillions of U.S. dollars, and its constituents are among the most actively traded securities in the world. 
+ KalshiEX LLC 
+
+--- PAGE 16 ---
+ KalshiEX LLC 
+ traded  equity  index  futures  in  the  world.  7  Listing  a  regulated  domestic  perpetual  on  a  broad  U.S. 
+ large-cap  index  on  a  CFTC-registered  DCM  brings  continuous,  funding-anchored  equity-index 
+ price  discovery  into  a  regulated  environment  with  robust  trade  surveillance,  know-your-customer 
+ verification,  risk-based  margin  requirements,  and  disciplinary  procedures  consistent  with  the 
+ CEA and Commission regulations thereunder. 
+ The  Contract's  reference  is  the  real-time  level  of  the  Index,  derived  from  the  prices  of  a  broad 
+ basket  of  large-capitalization  securities  on  their  primary  U.S.  listing  exchanges  during  regular 
+ trading  hours,  and  validated  daily  against  the  official  closing  level  MerQube  separately  publishes 
+ from  official  exchange  closing  prices.  MerQube  calculates  the  Index  once  per  Index  Business 
+ Day  from  those  official  closing  prices,  sourced  through  a  third-party  market-data  vendor  directly 
+ from  the  listing  exchanges,  and  MerQube  UK  Limited  administers  the  Index  as  an  authorized 
+ benchmark  administrator  under  the  United  Kingdom  Benchmarks  Regulation.  8  Because  the 
+ reference  is  a  rules-based,  float-capitalization-weighted  aggregate  of  500  independently  traded 
+ large-cap  securities,  struck  from  official  exchange  closing  prices  and  subject  to  the 
+ administrator’s  automated  validation  and  quality-control  procedures,  it  is  transparent,  auditable, 
+ and  resistant  to  manipulation  through  any  single  constituent.  Appendix  D  describes  the  Source 
+ Agency in detail. 
+ Finally,  CFTC  Chairman  Selig  has  stated  that  the  Commission  will  use  the  tools  at  its  disposal  to 
+ onshore  perpetual  and  other  novel  derivative  products  so  that  they  can  flourish  across  both 
+ centralized  and  decentralized  markets,  subject  to  appropriate  safeguards,  confirming  that  the 
+ listing  of  a  regulated  equity-index  perpetual  futures  contract  directly  advances  the  Commission’s 
+ stated  policy  objectives  of  deterring  manipulation,  protecting  market  participants,  and  promoting 
+ responsible innovation.  9 
+ 9  See supra note 1. 
+ 8  The Index is administered by MerQube UK Limited as an authorized benchmark administrator under the United 
+ Kingdom Benchmarks Regulation and is calculated by MerQube once per Index Business Day from the official 
+ closing prices of its constituent securities. See Appendix D. 
+ 7  E-mini futures on major U.S. large-cap benchmarks are among the most actively traded equity index futures in the 
+ world and trade on designated contract markets under the Commission’s oversight, providing continuous, regulated 
+ price discovery for the U.S. large-cap equity market alongside the underlying cash market. 
+ KalshiEX LLC 
+
+--- PAGE 17 ---
+ KalshiEX LLC 
+ APPENDIX D – SOURCE AGENCY 
+ The  Source  Agency  for  the  US500  Contract  is  MerQube.  MerQube  is  the  Index  Sponsor,  Index 
+ Administrator,  and  Index  Calculation  Agent  for  the  MerQube  US  Large  Cap  Index  (the  “Index”), 
+ and  MerQube  UK  Limited  is  the  Benchmark  Administrator  for  the  MerQube  US  Index  Series. 
+ MerQube  is  a  technology-driven  index  provider  that  designs,  calculates,  and  administers 
+ rules-based  indices  for  asset  managers,  banks,  and  other  financial  institutions,  and  it  calculates 
+ and  publishes  the  official  level  of  the  Index  and  its  constituent  weights  pursuant  to  a  published, 
+ rules-based methodology.  10 
+ Benchmark Administration and Governance 
+ MerQube  UK  Limited  administers  the  MerQube  US  Index  Series  as  an  authorized  benchmark 
+ administrator  subject  to  the  United  Kingdom  Benchmarks  Regulation,  and  has  published  a 
+ Benchmark  Statement  for  the  series  in  accordance  with  Article  27  of  that  regulation.  11  The  Index 
+ is  calculated  and  maintained  in  accordance  with  the  published  MerQube  US  Index  Series 
+ methodology,  which  sets  out  the  eligibility  criteria,  selection  rules,  weighting  scheme, 
+ rebalancing  schedule,  corporate-action  treatment,  and  disruption  procedures  for  the  Index. 
+ MerQube  maintains  a  documented  governance  framework,  including  an  Index  Oversight 
+ Committee  that  reviews,  at  least  annually,  any  exercise  of  discretion  or  expert  judgment  in  the 
+ determination  of  the  Index,  together  with  policies  and  procedures  for  methodology  changes,  error 
+ correction, and benchmark cessation.  12 
+ Index Construction and Calculation 
+ The  Index  is  designed  to  track  the  performance  of  the  500  largest  companies  listed  and  domiciled 
+ in  the  United  States,  selected  pursuant  to  the  methodology’s  size  and  eligibility  criteria  and 
+ weighted  by  float-adjusted  market  capitalization,  and  it  is  reconstituted  and  rebalanced  on  a 
+ quarterly  schedule.  The  Index  is  published  in  price-return,  total-return,  and  net-total-return 
+ versions;  the  US500  Contract  references  the  price-return  version  (Bloomberg:  MQ5C;  Reuters: 
+ .MQ5C).  The  Index  is  calculated  and  disseminated  in  real  time  during  regular  U.S.  equity  trading 
+ hours  on  each  Index  Business  Day,  and  an  official  closing  level  is  separately  calculated  at  the  end 
+ of  each  Index  Business  Day  from  the  official  closing  prices  of  the  constituent  securities, 
+ computed  to  twelve  decimal  places  and  published  to  four  decimal  places.  The  real-time  series 
+ and  the  official  closing  level  share  the  same  methodology,  constituent  set,  and  divisor.  The  Index 
+ 12  See MerQube US Index Series Index Methodology (Sept. 2025) §§ 10.1–10.9 (governance, recalculation, 
+ methodology change, benchmark cessation, input data, and exercise of discretion). Any exercise of discretion or 
+ expert judgment in determining the Index is reviewed at least annually by the MerQube Index Oversight Committee. 
+ 11  MerQube UK Limited administers the MerQube US Index Series as a benchmark administrator subject to the 
+ United Kingdom Benchmarks Regulation and has published a benchmark statement in accordance with Article 27 
+ thereof; the series is a non-significant benchmark under Article 3.1(27). See MerQube US Large Cap Benchmark 
+ Statement; MerQube Compliance Statement (Art. 26(3)). 
+ 10  MerQube is the Index Sponsor, Index Administrator, and Index Calculation Agent for the MerQube US Large Cap 
+ Index, and MerQube UK Limited is the Benchmark Administrator for the MerQube US Index Series. See MerQube 
+ US Index Series Index Methodology (Sept. 2025); MerQube US Large Cap Benchmark Statement. 
+ KalshiEX LLC 
+
+--- PAGE 18 ---
+ KalshiEX LLC 
+ was  launched  in  January  2023  with  an  index  base  date  of  December  20,  2002,  and  values  prior  to 
+ the applicable launch dates are backtested.  13 
+ Input Data and Validation 
+ The  official  closing  level  of  the  Index  is  calculated  from  the  official  closing  prices  of  its 
+ constituent  securities  as  set  by  each  constituent's  primary  listing  exchange.  MerQube  obtains 
+ those  closing  prices  through  a  third-party  market-data  vendor  that  sources  them  directly  from  the 
+ relevant  exchanges,  and  it  performs  automated  validations  on  both  the  underlying  constituent 
+ prices  and  the  calculated  Index  level  on  each  Index  Business  Day.  Where  updated  data  would 
+ result  in  a  potential  change  to  an  already-published  Index  level,  MerQube  treats  the  discrepancy 
+ as  a  potential  error,  investigates  it,  and,  if  warranted,  recalculates  and  republishes  the  affected 
+ level in accordance with its error-correction policy.  14 
+ For the real-time series, constituent prices are sourced from the exchanges. MerQube's 
+ recalculation policy distinguishes computation errors from selection decisions: an incorrect 
+ computation of the return of the constituent basket is recalculated, while a recalculation that 
+ would retroactively alter constituent selection or weighting already implemented is not made. 
+ Closing prices are received from a third-party vendor and verified by comparison against prices 
+ from an alternative vendor, and MerQube maintains an audit trail of all index calculations, 
+ including any restated values, with records retained for a minimum of five years. 
+ Corporate Actions 
+ Corporate  actions  affecting  the  Index’s  constituents—including  stock  splits,  dividends,  mergers, 
+ acquisitions,  spin-offs,  and  delistings—are  absorbed  at  the  level  of  the  Index  in  accordance  with 
+ the  methodology’s  corporate-action  rules,  so  that  the  Index  level  is  adjusted  to  preserve  its 
+ continuity  and  the  Contract,  which  references  only  the  Index  level,  requires  no 
+ constituent-by-constituent  adjustment.  When  Lennar  Corporation  spun  off  Millrose  Properties, 
+ Inc.  in  January  2025,  for  example,  MerQube  added  the  spun-off  entity  to  each  index  for  which 
+ Lennar  was  a  constituent  and  priced  it  in  accordance  with  the  announced  share  terms  until  it 
+ began trading separately, adjusting the affected indices without disrupting their continuity.  15 
+ Market Disruptions 
+ The  methodology  further  specifies  the  consequences  of  market  disruption  events.  If,  on  any 
+ Index  Business  Day,  a  market  disruption  event  materially  affects  the  Index,  MerQube  may, 
+ among  other  measures,  use  a  published  closing  value  for  a  disrupted  constituent,  defer  or 
+ 15  See MerQube US Index Series Index Methodology (Sept. 2025) § 8 (corporate actions). For example, in 
+ connection with Lennar Corporation’s January 2025 spin-off of Millrose Properties, Inc., MerQube added the 
+ spun-off entity to each index for which Lennar was a constituent and priced it in accordance with the announced 
+ share terms until it began trading separately. See MerQube, Spin-Off by Lennar Corp Effective January 21, 2025 
+ (Jan. 17, 2025). 
+ 14  See MerQube US Large Cap Benchmark Statement (the benchmarks are calculated each day using the closing 
+ prices of the constituent securities at the relevant exchanges, as provided by a third-party market-data vendor that 
+ sources them directly from those exchanges, subject to automated validation of the underlying prices and the 
+ calculated benchmark values and to an error-correction policy). 
+ 13  See MerQube US Index Series Index Methodology (Sept. 2025) §§ 2, 7, 9.1 (selection of the 500 largest 
+ U.S.-listed and U.S.-domiciled companies, float-market-capitalization weighting, quarterly rebalancing, and 
+ end-of-day calculation of the Index level from the official closing prices of the constituents, computed to twelve 
+ decimal places and published to four). 
+ KalshiEX LLC 
+
+--- PAGE 19 ---
+ KalshiEX LLC 
+ suspend  the  calculation  and  publication  of  the  Index  level  until  the  disruption  is  no  longer 
+ continuing,  or  make  such  adjustments  to  the  calculation  as  it  considers  necessary  to  preserve  the 
+ objectives  of  the  Index.  16  As  provided  in  Appendix  A,  no  Premiums  are  computed  for  any  period 
+ during  which  the  Source  Agency  suspends  or  defers  calculation  of  the  Index  or  the  feed  is  stale 
+ or  unavailable,  the  affected  one-minute  intervals  are  excluded  from  the  Funding  Rate,  and  the 
+ most  recent  Settlement  Price  and  published  Index  level  remain  in  effect  until  calculation 
+ resumes. 
+ Resilience and Manipulation Resistance 
+ The  rules-based,  float-capitalization-weighted  construction  of  the  Index  provides  inherent 
+ resistance  to  manipulation  through  any  single  constituent.  The  Index  aggregates  the  exchange 
+ prices  of  500  independently  traded  large-capitalization  securities,  each  of  which  trades  in  the 
+ deepest  and  most  liquid  equity  market  in  the  world  and  is  separately  subject  to  the  surveillance 
+ and  listing  standards  of  its  primary  exchange  and  to  the  federal  securities  laws.  Because  the 
+ Index  is  float-capitalization-weighted  across  500  constituents,  no  single  constituent  represents 
+ more  than  a  small  fraction  of  the  Index,  so  that  distorting  the  Index  level  would  require  moving 
+ the  prices  of  a  large  number  of  highly  liquid  securities  simultaneously—a  prohibitively  costly 
+ and  readily  detectable  undertaking.  The  real-time  series  is  calculated  from  primary-exchange 
+ prices  and  reconciled  each  Index  Business  Day  against  an  official  closing  level  struck  from 
+ official  exchange  closing  prices,  in  each  case  subject  to  the  administrator's  automated  validation 
+ and  quality-control  procedures  and  to  the  published  methodology  and  governance  framework 
+ described  above.  The  Exchange  believes  that,  for  purposes  of  the  US500  Contract,  MerQube  is  a 
+ transparent,  rules-based,  and  manipulation-resistant  Source  Agency,  and  that  the  Index’s  reliance 
+ on  official  exchange  closing  prices  for  a  broad  basket  of  large-cap  securities  makes  it  well-suited 
+ to  serve  as  the  reference  for  the  Underlying  Price  Index.  The  Exchange  will  monitor  the 
+ performance  of  the  Source  Agency  on  an  ongoing  basis  and  may,  consistent  with  the  Contract’s 
+ terms  and  applicable  Commission  filing  requirements,  add  or  substitute  a  Source  Agency  via  a 
+ Part 40 amendment. 
+ 16  See MerQube US Index Series Index Methodology (Sept. 2025) § 5 (consequences of market disruption events, 
+ including use of a published closing value for a disrupted constituent, deferral or suspension of the calculation and 
+ publication of the Index level until the disruption is no longer continuing, and such adjustments as the Index 
+ Administrator considers necessary to preserve the objectives of the Index). 
+ KalshiEX LLC 
+
+--- PAGE 20 ---
+ KalshiEX LLC 
+ APPENDIX E – COMPLIANCE WITH CORE PRINCIPLES 
+ Compliance with Core Principles 
+ A.  The Exchange has Exercised Reasonable Discretion by Categorizing the Contract as 
+ Futures Contracts for Purposes of Compliance with the Core Principles and Other 
+ Provisions of the CEA and Commission Regulations. 
+ Section  5(d)(1)(B)  17  of  the  CEA  and  Regulation  38.100(b)  18  thereunder  provide  that  a  DCM  has 
+ reasonable  discretion  in  establishing  the  manner  in  which  it  complies  with  the  Core  Principles. 
+ Through  the  analysis  laid  out  below,  Kalshi  has  exercised  reasonable  discretion  by  categorizing 
+ the  Contract  as  futures  contracts  for  purposes  of  compliance  with  the  Core  Principles  and  other 
+ provisions of the CEA and Commission regulations thereunder.  19 
+ On  May  29,  2026,  the  Commission  approved  for  listing  on  Kalshi  the  first  domestic  perpetual 
+ contract  as  a  contract  for  the  sale  of  a  commodity  (bitcoin)  for  future  delivery.  20  In  the 
+ BTCPERPs  Order,  the  Commission  determined  that  it  would  not  violate  the  CEA  or  the 
+ Commission’s  regulations  thereunder  for  Kalshi  and  other  DCMs  to  list  for  trading,  as  futures 
+ contracts,  the  BTCPERP  Contract.  However,  the  Commission  made  clear  that  “[c]ontract 
+ categorization  analysis  is  done  on  a  case-by-case  basis”  such  that  the  analysis  in  the  BTCPERPs 
+ Order  was  “limited  to  the  BTCPERP  Contract  and  similarly  structured  perpetual  contracts  that 
+ reference  the  spot  price  of  bitcoin  or  other  digital  commodities  that  have  deep,  active,  and 
+ continuous  spot  market  trading.”  21  The  Commission  further  stated  that  the  “market  attributes  of 
+ the  asset  class  underlying  a  perpetual  contract—including  the  presence,  or  absence,  of 
+ continually  available  spot  price  data—may  be  relevant  to  such  regulatory  treatment  and 
+ compliance considerations.”  22 
+ Contemporaneously  with  the  BTCPERPs  Order,  the  Commission  released  a  policy  statement  (the 
+ “Policy  Statement”)  describing  its  views  concerning  the  listing  of  perpetual  contracts  that 
+ reference  underlying  asset  classes  that  are  not  contemplated  in  the  BTCPERPs  Order,  including 
+ that  such  contracts  “should  be  submitted  for  Commission  review  and  approval  pursuant  to  the 
+ voluntary  product  approval  process  under  Commission  Regulation  40.3.”  23  In  both  the 
+ BTCPERPs  Order  and  the  Policy  Statement,  the  Commission  focused  on  the  role  of  the  funding 
+ rate  mechanism  of  perpetual  contracts,  which  “functions  as  a  replacement  to  the  traditional 
+ expiration-based convergence mechanism upon which a futures contract typically relies.”  24 
+ 24  BTCPERPs Order at 6–8; see also Policy Statement, supra (the funding-rate mechanism “functions as a 
+ replacement to the traditional expiration-based convergence mechanism upon which a futures contract typically 
+ relies”). 
+ 23  Policy Statement Concerning the Listing of Perpetual Contracts, 91 Fed. Reg. 33,160, 33,161 (June 3, 2026). 
+ 22  BTCPERPs Order at 9. 
+ 21  BTCPERPs Order at 8. 
+ 20  CFTC Order, In the Matter of the Request for Approval by KalshiEX LLC of the BTCPERP Futures Contract 
+ (May 29, 2026) (the “BTCPERPs Order”). 
+ 19  Kalshi and Klear intend to treat the Contract as a futures contract for purposes of compliance with the CEA and 
+ Commission regulations thereunder by themselves and their participants. 
+ 18  17 C.F.R. § 38.100(b). 
+ 17  7 U.S.C. § 7(d)(1)(B). 
+ KalshiEX LLC 
+
+--- PAGE 21 ---
+ KalshiEX LLC 
+ In  the  BTCPERPs  Order,  the  Commission  concluded  that  listing  the  BTCPERP  Contract  as  a 
+ futures  contract  would  not  violate  the  CEA  or  the  Commission’s  regulations  thereunder  on  the 
+ basis  that:  (i)  the  BTCPERP  Contract  exhibited  all  of  the  key  features  of  futures  contracts 
+ identified  in  relevant  judicial  precedent  and  Commission  guidance,  including  the  contract’s 
+ trading  at  a  fixed,  standardized  unit  quantity,  each  party’s  obligations  being  guaranteed  via 
+ novation  to  a  central  clearing  house  that  sets  margin  requirements,  the  ability  of  a  holder  to  exit 
+ their  position  via  offset,  availability  to  the  general  public,  risk  transference,  and  trading  on  the 
+ centralized  market  of  a  DCM;  25  and  (ii)  certain  characteristics  of  the  spot  market  of  the 
+ underlying  commodity  (i.e.,  bitcoin)  supported  the  effective  functioning  of  the  funding  rate 
+ mechanism  employed  by  the  BTCPERP  Contract,  including  continuous  and  broadly  distributed 
+ trading in, and depth and liquidity of, the underlying spot market.  26 
+ The  Contract  resembles  the  BTCPERP  Contract  in  all  respects  relevant  to  the  regulatory 
+ categorization  analysis.  The  Contract  will  have  a  fixed,  standardized  contract  size  (a  Contract 
+ Multiplier  of  US$1.00  per  Index  point).  Each  party’s  obligations  will  be  guaranteed  via  novation 
+ to  Klear,  which  will  act  as  central  counterparty  and  set  margin  requirements.  27  Holders  will  be 
+ able  to  exit  their  positions  via  offset.  28  The  Contract  will  be  available  to  the  general  public, 
+ including  retail  participants.  Parties  will  enter  into  the  Contract  for  the  purpose  of  assuming  or 
+ shifting  the  risk  of  change  in  value  of  the  Underlying,  without  the  possibility  of  transferring 
+ ownership  of  the  Underlying.  And  the  Contract  will  trade  on  the  centralized  market  of  a  DCM 
+ and settle exclusively in cash, with no delivery of any security or of any interest in the Index. 
+ Further,  the  market  underlying  the  Contract---the  U.S.  equity  market  from  whose  prices  the 
+ Index  is  calculated  in  real  time  throughout  regular  trading  hours---possesses  the  characteristics 
+ that  led  the  Commission  to  find  that  the  underlying  spot  market  of  the  BTCPERP  Contract 
+ allowed  the  “funding  rate  mechanism  to  function  consistently  with  DCM  Core  Principle  3.”  29 
+ Because  the  Index  is  a  broad-based  index  calculated  in  real  time  from  the  exchange  prices  of  a 
+ large  basket  of  highly  liquid  securities,  and  validated  each  Index  Business  Day  against  an  official 
+ closing  level  struck  from  official  closing  prices,  the  reference  against  which  the  Contract's 
+ funding  is  computed  is  a  reliable,  validated  convergence  signal  rather  than  a  thin  or  synthesized 
+ price.  The  Index  is  not  calculated  on  weekends  or  on  days  that  are  not  Index  Business  Days;  on 
+ any  such  day,  no  Premiums  are  computed,  no  Funding  Rate  is  determined,  and  no  Settlement 
+ 29  BTCPERPs Order at 6. 
+ 28  See BTCPERPs Order at 2–5; see also CFTC v. Co Petro Marketing Group, Inc., 680 F.2d 573, 579–580 (9th Cir. 
+ 1982) (“Except for price, all the futures contracts for a specified commodity are identical in quantity and other 
+ terms. The fungible nature of these contracts facilitates offsetting transactions by which purchasers or sellers can 
+ liquidate their positions by forming opposite contracts.”); In re Stovall, [1977–1980 Transfer Binder] Comm. Fut. L. 
+ Rep. (CCH) ¶ 20,941, at 6 (CFTC Dec. 6, 1979) (describing futures contracts as “standardized contracts for the 
+ purchase or sale of commodities which provide for future, as opposed to immediate, delivery, and which are directly 
+ or indirectly offered to the general public and generally secured by earnest money, or ‘margin’ . . . [and that] are 
+ entered into primarily for the purpose of assuming or shifting the risk of change in value of commodities, rather than 
+ for transferring ownership of the actual commodities.”); Salomon Forex, Inc. v. Tauber, 8 F.3d 966, 971 (4th Cir. 
+ 1993) (“Tauber”) (“To facilitate the development of a liquid market for these transactions, these contracts are 
+ standardized and transferrable. Trading in futures seldom results in physical delivery of the subject commodity, since 
+ the obligations are often extinguished by offsetting transactions that produce a net profit or loss.”). 
+ 27  Although the Dodd-Frank Act arguably changed the historical analysis in part by reducing the saliency of central 
+ clearing as a distinguishing factor of futures contracts, other characteristics remain relevant. 
+ 26  BTCPERPs Order at 7. 
+ 25  BTCPERPs Order at 6–8. 
+ KalshiEX LLC 
+
+--- PAGE 22 ---
+ KalshiEX LLC 
+ Price  is  determined,  and  the  most  recent  Settlement  Price  and  published  Index  level  remain  in 
+ effect.  During  any  period  in  which  the  Source  Agency  suspends  calculation  of  the  Index  or 
+ reports  the  feed  as  stale  or  unavailable,  no  Premiums  are  computed  for  the  affected  intervals.  In 
+ consequence,  the  Contract's  continuous  trading  in  those  periods  does  not  result  in  “settlement 
+ payments  being  calculated  against  stale  or  synthesized  prices  that  are  less  reliable  convergence 
+ signals.”  30  The  Index’s  constituent  securities  are  actively  traded  across  the  broadly  distributed 
+ trading  centers  of  the  U.S.  national  market  system—including  the  New  York  Stock  Exchange, 
+ Nasdaq,  and  Cboe  and  their  linked  trading  centers—and  the  U.S.  equity  market  from  which  the 
+ Index  is  derived  is  the  deepest  and  most  liquid  equity  market  in  the  world,  as  described  in 
+ Appendix C. 
+ The  BTCPERPs  Order  and  the  Policy  Statement  have  recently  been  challenged  in  litigation 
+ brought  by  the  Chicago  Mercantile  Exchange  Inc.  (“CME”),  one  of  the  largest  incumbent 
+ marketplaces  for  traditional  dated  futures.  31  In  its  complaint,  CME  argues  that  perpetual  contracts 
+ are  swaps  under  the  CEA  because,  by  virtue  of  the  funding  payment  mechanism,  perpetual 
+ contracts  “provide[]  on  an  executory  basis  for  the  exchange  .  .  .  of  1  or  more  payments  based  on 
+ the  value  or  level  of  .  .  .  commodities.”  32  However,  regardless  of  whether  a  contract  falls  within 
+ any  clause  in  subparagraph  (A)  of  the  CEA’s  swap  definition,  it  is  per  se  excluded  from  the  swap 
+ definition  to  the  extent  it  falls  within  any  of  the  exclusions  in  subparagraph  (B)  of  that  definition, 
+ including the exclusion for futures contracts.  33 
+ CME  argues  that  perpetual  contracts  are  not  futures  contracts  because  they  lack  what  CME  calls 
+ the  “defining  characteristic”  of  futures  contracts—“‘future  delivery’  by  a  date  certain.”  34  Not 
+ only  does  this  argument  conflict  with  the  position  taken  by  CME  in  its  comment  letter 
+ responding  to  the  Commission’s  request  for  comment  on  perpetual-style  derivatives,  where  it 
+ stated  that  “certain  perpetual-style  derivative  contracts  may  accurately  be  classified  as  futures,”  35 
+ but  it  is  predicated  on  a  red  herring.  Although  courts  have,  at  times,  described  futures  contracts 
+ as  providing  for  the  purchase  or  sale  of  a  commodity  “on  a  date  certain”  36  or  “at  or  before  a 
+ stated  future  time,”  37  no  court  has  held  that  future  delivery  on  a  specified  future  date  is  a 
+ necessary  condition  for  a  contract  to  be  a  futures  contract.  To  the  contrary,  courts  have  repeatedly 
+ explained  that  “[w]hile  futures  contracts  generally  have  a  specified  future  delivery  date,  or 
+ settlement  date,  that  date  is  not  always  specified  thus  allowing  some  futures  contracts  to  be  of 
+ ‘indefinite duration.’”  38 
+ 38  Standard Forex II, 1996 WL 435440, at *10, 1996 U.S. Dist. LEXIS 14778, at *29; see also CFTC v. Intern. Fin. 
+ Servs., 323 F. Supp. 2d 482, 498 (S.D.N.Y. 2004) (“defendants wrongly characterize certain indicia of futures 
+ contracts as essential features of such contracts . . . [t]hey cite no authority” for the proposition that a transaction 
+ without a fixed date for future delivery cannot be a futures contract); CFTC v. International Foreign Curren., 334 F. 
+ Supp. 2d 305, 312 (E.D.N.Y. 2004) (“[T]he fact that Defendants’ contracts failed to have a specified future delivery 
+ date is not determinative”). 
+ 37  CFTC v. Erskine, 512 F.3d 309, 323 (6th Cir. 2008). 
+ 36  Tauber at 971. 
+ 35  Letter from Jonathan Marcus, Senior Managing Dir. & Gen. Couns., CME Grp. Inc., to Christopher J. Kirkpatrick, 
+ Sec’y of the Comm’n, 2 (May 21, 2025). 
+ 34  CME v. Selig at 35, 36. 
+ 33  7 U.S.C. § 1a(47)(B)(i). 
+ 32  7 U.S.C. § 1a(47)(A)(iii). 
+ 31  See Chicago Mercantile Exchange Inc. v. Selig and Commodity Futures Trading Commission, Case No. 
+ 26-cv-02157 (D.D.C. June 18, 2026) (“CME v. Selig”). 
+ 30  See supra note 26. 
+ KalshiEX LLC 
+
+--- PAGE 23 ---
+ KalshiEX LLC 
+ For  example,  in  a  holding  to  which  CME  was  the  very  beneficiary,  the  Seventh  Circuit  in  CME 
+ v.  SEC  concluded  that  contracts  of  “indefinite  duration”  can  possess  the  attribute  of 
+ “futurity”—generally  associated  with  futures  contracts  39  —because  futurity  means  “value  that  is 
+ set  in  the  future”  and  exists  where  contracts  provide  for  future  executory  payment  obligations, 
+ not  only  where  a  contract  has  a  final-settlement  date  and  fixed  term.  40  And,  in  Zelener,  the 
+ Commission  itself  took  the  position  that  the  transactions  at  issue  were  futures  contracts  because 
+ customers’ positions were held open indefinitely.  41 
+ As  described  above,  the  Contracts  possess  all  of  the  relevant  characteristics  of  futures  contracts, 
+ and  their  disqualification  from  categorization  as  futures  contracts  on  the  basis  of  their  indefinite 
+ duration  cuts  directly  against  established  precedent.  And,  as  discussed  above,  if  the  Contracts 
+ qualify as futures contracts, then they are not swaps. 
+ CME  attempts  to  support  its  misguided  argument  that  perpetual  contracts  must  be  swaps,  and  not 
+ futures,  by  noting  that  “[t]he  swap-future  distinction  does  not  turn  on  whether  a  product  is 
+ standardized,  exchange-traded,  or  centrally  cleared”  because  “[a]lthough  swaps  historically  were 
+ traded  over-the-counter,  many  swaps  are  now  standardized,  DCM-traded,  and  centrally 
+ cleared.”  42  As  CME  itself  has  explained  in  a  prior  comment  letter  to  the  Commission,  although  it 
+ is  true  that,  following  enactment  of  the  Dodd-Frank  Act,  several  of  the  “significant  distinctions 
+ between  futures  and  swaps  [were]  eliminated,”  the  Dodd-Frank  Act  “preserves  ‘customer 
+ choice.’  That  is,  under  [the  Dodd-Frank  Act]  market  participants  retain  the  option  to  trade 
+ products as either ‘futures’ or ‘swaps.’”  43 
+ The  changes  brought  about  by  Dodd-Frank  led  CME  and  other  market  participants  to  request  that 
+ the  Commission  clarify  that  a  DCM  can  “list  for  trading  a  futures  contract  regardless  of  whether 
+ it  could  be  viewed  as  a  swap  if  traded  over-the-counter  or  on  a  SEF,  since  futures  and  swaps  are 
+ indistinguishable  in  material  economic  effects.”  44  The  Commission  declined  to  provide  that 
+ clarification,  underscoring  the  continued  relevance  of  standardization  and  exchange-trading  in 
+ 44  Further Definition of “Swap,” “Security-Based Swap,” and “Security-Based Swap Agreement”; Mixed Swaps; 
+ Security-Based Swap Agreement Record Keeping, 77 Fed. Reg. 48,208, 48,303 (Aug. 13, 2012) (the “2012 
+ Definitional Release”). 
+ 43  Letter from Craig S. Donohue, Chief Exec. Officer, CME Grp. Inc., to David A. Stawick, Sec’y of the Comm’n, 4 
+ (July 22, 2011). 
+ 42  CME v. Selig at 18. 
+ 41  See CFTC v. Zelener, 373 F.3d 861, 863 (7th Cir. 2004) (“Zelener”). Although the court ruled against the CFTC in 
+ Zelener, the facts in that case contrast with those here. There, retail customers traded foreign exchange on an 
+ over-the-counter basis with a company controlled by the defendant, and the parties rolled their transactions so that 
+ customers were exposed to foreign-currency prices without taking delivery. Id. Customers did not purchase identical 
+ contracts, and their contracts did not provide a right of offset. Id. at 867. By contrast, here each Contract would be 
+ identical, and offset would be guaranteed by operation of Klear as central counterparty to all Contracts bought or 
+ sold on Kalshi. 
+ 40  CME v. SEC at 541. The contracts at issue in CME v. SEC—“index participations” or “IPs”—were perpetual-term 
+ contracts based on the value of a securities index. The seller of an IP promised to pay the buyer the value of the 
+ underlying index as measured on a “cash-out day,” while the buyer paid the seller for the IP in cash on the date of 
+ sale. Id. at 539. The IPs were settled on a quarterly basis, and upon settlement the seller would owe the buyer a 
+ payment obligation approximating the value of dividends the index stocks paid during the prior quarter. Id. The IPs 
+ thus resemble the Contracts in that (i) long-side holders were not subject to a binding, final-settlement date and (ii) 
+ they provide for executory payments (for the IPs, the seller’s quarterly dividend payments; for the Contracts, the 
+ funding payments) determined following initiation of the contract. 
+ 39  See CFTC v. First Lexington Group, LLC, No. 03 CV 9124 (GBD) (S.D.N.Y. Mar. 24, 2008). 
+ KalshiEX LLC 
+
+--- PAGE 24 ---
+ KalshiEX LLC 
+ the  product  categorization  analysis.  45  Although  the  Commission  noted  that  “the  presence  or 
+ absence  of  clearing  .  .  .  may  no  longer  be  relevant”  to  distinguish  futures  from  swaps  in  light  of 
+ Dodd-Frank’s  grant  of  authority  to  the  Commission  to  mandate  swaps  for  central  clearing,  46  the 
+ Commission  did  not  address  the  other  relevant  factors,  such  as  standardization,  exchange  trading, 
+ and  retail  participation.  Those  factors  continue  to  be  relevant  to  distinguish  futures  contracts 
+ from  centrally  cleared  swaps,  such  as  interest-rate  swaps  and  credit  default  swaps,  which  in 
+ many  cases  are  not  standardized  as  to  tenor  or  size  (among  other  terms)  and  trade  on  swap 
+ execution  facilities  (“SEFs”),  which  may  lack  the  centralized  market  characteristics  of  a  DCM 
+ (e.g.,  SEFs  can  permit  trading  via  request  for  quote  in  addition  to  an  order  book)  and  lack  retail 
+ participation.  The  Commission  went  on  to  say  that  “[i]f  a  DCM  has  a  view  that  a  particular 
+ product  is  a  futures  contract,  it  may  self-certify  the  contract  consistent  with  that  view.”  47  This  is 
+ consistent  with  the  view  expressed  by  CME  in  its  response  to  the  Commission’s  recent  request 
+ for  comment  regarding  the  trading  and  clearing  of  perpetual-style  derivatives—that  certain 
+ perpetual-style  derivatives  contracts  may  be  appropriately  categorized  as  futures  48  —but 
+ inconsistent with its argument in the CME v. Selig complaint. 
+ CME  also  argues  that  the  Commission’s  approval  of  the  BTCPERP  Contract  for  listing  as  a 
+ futures  contract  is  inconsistent  with  its  prior  position,  taken  in  certain  enforcement  actions,  that 
+ perpetual-duration  digital-asset  derivative  products  constitute  swaps.  49  However,  in  all  but  one  of 
+ these  cases,  the  Commission  looked  only  to  features  of  the  products  at  issue  relevant  to  whether 
+ they  fell  within  the  scope  of  CEA  Section  1a(47)(A)(iii).  The  Commission  did  not  address 
+ whether  such  products  were  futures  contracts,  which  would  be  excluded  from  the  swap 
+ definition.  As  discussed  above,  the  fact  that  a  contract  falls  within  the  scope  of  CEA  Section 
+ 1a(47)(A)(iii)—because  it  “transfers,  as  between  the  parties  to  the  transaction  .  .  .  the  financial 
+ risk  associated  with  a  future  change”  in  the  price  of  the  underlying  asset—is  not  determinative  of 
+ its regulatory categorization if the product qualifies as a futures contract.  50 
+ The  only  instance  in  which  the  Commission  has  addressed  the  possibility  that  perpetual-duration 
+ digital-asset  derivative  products  could  be  excluded  from  the  “swap”  definition  as  futures 
+ contracts  is  in  a  single  footnote  in  the  Commission’s  response  to  Binance’s  Motion  to  Dismiss.  51 
+ However,  as  noted  by  the  Commission,  Binance  failed  to  meaningfully  address  why  the 
+ perpetual  contracts  at  issue  were  futures  contracts  under  applicable  case  law  and  Commission 
+ precedent;  in  particular,  Binance  relied  on  the  sole  point  that  positions  in  their  contracts  could  be 
+ closed  by  offset,  and  failed  to  reference  any  particular  facts  indicating  the  other  key 
+ characteristics of futures contracts identified in the BTCPERPs Order.  52 
+ 52  Brief in Support of Defendants’ Motion to Dismiss, Binance, at note 19 (July 27, 2023). 
+ 51  Plaintiff Response to Defendants’ Motion to Dismiss, Binance, at note 14 (Sept. 22, 2023). 
+ 50  See supra note 33. 
+ 49  See Complaint, CFTC v. Changpeng Zhao, No. 23-cv-01887 (Mar. 27, 2023) (“Binance”); Complaint, CFTC v. 
+ MEK Global Ltd., No. 24-cv-2255 (Mar. 26, 2024); Complaint, CFTC v. Eisenberg, No. 23-cv-00173 (Jan. 9, 2023); 
+ Complaint, CFTC v. HDR Global Trading Ltd., No. 20-cv-8132 (Oct. 1, 2020); In re Deridex, Inc., CFTC No. 23-42 
+ (Sept. 7, 2023). 
+ 48  See supra note 35. 
+ 47  See supra note 45. 
+ 46  See id.; 7 U.S.C. § 2(h)(1). 
+ 45  2012 Definitional Release at 48,303. 
+ KalshiEX LLC 
+
+--- PAGE 25 ---
+ KalshiEX LLC 
+ Because  no  party  in  the  Binance  litigation,  or  any  other  litigation  or  enforcement  action  that  we 
+ have  identified,  has  raised  the  question  of  whether  perpetual-duration  digital-asset  derivative 
+ products  are  futures  contracts  under  the  body  of  judicial  and  Commission  case  law  identifying 
+ the  key  characteristics  of  futures  contracts,  the  Commission  has  yet  to  squarely  address  this 
+ question.  That  the  product  categorization  of  perpetual  contracts  remained  an  open  question  at 
+ that  time  is  made  all  the  more  clear  by  the  fact  that  the  Commission  specifically  requested 
+ comment  as  to  whether  perpetual  derivatives  should  “be  classified  as  swaps  or  futures  contracts” 
+ in its request for comment on the trading and clearing of perpetual-style derivatives last year.  53 
+ Based  on  this  analysis,  Kalshi  is  of  the  view  that  the  Contract  is  appropriately  categorized  as 
+ futures  contracts  for  purposes  of  compliance  with  the  Core  Principles  and  other  provisions  of  the 
+ CEA and Commission regulations thereunder. 
+ B.  The Contract Is a Future on a Broad-Based Security Index Within the Commission’s 
+ Exclusive Jurisdiction 
+ The  Contract  is,  in  addition,  a  futures  contract  on  a  broad-based  security  index,  over  which  the 
+ Commission  has  exclusive  jurisdiction.  The  Underlying  is  a  securities  index,  and  a  securities 
+ index  is  an  “excluded  commodity”  under  Section  1a(19)  of  the  CEA.  54  A  contract  for  the  future 
+ delivery  of  a  group  or  index  of  securities  is  subject  to  a  distinct  statutory  regime:  the 
+ Commission  has  exclusive  jurisdiction  over  a  futures  contract  on  a  broad-based  security  index, 
+ whereas  a  futures  contract  on  a  single  security  or  on  a  narrow-based  security  index  is  a  “security 
+ future”  and  “security  futures  product”  subject  to  the  joint  jurisdiction  of  the  Commission  and  the 
+ Securities  and  Exchange  Commission.  Because  the  Index  is  a  broad-based  security  index,  the 
+ Contract  is  excluded  from  the  definition  of  “security  future,”  is  not  a  security  futures  product, 
+ and falls within the Commission’s exclusive jurisdiction.  55 
+ Section  2(a)(1)(C)(ii)  of  the  CEA  permits  a  futures  contract  on  a  group  or  index  of  securities  to 
+ be  traded,  subject  to  the  Commission’s  exclusive  jurisdiction,  where  three  requirements  are 
+ satisfied:  settlement  of  and  delivery  on  the  contract  must  be  effected  in  cash  or  by  means  other 
+ than  the  transfer  or  receipt  of  any  security;  the  contract  must  not  be  readily  susceptible  to 
+ manipulation  of  its  own  price,  nor  to  being  used  to  manipulate  the  price  of  any  underlying 
+ security;  and  the  group  or  index  of  securities  must  not  constitute  a  narrow-based  security  index.  56 
+ The  Contract  satisfies  each  requirement.  It  is  settled  exclusively  in  cash,  with  no  delivery  of  any 
+ security  or  of  any  interest  in  the  Index.  As  set  forth  throughout  this  Appendix  and  in  Appendix  F, 
+ it  is  not  readily  susceptible  to  manipulation,  whether  of  the  Contract’s  price  or  of  the  prices  of  the 
+ underlying  securities:  the  reference  is  a  broad-based,  float-capitalization-weighted  index  of  500 
+ highly  liquid  large-cap  securities,  calculated  in  real  time  from  primary-exchange  prices, 
+ reconciled  each  Index  Business  Day  against  an  official  closing  level  struck  from  official 
+ exchange  closing  prices,  and  subject  to  the  administrator's  validation  procedures,  and  the 
+ Exchange’s  surveillance,  position  accountability,  and  other  safeguards  apply  to  trading  in  the 
+ Contract.  And,  as  demonstrated  immediately  below,  the  Index  is  not  a  narrow-based  security 
+ index. 
+ 56  See supra note 4. 
+ 55  See supra note 3. 
+ 54  See supra note 2. 
+ 53  CFTC, Request for Comment on the Trading and Clearing of “Perpetual” Style Derivatives, question 13 (Apr. 21, 
+ 2025). 
+ KalshiEX LLC 
+
+--- PAGE 26 ---
+ KalshiEX LLC 
+ A  security  index  is  a  “narrow-based  security  index”  under  Section  1a(35)(A)  of  the  CEA  if  it 
+ meets  any  one  of  four  disqualifying  criteria:  (i)  the  index  has  nine  or  fewer  component  securities; 
+ (ii)  any  component  security  comprises  more  than  thirty  percent  of  the  index’s  weighting;  (iii)  the 
+ five  highest-weighted  component  securities  together  comprise  more  than  sixty  percent  of  the 
+ index’s  weighting;  or  (iv)  the  lowest-weighted  component  securities  comprising,  in  the 
+ aggregate,  twenty-five  percent  of  the  index’s  weighting  have  an  aggregate  dollar  value  of 
+ average  daily  trading  volume  of  less  than  $50  million  (or,  in  the  case  of  an  index  with  fifteen  or 
+ more  component  securities,  $30  million).  57  An  index  that  meets  none  of  these  criteria  is 
+ broad-based,  and  the  Index  meets  none  of  them,  by  a  wide  margin.  First,  the  Index  comprises 
+ 500  component  securities,  far  more  than  nine.  Second,  no  single  component  exceeds  thirty 
+ percent  of  the  Index’s  weight;  as  of  July  2,  2026,  the  largest  single  component  represented 
+ approximately  7.05%  of  the  Index.  Third,  the  five  highest-weighted  components  together 
+ comprise  far  less  than  sixty  percent  of  the  Index’s  weight;  as  of  the  same  date,  they  represented 
+ approximately  25.4%  of  the  Index  in  the  aggregate.  Fourth,  the  component  securities  comprising 
+ the  lowest-weighted  twenty-five  percent  of  the  Index’s  weight  are  themselves  large-capitalization 
+ securities  among  the  most  actively  traded  in  the  world,  and  the  aggregate  dollar  value  of  their 
+ average  daily  trading  volume—computed  as  provided  in  Commission  Regulation 
+ 41.11—exceeds  the  applicable  $30  million  threshold  by  orders  of  magnitude.  58  The  Index  is 
+ therefore a broad-based security index. 
+ Accordingly,  the  Contract  is  a  futures  contract  subject  to  the  Commission’s  exclusive 
+ jurisdiction,  to  be  listed  and  traded  on  the  Exchange  in  the  same  manner  as  the  Commission’s 
+ other  broad-based  security  index  futures.  The  Exchange  will  monitor  the  composition  of  the 
+ Index  on  an  ongoing  basis  to  confirm  that  it  remains  broad-based,  and  will  apply  the  tolerance 
+ period  and  conversion  provisions  of  Section  1a(35)(B)  of  the  CEA  and  the  joint  rules  of  the 
+ Commission  and  the  Securities  and  Exchange  Commission  thereunder;  should  the  Index  cease  to 
+ be  broad-based  for  longer  than  the  applicable  tolerance  period,  the  Contract  would  be  treated  in 
+ accordance with those rules.  59 
+ The  Contract’s  cash-settlement  provisions  are  consistent  with  the  guidance  in  Appendix  C  to  Part 
+ 38  of  the  Commission’s  regulations:  the  Contract's  daily  settlement  and  funding  mechanics  are 
+ anchored  to  the  real-time  level  of  a  broad-based  index  calculated  from  the  prices  of  a  large 
+ basket  of  highly  liquid  securities  on  their  primary  listing  exchanges,  and  validated  each  Index 
+ Business  Day  against  a  separately  published  official  closing  level---a  cash-settlement  reference 
+ that  is  reliable,  acceptable,  publicly  available,  timely,  and  not  readily  susceptible  to 
+ 59  See 7 U.S.C. § 1a(35)(B) (grace and tolerance provisions governing an index’s transition between broad-based and 
+ narrow-based status); 17 C.F.R. §§ 41.11–41.15 and Securities Exchange Act Rule 3a55-1 (joint rules of the 
+ Commission and the Securities and Exchange Commission implementing the narrow-based security index 
+ definition, including the tolerance period during which a security index future may continue to be traded before it is 
+ treated as a security futures product). 
+ 58  See 17 C.F.R. § 41.11 (method for determining the dollar value of average daily trading volume and market 
+ capitalization of component securities for purposes of the narrow-based security index definition). The 
+ lowest-weighted quartile of the Index consists of large-capitalization securities whose aggregate average daily 
+ trading volume, so measured, exceeds the applicable $30 million threshold by orders of magnitude. 
+ 57  See supra note 5. 
+ KalshiEX LLC 
+
+--- PAGE 27 ---
+ KalshiEX LLC 
+ manipulation.  60  Finally,  the  conclusion  that  the  Contract  falls  within  the  Commission’s  exclusive 
+ jurisdiction  does  not  depend  on  its  categorization  as  a  future  rather  than  a  swap.  Even  if  the 
+ Contract’s  funding  mechanism  were  viewed  as  introducing  a  swap-like  element—which,  for  the 
+ reasons  set  forth  above,  it  does  not—an  agreement,  contract,  or  transaction  based  on  a 
+ broad-based  security  index  is  a  “swap”  within  the  Commission’s  jurisdiction,  and  not  a 
+ “security-based  swap”  within  the  jurisdiction  of  the  Securities  and  Exchange  Commission, 
+ because  a  security-based  swap  is  confined  to  instruments  based  on  a  single  security  or  loan  or  on 
+ a  narrow-based  security  index.  Whether  analyzed  as  a  future  or,  counterfactually,  as  a  swap,  an 
+ instrument on this broad-based security index falls within the Commission’s jurisdiction.  61 
+ C.  The Contract Complies with the Core Principles 
+ The  Exchange  has  conducted  a  comprehensive  analysis  of  the  designated  contract  market  core 
+ principles  (“Core  Principles”)  as  set  forth  in  Part  38  of  the  Act.  The  Core  Principles  relevant  to 
+ the Contract are outlined and discussed in further detail in the next appendix. 
+ 61  See 7 U.S.C. § 1a(47) (defining “swap”); id. § 1a(42) (defining “security-based swap,” limited to agreements 
+ based on a single security or loan or on a narrow-based security index); Securities Exchange Act § 3(a)(68). An 
+ agreement based on a broad-based security index is a “swap” within the Commission’s jurisdiction, not a 
+ “security-based swap” within the jurisdiction of the Securities and Exchange Commission. 
+ 60  See 17 C.F.R. pt. 38, app. C (guidance on cash-settled contracts, providing, among other things, that the 
+ cash-settlement price should be reliable, acceptable, publicly available, and reported in a timely manner, and should 
+ not be readily susceptible to manipulation). 
+ KalshiEX LLC 
+
+--- PAGE 28 ---
+ KalshiEX LLC 
+ APPENDIX F – ADDITIONAL COMPLIANCE WITH CORE PRINCIPLES 
+ Core  Principle  2  -  Compliance  with  Rules  and  Impartial  Access:  The  Exchange  has  adopted 
+ the  Rulebook,  which  provides  the  requirements  for  accessing  and  trading  on  the  Exchange. 
+ Pursuant  to  Chapters  2,  3,  and  5  of  the  Rulebook,  in  utilizing  the  Exchange’s  services,  all 
+ Members  must  comply  with  the  Rules,  cooperate  with  Exchange  investigations,  inquiries,  audits, 
+ examinations  and  proceedings,  and  engage  in  conduct  consistent  with  just  and  equitable 
+ principles  of  trade.  Chapter  3  of  the  Rulebook  also  provides  clear  and  transparent  access  criteria 
+ and  requirements  for  Exchange  Members.  Trading  in  the  Contract  will  be  subject  to  all  of  the 
+ Rules,  which  are  aimed  at  enforcing  market  integrity  and  customer  protection.  Further,  Section 
+ 3.2  of  the  Klear  rulebook  includes  clear  and  transparent  criteria  for  clearing  members  eligible  to 
+ clear  transactions  in  the  Contract  through  Klear,  providing  that  the  Contract  will  be  available  to 
+ all  clearing  members  of  Klear,  either  directly  (for  clearing  members  who  are  eligible  contract 
+ participants) or indirectly through a futures commission merchant clearing member. 
+ In  particular,  Chapter  5  of  the  Rulebook  sets  forth  the  Exchange’s  Prohibited  Transactions  and 
+ Activities  and  specifically  prescribes  the  methods  by  which  Members  trade  contracts,  including 
+ the  Contract.  Pursuant  to  Rule  3.6,  each  Member  is  required  to  cooperate  promptly  and  fully  with 
+ an  Exchange  investigation  by  providing  access  to  information  on  the  activities  of  the  Member  in 
+ any  referenced  market,  which  includes  books  and  records  of  trading.  Pursuant  to  Rule  9.2,  the 
+ Exchange  may  compel  testimony,  subpoena  documents,  and  require  statements  under  oath  from 
+ any  Member.  As  described  in  Rule  9.1,  the  Exchange  conducts  trade  practice  surveillance, 
+ market  surveillance,  and  real-time  market  monitoring  to  ensure  that  Members  adhere  to  the  Rules 
+ of  the  Exchange.  The  Exchange,  through  the  compliance  department,  initiates  review  and,  where 
+ appropriate,  investigates  unusual  trading  activity.  The  compliance  department  also  investigates 
+ any  time  it  has  other  reason  to  believe  that  inappropriate  activity  of  any  sort  is  taking  place  on 
+ the Kalshi Platform or its website. 
+ Core  Principle  2  also  stipulates  that  an  exchange  shall  establish  means  to  provide  market 
+ participants  with  impartial  access  to  the  market.  Chapter  3  of  the  Rulebook,  and  Rule  3.1  in 
+ particular,  provides  clear  and  transparent  access  criteria  and  requirements  for  Members.  The 
+ Exchange  will  apply  access  criteria  in  an  impartial  manner,  including  through  the  application 
+ process described in Rule 3.1. 
+ Core Principle 3 - Contract not Readily Subject to Manipulation: 
+ Core  Principle  3  and  Rule  38.200  provide  that  a  DCM  shall  not  list  for  trading  contracts  that  are 
+ readily  susceptible  to  manipulation.  The  Exchange’s  marketplace  and  contracts,  including  this 
+ Contract,  have  been  designed  in  accordance  with  this  fundamental  principle.  The  Exchange 
+ maintains  various  safeguards  against  price  manipulation  and  all  other  forms  of  manipulation, 
+ including  (i)  real-time  market  monitoring,  automated  trade  surveillance,  and  suspicious  behavior 
+ detection,  (ii)  Rulebook  prohibitions,  Member  certification,  and  notification,  (iii)  Member 
+ monitoring  and  know-your-customer  verification,  and  (iv)  sanctions.  These  safeguards  will  be 
+ applied  with  respect  to  trading  in  the  Contract  and  render  the  Contract  not  readily  susceptible  to 
+ manipulation. 
+ (i)  Real-time  market  monitoring,  automated  trade  surveillance,  and  suspicious  behavior 
+ detection:  Kalshi  conducts  real-time  market  monitoring  of  all  trading  activity  on  the  Exchange 
+ KalshiEX LLC 
+
+--- PAGE 29 ---
+ KalshiEX LLC 
+ to  identify  disorderly  trading  and  any  market  or  system  anomalies.  As  described  in  Rule  5.11, 
+ Kalshi  has  the  authority  to  adjust  trade  prices  or  cancel  trades  when  necessary  to  mitigate 
+ market-disrupting  events  caused  by  malfunctions  in  its  electronic  trading  platform  or  errors  in 
+ orders  submitted  by  members  and  market  participants.  Any  trade  price  adjustments  or  trade 
+ cancellations  must  be  transparent  to  the  market  and  subject  to  standards  that  are  clear,  fair,  and 
+ publicly  available.  Kalshi  also  maintains  an  automated  trade  surveillance  system  capable  of 
+ detecting  and  investigating  potential  trade  practice  violations.  The  automated  system  loads  and 
+ processes  orders  and  trades  as  they  occur  on  the  Exchange  (well  within  24  hours  after  the 
+ completion  of  the  trading  day  stated  in  Commission  Regulation  38.156).  The  automated  trade 
+ surveillance  system  has  the  ability  to  detect  and  flag  specific  trade  execution  patterns  and  trade 
+ anomalies;  compute,  retain,  and  compare  trading  statistics;  compute  trade  gains,  losses,  and 
+ positions;  reconstruct  the  sequence  of  market  activity;  perform  market  analyses;  and  support 
+ system  users  to  perform  in-depth  analyses  and  ad  hoc  queries  of  trade-related  data.  As  described 
+ in  Rule  9.2(a),  Kalshi’s  Compliance  Department  investigates  unusual  trading  activity  or  other 
+ activity  that  the  Compliance  Department  has  reasonable  cause  to  believe  could  constitute  a 
+ violation  of  Kalshi’s  Rules,  or  upon  the  receipt  of  a  request  from  Commission  staff.  The 
+ Exchange  disciplinary  process  is  conducted  in  accordance  with  Chapter  9  of  the  Exchange 
+ Rulebook, and penalties may be imposed in accordance with Rule 9.5. 
+ (ii)  Rulebook  prohibitions,  member  certification  and  notification:  The  Exchange’s  Rulebook 
+ includes  various  provisions  that  prohibit  manipulative  behaviors  and  gives  the  Exchange  the 
+ authority  to  investigate  potential  violations  of  its  rules.  Pursuant  to  Rule  3.6,  each  Member  is 
+ required  to  cooperate  promptly  and  fully  with  an  Exchange  investigation.  Pursuant  to  Rule  9.2, 
+ the  Exchange  may  compel  testimony,  subpoena  documents,  and  require  statements  under  oath 
+ from  any  Member.  The  Exchange’s  Surveillance  Officers,  which  operate  within  the  Compliance 
+ Department,  perform  trade  practice  surveillance  and  real-time  market  monitoring.  The  Rulebook 
+ also  imposes  sanctions  on  Members  who  break  rules,  including  fines,  disgorgement,  and 
+ revocation  of  membership.  Only  Members  are  allowed  to  trade  on  the  Exchange,  and  Members 
+ cannot  complete  the  account  creation  process  and  trade  on  the  Exchange  until  they  certify  that 
+ they have read the Exchange’s rules and agree to be bound by them. 
+ (iii)  Member  monitoring  and  know-your-customer  verification  (“KYC”):  The  Exchange  has 
+ a  robust  KYC  process  that  helps  flag  and  uncover  higher-risk  traders  before  they  become 
+ Members  of  the  platform,  ensuring  that  the  Exchange  has  access  to  all  of  its  members’  personal 
+ identifying  information  for  use  in  its  surveillance.  During  the  application  process,  individual 
+ applicants  are  required  to  share  personally  identifiable  information,  such  as  their  full  legal  name, 
+ social  security  number,  date  of  birth,  and  address  with  the  Exchange.  Applicant  information  is 
+ run  through  a  comprehensive  set  of  databases  that  are  actively  compiled  and  maintained  by  an 
+ independent  third  party,  and  through  adverse  media  databases,  to  trigger  enhanced  due  diligence 
+ where appropriate. 
+ (iv)  Sanctions:  Exchange  Members  must  agree  to  the  terms  and  conditions  of  the  Exchange’s 
+ Rulebook  before  being  allowed  to  trade  and  are  subject  to  disciplinary  actions  and  fines  for 
+ engaging  in  improper  market  conduct.  In  the  event  that  suspicious  trading  activity  is  detected  and 
+ results  in  an  investigation,  market  participants  are  required  to  provide  the  Exchange  with 
+ information  relevant  to  the  scope  of  the  investigation  under  Rule  3.6.  Chapter  9  of  the 
+ Exchange’s  Rulebook  details  the  process  for  discipline  and  rule  enforcement,  ranging  from  a 
+ KalshiEX LLC 
+
+--- PAGE 30 ---
+ KalshiEX LLC 
+ letter  of  warning  to  fines  to  referral  to  governmental  authorities  that  can  result  in  criminal 
+ prosecution. 
+ In  addition  to  the  foregoing  surveillance,  enforcement,  and  KYC  safeguards,  the  Exchange 
+ maintains  pre-trade  risk  controls  designed  to  prevent  erroneous  or  manipulative  order  entry  in  the 
+ US500  Contract,  including  price  banding,  order  size  limits,  and  position  exposure  limits.  The 
+ Exchange  applies  a  price-band  check  to  incoming  orders  before  they  are  inserted  into  the  order 
+ book,  calculated  by  reference  to  the  then-current  relevant  top-of-book  price;  incoming  orders 
+ priced  outside  the  applicable  band  are  rejected  before  insertion.  The  price-band  check  is  a 
+ pre-insertion  control  and  does  not  operate  as  an  automatic  cancellation  mechanism  for  resting 
+ orders.  The  Exchange  may  also  impose  order  size  limits  and  position  exposure  limits  to  mitigate 
+ excessive  concentration  and  market  disruption  risk.  Together,  these  pre-trade  controls  provide 
+ complementary  protections  against  erroneous  order  entry,  disorderly  trading,  excessive 
+ concentration, and related risks to market integrity. 
+ Moreover,  the  specifics  of  the  US500  Contract  satisfy  the  Core  Principle  3  standard  through 
+ multiple,  independent,  and  mutually  reinforcing  layers  of  structural  design  and  institutional 
+ safeguards, as set forth below. 
+ [Remaining CP3 analysis filed confidentially] 
+ Core  Principle  4  -  Prevention  of  Market  Disruption:  Trading  in  the  Contract  will  be  subject  to 
+ the  Rules  of  the  Exchange,  which  include  prohibitions  on  manipulation.  Trading  activity  in  the 
+ Contract  will  be  subject  to  monitoring  and  surveillance  by  the  Exchange’s  Market  Surveillance 
+ Department.  In  particular,  the  Exchange’s  trade  surveillance  system  monitors  the  trading  on  the 
+ Exchange  to  detect  and  prevent  activities  that  threaten  market  integrity  and  market  fairness, 
+ including  manipulation,  price  distortion,  and  disruptions  of  the  settlement  process.  The  Exchange 
+ also  performs  real-time  market  surveillance.  The  Exchange  sets  position  accountability  levels, 
+ maintains  both  a  trade  practice  and  market  surveillance  program  to  monitor  for  market  abuses, 
+ including manipulation, and has disciplinary procedures for violations of the Rulebook. 
+ Core Principle 5 - Position Limitations: 
+ Core  Principle  5  and  Commission  Regulation  38.300  require  a  designated  contract  market  to 
+ adopt,  for  each  contract,  position  limitations  or  position  accountability  for  speculators,  where 
+ necessary  and  appropriate  to  reduce  the  potential  threat  of  market  manipulation  or  congestion. 
+ The  Contract  specification  includes  a  Position  Accountability  Level  of  US$25,000,000  of 
+ mark-to-market  position  value,  with  short  positions  evaluated  on  an  equivalent  long  basis,  and 
+ provides that position limits apply as set forth in the Exchange Rulebook. 
+ The  Contract  is  not  subject  to  federal  speculative  position  limits,  because  its  Underlying  is  a 
+ broad-based  security  index.  Section  1a(19)  of  the  CEA  defines  an  “excluded  commodity”  to 
+ include  “an  interest  rate,  exchange  rate,  currency,  security,  security  index,  credit  risk  or  measure, 
+ debt  or  equity  instrument,  index  or  measure  of  inflation,  or  other  macroeconomic  index  or 
+ measure,”  and  a  broad-based  security  index  is  squarely  a  “security  index”  within  that 
+ definition.  62  The  federal  speculative  position  limits  in  Part  150,  and  the  deliverable-supply,  bona 
+ 62  7 U.S.C. § 1a(19) (defining “excluded commodity” to include “an interest rate, exchange rate, currency, security, 
+ security index, credit risk or measure, debt or equity instrument, index or measure of inflation, or other 
+ KalshiEX LLC 
+
+--- PAGE 31 ---
+ KalshiEX LLC 
+ fide  hedging,  and  spot-month  framework  on  which  they  rest,  are  directed  at  physical-commodity 
+ derivative  contracts  and  the  enumerated  physical-commodity  core  referenced  futures  contracts 
+ listed  in  Regulation  150.2(d);  by  their  terms  they  define  “bona  fide  hedging”  and  “core 
+ referenced  futures  contract”  in  respect  of  a  physical  commodity,  and  there  is  no  core  referenced 
+ futures  contract—and  no  federal  speculative  position  limit—for  a  security  index.  63  The  Contract 
+ is  therefore  not  a  “referenced  contract”  subject  to  federal  limits,  and  the 
+ deliverable-supply-corner  and  spot-month  concerns  that  animate  the  federal  regime  are 
+ structurally  inapposite:  the  Contract  is  cash-settled,  has  no  delivery,  has  no  expiration  and 
+ therefore  no  spot  month,  and  and  references  a  broad-based  securities  index  calculated  from  the 
+ prices of the deepest and most liquid equity market in the world. 
+ Consistent  with  the  standard  and  accepted  treatment  of  financial  and  excluded-commodity 
+ contracts,  the  Exchange  therefore  satisfies  Core  Principle  5  through  position  accountability  rather 
+ than  a  hard  position  limit.  64  The  Position  Accountability  Level  of  US$25,000,000  of 
+ mark-to-market  position  value  provides  the  Exchange’s  market  surveillance  team  with  a  trigger 
+ to  examine  the  circumstances  surrounding  any  large  position—including  the  participant’s  trading 
+ activity,  hedging  rationale,  and  potential  impact  on  market  integrity—to  require  information 
+ regarding  the  position  and  any  related  hedging,  and  to  direct  that  a  position  be  reduced  or  not 
+ increased,  while  preserving  the  flexibility  to  permit  commercially  justified  positions.  As  open 
+ interest  in  the  Contract  develops,  the  Exchange  may,  consistent  with  Commission  standards  and 
+ applicable  filing  requirements,  supplement  this  accountability  framework  with  exchange-set 
+ position limits. 
+ The  depth  of  the  underlying  market  further  supports  this  approach.  As  described  in  Appendix  C, 
+ the  U.S.  equity  market  is  the  largest  and  most  liquid  equity  market  in  the  world,  and  the  500 
+ constituents  of  the  Index  represent  its  large-capitalization  segment,  with  an  aggregate  market 
+ capitalization  in  the  tens  of  trillions  of  U.S.  dollars.  65  The  depth  of  that  market  makes  it 
+ extremely  difficult  for  any  single  participant  to  amass  a  position  in  the  Contract  capable  of 
+ exerting  meaningful  influence  on  the  level  of  the  Index,  and  the  perpetual  funding-rate 
+ mechanism  itself  acts  as  a  natural  economic  check  on  position  concentration,  imposing  carrying 
+ costs  that  discourage  further  accumulation  as  positions  become  crowded  on  one  side.  This 
+ approach—position  accountability  calibrated  to  a  cash-settled  contract  on  an  excluded 
+ commodity,  supported  by  real-time  surveillance  and  a  deeply  liquid  underlying 
+ market—appropriately  balances  market-integrity  objectives  against  the  risk  of  unnecessarily 
+ constraining legitimate hedging and trading activity. 
+ 65  See supra note 6. 
+ 64  17 C.F.R. § 150.5 and 17 C.F.R. Part 38, App. B, Core Principle 5 (contemplating exchange-set position limits or 
+ position accountability); CEA § 5(d)(5), 7 U.S.C. § 7(d)(5). Position accountability, rather than a hard position limit, 
+ is the standard and accepted approach for cash-settled financial contracts referencing excluded commodities. 
+ 63  See 17 C.F.R. § 150.1 (defining “bona fide hedging transaction or position” as a transaction or position “in 
+ commodity derivative contracts in a physical commodity” and “core referenced futures contract” as a futures 
+ contract listed in § 150.2(d)); 17 C.F.R. § 150.2(d) (enumerating physical agricultural, metals, and energy core 
+ referenced futures contracts); Position Limits for Derivatives, 86 Fed. Reg. 3236 (Jan. 14, 2021). No core referenced 
+ futures contract is enumerated for an interest rate, and the federal speculative position limit regime applies to 
+ physical-commodity derivative contracts. 
+ macroeconomic index or measure”); CFTC Glossary (distinguishing a physical commodity, such as an agricultural 
+ product or natural resource, from a financial instrument such as a currency or interest rate). 
+ KalshiEX LLC 
+
+--- PAGE 32 ---
+ KalshiEX LLC 
+ Core  Principles  7  and  8  -  Availability  of  General  Information  and  Daily  Publication  of 
+ Trading  Information:  Core  Principles  7  and  8,  implemented  by  Regulations  Sections  38.400, 
+ 38.401,  38.450,  and  38.451,  require  a  DCM  to  make  available  to  the  public  accurate  information 
+ regarding  the  contract  terms  and  conditions,  daily  information  on  contracts  such  as  settlement 
+ price,  volume,  open  interest,  and  opening  and  closing  ranges,  the  rules,  regulations,  and 
+ mechanisms  for  executing  transactions  on  or  through  the  facilities  of  the  contract  market,  and  the 
+ rules  and  specifications  describing  the  operation  of  the  contract  market’s  electronic  matching 
+ platform. 
+ Rule  2.17  of  the  Rulebook  sets  forth  the  rules  for  publicizing  information.  The  Rulebook  and  the 
+ specifications  of  each  contract  listed  on  the  Exchange,  including  the  Contract,  are  made  public 
+ on  the  Exchange  website  and  remain  accessible  via  the  platform.  The  Exchange  will  post 
+ non-confidential  materials  associated  with  regulatory  filings,  including  the  Rulebook,  at  the  time 
+ the  Exchange  submits  such  filings  to  the  Commission.  Consistent  with  Rule  2.17  of  the 
+ Rulebook,  the  Exchange  website  will  publish  contract  specifications,  terms,  and  conditions,  as 
+ well  as  daily  trading  volume  and  open  interest  for  the  Contract.  Each  contract  has  a  dedicated 
+ “Market  Page”  on  the  Kalshi  Exchange  platform,  which  will  contain  the  information  described 
+ above  as  well  as  a  link  to  the  Underlying.  Chapter  5  sets  forth  the  rules,  regulations  and 
+ mechanisms  for  executing  transactions,  and  the  rules  and  specifications  for  Kalshi’s  trading 
+ systems. 
+ Core  Principle  11  -  Financial  Integrity  of  Transactions:  Each  Member  must  be  in  good 
+ standing  and  in  compliance  with  the  Member  eligibility  standards  set  forth  in  Chapter  3  of  the 
+ Rulebook.  All  contracts  offered  by  the  Exchange,  including  the  Contract,  are  cleared  through  the 
+ Clearinghouse,  a  Derivatives  Clearing  Organization  (“DCO”)  registered  with  the  CFTC  and 
+ subject  to  all  CFTC  Regulations  related  thereto.  The  Exchange  requires  that  Members  post  initial 
+ margin  before  entering  into  positions  and  maintain  maintenance  margin  throughout  the  life  of  a 
+ position.  Margin  requirements  are  calculated  using  the  Exchange’s  risk-based  margin 
+ methodology  and  are  designed  to  ensure  that  the  Exchange  can  liquidate  positions  in  an  orderly 
+ manner  before  losses  exceed  posted  collateral.  Positions  that  fall  below  maintenance  margin 
+ levels  are  subject  to  liquidation.  The  protection  of  customer  funds  is  monitored  by  the  Exchange 
+ and  ensured  by  the  Clearinghouse  as  member  property  or  futures  commission  merchant  customer 
+ property. 
+ All  Remaining  Requirements:  All  remaining  Core  Principles  are  satisfied  through  operation  of 
+ the Exchange’s Rules, processes, and policies applicable to the other contracts traded thereon. 
+ KalshiEX LLC 

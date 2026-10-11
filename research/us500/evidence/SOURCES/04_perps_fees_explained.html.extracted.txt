@@ -1,0 +1,62 @@
+Perps Fees Explained | Kalshi Help Center
+Skip to main content
+API Docs
+Search ⌘ K
+Getting Started
+Perpetual Futures
+Account & Security
+Deposits & Withdrawals
+Trading
+Markets
+Portfolio & Tools
+Taxes & Documents
+Programs & Promotions
+API & Developers
+Support
+Kalshi Social
+All Collections Perpetual Futures Perps Fees Explained
+Perps Fees Explained
+How trading fees on perpetual futures are calculated, why the fee can look larger than expected when using leverage, and the difference between fees and funding payments.
+July 24, 2026
+Copy for LLM
+How perps trading fees are calculated
+Trading fees on perpetual futures are charged as a percentage of your position's notional value — the full size of your position including leverage — not the margin you posted.
+Example: You open a position with $50 of margin at 5x leverage. Your notional position size is $250, and the fee is calculated on $250 — not on your $50. This is why the fee can look larger than you expected: higher leverage means a larger notional position, which means a larger fee in dollar terms.
+Maker vs. taker fees
+Taker fees apply when your order fills immediately against an existing order (for example, a market order).
+Maker fees apply when your order rests on the book and is later filled by someone else. Maker fees are lower than taker fees.
+Fee rates are tiered by trading volume. Full fee schedule is here .
+Fees are charged on open and close
+A round trip involves two fees: one when you open the position and one when you close it. When reviewing your P&L, remember that both legs' fees are deducted.
+Funding payments are not fees
+Separately from trading fees, open positions pay or receive small funding payments on a regular schedule to keep the contract price anchored to the spot price. Depending on market conditions, funding can be a cost or income for your position. See How Funding Works .
+Where to see the fees you paid
+Each trade's fee is shown in your trade details and account activity.
+Did this answer your question?
+Disappointed Reaction Neutral Reaction Smiley Reaction
+Related Articles
+What are Perpetual Futures?
+How Margin Works
+How Funding Works
+Order Types
+Risks of Trading Perpetual Futures
+On this page
+How perps trading fees are calculated
+Maker vs. taker fees
+Fees are charged on open and close
+Funding payments are not fees
+Where to see the fees you paid
+Trade what's next.
+Company
+Markets
+About
+Blog
+Careers
+Legal and trust
+Fee schedule
+Regulatory
+Policy Center
+Privacy Policy
+Trust Center
+© 2026 Kalshi Inc. · All rights reserved
+​ ​​​​​Trading on Kalshi involves risk and may not be appropriate for all. Members risk losing their cost to enter any transaction, including fees. You should carefully consider whether trading on Kalshi is appropriate for you in light of your investment experience and financial resources. Any trading decisions you make are solely your responsibility and at your own risk. Information is provided for convenience only on an "AS IS" basis. Past performance is not necessarily indicative of future results. Kalshi is subject to U.S. regulatory oversight by the CFTC.

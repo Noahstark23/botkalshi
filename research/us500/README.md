@@ -1,4 +1,4 @@
-# US500 V2 — simulación, sesiones y control local
+# US500 V2.1 — simulación, sesiones y control local
 
 Candidato de revisión del 11 de octubre de 2026. Circuito implementado: capturas públicas → validación → hipótesis momentum congelada → ejecución ficticia con una captura posterior → ledger persistente → informe y reinicio. Incluye controles de Telegram **para US500 paper**. No contiene transporte de órdenes reales, credenciales Kalshi, integración con el bot deportivo ni cambios de producción.
 
@@ -29,13 +29,13 @@ El recorrido original continúa dando USD100 → USD98.6643 bajo sus supuestos, 
 | `us500_ledger.py` | Cash, coste acumulado, posición, PnL, fees, reservas y margen hipotético |
 | `us500_runner.py` | Momentum congelado, ejecución ficticia posterior, replay y permiso de control |
 | `us500_control.py` | Dueño/chat exactos, confirmación única, pausa persistente y permisos por evento |
-| `us500_telegram.py`, `TELEGRAM_PAPER.md` | Transporte explícito, cursor/outbox, respuestas ambiguas y operación del menú |
+| `us500_telegram.py`, `us500_telegram_service.py`, `TELEGRAM_PAPER.md` | Transporte, cursor/outbox, supervisor local acotado y pausa al parar/fallar |
 | `run_demo.py`, `run_control_demo.py` | Recorridos offline reproducibles |
-| `VERIFICACION_V2.md` | Qué se verificó y qué queda abierto |
+| `VERIFICACION_V2.md`, `VERIFICACION_V2_1.md` | Evidencia histórica y correcciones de la revisión actual |
 
 ## Modelo y continuidad
 
-`momentum-v1` compara midpoints separados por `lookback-1` observaciones. No se optimizó con los ejemplos. Una señal sólo puede usar un libro solicitado después de la observación que la generó. Reversión: cerrar primero; abrir el sentido contrario requiere otra observación. Spread, paso, tick, datos, nocional y margen limitan cada propuesta.
+`momentum-v1` compara midpoints separados por `lookback-1` observaciones. No se optimizó con los ejemplos. Una señal sólo puede usar un libro solicitado después de la observación que la generó. Reversión: cerrar primero; abrir el sentido contrario requiere otra observación. Spread, paso, tick, datos, nocional y margen limitan cada propuesta. Una observación con spread superior al máximo fija target=0: puede cerrar exposición en la captura posterior y provocar una reapertura posterior cuando vuelva a cumplir el umbral; no es una simple espera.
 
 Los fills hipotéticos recorren profundidad visible, aplican slippage adverso y redondean al tick. El remanente se cancela bajo un supuesto IOC local. No se reproducen cola, latencia, liquidez futura ni resultado de una orden desconocida del exchange. UNKNOWN en el ledger pausa y conserva reservas hasta un evento terminal explícito.
 
@@ -65,6 +65,6 @@ Límites: 4.096 frames, 100.000 eventos, 8.192 órdenes ficticias por ledger; no
 
 V2 completa las piezas locales anteriores y su integración offline. La consulta pública nueva devolvió HTTP200 y mercado cerrado; se registró 1 GET y pausa. No aporta una sesión abierta ni resultados prospectivos.
 
-Quedan abiertos: permisos Perps de la cuenta, condiciones contractuales y económicas aplicables, datos completos de sesiones abiertas, evaluación independiente, conciliación de cuenta y ejecutor real. La comunicación real del menú tampoco se ha instalado o comprobado en Telegram. No hay evidencia de rentabilidad ni declaración de preparación para dinero real.
+Quedan abiertos: permisos Perps de la cuenta, condiciones contractuales y económicas aplicables, datos completos de sesiones abiertas, evaluación independiente, conciliación de cuenta y ejecutor real. El menú se conectó y verificó en Telegram mediante un receptor local aislado; el alcance y la duración se registran en VERIFICACION_V2_1.md. El receptor no inicia una estrategia ni obtiene datos de mercado. No hay evidencia de rentabilidad ni declaración de preparación para dinero real.
 
 Jev no decide señales ni mueve dinero; no se consumió Jev ni Odds durante V2. M2/M5 siguen en su rama separada y fuera de esta integración. Los documentos y logs V1 se conservan como históricos, no como prueba de la nueva revisión.

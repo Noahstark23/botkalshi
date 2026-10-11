@@ -1,7 +1,10 @@
 """Offline integrity and explicit scenario tests; all market fixtures are synthetic."""
 
+import contextlib
 import copy
 import hashlib
+import http.client
+import io
 import json
 import tempfile
 import unittest
@@ -128,6 +131,97 @@ class DecimalAndJsonTests(unittest.TestCase):
         self.assertIsInstance(market(decoded)["tick_size"], Decimal)
         with self.assertRaises(engine.DataError):
             engine.normalize(decoded, at_ms=NOW)
+
+    def test_numeric_tick_remains_invalid_after_saving_and_reloading(self):
+        data = sample()
+        market(data)["tick_size"] = Decimal("0.0001")
+        for observation in data["observations"].values():
+            observation["canonical_body_sha256"] = engine.body_digest(
+                observation["body"]
+            )
+        with self.assertRaisesRegex(engine.DataError, "INVALID_DECIMAL_TEXT"):
+            engine.normalize(data, at_ms=NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "numeric-tick.json"
+            engine.save_new(path, data)
+            loaded = engine.decode(path.read_bytes())
+        self.assertIsInstance(market(loaded)["tick_size"], Decimal)
+        self.assertEqual(engine.body_digest(data), engine.body_digest(loaded))
+        with self.assertRaisesRegex(engine.DataError, "INVALID_DECIMAL_TEXT"):
+            engine.normalize(loaded, at_ms=NOW)
+
+    def test_numeric_and_string_digest_are_distinct(self):
+        self.assertNotEqual(
+            engine.body_digest({"v": Decimal("0.0001")}),
+            engine.body_digest({"v": "0.0001"}),
+        )
+        self.assertNotEqual(
+            engine.body_digest({"v": Decimal("1")}), engine.body_digest({"v": "1"})
+        )
+
+    def test_legacy_text_integer_boolean_and_unicode_hashes_remain_compatible(self):
+        data = sample()
+        expected = {
+            "market": "8f5b0658210aaf68d24d84766964eb4ffa703eed01a375a6a5b54e8c7b828d40",
+            "orderbook": "c2a85a212f8b1b37b93357637002874cedd335d83f232e6d4db771e135e9809c",
+        }
+        for name, digest in expected.items():
+            self.assertEqual(
+                engine.body_digest(data["observations"][name]["body"]), digest
+            )
+        self.assertEqual(
+            engine.body_digest({"á": "línea\n", "a": [1, True, None, {"b": "1.00"}]}),
+            "eecfbab8d6bc8013e9a4b7f579bf1134e06a3561924958715ef3aae167ee05fe",
+        )
+
+    def test_typed_json_preserves_decimal_precision_independent_of_context(self):
+        values = [
+            Decimal("123456789012345678901234567890.1234567890123456789000"),
+            Decimal("-0"),
+            Decimal("-0.0000"),
+            Decimal("1E+10000"),
+            Decimal("1E-10000"),
+        ]
+        with localcontext() as context:
+            context.prec = 2
+            text = engine.json_text({"values": values})
+        loaded = engine.decode(text.encode())["values"]
+        self.assertEqual(values, loaded)
+        self.assertTrue(all(type(item) is Decimal for item in loaded))
+        self.assertEqual(loaded[0].as_tuple(), values[0].as_tuple())
+        self.assertTrue(loaded[1].is_signed())
+        self.assertEqual(
+            engine.body_digest({"values": values}),
+            engine.body_digest({"values": loaded}),
+        )
+
+    def test_typed_json_pretty_and_compact_keep_standard_json_layout(self):
+        value = {"z": [False, None, 123, "texto", []], "a": {"á": "dos\n"}}
+        self.assertEqual(
+            engine.json_text(value, sort_keys=True),
+            json.dumps(value, sort_keys=True, separators=(",", ":")),
+        )
+        self.assertEqual(
+            engine.json_text(value, indent=2, ensure_ascii=False),
+            json.dumps(value, indent=2, ensure_ascii=False),
+        )
+
+    def test_float_exponents_and_signed_zero_keep_digest_after_reload(self):
+        values = [1e20, 1e-20, 1.25e24, 4.4e-308, 0.0, -0.0]
+        data = {"values": values}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "float-numbers.json"
+            with localcontext() as context:
+                context.prec = 2
+                engine.save_new(path, data)
+            loaded = engine.decode(path.read_bytes())
+        self.assertEqual(engine.body_digest(data), engine.body_digest(loaded))
+        for original, parsed in zip(values, loaded["values"]):
+            with self.subTest(value=repr(original)):
+                self.assertIs(type(parsed), Decimal)
+                self.assertEqual(parsed.as_tuple(), Decimal(repr(original)).as_tuple())
+        self.assertTrue(loaded["values"][-1].is_signed())
+        self.assertFalse(loaded["values"][-2].is_signed())
 
     def test_json_requires_bounded_object(self):
         for raw in (
@@ -583,9 +677,45 @@ class EvidenceFileTests(unittest.TestCase):
                 destination, {"amount": Decimal("13.456789012345"), "synthetic": True}
             )
             self.assertEqual(
-                json.loads(destination.read_text()),
-                {"amount": "13.456789012345", "synthetic": True},
+                engine.decode(destination.read_bytes()),
+                {"amount": Decimal("13.456789012345"), "synthetic": True},
             )
+
+    def test_invalid_json_values_never_create_partial_evidence(self):
+        cycle = []
+        cycle.append(cycle)
+        invalid = [
+            object(),
+            {1: "ambiguous key"},
+            {True: "bool key"},
+            Decimal("NaN"),
+            Decimal("sNaN"),
+            Decimal("Infinity"),
+            Decimal("-Infinity"),
+            float("nan"),
+            float("inf"),
+            b"bytes",
+            {"set"},
+            cycle,
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for index, value in enumerate(invalid):
+                path = Path(directory) / f"invalid-{index}.json"
+                with self.subTest(index=index):
+                    with self.assertRaises(engine.DataError):
+                        engine.save_new(path, {"ok": 1, "bad": value})
+                    self.assertFalse(path.exists())
+                    with self.assertRaisesRegex(
+                        engine.DataError, "INVALID_CANONICAL_BODY"
+                    ):
+                        engine.body_digest({"bad": value})
+
+    def test_invalid_utf8_never_creates_partial_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "surrogate.json"
+            with self.assertRaises(engine.DataError):
+                engine.save_new(path, {"text": "\ud800"})
+            self.assertFalse(path.exists())
 
     def test_existing_evidence_is_not_replaced_or_truncated(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -715,6 +845,49 @@ class PublicReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(engine.DataError, "REQUEST_BUDGET_EXHAUSTED"):
             reader.get("market")
         self.assertEqual(len(transport.calls), 2)
+
+    def test_http_protocol_failures_are_sanitized_without_retry(self):
+        class BrokenResponse(FakeResponse):
+            def read(self, size):
+                raise http.client.IncompleteRead(b"private payload", 10)
+
+        for failure in (
+            http.client.BadStatusLine("private diagnostic"),
+            BrokenResponse(),
+        ):
+            reader, transport = self.reader([failure])
+            with self.assertRaisesRegex(
+                engine.DataError, "PUBLIC_DATA_UNAVAILABLE"
+            ) as error:
+                reader.get("market")
+            self.assertIsNone(error.exception.__cause__)
+            self.assertTrue(error.exception.__suppress_context__)
+            self.assertEqual(str(error.exception), "PUBLIC_DATA_UNAVAILABLE")
+            self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(reader.requests, 1)
+
+    def test_cli_http_protocol_failure_has_safe_json_and_no_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.json"
+            output = io.StringIO()
+            with (
+                patch(
+                    "sys.argv", ["us500_engine.py", "capture", "--output", str(path)]
+                ),
+                patch.object(
+                    engine.PublicReader,
+                    "capture",
+                    side_effect=http.client.HTTPException("private diagnostic"),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                result = engine.main()
+            self.assertEqual(result, 2)
+            self.assertEqual(
+                json.loads(output.getvalue()), {"error": "LOCAL_IO_OR_SCHEMA_ERROR"}
+            )
+            self.assertNotIn("private", output.getvalue())
+            self.assertFalse(path.exists())
 
     def test_oversized_and_bad_json_responses_fail_after_bounded_read(self):
         for raw in (b" " * (engine.MAX_BYTES + 10), b'{"a":1,"a":2}', b'{"a":NaN}'):
