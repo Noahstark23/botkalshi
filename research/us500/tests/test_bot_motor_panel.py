@@ -11,6 +11,7 @@ from unittest.mock import patch
 from test_us500_control import CHAT, NOW, OWNER, confirmation, update
 
 from bot_motor_panel import MOTORS, disconnected_detail, overview
+from motor_status_readonly import status_from_responses
 from us500_control import PaperControl
 from us500_telegram import _payload
 
@@ -40,7 +41,7 @@ class MotorPanelTests(unittest.TestCase):
             with self.subTest(command=command):
                 payload = self.send(text=command)[-1]["payload"]
                 text = payload["text"]
-                self.assertIn("no consulta su estado", text)
+                self.assertIn("fuente sin conectar", text)
                 self.assertIn("permiso de simulación pausado", text)
                 buttons = [
                     b for row in payload["reply_markup"]["inline_keyboard"] for b in row
@@ -52,17 +53,26 @@ class MotorPanelTests(unittest.TestCase):
                 self.assertEqual(len(targets), 11)
         self.assertFalse(self.control.snapshot()["production_control_available"])
 
-    def test_each_disconnected_motor_has_explicit_locked_controls(self):
+    def test_each_motor_has_only_readonly_refresh_and_back(self):
         for key in [m.key for m in MOTORS] + ["all"]:
             with self.subTest(key=key):
                 payload = self.send(action="u5:engine:" + key)[-1]["payload"]
-                self.assertIn("Estado del proceso: no consultado", payload["text"])
-                buttons = payload["reply_markup"]["inline_keyboard"][0]
+                self.assertIn("Estados desconocidos", payload["text"])
+                buttons = [
+                    button
+                    for row in payload["reply_markup"]["inline_keyboard"]
+                    for button in row
+                ]
                 self.assertEqual(
                     [b["callback_data"] for b in buttons],
-                    [f"u5:blocked:{key}:enable", f"u5:blocked:{key}:pause"],
+                    [f"u5:engine:{key}", "u5:panel"],
                 )
-                self.assertTrue(all("sin conexión" in b["text"] for b in buttons))
+                self.assertTrue(
+                    all(
+                        "Activar" not in b["text"] and "Desactivar" not in b["text"]
+                        for b in buttons
+                    )
+                )
 
     def test_disconnected_actions_never_change_us500_permission_or_pending_nonce(self):
         action = confirmation(self.send(action="u5:enable"))
@@ -163,7 +173,7 @@ class MotorPanelTests(unittest.TestCase):
         self.send(action="u5:engine:all")
         self.send(action=action)
         payload = self.send(action="u5:panel")[-1]["payload"]
-        self.assertIn("conexión pendiente", payload["text"])
+        self.assertIn("fuente sin conectar", payload["text"])
         self.assertFalse(self.control.snapshot()["production_control_available"])
 
     def test_descriptions_preserve_dependency_and_exit_distinctions(self):
@@ -176,7 +186,164 @@ class MotorPanelTests(unittest.TestCase):
         for key in ("m6", "m8", "m9"):
             self.assertIn("No tiene ejecutor", disconnected_detail(key)[0])
         self.assertIsNone(disconnected_detail("m4"))
-        self.assertIn("no consulta su estado", overview(False)[0])
+        self.assertIn("fuente sin conectar", overview(False)[0])
+
+    def runtime(self, now, *, m5_running=False):
+        from datetime import datetime, timezone
+
+        return status_from_responses(
+            {
+                "status": "healthy",
+                "timestamp": datetime.fromtimestamp(
+                    now / 1000, timezone.utc
+                ).isoformat(),
+            },
+            {
+                "bot": {
+                    "capture_running": True,
+                    "ws_connected": True,
+                    "is_paused": False,
+                    "motor5": {"enabled": False, "task_running": m5_running},
+                },
+                "config": {
+                    "environment": "production",
+                    "trading_enabled": False,
+                    "motors_enabled": {
+                        "motor_1_arbitrage": True,
+                        "motor_2_sportsbook": False,
+                        "motor_2_execution": False,
+                        "motor_5_mm": False,
+                        "motor_5_execution": False,
+                    },
+                },
+                "capital": {"is_paused": True},
+            },
+            now_ms=now,
+        )
+
+    def with_provider(self, provider):
+        self.control = PaperControl(
+            self.path, owner_user_id=OWNER, owner_chat_id=CHAT, status_provider=provider
+        )
+
+    def test_fresh_runtime_separates_configured_detection_and_task(self):
+        calls = []
+
+        def provider(*, now_ms):
+            calls.append(now_ms)
+            return self.runtime(now_ms, m5_running=True)
+
+        self.with_provider(provider)
+        m1 = self.send(action="u5:engine:m1")[-1]["payload"]["text"]
+        self.assertIn("Detección configurada: sí", m1)
+        self.assertIn("Ejecución configurada: desconocido", m1)
+        self.assertIn("Tarea reportada: desconocida", m1)
+        m5 = self.send(action="u5:engine:m5")[-1]["payload"]["text"]
+        self.assertIn("Configurado: no", m5)
+        self.assertIn("Tarea reportada: en marcha", m5)
+        self.assertIn("M5 habilitado según runtime: no", m5)
+        self.assertEqual(len(calls), 2)
+
+    def test_runtime_provider_only_runs_for_authorized_real_status_views(self):
+        calls = []
+
+        def provider(*, now_ms):
+            calls.append(now_ms)
+            return self.runtime(now_ms)
+
+        self.with_provider(provider)
+        for action in ("u5:panel", "u5:engine:m1", "u5:blocked:m5:enable"):
+            self.assertEqual(self.send(action=action, actor=999), [])
+            self.assertEqual(self.send(action=action, kind="group"), [])
+        for action in ("u5:menu", "u5:pause", "u5:enable", "u5:engine:private-url"):
+            self.send(action=action)
+        self.assertEqual(calls, [])
+        self.send(text="/motores")
+        self.assertEqual(len(calls), 1)
+
+    def test_readonly_views_never_change_permission_or_confirmation(self):
+        self.with_provider(lambda *, now_ms: self.runtime(now_ms))
+        action = confirmation(self.send(action="u5:enable"))
+        before = self.control.snapshot()
+        for key in [m.key for m in MOTORS] + ["all"]:
+            self.send(action="u5:engine:" + key)
+        after = self.control.snapshot()
+        for field in ("paper_enabled", "revision", "reason", "updated_at_ms"):
+            self.assertEqual(after[field], before[field])
+        self.send(action=action)
+        self.assertTrue(self.control.snapshot()["paper_enabled"])
+
+    def test_fault_after_fresh_status_never_displays_previous_enabled_state(self):
+        answers = [self.runtime(NOW, m5_running=True), RuntimeError("PRIVATE_SECRET")]
+
+        def provider(*, now_ms):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        self.with_provider(provider)
+        first = self.send(action="u5:engine:m5")[-1]["payload"]["text"]
+        second = self.send(action="u5:engine:m5")[-1]["payload"]["text"]
+        self.assertIn("Tarea reportada: en marcha", first)
+        self.assertIn("consulta fallida", second)
+        self.assertIn("Tarea reportada: desconocida", second)
+        self.assertNotIn("PRIVATE_SECRET", second)
+        self.assertNotIn(b"PRIVATE_SECRET", self.path.read_bytes())
+
+    def test_stale_provider_unknown_even_if_provider_claims_fresh(self):
+        self.with_provider(
+            lambda *, now_ms: self.runtime(now_ms - 30001, m5_running=True)
+        )
+        text = self.send(action="u5:engine:m5")[-1]["payload"]["text"]
+        self.assertIn("dato vencido", text)
+        self.assertIn("Configurado: desconocido", text)
+        self.assertIn("Tarea reportada: desconocida", text)
+
+    def test_runtime_source_cannot_inject_sensitive_text_or_unsupported_running(self):
+        def provider(*, now_ms):
+            value = self.runtime(now_ms)
+            value.update(
+                source="PRIVATE_TOKEN",
+                environment="PRIVATE_TOKEN",
+                health="PRIVATE_TOKEN",
+            )
+            value["flags"]["trading_enabled"] = "PRIVATE_TOKEN"
+            value["motors"]["m6"].update(running=True, configured=True)
+            return value
+
+        self.with_provider(provider)
+        overview_text = self.send(text="/motores")[-1]["payload"]["text"]
+        self.assertNotIn("PRIVATE_TOKEN", overview_text)
+        self.assertIn("Trading configurado: desconocido", overview_text)
+        text = self.send(action="u5:engine:m6")[-1]["payload"]["text"]
+        self.assertIn("Configurado: desconocido", text)
+        self.assertIn("Tarea reportada: desconocida", text)
+        self.assertNotIn(b"PRIVATE_TOKEN", self.path.read_bytes())
+
+    def test_rest_does_not_inherit_general_capture_running(self):
+        self.with_provider(lambda *, now_ms: self.runtime(now_ms))
+        text = self.send(action="u5:engine:rest")[-1]["payload"]["text"]
+        self.assertIn("Tarea reportada: desconocida", text)
+        self.assertIn("captura general no demuestra", text)
+
+    def test_m2_execution_flag_describes_only_exits_not_entries(self):
+        self.with_provider(lambda *, now_ms: self.runtime(now_ms))
+        text = self.send(action="u5:engine:m2")[-1]["payload"]["text"]
+        self.assertIn("Salidas configuradas: no", text)
+        self.assertIn("Entradas: sin dato expuesto", text)
+        self.assertNotIn("Ejecución configurada", text)
+
+    def test_runtime_fetch_is_outside_control_lock(self):
+        def provider(*, now_ms):
+            with closing(sqlite3.connect(self.path, timeout=0)) as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.rollback()
+            return self.runtime(now_ms)
+
+        self.with_provider(provider)
+        text = self.send(text="/motores")[-1]["payload"]["text"]
+        self.assertIn("Actualizado:", text)
 
 
 if __name__ == "__main__":

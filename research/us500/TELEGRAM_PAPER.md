@@ -52,3 +52,12 @@ python3 us500_runner.py --input SESION.json --database /RUTA/NUEVA/paper.sqlite3
 No cambia el estado a habilitado: sólo procesa si el permiso confirmado ya existe. Omitir el control en una base vinculada se rechaza. Los archivos de salida deben ser nuevos. Las tres bases tienen propietarios y propósitos distintos; no reutilizar DB históricas.
 
 Referencia del protocolo: [Telegram Bot API](https://core.telegram.org/bots/api#getupdates) y [CallbackQuery](https://core.telegram.org/bots/api#callbackquery). La cobertura offline prueba el protocolo con transportes falsos; no demuestra entrega al teléfono.
+
+
+## Actualización V2.3 — receptor cloud y estados
+
+La nueva instalación aislada está documentada en `TELEGRAM_CLOUD.md`. Permite operación
+continua del receptor sin Mac, estados de sólo lectura del runtime y permiso paper
+US500. Las descripciones anteriores del panel desconectado/local son históricas.
+No incorpora activación real ni ejecutor automático. M6/M8/M9/REST carecen de señal
+específica en el API actual; el panel lo declara como desconocido.

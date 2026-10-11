@@ -67,6 +67,8 @@ _SAFE_ERRORS = {
     "TELEGRAM_TOKEN_REQUIRED",
     "GET_UPDATES_FAILED",
     "OUTBOX_DELIVERY_FAILED",
+    "INVALID_RETENTION_LIMIT",
+    "OUTBOX_RETENTION_FAILED",
 }
 
 
@@ -294,6 +296,7 @@ class PaperTelegram:
                 "bot_id": transport.bot_id,
             }
         )
+        self._binding = binding
         self._db = sqlite3.connect(str(self.path), timeout=5, isolation_level=None)
         self._db.execute("PRAGMA synchronous=FULL")
         try:
@@ -365,6 +368,87 @@ class PaperTelegram:
             "production_control_available": False,
             "automatic_unknown_retry": False,
         }
+
+    def prune_delivered(self, *, keep_updates=500):
+        """Explicit, transactional retention; never sends or changes control.
+
+        Keep the most recent update IDs regardless of delivery state. Older IDs
+        strictly behind the cursor may be removed only when all their responses
+        are SENT (including ignored updates that have no response). Any other
+        status protects the entire update and all its outbox rows. Cursor and
+        control binding survive intact: a forgotten ID cannot be executed again.
+        Protected rows may still exhaust capacity; they are never auto-retried
+        or erased to keep a receiver running.
+        """
+        if not _integer(keep_updates, minimum=1, maximum=MAX_UPDATES):
+            raise TelegramError("INVALID_RETENTION_LIMIT")
+        try:
+            self._check_file()
+            current = self.control.snapshot()
+            if (
+                type(current) is not dict
+                or current.get("mode") != "paper"
+                or current.get("scope") != "US500"
+                or current.get("production_control_available") is not False
+            ):
+                raise TelegramError("INVALID_CONTROL_SCOPE")
+            binding = _canonical(
+                {
+                    "control_id": current.get("control_id"),
+                    "owner_user_id": self.control.owner_user_id,
+                    "owner_chat_id": self.control.owner_chat_id,
+                    "bot_id": self.transport.bot_id,
+                }
+            )
+            if binding != self._binding:
+                raise TelegramError("OUTBOX_BINDING_CONFLICT")
+            self._db.execute("BEGIN IMMEDIATE")
+            metadata = self._db.execute(
+                "SELECT binding, next_offset FROM telegram_meta WHERE id=1"
+            ).fetchone()
+            if metadata is None or metadata[0] != self._binding:
+                raise TelegramError("OUTBOX_BINDING_CONFLICT")
+            offset = metadata[1]
+            if not _integer(offset):
+                raise TelegramError("OUTBOX_RETENTION_FAILED")
+            cutoff = self._db.execute(
+                "SELECT update_id FROM telegram_updates ORDER BY update_id DESC LIMIT 1 OFFSET ?",
+                (keep_updates - 1,),
+            ).fetchone()
+            eligible = []
+            if cutoff is not None:
+                eligible = self._db.execute(
+                    "SELECT u.update_id FROM telegram_updates u "
+                    "WHERE u.update_id < ? AND u.update_id < ? "
+                    "AND NOT EXISTS (SELECT 1 FROM telegram_outbox o "
+                    "WHERE o.update_id=u.update_id AND o.status IS NOT 'SENT') "
+                    "ORDER BY u.update_id",
+                    (cutoff[0], offset),
+                ).fetchall()
+            deleted_outbox = self._db.executemany(
+                "DELETE FROM telegram_outbox WHERE update_id=? AND status='SENT'",
+                eligible,
+            ).rowcount
+            deleted_updates = self._db.executemany(
+                "DELETE FROM telegram_updates WHERE update_id=?", eligible
+            ).rowcount
+            retained_updates = self._db.execute(
+                "SELECT count(*) FROM telegram_updates"
+            ).fetchone()[0]
+            self._check_file()
+            self._db.execute("COMMIT")
+            return {
+                "deleted_updates": deleted_updates,
+                "deleted_outbox": deleted_outbox,
+                "retained_updates": retained_updates,
+                "next_offset": offset,
+            }
+        except BaseException as exc:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            if isinstance(exc, TelegramError) or not isinstance(exc, Exception):
+                raise
+            raise TelegramError("OUTBOX_RETENTION_FAILED") from None
 
     def _persist_update(self, update, now_ms):
         if type(update) is not dict or not _integer(update.get("update_id")):

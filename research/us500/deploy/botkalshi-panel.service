@@ -1,0 +1,52 @@
+[Unit]
+Description=BotKalshi Telegram panel (read-only runtime and US500 paper permission)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=botkalshi-panel
+Group=botkalshi-panel
+WorkingDirectory=/opt/botkalshi-panel/current
+ExecStart=/usr/bin/python3 -B /opt/botkalshi-panel/current/us500_telegram_cloud.py --state-dir /var/lib/botkalshi-panel --credential-file ${CREDENTIALS_DIRECTORY}/telegram-token --bot-id 8743999316 --owner-id 7415039830
+LoadCredentialEncrypted=telegram-token:/etc/botkalshi-panel/telegram-token.cred
+StateDirectory=botkalshi-panel
+StateDirectoryMode=0700
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+InaccessiblePaths=-/etc/botkalshi-runtime -/etc/botkalshi-research.env -/opt/botkalshi-runtime -/opt/botkalshi-live -/opt/botkalshi-research -/var/lib/botkalshi-runtime -/var/lib/botkalshi-research -/var/run/docker.sock
+MemoryHigh=64M
+MemoryMax=96M
+MemorySwapMax=0
+CPUQuota=10%
+TasksMax=16
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botkalshi-panel
+
+[Install]
+WantedBy=multi-user.target

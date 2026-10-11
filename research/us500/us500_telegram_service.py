@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import itertools
 import json
 import math
 import os
@@ -30,6 +31,7 @@ MAX_STATUS_BYTES = 32_768
 _CONTROL_ID = re.compile(r"[a-f0-9]{32}\Z")
 _REASON = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _OUTBOX_STATES = {"PENDING", "ATTEMPTED", "SENT", "FAILED", "UNKNOWN"}
+_TRANSIENT_POLL_ERRORS = {"TELEGRAM_RESPONSE_UNKNOWN", "TELEGRAM_RESPONSE_TIMEOUT"}
 
 
 class ServiceError(ValueError):
@@ -305,8 +307,12 @@ class TelegramPaperService:
             except FileNotFoundError:
                 pass
 
-    def run(self, max_cycles, interval_seconds, stop_event):
-        if not _integer(max_cycles, 1, MAX_CYCLES):
+    def run(self, max_cycles, interval_seconds, stop_event, *, persistent=False):
+        if type(persistent) is not bool:
+            raise ServiceError("INVALID_PERSISTENT_MODE")
+        if not (persistent and max_cycles is None) and not _integer(
+            max_cycles, 1, MAX_CYCLES
+        ):
             raise ServiceError("INVALID_MAX_CYCLES")
         if (
             type(interval_seconds) not in (int, float)
@@ -324,6 +330,7 @@ class TelegramPaperService:
         completed, errors, pause_confirmed, owns_control = 0, [], False, False
         phase = "STARTING"
         status = None
+        retry_delay = 3
         try:
             self._directory_identity = self._directory(self.state_dir)
             self._lock(self.state_dir / ".telegram-service.lock")
@@ -355,9 +362,18 @@ class TelegramPaperService:
                     control=self.control,
                     transport=transport,
                 )
-                for _ in range(max_cycles):
+                cycles = itertools.count() if max_cycles is None else range(max_cycles)
+                for _ in cycles:
                     if stop_event.is_set():
                         break
+                    if persistent:
+                        self._adapter.prune_delivered(keep_updates=500)
+                        counts = self._outbox_status()["outbox_counts"]
+                        unresolved = any(
+                            counts.get(key, 0)
+                            for key in ("UNKNOWN", "FAILED", "ATTEMPTED")
+                        )
+                        self.control.set_transport_available(not unresolved)
                     # Validating identity before each request prevents a replaced
                     # control DB from silently changing the supervised account.
                     self._control_status()
@@ -391,18 +407,53 @@ class TelegramPaperService:
                             )
                         else:
                             self._last_poll_error = "INVALID_POLL_RESULT"
+                        if (
+                            persistent
+                            and self._last_poll_error in _TRANSIENT_POLL_ERRORS
+                        ):
+                            if not self._pause():
+                                raise ServiceError("RECOVERY_PAUSE_UNCONFIRMED")
+                            status = self._status(
+                                "RECOVERING",
+                                completed,
+                                max_cycles,
+                                interval_seconds,
+                                ["POLL_TEMPORARILY_UNAVAILABLE"],
+                                True,
+                            )
+                            self._write_status(status)
+                            if stop_event.wait(retry_delay):
+                                break
+                            retry_delay = min(60, retry_delay * 2)
+                            continue
                         raise ServiceError("POLL_CYCLE_STOPPED")
+                    retry_delay = 3
                     outbox = self._outbox_status()
+                    cycle_phase, cycle_errors = "RUNNING", []
                     if any(
                         outbox["outbox_counts"].get(key, 0)
                         for key in ("UNKNOWN", "FAILED", "ATTEMPTED")
                     ):
-                        raise ServiceError("OUTBOX_DELIVERY_UNCONFIRMED")
+                        if not persistent:
+                            raise ServiceError("OUTBOX_DELIVERY_UNCONFIRMED")
+                        # Keep receiving new owner commands while preserving every
+                        # uncertain response without resending it. Paper stays paused.
+                        if not self._pause():
+                            raise ServiceError("RECOVERY_PAUSE_UNCONFIRMED")
+                        cycle_phase = "DEGRADED"
+                        cycle_errors = ["OUTBOX_DELIVERY_UNCONFIRMED"]
                     status = self._status(
-                        "RUNNING", completed, max_cycles, interval_seconds, errors, None
+                        cycle_phase,
+                        completed,
+                        max_cycles,
+                        interval_seconds,
+                        cycle_errors,
+                        True if cycle_errors else None,
                     )
                     self._write_status(status)
-                    if completed < max_cycles and stop_event.wait(interval_seconds):
+                    if (
+                        max_cycles is None or completed < max_cycles
+                    ) and stop_event.wait(interval_seconds):
                         break
             phase = "STOPPED"
         except ServiceError as exc:

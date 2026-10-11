@@ -1,10 +1,9 @@
-"""Catálogo del panel: no importa motores, entornos ni clientes de producción.
-
-La disponibilidad describe este receptor, nunca el estado del bot remoto.
-Sólo US500 posee un adaptador conectado, limitado al permiso de replay paper.
-"""
+"""Read-only runtime cards and the separate, local US500 paper control link."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from motor_status_readonly import sanitize_snapshot, unknown_status
 
 
 @dataclass(frozen=True)
@@ -69,8 +68,77 @@ _BY_KEY = {motor.key: motor for motor in MOTORS}
 BACK = [{"text": "← Todos los motores", "callback_data": "u5:panel"}]
 
 
-def overview(enabled):
-    """Texto y teclado; no representa flags ni salud de procesos remotos."""
+def is_runtime_action(action):
+    if action == "u5:panel":
+        return True
+    if action.startswith("u5:engine:"):
+        return action[len("u5:engine:") :] in (*_BY_KEY, "all")
+    parts = action.split(":")
+    return (
+        len(parts) == 4
+        and parts[:2] == ["u5", "blocked"]
+        and parts[2] in (*_BY_KEY, "all")
+        and parts[3] in ("enable", "pause")
+    )
+
+
+def _snapshot(runtime, now_ms):
+    return (
+        sanitize_snapshot(runtime, now_ms=now_ms)
+        if runtime is not None
+        else unknown_status(now_ms, "NOT_CONNECTED")
+    )
+
+
+def _bool(value):
+    return "sí" if value is True else "no" if value is False else "desconocido"
+
+
+def _source(status):
+    def iso(at):
+        return (
+            datetime.fromtimestamp(at / 1000, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+            if at is not None
+            else "sin fecha"
+        )
+
+    if status["fresh"]:
+        return (
+            "Fuente: runtime técnico del droplet · sólo lectura.\n"
+            f"Actualizado: {iso(status['source_at_ms'])} · antigüedad {status['age_ms'] // 1000} s."
+        )
+    reason = {
+        "NOT_CONNECTED": "fuente sin conectar",
+        "STALE": "dato vencido",
+        "INVALID": "dato inválido",
+        "UNAVAILABLE": "consulta fallida",
+    }.get(status["reason"], "sin dato vigente")
+    return (
+        "Fuente: runtime técnico del droplet · sólo lectura.\n"
+        f"Consulta: {iso(status['checked_at_ms'])} · {reason}. Estados desconocidos."
+    )
+
+
+def _global(status):
+    flags = status["flags"]
+    environment = {"production": "producción", "demo": "demo"}.get(
+        status["environment"], "desconocido"
+    )
+    return (
+        f"Entorno reportado: {environment}.\n"
+        f"Trading configurado: {_bool(flags['trading_enabled'])}. "
+        f"Pausa del bot: {_bool(flags['bot_paused'])}.\n"
+        f"Pausa por capital: {_bool(flags['capital_paused'])}.\n"
+        f"Captura reportada: {_bool(flags['capture_running'])}. "
+        f"WebSocket conectado: {_bool(flags['ws_connected'])}."
+    )
+
+
+def overview(enabled, *, runtime=None, now_ms=None):
+    """Configured flags and reported tasks are separate; none grants control."""
+    status = _snapshot(runtime, now_ms)
     rows = [
         [
             {"text": motor.title, "callback_data": "u5:engine:" + motor.key}
@@ -82,61 +150,98 @@ def overview(enabled):
         [
             [{"text": "US500 · Simulación", "callback_data": "u5:menu"}],
             [
-                {"text": "Control general", "callback_data": "u5:engine:all"},
+                {"text": "Estado general", "callback_data": "u5:engine:all"},
                 {"text": "Actualizar estado", "callback_data": "u5:panel"},
             ],
         ]
     )
+    lines = []
+    for motor in MOTORS:
+        observed = status["motors"][motor.key]
+        label = "detección configurada" if motor.key == "m1" else "configurado"
+        lines.append(
+            f"{motor.key.upper()}: {label} {_bool(observed['configured'])} · tarea {_bool(observed['running'])}."
+        )
     return (
         "BotKalshi · Todos los motores\n\n"
-        "US500: permiso de simulación "
+        + _source(status)
+        + "\n\n"
+        + _global(status)
+        + "\n\n"
+        + "\n".join(lines)
+        + "\n\nUS500: permiso de simulación "
         + ("habilitado" if enabled else "pausado")
-        + ".\nM1, M2, M3, M5, M6, REST, M8 y M9: conexión pendiente.\n\n"
-        "Elegí un motor para ver sus controles.\n"
-        "Este panel no está conectado al trading real y no consulta su estado. "
-        "Habilitar US500 permite replays locales; no inicia una estrategia automática.",
+        + ".\nConfiguración no demuestra ejecución. Sólo M5 expone tarea en marcha."
+        + "\nEste panel no puede activar ni pausar motores reales. "
+        + "Habilitar US500 permite replays locales; no inicia una estrategia automática.",
         rows,
     )
 
 
-def disconnected_detail(key, *, requested_action=None):
-    """Los botones sin adaptador explican el bloqueo, jamás fingen una operación."""
+def disconnected_detail(key, *, requested_action=None, runtime=None, now_ms=None):
+    """Legacy name retained; cards are read-only and old action buttons stay blocked."""
+    status = _snapshot(runtime, now_ms)
     if key == "all":
-        title = "Control general del bot"
-        description = "La conexión de los motores al panel está pendiente."
-        contract = (
-            "Una futura pausa general debe frenar nuevas entradas y mantener "
-            "salidas, reservas y conciliación. No equivale a cerrar posiciones."
-        )
+        title = "Estado general del bot"
+        description = _global(status)
+        contract = "Las banderas configuradas no prueban que haya operaciones ni tareas ejecutándose."
     else:
         motor = _BY_KEY.get(key)
         if motor is None:
             return None
-        title, description, contract = (
-            motor.title,
-            motor.description,
-            motor.pause_contract,
+        title = motor.title
+        observed = status["motors"][key]
+        task = (
+            "en marcha"
+            if observed["running"] is True
+            else "detenida"
+            if observed["running"] is False
+            else "desconocida"
         )
+        label = "Detección configurada" if key == "m1" else "Configurado"
+        execution_label = (
+            "Salidas configuradas" if key == "m2" else "Ejecución configurada"
+        )
+        description = (
+            f"{label}: {_bool(observed['configured'])}.\n"
+            f"{execution_label}: {_bool(observed['execution_configured'])}.\n"
+            f"Tarea reportada: {task}.\n"
+        )
+        if key == "m2":
+            description += "Entradas: sin dato expuesto.\n"
+        if key == "m5":
+            description += (
+                f"M5 habilitado según runtime: {_bool(observed['runtime_enabled'])}.\n"
+            )
+        if key == "m1":
+            description += "La bandera de detección de M1 no demuestra ejecución.\n"
+        if key == "rest":
+            description += "La captura general no demuestra que la tarea REST de arbitraje esté en marcha.\n"
+        if key in ("m6", "m8", "m9"):
+            description += (
+                "El runtime no expone una señal específica de este observador.\n"
+            )
+        description += "\n" + motor.description
+        contract = motor.pause_contract
     acknowledgement = ""
     if requested_action is not None:
-        acknowledgement = "No se aplicó ningún cambio: falta conectar este control.\n\n"
+        acknowledgement = "No se aplicó ningún cambio: este panel es de sólo lectura para motores reales.\n\n"
     return (
         acknowledgement
         + title
-        + "\nConexión al panel: pendiente.\nEstado del proceso: no consultado.\n\n"
+        + "\n\n"
+        + _source(status)
+        + "\n\n"
         + description
         + "\n"
-        + contract,
+        + contract
+        + "\n\nSin controles de activación o pausa real.",
         [
             [
                 {
-                    "text": "🔒 Activar · sin conexión",
-                    "callback_data": "u5:blocked:" + key + ":enable",
-                },
-                {
-                    "text": "🔒 Desactivar · sin conexión",
-                    "callback_data": "u5:blocked:" + key + ":pause",
-                },
+                    "text": "Actualizar estado",
+                    "callback_data": "u5:engine:" + key,
+                }
             ],
             BACK,
         ],

@@ -40,3 +40,12 @@ Rutas contrastadas en el candidato M2/M5: `src/runner.py`, `src/utils/config.py`
 `tests/test_bot_motor_panel.py` recorre catálogo, disponibilidad, todos los botones desconectados, propietario/chat, entradas desconocidas, idempotencia, conservación de confirmaciones, control general y reinicio. Los tests previos siguen cubriendo caducidad, pausas, exclusión entre consumidores, fallos de SQLite y outbox UNKNOWN.
 
 Ejecutar desde esta carpeta `python3 verify_offline.py`, `python3 verify_package.py` y Ruff0.14.0. Sólo la prueba visual conectada documentada por el operador demuestra recepción de Telegram; los tests offline no acreditan entrega ni control remoto. No se ha reproducido la suite M2/M5 al cambiar sólo este módulo aislado.
+
+
+## Actualización V2.3 — receptor cloud y estados
+
+La nueva instalación aislada está documentada en `TELEGRAM_CLOUD.md`. Permite operación
+continua del receptor sin Mac, estados de sólo lectura del runtime y permiso paper
+US500. Las descripciones anteriores del panel desconectado/local son históricas.
+No incorpora activación real ni ejecutor automático. M6/M8/M9/REST carecen de señal
+específica en el API actual; el panel lo declara como desconocido.

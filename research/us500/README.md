@@ -73,3 +73,12 @@ V2 completa las piezas locales anteriores y su integración offline. La consulta
 Quedan abiertos: permisos Perps de la cuenta, condiciones contractuales y económicas aplicables, datos completos de sesiones abiertas, evaluación independiente, conciliación de cuenta y ejecutor real. El menú se conectó y verificó en Telegram mediante un receptor local aislado; el alcance y la duración se registran en VERIFICACION_V2_1.md. El receptor no inicia una estrategia ni obtiene datos de mercado. No hay evidencia de rentabilidad ni declaración de preparación para dinero real.
 
 Jev no decide señales ni mueve dinero; no se consumió Jev ni Odds durante V2. M2/M5 siguen en su rama separada y fuera de esta integración. Los documentos y logs V1 se conservan como históricos, no como prueba de la nueva revisión.
+
+
+## Actualización V2.3 — receptor cloud y estados
+
+La nueva instalación aislada está documentada en `TELEGRAM_CLOUD.md`. Permite operación
+continua del receptor sin Mac, estados de sólo lectura del runtime y permiso paper
+US500. Las descripciones anteriores del panel desconectado/local son históricas.
+No incorpora activación real ni ejecutor automático. M6/M8/M9/REST carecen de señal
+específica en el API actual; el panel lo declara como desconocido.

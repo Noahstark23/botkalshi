@@ -16,7 +16,8 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-from bot_motor_panel import BACK, disconnected_detail, overview
+from bot_motor_panel import BACK, disconnected_detail, is_runtime_action, overview
+from motor_status_readonly import sanitize_snapshot, unknown_status
 
 
 class ControlError(ValueError):
@@ -89,6 +90,7 @@ class PaperControl:
         confirmation_ttl_ms=60000,
         max_updates=2000,
         max_audit=4000,
+        status_provider=None,
     ):
         if not _integer(owner_user_id) or not _integer(owner_chat_id):
             raise ControlError("INVALID_OWNER_CONFIGURATION")
@@ -96,6 +98,10 @@ class PaperControl:
             raise ControlError("INVALID_CONFIRMATION_TTL")
         if not _integer(max_updates, 1, 10000) or not _integer(max_audit, 1, 20000):
             raise ControlError("INVALID_CONTROL_BUDGET")
+        if status_provider is not None and not callable(status_provider):
+            raise ControlError("INVALID_STATUS_PROVIDER")
+        self._status_provider = status_provider
+        self._transport_available = True
         self.path = Path(path)
         if str(path) == ":memory:" or self.path.is_symlink():
             raise ControlError("INVALID_CONTROL_DATABASE")
@@ -367,7 +373,7 @@ class PaperControl:
                 [{"text": "Activar simulación US500", "callback_data": "u5:enable"}],
                 [
                     {"text": "Pausar US500", "callback_data": "u5:pause"},
-                    {"text": "Estado", "callback_data": "u5:status"},
+                    {"text": "Actualizar estado", "callback_data": "u5:status"},
                 ],
                 BACK,
             ],
@@ -390,18 +396,50 @@ class PaperControl:
             (self.max_audit,),
         )
 
-    def _action(self, db, parsed, now, state):
+    def set_transport_available(self, available):
+        """Receiver-local inhibition; never grants a permission or clears risk."""
+        if type(available) is not bool:
+            raise ControlError("INVALID_TRANSPORT_AVAILABILITY")
+        self._transport_available = available
+
+    def _runtime_status(self, now):
+        if self._status_provider is None:
+            return unknown_status(now, "NOT_CONNECTED")
+        try:
+            return sanitize_snapshot(self._status_provider(now_ms=now), now_ms=now)
+        except Exception:
+            return unknown_status(now, "UNAVAILABLE")
+
+    def _action(self, db, parsed, now, state, runtime=None):
         action = parsed["action"]
+        if not self._transport_available and (
+            action == "u5:enable" or action.startswith("u5:confirm:")
+        ):
+            return [
+                self._message(
+                    "La simulación sigue pausada: hay una respuesta de Telegram sin confirmar. "
+                    "Podés consultar los estados; la habilitación requiere resolver esa incidencia.",
+                    [BACK],
+                )
+            ]
         if action == "u5:panel":
-            return [self._message(*overview(bool(state["enabled"])))]
+            return [
+                self._message(
+                    *overview(bool(state["enabled"]), runtime=runtime, now_ms=now)
+                )
+            ]
         if action.startswith("u5:engine:"):
-            detail = disconnected_detail(action[len("u5:engine:") :])
+            detail = disconnected_detail(
+                action[len("u5:engine:") :], runtime=runtime, now_ms=now
+            )
             if detail is not None:
                 return [self._message(*detail)]
         if action.startswith("u5:blocked:"):
             parts = action.split(":")
             if len(parts) == 4 and parts[3] in ("enable", "pause"):
-                detail = disconnected_detail(parts[2], requested_action=parts[3])
+                detail = disconnected_detail(
+                    parts[2], requested_action=parts[3], runtime=runtime, now_ms=now
+                )
                 if detail is not None:
                     self._audit(
                         db,
@@ -514,11 +552,16 @@ class PaperControl:
         return [self._message("Acción desconocida. Usá /us500.")]
 
     def handle_update(self, update, *, now_ms):
-        """Pure Telegram adapter plus durable control; no external side effects."""
+        """Owner commands and optional read-only runtime views; no real controls."""
         now = _time(now_ms)
         parsed = self._parse(update)
         if parsed is None:
             return []
+        # Authenticate before fetching, and fetch before holding the control
+        # write lock so a slow read-only source cannot block a paper pause.
+        runtime = (
+            self._runtime_status(now) if is_runtime_action(parsed["action"]) else None
+        )
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -546,7 +589,7 @@ class PaperControl:
                         "payload": {"callback_query_id": parsed["callback_id"]},
                     }
                 )
-            responses.extend(self._action(db, parsed, now, state))
+            responses.extend(self._action(db, parsed, now, state, runtime))
             db.execute(
                 "UPDATE paper_control_meta SET last_update_id=?,last_seen_ms=? WHERE id=1",
                 (parsed["update_id"], now),

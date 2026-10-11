@@ -271,6 +271,221 @@ class PaperTelegramTests(unittest.TestCase):
             self.assertEqual(result["error"], "OUTBOX_CAPACITY_EXHAUSTED")
             self.assertEqual(result["next_offset"], 2)
 
+    def test_retention_prunes_only_old_delivered_updates_and_is_idempotent(self):
+        self.poll(*(message(i) for i in range(1, 6)))
+        control_before = self.control.snapshot()
+        sent_before = len(self.transport.sent())
+        result = self.adapter.prune_delivered(keep_updates=2)
+        self.assertEqual(
+            result,
+            {
+                "deleted_updates": 3,
+                "deleted_outbox": 3,
+                "retained_updates": 2,
+                "next_offset": 6,
+            },
+        )
+        self.assertEqual(self.control.snapshot(), control_before)
+        self.assertEqual(len(self.transport.sent()), sent_before)
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT update_id FROM telegram_updates ORDER BY update_id"
+                ).fetchall(),
+                [(4,), (5,)],
+            )
+        second = self.adapter.prune_delivered(keep_updates=2)
+        self.assertEqual(second["deleted_updates"], 0)
+        self.assertEqual(second["deleted_outbox"], 0)
+        self.assertEqual(second["next_offset"], 6)
+
+    def test_forgotten_update_is_ignored_after_restart_even_with_changed_payload(self):
+        confirmation_update = self.enable()
+        self.poll(callback(3, "u5:pause"), now=T + 2)
+        self.poll(message(4), now=T + 3)
+        self.adapter.prune_delivered(keep_updates=1)
+        paused = self.control.snapshot()
+        outbox = self.adapter.snapshot()
+        sent = len(self.transport.sent())
+        self.adapter.close()
+        self.adapter = PaperTelegram(
+            self.path, control=self.control, transport=self.transport
+        )
+        with patch.object(
+            self.control,
+            "handle_update",
+            side_effect=AssertionError("MUST_NOT_REEXECUTE"),
+        ):
+            result = self.poll(confirmation_update, callback(1, "u5:enable"), now=T + 4)
+        self.assertEqual(result["poll_status"], "COMPLETE")
+        self.assertEqual(self.adapter.snapshot(), outbox)
+        self.assertEqual(self.control.snapshot(), paused)
+        self.assertEqual(len(self.transport.sent()), sent)
+        self.assertFalse(paused["paper_enabled"])
+
+    def test_retention_preserves_entire_mixed_update_and_each_non_sent_state(self):
+        self.poll(message(0))
+        states = ("UNKNOWN", "FAILED", "ATTEMPTED", "PENDING")
+        for identifier, state in enumerate(states, 1):
+            self.adapter._persist_update(
+                callback(identifier, "u5:status"), T + identifier
+            )
+            self.adapter._db.execute(
+                "UPDATE telegram_outbox SET status=CASE WHEN ordinal=0 THEN ? ELSE 'SENT' END WHERE update_id=?",
+                (state, identifier),
+            )
+        self.adapter._persist_update(message(5), T + 5)
+        self.adapter._db.execute(
+            "UPDATE telegram_outbox SET status='SENT' WHERE update_id=5"
+        )
+        protected = self.adapter._db.execute(
+            "SELECT * FROM telegram_outbox WHERE update_id BETWEEN 1 AND 4 ORDER BY id"
+        ).fetchall()
+        calls = list(self.transport.calls)
+        result = self.adapter.prune_delivered(keep_updates=1)
+        self.assertEqual(result["deleted_updates"], 1)
+        self.assertEqual(result["deleted_outbox"], 1)
+        self.assertEqual(result["retained_updates"], 5)
+        self.assertEqual(
+            self.adapter._db.execute(
+                "SELECT * FROM telegram_outbox WHERE update_id BETWEEN 1 AND 4 ORDER BY id"
+            ).fetchall(),
+            protected,
+        )
+        self.assertEqual(self.transport.calls, calls)
+
+    def test_retention_ignored_updates_with_no_response_are_reclaimable(self):
+        before = self.control.snapshot()
+        self.poll(*(message(i, owner=999) for i in range(1, 5)))
+        result = self.adapter.prune_delivered(keep_updates=1)
+        self.assertEqual(result["deleted_updates"], 3)
+        self.assertEqual(result["deleted_outbox"], 0)
+        self.assertEqual(result["next_offset"], 5)
+        self.assertEqual(self.control.snapshot(), before)
+        self.assertEqual(self.transport.sent(), [])
+
+    def test_explicit_retention_frees_capacity_without_removing_unconfirmed_rows(self):
+        with (
+            patch("us500_telegram.MAX_UPDATES", 3),
+            patch("us500_telegram.MAX_OUTBOX", 6),
+        ):
+            self.poll(message(1), message(2), message(3))
+            self.adapter.prune_delivered(keep_updates=1)
+            result = self.poll(message(4), message(5), now=T + 1)
+            self.assertEqual(result["poll_status"], "COMPLETE")
+            self.assertEqual(result["saved_updates"], 3)
+            self.adapter._db.execute("UPDATE telegram_outbox SET status='UNKNOWN'")
+            retained = self.adapter.prune_delivered(keep_updates=1)
+            self.assertEqual(retained["deleted_updates"], 0)
+            stopped = self.poll(message(6), now=T + 2)
+            self.assertEqual(stopped["error"], "UPDATE_CAPACITY_EXHAUSTED")
+            self.assertEqual(stopped["outbox_counts"], {"UNKNOWN": 3})
+            self.assertTrue(stopped["paper_pause_confirmed"])
+
+    def test_retention_never_deletes_at_or_ahead_of_cursor(self):
+        self.poll(message(1), message(2), message(3))
+        self.adapter._db.execute("UPDATE telegram_meta SET next_offset=2 WHERE id=1")
+        result = self.adapter.prune_delivered(keep_updates=1)
+        self.assertEqual(result["deleted_updates"], 1)
+        self.assertEqual(result["retained_updates"], 2)
+        self.assertEqual(result["next_offset"], 2)
+        self.assertEqual(
+            self.adapter._db.execute(
+                "SELECT update_id FROM telegram_updates ORDER BY update_id"
+            ).fetchall(),
+            [(2,), (3,)],
+        )
+
+    def test_retention_failure_rolls_back_both_tables_and_can_be_repeated(self):
+        self.poll(message(1), message(2), message(3))
+        before = self.adapter.snapshot()
+        self.adapter._db.execute(
+            "CREATE TRIGGER retention_fail BEFORE DELETE ON telegram_updates BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        )
+        with self.assertRaisesRegex(TelegramError, "OUTBOX_RETENTION_FAILED"):
+            self.adapter.prune_delivered(keep_updates=1)
+        self.assertEqual(self.adapter.snapshot(), before)
+        self.adapter._db.execute("DROP TRIGGER retention_fail")
+        self.adapter.close()
+        self.adapter = PaperTelegram(
+            self.path, control=self.control, transport=self.transport
+        )
+        self.assertEqual(self.adapter.snapshot(), before)
+        self.assertEqual(
+            self.adapter.prune_delivered(keep_updates=1)["deleted_updates"], 2
+        )
+
+    def test_retention_rejects_invalid_limit_or_changed_identity_without_mutation(self):
+        self.poll(message(1), message(2))
+        before = self.adapter.snapshot()
+        for limit in (0, -1, True, 500.0, "500", None, 2001):
+            with (
+                self.subTest(limit=limit),
+                self.assertRaisesRegex(TelegramError, "INVALID_RETENTION_LIMIT"),
+            ):
+                self.adapter.prune_delivered(keep_updates=limit)
+        current = self.control.snapshot()
+        with patch.object(
+            self.control, "snapshot", return_value={**current, "control_id": "f" * 32}
+        ):
+            with self.assertRaisesRegex(TelegramError, "OUTBOX_BINDING_CONFLICT"):
+                self.adapter.prune_delivered(keep_updates=1)
+        self.assertEqual(self.adapter.snapshot(), before)
+        binding = self.adapter._db.execute(
+            "SELECT binding FROM telegram_meta WHERE id=1"
+        ).fetchone()[0]
+        self.adapter._db.execute(
+            "UPDATE telegram_meta SET binding='foreign' WHERE id=1"
+        )
+        with self.assertRaisesRegex(TelegramError, "OUTBOX_BINDING_CONFLICT"):
+            self.adapter.prune_delivered(keep_updates=1)
+        self.adapter._db.execute(
+            "UPDATE telegram_meta SET binding=? WHERE id=1", (binding,)
+        )
+        self.assertEqual(self.adapter.snapshot(), before)
+
+    def test_retention_interrupted_before_commit_rolls_back_and_releases_transaction(
+        self,
+    ):
+        self.poll(message(1), message(2), message(3))
+        before = self.adapter.snapshot()
+        with patch.object(
+            self.adapter, "_check_file", side_effect=[None, KeyboardInterrupt()]
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.adapter.prune_delivered(keep_updates=1)
+        self.assertFalse(self.adapter._db.in_transaction)
+        self.assertEqual(self.adapter.snapshot(), before)
+        self.assertEqual(
+            self.adapter.prune_delivered(keep_updates=1)["deleted_updates"], 2
+        )
+
+    def test_rejected_callback_ack_is_retained_without_retry_and_new_updates_can_arrive(
+        self,
+    ):
+        original = self.transport.call
+
+        def reject_callback_only(method, payload):
+            if method == "answerCallbackQuery":
+                self.transport.calls.append((method, copy.deepcopy(payload)))
+                raise TelegramRejected("expired callback " + FAKE_TOKEN)
+            return original(method, payload)
+
+        with patch.object(self.transport, "call", reject_callback_only):
+            first = self.poll(callback(1, "u5:pause"))
+            self.assertEqual(first["outbox_counts"], {"FAILED": 1, "SENT": 1})
+            second = self.poll(message(2), now=T + 1)
+        self.assertEqual(second["poll_status"], "COMPLETE")
+        self.assertEqual(second["next_offset"], 3)
+        self.assertEqual(second["outbox_counts"], {"FAILED": 1, "SENT": 2})
+        self.assertEqual(
+            self.adapter.prune_delivered(keep_updates=1)["deleted_updates"], 0
+        )
+        sent = len(self.transport.sent())
+        self.poll(callback(1, "u5:pause"), now=T + 2)
+        self.assertEqual(len(self.transport.sent()), sent)
+        self.assertEqual(self.adapter.snapshot()["outbox_counts"]["FAILED"], 1)
+
     def test_existing_database_and_wrong_bot_are_rejected(self):
         before = (self.root / "control.sqlite").read_bytes()
         with self.assertRaisesRegex(TelegramError, "FOREIGN_OR_INCOMPLETE"):
