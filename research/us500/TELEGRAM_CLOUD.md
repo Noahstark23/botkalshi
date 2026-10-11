@@ -69,3 +69,8 @@ respaldar el estado actual del cloud y migrarlo primero. No ejecutar ambos.
 No reiniciar ni tocar `botkalshi-runtime`, `botkalshi-research` o Coolify.
 
 Referencia de entrega/cursor: [Telegram Bot API getUpdates](https://core.telegram.org/bots/api#getupdates).
+
+Validación del host: systemd255 entrega credenciales descifradas root:grupo-del-servicio
+con modo0440. El lector admite esa combinación exacta; rechaza otro grupo, permisos
+públicos o escritura por grupo. El primer arranque falló antes del polling por una
+validación que sólo admitía0400/0600; se corrigió con regresiones específicas.

@@ -30,10 +30,15 @@ def load_credential(path, *, bot_id, owner_chat_id, connection_factory=None):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor, "rb") as source:
         info = os.fstat(source.fileno())
+        mode = stat.S_IMODE(info.st_mode)
+        private_file = info.st_uid in {0, os.getuid()} and mode in {0o400, 0o600}
+        # systemd 255 exposes encrypted credentials as root:<service-group>
+        # 0440 on its private read-only credentials mount. Do not broaden this
+        # to arbitrary group-readable or writable secret files.
+        systemd_file = info.st_uid == 0 and info.st_gid == os.getgid() and mode == 0o440
         if (
             not stat.S_ISREG(info.st_mode)
-            or info.st_uid not in {0, os.getuid()}
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or not (private_file or systemd_file)
             or info.st_size > 256
         ):
             raise ValueError("CREDENTIAL_UNAVAILABLE")

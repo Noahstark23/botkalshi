@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from us500_control import PaperControl
@@ -71,6 +72,29 @@ class CloudTests(unittest.TestCase):
         self.path = link
         with self.assertRaises(OSError):
             self.read()
+        self.assertEqual(self.calls, [])
+
+    def test_systemd_root_service_group_readonly_credential(self):
+        metadata = SimpleNamespace(
+            st_mode=0o100440, st_uid=0, st_gid=os.getgid(), st_size=len(TOKEN)
+        )
+        with patch("os.fstat", return_value=metadata):
+            self.assertEqual(self.read(), TOKEN)
+
+    def test_other_group_or_writable_group_is_rejected(self):
+        for mode, uid, gid in (
+            (0o100440, 0, os.getgid() + 1),
+            (0o100640, 0, os.getgid()),
+            (0o100444, 0, os.getgid()),
+        ):
+            metadata = SimpleNamespace(
+                st_mode=mode, st_uid=uid, st_gid=gid, st_size=len(TOKEN)
+            )
+            with (
+                patch("os.fstat", return_value=metadata),
+                self.assertRaises(ValueError),
+            ):
+                self.read()
         self.assertEqual(self.calls, [])
 
     def test_wrong_bot_and_unknown_or_existing_webhook_rejected(self):
