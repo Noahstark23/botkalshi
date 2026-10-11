@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from motor_status_readonly import ACTIVITY_KINDS, sanitize_snapshot, unknown_status
+from runtime_telemetry_contract import parse_runtime_telemetry
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,47 @@ def _activity(status, key=None):
     )
 
 
+def _telemetry(status, now_ms, key=None):
+    parsed = parse_runtime_telemetry(status.get("telemetry"), now_ms=now_ms)
+    if not parsed["available"]:
+        reason = status.get("telemetry_reason", parsed["reason"])
+        label = {
+            "NOT_INSTALLED": "el runtime todavía no publica el detalle por componente",
+            "STALE": "la observación por componente está vencida",
+            "INVALID": "la observación por componente fue rechazada",
+        }.get(reason, "sin observación por componente")
+        return "Telemetría individual: " + label + "."
+    source = parsed["source"]
+    if key is None:
+        return (
+            "Telemetría individual disponible en la ficha de cada motor. "
+            f"Fuente {source['commit_sha'][:12]} · instancia {source['instance_id'][:8]}."
+        )
+    flags = parsed["motors"][key]
+    lines = [
+        "Observación por componente:",
+        f"Configurado: {_bool(flags['configured'])}; entradas: {_bool(flags['execution_entry_configured'])}; salidas: {_bool(flags['execution_sell_configured'])}.",
+    ]
+    for name, component in parsed["components"].items():
+        if component["motor"] != key:
+            continue
+        if component["task_model"] == "callback":
+            lines.append(f"{name}: callback dependiente, sin tarea propia.")
+        else:
+            lines.append(f"{name}: tarea {_bool(component['task_running']['value'])}.")
+        returned = component["tick_returned"]
+        age = (
+            str(max(0, now_ms - returned["observed_at_ms"]) // 1000) + " s"
+            if returned["observed_at_ms"] is not None
+            else "sin registro"
+        )
+        lines.append(f"Último retorno: {_bool(returned['value'])}; antigüedad {age}.")
+    lines.append(
+        "Una tarea viva o un retorno no prueban una operación ni una evaluación exitosa."
+    )
+    return "\n".join(lines)
+
+
 def overview(enabled, *, runtime=None, now_ms=None):
     """Configured flags and reported tasks are separate; none grants control."""
     status = _snapshot(runtime, now_ms)
@@ -196,7 +238,8 @@ def overview(enabled, *, runtime=None, now_ms=None):
         + _activity(status)
         + "\n\nUS500: permiso de simulación "
         + ("habilitado" if enabled else "pausado")
-        + ".\nConfiguración no demuestra ejecución. Sólo M5 expone tarea en marcha."
+        + ".\nConfiguración no demuestra ejecución.\n"
+        + _telemetry(status, now_ms)
         + "\nEste panel no puede activar ni pausar motores reales. "
         + "Habilitar US500 permite replays locales; no inicia una estrategia automática.",
         rows,
@@ -208,7 +251,13 @@ def disconnected_detail(key, *, requested_action=None, runtime=None, now_ms=None
     status = _snapshot(runtime, now_ms)
     if key == "all":
         title = "Estado general del bot"
-        description = _global(status) + "\n\n" + _activity(status)
+        description = (
+            _global(status)
+            + "\n\n"
+            + _activity(status)
+            + "\n\n"
+            + _telemetry(status, now_ms)
+        )
         contract = "Las banderas configuradas no prueban que haya operaciones ni tareas ejecutándose."
     else:
         motor = _BY_KEY.get(key)
@@ -242,10 +291,11 @@ def disconnected_detail(key, *, requested_action=None, runtime=None, now_ms=None
             description += "La bandera de detección de M1 no demuestra ejecución.\n"
         if key == "rest":
             description += "La captura general no demuestra que la tarea REST de arbitraje esté en marcha.\n"
-        if key in ("m6", "m8", "m9"):
+        if key in ("m6", "m8", "m9") and status["telemetry"] is None:
             description += "El runtime no expone configuración ni tarea actual de este observador.\n"
         if key in ACTIVITY_KINDS:
             description += "\n" + _activity(status, key) + "\n"
+        description += "\n" + _telemetry(status, now_ms, key) + "\n"
         description += "\n" + motor.description
         contract = motor.pause_contract
     acknowledgement = ""

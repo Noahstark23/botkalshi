@@ -1,4 +1,11 @@
-# Revisión US500 V2.2.1 en GitHub
+# Revisión US500 V2.5 en GitHub
+
+Estado actual: la rama de revisión contiene un recolector de ventanas públicas
+acotadas y el contrato de telemetría individual. Revisar `us500/VERIFICACION_V2_5.md`,
+`us500/SESION_COMPLETA.md` y `us500/TELEMETRIA_PENDIENTE.md` primero. Los recuentos
+y estados V2.2.1 que siguen documentan antecedentes, no la entrega actual.
+El panel consume un bloque opcional validado; no se instalaron hooks en el runtime
+financiero. Ninguna de estas piezas concede activación real.
 
 Rama: `codex/us500-paper-v1-20261011`. Base main: `9bf685d345844d12eb5e46c17aad0bbae5462d72`. V1 está en `0fd3bf74551ca2586add9fa915b54c8d555e073f`; revisar el diff posterior para V2.
 

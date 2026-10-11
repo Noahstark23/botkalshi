@@ -1,4 +1,17 @@
-# US500 V2.2.1 — simulación, sesiones y panel de motores
+# US500 V2.5 — captura pública acotada y telemetría explícita
+
+La revisión actual añade `us500_window_capture.py`: una ventana inmutable de hasta
+26 horas, un intento por minuto, presupuesto durable, recuperación sin repetir
+slots y evidencia con hashes. Su servicio aislado no recibe credenciales ni envía
+órdenes. Ver `SESION_COMPLETA.md` y `deploy/US500_DATA.md`. Instalar un recolector
+no equivale a haber obtenido una sesión completa; se verifica después con horarios,
+huecos y validez de las observaciones.
+
+Telegram tiene lectura de estados y conteos de señales, sin activación real.
+El nuevo contrato de telemetría por componente está preparado y su parser conectado
+al panel; los hooks financieros **no están instalados**. Sin el bloque opcional
+`motor_telemetry` siguen desconocidos los datos que el runtime no publica.
+Ver `TELEMETRIA_PENDIENTE.md`. Los apartados V2.2/V2.3 siguientes son históricos.
 
 Candidato de revisión del 11 de octubre de 2026. Circuito implementado: capturas públicas → validación → hipótesis momentum congelada → ejecución ficticia con una captura posterior → ledger persistente → informe y reinicio. Incluye controles de Telegram **para US500 paper**. No contiene transporte de órdenes reales, credenciales Kalshi, integración con el bot deportivo ni cambios de producción.
 

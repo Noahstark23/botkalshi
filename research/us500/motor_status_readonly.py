@@ -6,12 +6,15 @@ The reader is opt-in and has no network effects until explicitly called.
 
 from __future__ import annotations
 
+import copy
 import http.client
 import json
 import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+
+from runtime_telemetry_contract import parse_runtime_telemetry
 
 SCHEMA = "bot-runtime-readonly-v1"
 MAX_BYTES = 65536
@@ -158,6 +161,8 @@ def unknown_status(now_ms, reason="UNAVAILABLE"):
         "flags": {key: None for key in FLAG_KEYS},
         "motors": {key: {field: None for field in MOTOR_FIELDS} for key in MOTOR_KEYS},
         "activity": unknown_activity(reason),
+        "telemetry": None,
+        "telemetry_reason": "NOT_INSTALLED",
         "real_controls_available": False,
     }
 
@@ -216,6 +221,15 @@ def sanitize_snapshot(value, *, now_ms):
             result["motors"][key] = {field: None for field in MOTOR_FIELDS}
     result["motors"]["m1"]["execution_configured"] = None
     result["activity"] = sanitize_activity(value.get("activity"), now_ms=now_ms)
+    telemetry = value.get("telemetry")
+    parsed = parse_runtime_telemetry(telemetry, now_ms=now_ms)
+    result["telemetry_reason"] = parsed["reason"]
+    if parsed["available"]:
+        # Strict parser has validated every key and primitive. Retain that wire
+        # representation so a later card can recheck freshness at its own time.
+        result["telemetry"] = copy.deepcopy(telemetry)
+    elif telemetry is None and value.get("telemetry_reason") in ("INVALID", "STALE"):
+        result["telemetry_reason"] = value["telemetry_reason"]
     return result
 
 
@@ -261,6 +275,7 @@ def status_from_responses(health, status, *, now_ms):
     result["motors"]["m5"].update(
         running=m5.get("task_running"), runtime_enabled=m5.get("enabled")
     )
+    result["telemetry"] = status.get("motor_telemetry")
     return sanitize_snapshot(result, now_ms=now_ms)
 
 
