@@ -1,0 +1,67 @@
+{
+  "schema": "us500-public-history-v1",
+  "environment": "public",
+  "ticker": "KXUS500PERP",
+  "resource": "funding",
+  "requested_range_ms": {
+    "start": 1791742829661,
+    "end": 1791746429661
+  },
+  "period_minutes": null,
+  "max_pages": 1,
+  "requests_made": 1,
+  "pages": [
+    {
+      "url": "https://external-api.kalshi.com/trade-api/v2/margin/funding_rates/historical?ticker=KXUS500PERP&start_ts=1791742828&end_ts=1791746431",
+      "window_start_ms": 1791742829661,
+      "window_end_ms": 1791746429661,
+      "cursor_in": "",
+      "requested_at_ms": 1791746430665,
+      "received_at_ms": 1791746430910,
+      "http_status": 200,
+      "raw_base64": "eyJmdW5kaW5nX3JhdGVzIjpbXX0=",
+      "raw_sha256": "0e65346746a441ab2d65363c554650dd6bfdfb12e5e98903499c5853145de478",
+      "canonical_body_sha256": "0e65346746a441ab2d65363c554650dd6bfdfb12e5e98903499c5853145de478",
+      "body": {
+        "funding_rates": []
+      }
+    }
+  ],
+  "capture_stop_reason": null,
+  "authenticated": false,
+  "execution_available": false,
+  "source_authenticity_verified": false,
+  "analysis": {
+    "schema": "us500-history-analysis-v1",
+    "valid_evidence": true,
+    "retrieval_complete": true,
+    "history_sufficient": false,
+    "source_authenticity_verified": false,
+    "strategy_validated": false,
+    "execution_available": false,
+    "errors": [],
+    "records": [],
+    "resource": "funding",
+    "ticker": "KXUS500PERP",
+    "requested_range_ms": {
+      "start": 1791742829661,
+      "end": 1791746429661
+    },
+    "observed_range_ms": null,
+    "record_count": 0,
+    "identical_duplicates": 0,
+    "excluded_outside_window": 0,
+    "empty_pages": 1,
+    "completed_windows": 1,
+    "requested_windows": 1,
+    "pagination_exhausted": true,
+    "request_count": 1,
+    "coverage_state": "EMPTY",
+    "coverage_note": "HTTP success and exhausted pagination do not prove retention, complete market history, or an independent sample.",
+    "cadence": {
+      "expected_cadence_verified": false,
+      "gap_count": null,
+      "interpretation": "No documented guaranteed row cadence; gaps cannot be inferred from silence."
+    }
+  }
+}

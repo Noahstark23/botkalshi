@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "restart_equal": true,
+  "initial_cash_usd": "100",
+  "final_cash_usd": "98.6643",
+  "net_pnl_usd": "-1.3357",
+  "fees_usd": "0.1893",
+  "funding_usd": "0",
+  "costs_usd": "0.010",
+  "residual_position_quantity": "0",
+  "reserved_margin_usd": "0",
+  "events": 42,
+  "actual_orders": 0,
+  "strategy_validated": false,
+  "execution_available": false
+}

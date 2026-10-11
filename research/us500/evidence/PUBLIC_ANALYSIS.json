@@ -1,0 +1,11 @@
+{
+  "schema": "us500-analysis-v1",
+  "evaluated_at_ms": 1791746430177,
+  "execution_available": false,
+  "strategy_validated": false,
+  "atomic_snapshot": false,
+  "orderbook_exchange_timestamp_available": false,
+  "source_authenticity_verified": false,
+  "data_state": "INCOMPLETE_OR_UNUSABLE",
+  "reason": "MARKET_CLOSED"
+}

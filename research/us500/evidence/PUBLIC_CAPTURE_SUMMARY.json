@@ -1,0 +1,121 @@
+{
+  "started_at_utc": "2026-10-11T19:20:29.661140+00:00",
+  "max_market_get_requests": 5,
+  "account_requests": 0,
+  "orders": 0,
+  "credentials_loaded": false,
+  "odds_jev_calls": 0,
+  "resources": {
+    "snapshot": {
+      "data_state": "INCOMPLETE_OR_UNUSABLE",
+      "reason": "MARKET_CLOSED"
+    },
+    "trades": {
+      "schema": "us500-history-analysis-v1",
+      "valid_evidence": true,
+      "retrieval_complete": true,
+      "history_sufficient": false,
+      "source_authenticity_verified": false,
+      "strategy_validated": false,
+      "execution_available": false,
+      "errors": [],
+      "resource": "trades",
+      "ticker": "KXUS500PERP",
+      "requested_range_ms": {
+        "start": 1791742829661,
+        "end": 1791746429661
+      },
+      "observed_range_ms": null,
+      "record_count": 0,
+      "identical_duplicates": 0,
+      "excluded_outside_window": 0,
+      "empty_pages": 1,
+      "completed_windows": 1,
+      "requested_windows": 1,
+      "pagination_exhausted": true,
+      "request_count": 1,
+      "coverage_state": "EMPTY",
+      "coverage_note": "HTTP success and exhausted pagination do not prove retention, complete market history, or an independent sample.",
+      "cadence": {
+        "expected_cadence_verified": false,
+        "gap_count": null,
+        "interpretation": "No documented guaranteed row cadence; gaps cannot be inferred from silence."
+      }
+    },
+    "candles": {
+      "schema": "us500-history-analysis-v1",
+      "valid_evidence": true,
+      "retrieval_complete": true,
+      "history_sufficient": false,
+      "source_authenticity_verified": false,
+      "strategy_validated": false,
+      "execution_available": false,
+      "errors": [],
+      "resource": "candles",
+      "ticker": "KXUS500PERP",
+      "requested_range_ms": {
+        "start": 1791742829661,
+        "end": 1791746429661
+      },
+      "observed_range_ms": null,
+      "record_count": 0,
+      "identical_duplicates": 0,
+      "excluded_outside_window": 0,
+      "empty_pages": 1,
+      "completed_windows": 1,
+      "requested_windows": 1,
+      "pagination_exhausted": true,
+      "request_count": 1,
+      "coverage_state": "EMPTY",
+      "coverage_note": "HTTP success and exhausted pagination do not prove retention, complete market history, or an independent sample.",
+      "cadence": {
+        "expected_minute_boundaries": 60,
+        "missing_candles": 60,
+        "gap_ranges": [
+          {
+            "start_ms": 1791742860000,
+            "end_ms": 1791746400000,
+            "missing_candles": 60
+          }
+        ],
+        "gap_range_count": 1,
+        "gap_ranges_truncated": false,
+        "calendar_verified": false,
+        "interpretation": "Missing rows may be closure, no activity, or missing data; not imputed."
+      },
+      "candles_without_trade_prices": 0
+    },
+    "funding": {
+      "schema": "us500-history-analysis-v1",
+      "valid_evidence": true,
+      "retrieval_complete": true,
+      "history_sufficient": false,
+      "source_authenticity_verified": false,
+      "strategy_validated": false,
+      "execution_available": false,
+      "errors": [],
+      "resource": "funding",
+      "ticker": "KXUS500PERP",
+      "requested_range_ms": {
+        "start": 1791742829661,
+        "end": 1791746429661
+      },
+      "observed_range_ms": null,
+      "record_count": 0,
+      "identical_duplicates": 0,
+      "excluded_outside_window": 0,
+      "empty_pages": 1,
+      "completed_windows": 1,
+      "requested_windows": 1,
+      "pagination_exhausted": true,
+      "request_count": 1,
+      "coverage_state": "EMPTY",
+      "coverage_note": "HTTP success and exhausted pagination do not prove retention, complete market history, or an independent sample.",
+      "cadence": {
+        "expected_cadence_verified": false,
+        "gap_count": null,
+        "interpretation": "No documented guaranteed row cadence; gaps cannot be inferred from silence."
+      }
+    }
+  }
+}

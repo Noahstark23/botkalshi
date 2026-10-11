@@ -1,0 +1,688 @@
+{
+  "schema": "us500-paper-session-v1",
+  "run_id": "synthetic-example-v1",
+  "mode": "paper",
+  "ledger": {
+    "initial_cash_usd": "100",
+    "initial_margin_rate": "1",
+    "maintenance_margin_rate": "0.5",
+    "fee_bps": "12",
+    "fee_quantum_usd": "0.0001",
+    "max_notional_usd": "50",
+    "max_loss_usd": "10",
+    "max_gap_ms": 5000,
+    "quantity_step": "1",
+    "tick_size": "0.0001"
+  },
+  "strategy": {
+    "name": "momentum-v1",
+    "lookback": 2,
+    "threshold_bps": "10",
+    "quantity": "2",
+    "max_spread_bps": "30",
+    "slippage_bps": "1",
+    "assumptions_note": "Synthetic prices, fictitious USD100, full-notional initial margin, fixed hypothetical rates. Zero funding is explicitly assumed over this nine-second fixture; fees and USD0.001 per observation are invented cost parameters for tests, not account terms."
+  },
+  "frames": [
+    {
+      "at_ms": 1791744840000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744839980,
+            "received_at_ms": 1791744840000,
+            "canonical_body_sha256": "4ddfda1b28144b7d1bc2356f7d04785a12d61176864034e705d79d12a4103aa5",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13",
+                  "ts_ms": 1791744840000
+                },
+                "liquidation_mark_price": {
+                  "price": "13",
+                  "ts_ms": 1791744840000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744839980,
+            "received_at_ms": 1791744840000,
+            "canonical_body_sha256": "81225e6375bebd4ba6178df106089ef647deedb6ab9c755cb3067ea778943027",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "12.99",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.01",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744841000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744840980,
+            "received_at_ms": 1791744841000,
+            "canonical_body_sha256": "375b50b6ae84cb18bd399a6e80313f74daae9a78ae5b130872ed7aa5032ff93f",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.1",
+                  "ts_ms": 1791744841000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.1",
+                  "ts_ms": 1791744841000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744840980,
+            "received_at_ms": 1791744841000,
+            "canonical_body_sha256": "3497f084796e076cbc6cf0fa0648966796841c200a965dfbbcb166e074b57564",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.09",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.11",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744842000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744841980,
+            "received_at_ms": 1791744842000,
+            "canonical_body_sha256": "c1b53269c20510431dd2aa19799634fd702bbd0a6e5a7aa980d08b97d803ca40",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744842000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744842000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744841980,
+            "received_at_ms": 1791744842000,
+            "canonical_body_sha256": "c75096f49973372f3a3e0e5dd1da8d37e7de8be66efd00efa592119692d44f34",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.19",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.21",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744843000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744842980,
+            "received_at_ms": 1791744843000,
+            "canonical_body_sha256": "fc477d0bc01571bdb0f61b58a3c9f52dc94b38309f39405bab31be2576c9a020",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.1",
+                  "ts_ms": 1791744843000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.1",
+                  "ts_ms": 1791744843000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744842980,
+            "received_at_ms": 1791744843000,
+            "canonical_body_sha256": "3497f084796e076cbc6cf0fa0648966796841c200a965dfbbcb166e074b57564",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.09",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.11",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744844000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744843980,
+            "received_at_ms": 1791744844000,
+            "canonical_body_sha256": "9a3d5bd22df2aad7faf48f939cf80298a6738820b03ce125d0eb8cb21b53c450",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13",
+                  "ts_ms": 1791744844000
+                },
+                "liquidation_mark_price": {
+                  "price": "13",
+                  "ts_ms": 1791744844000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744843980,
+            "received_at_ms": 1791744844000,
+            "canonical_body_sha256": "81225e6375bebd4ba6178df106089ef647deedb6ab9c755cb3067ea778943027",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "12.99",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.01",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744845000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744844980,
+            "received_at_ms": 1791744845000,
+            "canonical_body_sha256": "9f233e4824b8c922d4c02c9d9b8c7cb489ce5671d7c8ac40f8b65bcff8372396",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "12.9",
+                  "ts_ms": 1791744845000
+                },
+                "liquidation_mark_price": {
+                  "price": "12.9",
+                  "ts_ms": 1791744845000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744844980,
+            "received_at_ms": 1791744845000,
+            "canonical_body_sha256": "bea16cd80d023244aac6fdf1cd3aabfc5cdfbf3d8434140d95f7f3287e81d331",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "12.89",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "12.91",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744846000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744845980,
+            "received_at_ms": 1791744846000,
+            "canonical_body_sha256": "5bb67d06373f269306f6d3d563854a7a29e2df3c2fbe8ba47f156ca054d9b203",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.1",
+                  "ts_ms": 1791744846000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.1",
+                  "ts_ms": 1791744846000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744845980,
+            "received_at_ms": 1791744846000,
+            "canonical_body_sha256": "3497f084796e076cbc6cf0fa0648966796841c200a965dfbbcb166e074b57564",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.09",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.11",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744847000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744846980,
+            "received_at_ms": 1791744847000,
+            "canonical_body_sha256": "50ddf88b1631825de014861bb115d8558eb3e2ceb06dc5e27f4648c13109c9f5",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744847000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744847000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744846980,
+            "received_at_ms": 1791744847000,
+            "canonical_body_sha256": "c75096f49973372f3a3e0e5dd1da8d37e7de8be66efd00efa592119692d44f34",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.19",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.21",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744848000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744847980,
+            "received_at_ms": 1791744848000,
+            "canonical_body_sha256": "c830f4b4ec87f75fe5858244387d3a0e21343f7d492d49ca4423d041e1f4edd8",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744848000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744848000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744847980,
+            "received_at_ms": 1791744848000,
+            "canonical_body_sha256": "c75096f49973372f3a3e0e5dd1da8d37e7de8be66efd00efa592119692d44f34",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.19",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.21",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    },
+    {
+      "at_ms": 1791744849000,
+      "snapshot": {
+        "schema": "us500-public-snapshot-v1",
+        "environment": "demo",
+        "ticker": "KXUS500PERP1",
+        "synthetic": true,
+        "authenticated": false,
+        "atomic_snapshot": false,
+        "observations": {
+          "market": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1",
+            "http_status": 200,
+            "requested_at_ms": 1791744848980,
+            "received_at_ms": 1791744849000,
+            "canonical_body_sha256": "7d66d73056f4ce359dac7672adf2a299a70b5cd59e2a0997c5f7c72084bf33b4",
+            "body": {
+              "market": {
+                "ticker": "KXUS500PERP1",
+                "status": "active",
+                "schedule": {
+                  "is_open": true
+                },
+                "tick_size": "0.0001",
+                "contract_size": "0.001000",
+                "underlying_multiplier": "1.000000",
+                "fractional_trading_enabled": false,
+                "reference_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744849000
+                },
+                "liquidation_mark_price": {
+                  "price": "13.2",
+                  "ts_ms": 1791744849000
+                }
+              }
+            }
+          },
+          "orderbook": {
+            "url": "https://external-api.demo.kalshi.co/trade-api/v2/margin/markets/KXUS500PERP1/orderbook?depth=20",
+            "http_status": 200,
+            "requested_at_ms": 1791744848980,
+            "received_at_ms": 1791744849000,
+            "canonical_body_sha256": "c75096f49973372f3a3e0e5dd1da8d37e7de8be66efd00efa592119692d44f34",
+            "body": {
+              "orderbook": {
+                "bids": [
+                  [
+                    "13.19",
+                    "10"
+                  ]
+                ],
+                "asks": [
+                  [
+                    "13.21",
+                    "10"
+                  ]
+                ]
+              }
+            }
+          }
+        }
+      },
+      "funding_cashflow_usd": "0",
+      "infrastructure_cost_usd": "0.001"
+    }
+  ]
+}

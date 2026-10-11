@@ -1,0 +1,125 @@
+{
+  "label": "EJEMPLO SINTETICO; no son cotizaciones observadas ni una estrategia",
+  "entry": {
+    "schema": "us500-public-snapshot-v1",
+    "environment": "public",
+    "ticker": "KXUS500PERP",
+    "synthetic": true,
+    "atomic_snapshot": false,
+    "authenticated": false,
+    "observations": {
+      "market": {
+        "url": "https://external-api.kalshi.com/trade-api/v2/margin/markets/KXUS500PERP",
+        "http_status": 200,
+        "requested_at_ms": 1791471599900,
+        "received_at_ms": 1791471600000,
+        "canonical_body_sha256": "055b65ddb45c5a73922591c2d8b503ee9bc224604a1efd9eb45ab0f28ac667db",
+        "body": {
+          "market": {
+            "ticker": "KXUS500PERP",
+            "status": "active",
+            "schedule": {
+              "is_open": true
+            },
+            "tick_size": "0.0001",
+            "contract_size": "0.001000",
+            "underlying_multiplier": "1.000000",
+            "fractional_trading_enabled": false,
+            "reference_price": {
+              "price": "14.0000",
+              "ts_ms": 1791471599500
+            }
+          }
+        }
+      },
+      "orderbook": {
+        "url": "https://external-api.kalshi.com/trade-api/v2/margin/markets/KXUS500PERP/orderbook?depth=20",
+        "http_status": 200,
+        "requested_at_ms": 1791471599900,
+        "received_at_ms": 1791471600000,
+        "canonical_body_sha256": "2519db4d0240e14d2d58940b410a3dffcc8c4bd561ca55b00aef097fe44abc47",
+        "body": {
+          "orderbook": {
+            "bids": [
+              [
+                "14.0000",
+                "10"
+              ]
+            ],
+            "asks": [
+              [
+                "14.0100",
+                "10"
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "exit": {
+    "schema": "us500-public-snapshot-v1",
+    "environment": "public",
+    "ticker": "KXUS500PERP",
+    "synthetic": true,
+    "atomic_snapshot": false,
+    "authenticated": false,
+    "observations": {
+      "market": {
+        "url": "https://external-api.kalshi.com/trade-api/v2/margin/markets/KXUS500PERP",
+        "http_status": 200,
+        "requested_at_ms": 1791475199900,
+        "received_at_ms": 1791475200000,
+        "canonical_body_sha256": "561e1e4f4d5f1b24662c66fd5111ee419d63e7fc6d1cc04aee51fa0c99c42996",
+        "body": {
+          "market": {
+            "ticker": "KXUS500PERP",
+            "status": "active",
+            "schedule": {
+              "is_open": true
+            },
+            "tick_size": "0.0001",
+            "contract_size": "0.001000",
+            "underlying_multiplier": "1.000000",
+            "fractional_trading_enabled": false,
+            "reference_price": {
+              "price": "14.0000",
+              "ts_ms": 1791475199500
+            }
+          }
+        }
+      },
+      "orderbook": {
+        "url": "https://external-api.kalshi.com/trade-api/v2/margin/markets/KXUS500PERP/orderbook?depth=20",
+        "http_status": 200,
+        "requested_at_ms": 1791475199900,
+        "received_at_ms": 1791475200000,
+        "canonical_body_sha256": "2554fa21c7db6490b4c51e76b8c367ce92145e06b1dcfe7ccc963a82dfc2ab36",
+        "body": {
+          "orderbook": {
+            "bids": [
+              [
+                "14.0300",
+                "10"
+              ]
+            ],
+            "asks": [
+              [
+                "14.0400",
+                "10"
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "assumptions": {
+    "direction": "long",
+    "quantity": "2",
+    "fee_bps_per_leg": "12",
+    "fee_quantum_usd": "0.0001",
+    "slippage_bps_per_leg": "1",
+    "funding_cashflow_usd": "-0.002"
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "schema": "us500-public-history-v1",
+  "environment": "public",
+  "ticker": "KXUS500PERP",
+  "resource": "candles",
+  "requested_range_ms": {
+    "start": 1791742829661,
+    "end": 1791746429661
+  },
+  "period_minutes": 1,
+  "max_pages": 1,
+  "requests_made": 1,
+  "pages": [
+    {
+      "url": "https://external-api.kalshi.com/trade-api/v2/margin/markets/KXUS500PERP/candlesticks?start_ts=1791742828&end_ts=1791746431&period_interval=1&include_latest_before_start=false",
+      "window_start_ms": 1791742829661,
+      "window_end_ms": 1791746429661,
+      "cursor_in": "",
+      "requested_at_ms": 1791746430422,
+      "received_at_ms": 1791746430660,
+      "http_status": 200,
+      "raw_base64": "eyJjYW5kbGVzdGlja3MiOltdLCJ0aWNrZXIiOiJLWFVTNTAwUEVSUCJ9",
+      "raw_sha256": "eddcfb7e94bc8a89761a056c466ecee9b817b213217e92077f6e8437756d64c3",
+      "canonical_body_sha256": "eddcfb7e94bc8a89761a056c466ecee9b817b213217e92077f6e8437756d64c3",
+      "body": {
+        "candlesticks": [],
+        "ticker": "KXUS500PERP"
+      }
+    }
+  ],
+  "capture_stop_reason": null,
+  "authenticated": false,
+  "execution_available": false,
+  "source_authenticity_verified": false,
+  "analysis": {
+    "schema": "us500-history-analysis-v1",
+    "valid_evidence": true,
+    "retrieval_complete": true,
+    "history_sufficient": false,
+    "source_authenticity_verified": false,
+    "strategy_validated": false,
+    "execution_available": false,
+    "errors": [],
+    "records": [],
+    "resource": "candles",
+    "ticker": "KXUS500PERP",
+    "requested_range_ms": {
+      "start": 1791742829661,
+      "end": 1791746429661
+    },
+    "observed_range_ms": null,
+    "record_count": 0,
+    "identical_duplicates": 0,
+    "excluded_outside_window": 0,
+    "empty_pages": 1,
+    "completed_windows": 1,
+    "requested_windows": 1,
+    "pagination_exhausted": true,
+    "request_count": 1,
+    "coverage_state": "EMPTY",
+    "coverage_note": "HTTP success and exhausted pagination do not prove retention, complete market history, or an independent sample.",
+    "cadence": {
+      "expected_minute_boundaries": 60,
+      "missing_candles": 60,
+      "gap_ranges": [
+        {
+          "start_ms": 1791742860000,
+          "end_ms": 1791746400000,
+          "missing_candles": 60
+        }
+      ],
+      "gap_range_count": 1,
+      "gap_ranges_truncated": false,
+      "calendar_verified": false,
+      "interpretation": "Missing rows may be closure, no activity, or missing data; not imputed."
+    },
+    "candles_without_trade_prices": 0
+  }
+}
