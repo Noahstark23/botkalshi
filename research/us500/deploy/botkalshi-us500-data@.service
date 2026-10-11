@@ -1,0 +1,46 @@
+[Unit]
+Description=US500 bounded anonymous public data capture (no trading)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=botkalshi-us500-data
+Group=botkalshi-us500-data
+WorkingDirectory=/opt/botkalshi-us500-data/chain-code
+ExecCondition=/usr/bin/python3 -B /opt/botkalshi-us500-data/chain-code/us500_chain_gate.py --chain /etc/botkalshi-us500-data/chain.json --segment %i --plan /etc/botkalshi-us500-data/plans/%i.json --state-root /var/lib/botkalshi-us500-data
+ExecStart=/usr/bin/python3 -B /opt/botkalshi-us500-data/chain-code/us500_window_capture.py --plan /etc/botkalshi-us500-data/plans/%i.json --directory /var/lib/botkalshi-us500-data/%i --once
+StateDirectory=botkalshi-us500-data
+StateDirectoryMode=0700
+Environment=PYTHONUNBUFFERED=1
+Restart=no
+TimeoutStartSec=25
+TimeoutStopSec=5
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+InaccessiblePaths=-/etc/botkalshi-runtime -/etc/botkalshi-research.env -/etc/botkalshi-panel -/opt/botkalshi-runtime -/opt/botkalshi-live -/opt/botkalshi-research -/var/lib/botkalshi-runtime -/var/lib/botkalshi-research -/var/lib/botkalshi-panel -/var/run/docker.sock
+MemoryHigh=64M
+MemoryMax=96M
+MemorySwapMax=0
+CPUQuota=10%
+TasksMax=8
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botkalshi-us500-data

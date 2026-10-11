@@ -1,7 +1,9 @@
-# Revisión US500 V2.5 en GitHub
+# Revisión US500 V2.6 en GitHub
 
-Estado actual: la rama de revisión contiene un recolector de ventanas públicas
-acotadas y el contrato de telemetría individual. Revisar `us500/VERIFICACION_V2_5.md`,
+Estado actual: la rama contiene continuidad de ventanas públicas mediante planes
+inmutables y un gate de sólo lectura. Revisar primero `us500/VERIFICACION_V2_6.md`
+y `us500/SESION_EN_TRAMOS.md`. Incluye el recolector acotado y el contrato de
+telemetría individual anteriores. Ver también `us500/VERIFICACION_V2_5.md`,
 `us500/SESION_COMPLETA.md` y `us500/TELEMETRIA_PENDIENTE.md` primero. Los recuentos
 y estados V2.2.1 que siguen documentan antecedentes, no la entrega actual.
 El panel consume un bloque opcional validado; no se instalaron hooks en el runtime

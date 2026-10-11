@@ -1,6 +1,12 @@
-# US500 V2.5 — captura pública acotada y telemetría explícita
+# US500 V2.6 — continuidad de datos y telemetría explícita
 
-La revisión actual añade `us500_window_capture.py`: una ventana inmutable de hasta
+V2.6 añade un gate de continuidad de sólo lectura para encadenar ventanas con
+planes contiguos y un presupuesto global explícito. No inicia de nuevo un tramo
+terminal ni acredita una sesión completa. Ver `SESION_EN_TRAMOS.md` y
+`VERIFICACION_V2_6.md`. La captura y Telegram se despliegan por separado; los
+SHAs instalados se conservan en el informe operativo.
+
+La revisión V2.5 añadió `us500_window_capture.py`: una ventana inmutable de hasta
 26 horas, un intento por minuto, presupuesto durable, recuperación sin repetir
 slots y evidencia con hashes. Su servicio aislado no recibe credenciales ni envía
 órdenes. Ver `SESION_COMPLETA.md` y `deploy/US500_DATA.md`. Instalar un recolector
