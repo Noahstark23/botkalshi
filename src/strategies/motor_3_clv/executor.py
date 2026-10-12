@@ -539,6 +539,8 @@ class Motor3ExitExecutor:
     async def _reconcile_pending_sells(self, ticker: str, side: str) -> bool:
         """Resuelve intents SELL 'pending' (ERROR_RED previo) contra get_orders, por coid.
 
+        Lee todas las páginas antes de mutar el ledger: un prefijo terminal no
+        descarta una identidad contradictoria ni prueba un barrido completo.
         Devuelve True si el camino quedó limpio para una venta nueva. False si algún
         intent sigue irresoluble (la orden no aparece / la API falla / la persistencia del
         fill reconciliado falla) → el caller NO vende este tick.
@@ -569,15 +571,19 @@ class Motor3ExitExecutor:
             logger.warning(f"motor3.exit.shared_pending_sell ticker={ticker} side={side}")
             return False
         try:
-            resp = await self.client.get_orders(ticker=ticker)
+            # Reusar el presupuesto acotado del cliente (100 páginas / 30s), sin
+            # cortar por página corta/vacía. Un fallo conserva todas las reservas.
+            orders = await KalshiRestClient.get_all_orders(self.client, ticker=ticker, limit=200)
+            order_ids = [o["order_id"] for o in orders if o.get("order_id") is not None]
+            if len(order_ids) != len(set(order_ids)):
+                # Una identidad repetida conserva la pausa durable que ya exigía
+                # el reconciliador para coid duplicado; no es un fallo de red.
+                for trade in pending:
+                    self._engage_preventive_pause(trade.client_order_id)
+                return False
         except Exception as exc:
             logger.warning(f"motor3.exit.reconcile_get_orders_failed ticker={ticker}: {exc}")
             return False
-        orders = [
-            o
-            for o in (resp.get("orders", []) if isinstance(resp, dict) else [])
-            if isinstance(o, dict)
-        ]
         clear = True
         for t in pending:
             matches = [o for o in orders if o.get("client_order_id") == t.client_order_id]

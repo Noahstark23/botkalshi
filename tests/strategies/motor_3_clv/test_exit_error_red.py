@@ -62,7 +62,7 @@ def _client(*, place=None, place_exc=None, orders=None) -> MagicMock:
             return_value=place
             or {"order": {"remaining_count": 0, "order_id": "o", "fill_count": 10}}
         )
-    c.get_orders = AsyncMock(return_value={"orders": orders or []})
+    c.get_orders = AsyncMock(return_value={"orders": orders or [], "cursor": ""})
     wire_exit_fills(c, [("yes", 10, 60, 17)])
     return c
 
