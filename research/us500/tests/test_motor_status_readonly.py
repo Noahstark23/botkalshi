@@ -192,12 +192,11 @@ class RuntimeStatusTests(unittest.TestCase):
             status_from_responses(health(NOW + 1000), status(), now_ms=NOW)["fresh"]
         )
 
-    def test_missing_invalid_or_unhealthy_health_is_unknown(self):
+    def test_missing_or_invalid_health_is_unknown(self):
         for item in (
             None,
             [],
             {},
-            {"status": "unhealthy", "timestamp": health()["timestamp"]},
             {"status": "healthy", "timestamp": "2026-10-11T00:00:00"},
             {"status": "healthy", "timestamp": "SECRET_MARKER"},
         ):

@@ -31,6 +31,15 @@ ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+# TG-02: deny loopback runtime and private networks; only resolver stub excepted.
+IPAddressDeny=localhost link-local 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53/32
+ReadOnlyPaths=/var/lib/botkalshi-status
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true

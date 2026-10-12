@@ -105,6 +105,18 @@ class RunnerTests(unittest.TestCase):
                 replay(data, self.db)
         self.assertEqual(replay(original, self.db), first)
 
+    def test_unbounded_settlement_price_rejects_before_creating_ledger(self):
+        for price in ("1000000000", "1e1000"):
+            data = session()
+            data["frames"][2]["variation_margin_settlement_price"] = price
+            with self.subTest(price=price), self.assertRaises((DataError, ValueError)):
+                replay(data, self.db)
+            self.assertFalse(self.db.exists())
+        data = session()
+        data["frames"][2]["variation_margin_settlement_price"] = "999999999.9999"
+        events, _ = build_plan(data)
+        self.assertTrue(any(e["type"] == "variation_margin" for e in events))
+
     def test_partial_depth_never_invents_a_full_fill(self):
         data = session(depth="1")
         events, result = build_plan(data)

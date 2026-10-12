@@ -566,6 +566,8 @@ class LedgerTests(unittest.TestCase):
         cases = [
             self.event("variation_margin", settlement_price="0"),
             self.event("variation_margin", settlement_price="NaN"),
+            self.event("variation_margin", settlement_price="1000000000"),
+            self.event("variation_margin", settlement_price="1e1000"),
             self.event("variation_margin", settlement_price=100),
             self.event(
                 "margin_rates", initial_margin_rate="0.1", maintenance_margin_rate="0.2"

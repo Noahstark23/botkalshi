@@ -31,7 +31,12 @@ MAX_STATUS_BYTES = 32_768
 _CONTROL_ID = re.compile(r"[a-f0-9]{32}\Z")
 _REASON = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _OUTBOX_STATES = {"PENDING", "ATTEMPTED", "SENT", "FAILED", "UNKNOWN"}
-_TRANSIENT_POLL_ERRORS = {"TELEGRAM_RESPONSE_UNKNOWN", "TELEGRAM_RESPONSE_TIMEOUT"}
+_TRANSIENT_POLL_ERRORS = {
+    "TELEGRAM_RESPONSE_UNKNOWN",
+    "TELEGRAM_RESPONSE_TIMEOUT",
+    "TELEGRAM_RATE_LIMITED",
+    "CONTROL_CLOCK_REGRESSION",
+}
 
 
 class ServiceError(ValueError):
@@ -441,7 +446,30 @@ class TelegramPaperService:
                                 True,
                             )
                             self._write_status(status)
-                            if stop_event.wait(retry_delay):
+                            delay = result.get("retry_after_seconds", retry_delay)
+                            if not _integer(delay, 1, 86400):
+                                raise ServiceError("INVALID_RETRY_DELAY")
+                            delay = max(retry_delay, delay)
+                            # Espera interrumpible, con heartbeat cada 30s para
+                            # distinguir backoff de receptor muerto.
+                            interrupted = False
+                            while delay > 0:
+                                chunk = min(delay, 30) if delay > 60 else delay
+                                if stop_event.wait(chunk):
+                                    interrupted = True
+                                    break
+                                delay -= chunk
+                                if delay:
+                                    status = self._status(
+                                        "RECOVERING",
+                                        completed,
+                                        max_cycles,
+                                        interval_seconds,
+                                        ["POLL_TEMPORARILY_UNAVAILABLE"],
+                                        True,
+                                    )
+                                    self._write_status(status)
+                            if interrupted:
                                 break
                             retry_delay = min(60, retry_delay * 2)
                             continue

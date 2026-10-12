@@ -1,0 +1,32 @@
+{
+  "version": "2.7.0",
+  "baseline_sha": "dff81f919dede937e8965de98a0e6bb12ebad90f",
+  "verified_at_utc": "2026-10-12T16:52:43.933521+00:00",
+  "python": "3.14.8",
+  "tests_run": 456,
+  "walkthroughs": 2,
+  "network_denied": true,
+  "synthetic_frames": 7141,
+  "synthetic_cadence_ms": 60000,
+  "synthetic_span_hours": 119,
+  "segments": 5,
+  "capital_resets": 0,
+  "real_orders": 0,
+  "market_evaluation_completed": false,
+  "baseline_reproductions": {
+    "TG-01": {
+      "error": "UPDATE_TOO_LARGE",
+      "offset": 0
+    },
+    "TG-03": {
+      "error": "TELEGRAM_REQUEST_REJECTED",
+      "recovers": false
+    },
+    "TG-04": {
+      "clock_regression_recovers": false
+    },
+    "TG-05": {
+      "fresh": false
+    }
+  }
+}

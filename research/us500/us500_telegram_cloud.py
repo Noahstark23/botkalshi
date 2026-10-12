@@ -15,7 +15,7 @@ import stat
 import threading
 from pathlib import Path
 
-from motor_status_readonly import RuntimeStatusReader
+from runtime_status_cache import SnapshotStatusReader
 from us500_control import PaperControl
 from us500_telegram import TelegramTransport
 from us500_telegram_service import TelegramPaperService
@@ -113,7 +113,7 @@ def main(argv=None):
             args.state_dir / "control.sqlite",
             owner_user_id=args.owner_id,
             owner_chat_id=args.owner_id,
-            status_provider=RuntimeStatusReader(),
+            status_provider=SnapshotStatusReader(),
         )
         preflight_transient = False
 

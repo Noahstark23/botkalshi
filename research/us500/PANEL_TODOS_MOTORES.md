@@ -16,7 +16,12 @@ Los controles de M1, M2, M3, M5, M6, REST, M8 y M9 y el control general están *
 - `/us500` y callbacks anteriores siguen funcionando. El estado dice «permiso de replay», porque ese permiso no inicia un proceso ni representa el estado de riesgo o exposición.
 - El supervisor local mantiene sus límites, pausas de ciclo de vida y exclusión de consumidores. No se extendió su duración ni se instalaron servicios.
 
-## Contrato para una integración posterior
+## Límites para cualquier integración posterior
+
+Estas restricciones no son un plan autorizado de controles reales por chat. V2.7
+excluye esa implementación; requiere otro alcance y revisión del ejecutor,
+conciliación y permisos. Ningún botón de este paquete activa trading ni se
+traduce a flags, shell, reinicios o endpoints administrativos.
 
 Esta entrega NO implementa los adaptadores ni la activación real. Cada adaptador necesitará informar por separado `adapter_connection`, `process_state`, `operator_permission`, `risk_pause`, `exposure`, fuente, entorno y momento de observación. Sin conexión: estado `UNKNOWN`, no `OFF`; sin evidencia de exposición: `null`, no cero. Datos vencidos deben identificarse como tales.
 

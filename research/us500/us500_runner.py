@@ -23,7 +23,6 @@ from us500_control import ControlError, PaperControl
 from us500_engine import (
     DataError,
     body_digest,
-    decode,
     instrument_metadata,
     normalize,
     number,
@@ -32,7 +31,7 @@ from us500_engine import (
 )
 from us500_ledger import LedgerError, PaperLedger
 
-MAX_FRAMES = 4096
+MAX_FRAMES = 8192
 SCHEMA = "us500-paper-session-v1"
 MODEL_REVISION = 2
 
@@ -143,7 +142,11 @@ def validate_session(data):
         if number(frame["infrastructure_cost_usd"]) < 0:
             raise DataError("NEGATIVE_INFRASTRUCTURE_COST")
         if "variation_margin_settlement_price" in frame:
-            number(frame["variation_margin_settlement_price"], positive=True)
+            if (
+                number(frame["variation_margin_settlement_price"], positive=True)
+                >= 1000000000
+            ):
+                raise DataError("INVALID_SETTLEMENT_PRICE")
         if "margin_rates" in frame:
             rates = frame["margin_rates"]
             if not isinstance(rates, dict) or set(rates) != {
@@ -683,7 +686,10 @@ def main():
             if args.control_database is not None
             else None
         )
-        result = replay(decode(args.input.read_bytes()), args.database, control=control)
+        # Paquetes largos tienen una cota separada de las respuestas de red.
+        from us500_session import load_package
+
+        result = replay(load_package(args.input), args.database, control=control)
         save_new(args.output, result)
     except (DataError, LedgerError, ControlError, OSError, sqlite3.Error) as exc:
         print(

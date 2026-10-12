@@ -4,8 +4,10 @@ Receptor independiente del Mac. Servicio nuevo `botkalshi-panel.service`, usuari
 sin privilegios `botkalshi-panel`, código `/opt/botkalshi-panel/current`, estado
 `/var/lib/botkalshi-panel`. No depende de una sesión SSH abierta.
 
-Alcance: menú de todos los motores, lectura de `/health` y `/status` del runtime
-técnico del droplet, y permiso de simulación US500. No contiene un ejecutor,
+Alcance: menú de todos los motores, copia saneada de estados del runtime
+técnico del droplet, y permiso de simulación US500. Desde V2.7 el panel lee
+`/var/lib/botkalshi-status/status.json`; el productor separado consulta
+`/health`, `/status` y `/stats/edges?days=1`. No contiene un ejecutor,
 estrategia automática, shell por Telegram ni acceso a credenciales financieras.
 No controla Coolify ni habilita operaciones reales. Un flag de configuración
 no demuestra que la tarea esté corriendo; el panel distingue esos conceptos.
@@ -80,11 +82,11 @@ ordinarios0440, escritura por grupo y lectura pública. La primera validación d
 modo y luego la suposición del grupo del servicio fallaron antes de polling. La
 corrección fue comprobada con getMe/getWebhookInfo en el propio host: PREFLIGHT_OK.
 
-## Actividad registrada (V2.4)
+## Actividad registrada (V2.4, transporte actualizado en V2.7)
 
-`/stats/edges?days=1` se consulta sólo después de autenticar al dueño y obtener
-un estado válido. Por instancia de receptor se admite como máximo una consulta
-agregada cada300s, incluyendo fallos. La caché se revalida por fecha y caducidad;
+Desde V2.7 el productor sin token consulta `/health` y `/status` cada15s;
+`/stats/edges?days=1` sólo tras obtener estado válido, como máximo cada300s,
+incluyendo fallos. Las consultas no dependen de mensajes de Telegram. La caché se revalida por fecha y caducidad;
 no conserva un dato anterior después de un fallo. Un reinicio comienza una caché
 nueva. Ventana: inicio UTC del día anterior hasta la fecha de generación.
 
@@ -92,3 +94,42 @@ M6/REST/M8/M9 muestran cantidad de registros de linemove/multi_outcome/ofi/spill
 No indican tareas activas, flags ni órdenes: esos campos continúan desconocidos.
 Cero filas puede incluir ausencia de señales o retención; no demuestra apagado.
 No se consulta /stats/daily ni se escanean archivos/DBs desde el receptor.
+
+
+## Correcciones V2.7
+
+- TG-01: un update válido mayor de32KiB consume únicamente ID/hash, sin guardar
+  contenido, llamar al control ni responder. El siguiente update puede continuar.
+  El límite HTTP global y el rechazo de IDs inválidos/conflictivos permanecen.
+- TG-03: HTTP429 con retry_after entero entre1 y86400s pausa paper y espera el
+  plazo del proveedor (mínimo backoff local), con heartbeat durante la espera.
+  Continúa getUpdates. Si ocurrió al enviar, conserva el mensaje como FAILED y
+  no lo reenvía; posteriores consultas funcionan pero un sendMessage fallido
+  bloquea paper hasta revisión. UNKNOWN nunca se reintenta ni elimina.
+- TG-04: retroceso de reloj conserva pausa y cursor, invalida confirmaciones y
+  reintenta con backoff hasta que el reloj alcance el último tiempo aceptado.
+  No rebaja las comprobaciones temporales ni mueve timestamps hacia atrás.
+- TG-05: /health503 sólo se acepta con envoltorio detail/status=unhealthy y
+  timestamp válido; permite mostrar la pausa indicada por /status. Fresh significa
+  lectura reciente, no salud ni actividad individual. Otros503 son desconocidos.
+- TG-02: usuario productor separado, sin token Telegram, publica JSON saneado
+  con TTL. El consumidor no puede escribirlo; rechaza symlinks, permisos inseguros,
+  archivos sobredimensionados y caché vencida. systemd bloquea al panel loopback,
+  link-local y redes privadas salvo DNS127.0.0.53. Requiere BPF/cgroup operativo:
+  validar denegación TCP al runtime y conectividad Telegram antes de afirmar cierre.
+  El productor sólo usa GET fijos, pero no añade autenticación al runtime; esa
+  superficie del servicio financiero requiere una revisión separada.
+
+Instalación V2.7: crear usuario botkalshi-status y directorio0755, instalar y
+validar ambas unidades. Exportador sin credenciales financieras ni Telegram,
+StateDirectory propio, CPU5%, memoria48MiB. Arrancar primero exportador; comprobar
+caché fresca, luego detener sólo panel, respaldar control/outbox/cursor actuales,
+actualizar su release/unidad y arrancar una vez con su token cifrado existente.
+Conservar bases y registros inciertos; no copiar un cursor antiguo. La Mac sigue
+retirada. La captura y runtime/research conservan unidades, releases y procesos.
+
+La separación no garantiza disponibilidad perfecta ni estados que el runtime no
+publica. M6/REST/M8/M9 siguen con flags/tareas individuales desconocidos. Cualquier
+función real continúa fuera del panel y de esta reparación.
+
+Referencia: [Telegram ResponseParameters](https://core.telegram.org/bots/api#responseparameters).

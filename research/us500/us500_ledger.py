@@ -360,6 +360,8 @@ class PaperLedger:
             result["settlement_price"] = _decimal(
                 event["settlement_price"], positive=True
             )
+            if result["settlement_price"] >= Decimal("1000000000"):
+                raise LedgerError("INVALID_SETTLEMENT_PRICE")
         if kind == "margin_rates":
             result["initial_margin_rate"] = _decimal(
                 event["initial_margin_rate"], positive=True

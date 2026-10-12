@@ -237,7 +237,7 @@ def status_from_responses(health, status, *, now_ms):
     """Extract the current runtime schema without retaining raw server values."""
     if type(health) is not dict or type(status) is not dict:
         return unknown_status(now_ms, "INVALID")
-    if health.get("status") != "healthy":
+    if health.get("status") not in ("healthy", "unhealthy"):
         return unknown_status(now_ms, "UNAVAILABLE")
     source_at = _iso_ms(health.get("timestamp"))
     if source_at is None:
@@ -314,7 +314,9 @@ class RuntimeStatusReader:
             connection = self._factory("127.0.0.1", 18080, timeout=TIMEOUT_SECONDS)
             connection.request("GET", path, headers={"Accept": "application/json"})
             response = connection.getresponse()
-            if response.status != 200:
+            if response.status != 200 and not (
+                path == "/health" and response.status == 503
+            ):
                 raise ValueError("RUNTIME_RESPONSE_UNAVAILABLE")
             raw = bytearray()
             while True:
@@ -329,7 +331,18 @@ class RuntimeStatusReader:
                 raw.extend(chunk)
                 if len(raw) > MAX_BYTES:
                     raise ValueError("RUNTIME_RESPONSE_TOO_LARGE")
-            return json.loads(raw, object_pairs_hook=_unique, parse_constant=_constant)
+            parsed = json.loads(
+                raw, object_pairs_hook=_unique, parse_constant=_constant
+            )
+            if response.status == 503:
+                if (
+                    type(parsed) is not dict
+                    or type(parsed.get("detail")) is not dict
+                    or parsed["detail"].get("status") != "unhealthy"
+                ):
+                    raise ValueError("RUNTIME_RESPONSE_UNAVAILABLE")
+                return parsed["detail"]
+            return parsed
         finally:
             if connection is not None:
                 try:

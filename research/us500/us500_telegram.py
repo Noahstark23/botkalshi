@@ -69,6 +69,8 @@ _SAFE_ERRORS = {
     "OUTBOX_DELIVERY_FAILED",
     "INVALID_RETENTION_LIMIT",
     "OUTBOX_RETENTION_FAILED",
+    "TELEGRAM_RATE_LIMITED",
+    "CONTROL_CLOCK_REGRESSION",
 }
 
 
@@ -78,6 +80,14 @@ class TelegramError(ValueError):
 
 class TelegramRejected(TelegramError):
     """An explicit provider rejection. Never retried automatically."""
+
+
+class TelegramRateLimited(TelegramRejected):
+    """Rechazo explícito: respetar espera sin reenviar mensajes de salida."""
+
+    def __init__(self, retry_after):
+        super().__init__("TELEGRAM_RATE_LIMITED")
+        self.retry_after = retry_after
 
 
 def _safe_error(exc):
@@ -213,7 +223,7 @@ class TelegramTransport:
                 },
             )
             response = connection.getresponse()
-            if response.status != 200:
+            if response.status not in (200, 429):
                 if 400 <= response.status < 500:
                     raise TelegramRejected("TELEGRAM_REQUEST_REJECTED")
                 raise TelegramError("TELEGRAM_RESPONSE_UNKNOWN")
@@ -236,7 +246,21 @@ class TelegramTransport:
             if type(parsed) is not dict or type(parsed.get("ok")) is not bool:
                 raise TelegramError("TELEGRAM_RESPONSE_UNKNOWN")
             if not parsed["ok"]:
+                delay = (
+                    parsed.get("parameters", {}).get("retry_after")
+                    if type(parsed.get("parameters")) is dict
+                    else None
+                )
+                if (
+                    response.status in (200, 429)
+                    and type(parsed.get("error_code")) is int
+                    and parsed["error_code"] == 429
+                    and _integer(delay, minimum=1, maximum=86400)
+                ):
+                    raise TelegramRateLimited(delay)
                 raise TelegramRejected("TELEGRAM_REQUEST_REJECTED")
+            if response.status != 200:
+                raise TelegramError("TELEGRAM_RESPONSE_UNKNOWN")
             return parsed
         except TelegramError:
             raise
@@ -466,8 +490,7 @@ class PaperTelegram:
         if type(update) is not dict or not _integer(update.get("update_id")):
             raise TelegramError("INVALID_UPDATE_ID")
         canonical = _canonical(update).encode("utf-8")
-        if len(canonical) > 32768:
-            raise TelegramError("UPDATE_TOO_LARGE")
+        oversized = len(canonical) > 32768
         update_id = update["update_id"]
         digest = hashlib.sha256(canonical).hexdigest()
         try:
@@ -497,7 +520,11 @@ class PaperTelegram:
                 > MAX_OUTBOX
             ):
                 raise TelegramError("OUTBOX_CAPACITY_EXHAUSTED")
-            responses = self.control.handle_update(update, now_ms=now_ms)
+            # TG-01: consumir el ID y hash, sin ejecutar, guardar ni responder
+            # al contenido excesivo. El límite HTTP global sigue vigente.
+            responses = (
+                [] if oversized else self.control.handle_update(update, now_ms=now_ms)
+            )
             if type(responses) is not list or len(responses) > 2:
                 raise TelegramError("INVALID_CONTROL_RESPONSE")
             for ordinal, response in enumerate(responses):
@@ -578,6 +605,13 @@ class PaperTelegram:
                     status, error = "SENT", None
                 elif type(response) is dict and response.get("ok") is False:
                     status, error = "FAILED", "TELEGRAM_REQUEST_REJECTED"
+            except TelegramRateLimited as exc:
+                # Un rechazo definitivo se conserva; UNKNOWN jamás se reenvía.
+                self._db.execute(
+                    "UPDATE telegram_outbox SET status='FAILED', error='TELEGRAM_RATE_LIMITED' WHERE id=? AND status='ATTEMPTED'",
+                    (outbox_id,),
+                )
+                raise exc
             except TelegramRejected:
                 status, error = "FAILED", "TELEGRAM_REQUEST_REJECTED"
             except Exception:
@@ -663,12 +697,20 @@ class PaperTelegram:
                 if time.monotonic() >= deadline:
                     break
                 self._persist_update(update, now_ms)
+        except TelegramRateLimited as exc:
+            result = self._stopped("TELEGRAM_RATE_LIMITED", now_ms)
+            result["retry_after_seconds"] = exc.retry_after
+            return result
         except (TelegramError, ControlError) as exc:
             return self._stopped(_safe_error(exc), now_ms)
         except Exception:
             return self._stopped("GET_UPDATES_FAILED", now_ms)
         try:
             self._deliver(deadline)
+        except TelegramRateLimited as exc:
+            result = self._stopped("TELEGRAM_RATE_LIMITED", now_ms)
+            result["retry_after_seconds"] = exc.retry_after
+            return result
         except Exception:
             return self._stopped("OUTBOX_DELIVERY_FAILED", now_ms)
         result = self.snapshot()

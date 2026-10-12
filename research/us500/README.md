@@ -1,4 +1,13 @@
-# US500 V2.6 — continuidad de datos y telemetría explícita
+# US500 V2.7 — recuperación de Telegram y evaluación larga
+
+V2.7 corrige TG-01/03/04/05, separa el acceso a estados del receptor Telegram,
+limita settlement de variation margin y verifica el inventario exacto del paquete.
+Admite 8.192 frames en una sola contabilidad; el ensayo de 7.141 observaciones
+a 60s es sintético, no evaluación del mercado. Ver `VERIFICACION_V2_7.md`,
+`EVALUACION_LARGA.md` y `TELEGRAM_CLOUD.md`. El despliegue efectivo y la captura
+vigente se verifican por separado en el informe operativo.
+
+## Antecedente V2.6
 
 V2.6 añade un gate de continuidad de sólo lectura para encadenar ventanas con
 planes contiguos y un presupuesto global explícito. No inicia de nuevo un tramo
@@ -83,7 +92,7 @@ Ante breach, gap o UNKNOWN queda una pausa durable, sin fill inventado de liquid
 
 La DB fija configuración, versión del modelo y hashes del prefijo. Puede extenderse una sesión, sin alterar su historia. Las bases del runner V1 se rechazan antes de escribir: V2 necesita una DB nueva y no migra implícitamente contabilidad histórica. No descartar una base con exposición residual; conservarla y revisar su conciliación con la versión que la creó. Los mismos eventos V2 se reejecutan sin duplicar dinero. Una base vinculada a un control exige ese mismo control incluso al invocar el CLI directamente.
 
-Límites: 4.096 frames, 100.000 eventos, 8.192 órdenes ficticias por ledger; no se borra historia para volver a habilitar capacidad. El colector público reserva GET antes de enviarlos y conserva el presupuesto al reiniciar; un cierre del mercado detiene la captura antes de consultar el libro.
+Límites: 8.192 frames, 100.000 eventos, 8.192 órdenes ficticias por ledger; no se borra historia para volver a habilitar capacidad. El colector público reserva GET antes de enviarlos y conserva el presupuesto al reiniciar; un cierre del mercado detiene la captura antes de consultar el libro.
 
 ## Estado y pendientes externos
 
