@@ -39,6 +39,13 @@ Incluyen kill-switch durable, capital, incertidumbre, dependencias e identidad r
 `boot_allowed` es el techo inmutable provisionado por el operador: Telegram no lo eleva.
 Todos los valores desconocidos/vencidos bloquean habilitación.
 
+El arranque del runner rechaza una lectura fallida o un valor durable desconocido
+del kill-switch antes de lanzar servicios (`KILL_SWITCH_BOOT_UNVERIFIED`, exit1).
+Conserva la fila original: no sustituye incertidumbre por clear ni repara la DB.
+Incluso en shadow debe poder verificar esa pausa. Un nuevo arranque vuelve a leerla;
+no es una vía para levantar un engaged válido. Esta protección de boot no sustituye
+la revalidación transaccional posterior que exige el adaptador de permisos.
+
 `apply_if_current` debe revalidar bajo su propia transacción CAS, después del preflight
 del canal. Debe persistir permiso/revisión/command_id juntos; nunca levantar kill-switch,
 mutar límites, liberar UNKNOWN o iniciar órdenes para habilitar. La prueba de carrera

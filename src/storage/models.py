@@ -764,12 +764,17 @@ def engage_kill_switch(reason: str) -> None:
 
 
 def kill_switch_engaged() -> tuple[bool, str | None]:
-    """(engaged, reason) del kill-switch persistente. Propaga si la DB falla — el
-    caller decide el fail-safe (la Capa A asume engaged ante error)."""
+    """(engaged, reason) de un estado conocido; falla ante DB/valor desconocido.
+
+    Sólo ausencia inicial o clear explícito permiten continuar. No normalizar ni
+    reparar aquí un valor inválido: borraría evidencia y podría levantar una pausa.
+    """
     with get_session() as s:
         row = s.get(OperationalState, _KILL_SWITCH_KEY)
-        if row is None or row.value != "engaged":
+        if row is None or row.value == "clear":
             return False, None
+        if row.value != "engaged":
+            raise ValueError("KILL_SWITCH_STATE_INVALID")
         return True, row.reason
 
 

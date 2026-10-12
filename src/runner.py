@@ -160,15 +160,19 @@ class ProductionRunner:
         """
         Si el kill-switch persistente quedó ENGAGED, arrancar PAUSADO + avisar.
 
-        Tolerante a fallas de DB: si no se puede leer, NO bloquea el arranque (el
-        TRADING_ENABLED gate + la Capa A siguen protegiendo); se registra el error.
+        No poder leer la pausa no equivale a permiso. Abortar antes de crear tareas:
+        las capas A/C podrían estar habilitadas y la conciliación posterior puede
+        terminar sin pendientes. No escribir sobre un estado durable desconocido.
         """
         try:
             engaged, reason = kill_switch_engaged()
-        except Exception:
-            logger.exception("No se pudo leer el kill-switch persistente al boot")
-            BotState.record_error("kill_switch read failed at boot")
-            return
+        except Exception as exc:
+            failure = "KILL_SWITCH_BOOT_UNVERIFIED"
+            BotState.is_paused = True
+            BotState.pause_reason = failure
+            BotState.record_error(failure)
+            logger.error("Arranque rechazado: {} ({})", failure, type(exc).__name__)
+            raise RuntimeError(failure) from None
         if not engaged:
             return
         BotState.is_paused = True
