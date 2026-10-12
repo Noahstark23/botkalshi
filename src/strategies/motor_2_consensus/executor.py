@@ -396,6 +396,18 @@ class Motor2Executor:
             return None, None
         return 100 - bid, size
 
+    def _open_position_query(self, signal: ConsensusSignal):
+        """Mismo scope de dedup para el filtro temprano y la reserva atómica."""
+        stmt = select(Trade.id).where(
+            Trade.strategy == STRATEGY,
+            col(Trade.status).in_(("pending", "filled")),
+        )
+        if self._one_bet_per_event and signal.event_key:
+            stmt = stmt.where(col(Trade.ticker).like(f"{signal.event_key}-%"))
+        else:
+            stmt = stmt.where(Trade.ticker == signal.market_ticker)
+        return stmt.limit(1)
+
     def _open_position_exists(self, signal: ConsensusSignal) -> bool:
         """True si hay un Trade vivo (pending/filled) de Motor 2 en el evento/ticker.
 
@@ -407,15 +419,7 @@ class Motor2Executor:
         """
         try:
             with get_session() as s:
-                stmt = select(Trade).where(
-                    Trade.strategy == STRATEGY,
-                    col(Trade.status).in_(("pending", "filled")),
-                )
-                if self._one_bet_per_event and signal.event_key:
-                    stmt = stmt.where(col(Trade.ticker).like(f"{signal.event_key}-%"))
-                else:
-                    stmt = stmt.where(Trade.ticker == signal.market_ticker)
-                return s.exec(stmt.limit(1)).first() is not None
+                return s.exec(self._open_position_query(signal)).first() is not None
         except Exception:
             logger.exception(
                 f"motor2.exec.dedup_check_failed ticker={signal.market_ticker} → skip conservador"
@@ -453,6 +457,13 @@ class Motor2Executor:
                     fee_observations={trade.ticker: fee_observation},
                 )
             with get_session() as s:
+                # El book se espera después del primer dedup: otra llamada puede
+                # haber reservado mientras tanto. Releer bajo el mismo lock SQLite
+                # que el INSERT protege también entre instancias/procesos.
+                s.connection().execute(text("BEGIN IMMEDIATE"))
+                if s.exec(self._open_position_query(signal)).first() is not None:
+                    logger.info(f"motor2.exec.dedup_at_reservation ticker={signal.market_ticker}")
+                    return False
                 s.add(
                     Trade(
                         client_order_id=coid,
