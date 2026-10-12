@@ -219,6 +219,15 @@ class Motor2Executor:
                 False, False, reason="trading_disabled", client_order_id=coid
             )
         except KalshiClientError as exc:
+            if exc.status_code in (408, 409):
+                # Timeout/conflicto no prueban rechazo de este IOC: conservar la
+                # reserva previa y el dedup hasta obtener evidencia correlacionada.
+                reason = f"ambiguous_http_{exc.status_code}"
+                self._update_trade(coid, critical=False, notes_append=reason)
+                logger.warning(f"motor2.exec.{reason} ticker={signal.market_ticker} coid={coid}")
+                return Motor2ExecutionOutcome(
+                    True, False, uncertain=True, reason=reason, client_order_id=coid
+                )
             # 4xx determinístico (saldo, mercado cerrado, precio inválido): sin posición.
             self._update_trade(
                 coid,

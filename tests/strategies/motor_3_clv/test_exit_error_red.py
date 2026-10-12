@@ -22,6 +22,7 @@ import pytest
 from sqlmodel import select
 
 import src.storage.models as models
+from src.clients.kalshi_rest import KalshiClientError
 from src.storage.models import PortfolioPosition, Trade, get_session, kill_switch_engaged
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
 from tests.exit_fill_fixtures import wire_exit_fills
@@ -98,6 +99,100 @@ async def test_intent_row_written_before_network_and_error_red_leaves_pending():
     sells = _sells()
     assert len(sells) == 1 and sells[0].status == "pending"
     assert sells[0].client_order_id == out.client_order_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 409])
+@pytest.mark.parametrize("strategy", ["motor_2_consensus", "motor_3_clv"])
+@pytest.mark.parametrize("other_strategy", [False, True])
+async def test_ambiguous_http_exit_survives_restart_without_reselling(
+    status, strategy, other_strategy, _tmp_db_engine, monkeypatch
+):
+    from sqlmodel import create_engine
+
+    _seed_buy(count=10)
+    client = _client(place_exc=KalshiClientError(status, "respuesta incierta ficticia"))
+    out = await Motor3ExitExecutor(client, strategy=strategy).exit_position(_pos())
+    assert len(_sells()) == 1 and _sells()[0].status == "pending"
+    assert out.placed and not out.filled and out.reason == f"ambiguous_http_{status}"
+    assert _buys()[0].status == "filled" and not _buys()[0].closed_by_clv
+    assert _buys()[0].pnl_cents is None
+    client.place_order.assert_awaited_once()
+
+    url = _tmp_db_engine.url
+    _tmp_db_engine.dispose()
+    reopened = create_engine(url)
+    monkeypatch.setattr(models, "_engine", reopened)
+    Motor3ExitExecutor._locks.clear()
+    try:
+        recovery = _client(orders=[])
+        recovery.get_orders.return_value["cursor"] = ""
+        new_strategy = (
+            ("motor_3_clv" if strategy == "motor_2_consensus" else "motor_2_consensus")
+            if other_strategy
+            else strategy
+        )
+        out = await Motor3ExitExecutor(recovery, strategy=new_strategy).exit_position(_pos())
+        assert not out.placed and out.reason == "pending_sell_unresolved"
+        recovery.place_order.assert_not_awaited()
+        assert len(_sells()) == 1 and _sells()[0].status == "pending"
+        assert _buys()[0].status == "filled" and not _buys()[0].closed_by_clv
+        assert _buys()[0].pnl_cents is None
+    finally:
+        reopened.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 422])
+async def test_definitive_http_exit_rejection_preserves_original_position(status):
+    _seed_buy(count=10)
+    client = _client(place_exc=KalshiClientError(status, "rechazo definitivo ficticio"))
+    out = await _ex(client).exit_position(_pos())
+    assert out.reason == f"client_error_{status}"
+    assert len(_sells()) == 1 and _sells()[0].status == "cancelled"
+    assert _buys()[0].status == "filled" and not _buys()[0].closed_by_clv
+    assert _buys()[0].pnl_cents is None
+
+
+def test_sell_intent_reservation_is_shared_and_atomic():
+    """Dos admisiones simultáneas al mismo inventario no crean dos reservas vendibles."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    _seed_buy(count=10)
+    barrier = Barrier(2, timeout=5)
+
+    def reserve(strategy):
+        ex = Motor3ExitExecutor(_client(), strategy=strategy)
+        barrier.wait()
+        return ex._persist_sell_intent(f"fake-{strategy}", TICKER, "yes", 10, 60)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, ["motor_2_consensus", "motor_3_clv"]))
+    assert sorted(results) == [False, True]
+    assert len(_sells()) == 1 and _sells()[0].status == "pending"
+    assert _buys()[0].status == "filled" and not _buys()[0].closed_by_clv
+
+
+@pytest.mark.asyncio
+async def test_inventory_closed_during_book_read_cannot_be_reserved_again():
+    _seed_buy(count=10)
+    client = _client()
+
+    async def book_after_another_exit_closed_inventory(*args, **kwargs):
+        with get_session() as session:
+            row = session.exec(select(Trade).where(Trade.action == "buy")).one()
+            row.status = "settled"
+            row.closed_by_clv = True
+            session.add(row)
+            session.commit()
+        return {"orderbook": {"yes": [["0.60", "100"]], "no": []}}
+
+    client.get_orderbook.side_effect = book_after_another_exit_closed_inventory
+    out = await _ex(client).exit_position(_pos())
+    client.place_order.assert_not_awaited()
+    assert not out.placed and out.reason == "persist_intent_failed"
+    assert not _sells()
 
 
 @pytest.mark.asyncio

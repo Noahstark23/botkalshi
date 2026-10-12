@@ -278,6 +278,13 @@ class Motor3ExitExecutor:
             )
             return Motor3ExitOutcome(False, False, reason="trading_disabled", client_order_id=coid)
         except KalshiClientError as exc:
+            if exc.status_code in (408, 409):
+                # La venta pudo entrar: mantener el intent impide otra venta del
+                # mismo inventario antes de conciliarla, incluso tras reiniciar.
+                reason = f"ambiguous_http_{exc.status_code}"
+                self._update_sell_intent(coid, critical=False, notes_append=reason)
+                logger.warning(f"motor3.exit.{reason} ticker={ticker} coid={coid}")
+                return Motor3ExitOutcome(True, False, reason=reason, client_order_id=coid)
             # 4xx determinístico: la orden NO entró — sin posición, intent liberado.
             logger.warning(
                 f"motor3.exit.client_error ticker={ticker} status={exc.status_code}: {exc}"
@@ -380,10 +387,29 @@ class Motor3ExitExecutor:
     def _persist_sell_intent(
         self, coid: str, ticker: str, side: str, count: int, price: int
     ) -> bool:
-        """Escribe la fila SELL 'pending' ANTES de tocar la red (patrón A.1). False si falla
-        (→ el caller ABORTA sin vender: sin rastro no hay reconciliación posible)."""
+        """Reserva inventario bajo lock SQLite ANTES de red, compartido entre motores.
+
+        Revalida tras el await del libro: otra salida pudo reservar o cerrar las BUY.
+        False obliga al caller a abortar sin vender; no se reutiliza inventario incierto.
+        """
         try:
             with get_session() as s:
+                s.exec(text("BEGIN IMMEDIATE"))
+                pending = s.exec(
+                    select(Trade.id)
+                    .where(
+                        Trade.ticker == ticker,
+                        Trade.side == side,
+                        Trade.action == "sell",
+                        Trade.status == "pending",
+                    )
+                    .limit(1)
+                ).first()
+                if pending is not None:
+                    return False
+                available = sum(open_quantity(b) for b in self._attributable_buys(s, ticker, side))
+                if count <= 0 or count > available:
+                    return False
                 s.add(
                     Trade(
                         client_order_id=coid,
@@ -529,7 +555,6 @@ class Motor3ExitExecutor:
                             Trade.side == side,
                             Trade.action == "sell",
                             Trade.status == "pending",
-                            Trade.strategy == self._strategy,
                         )
                     )
                 )
@@ -538,6 +563,11 @@ class Motor3ExitExecutor:
             return False
         if not pending:
             return True
+        if any(t.strategy != self._strategy for t in pending):
+            # Los motores comparten inventario: una venta incierta ajena también
+            # bloquea. Su dueño conserva la conciliación y la atribución contable.
+            logger.warning(f"motor3.exit.shared_pending_sell ticker={ticker} side={side}")
+            return False
         try:
             resp = await self.client.get_orders(ticker=ticker)
         except Exception as exc:
