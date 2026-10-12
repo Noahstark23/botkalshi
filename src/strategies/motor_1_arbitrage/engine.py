@@ -36,6 +36,7 @@ from loguru import logger
 
 from src.math.arbitrage import detect_binary_arb
 from src.monitoring.health import BotState
+from src.monitoring.motor_telemetry import observed_tick
 from src.storage.models import EdgeWindow, get_session
 from src.utils.config import get_settings
 
@@ -165,6 +166,7 @@ class Motor1Engine:
             min_edge_pct=min(self.settings.MIN_EDGE_PCT, self.settings.MOTOR_1_EXECUTION_EDGE_PCT),
         )
 
+    @observed_tick
     async def _tick(self) -> None:
         """Un ciclo: barre los tickers trackeados, detecta y (graba/ejecuta) cada arb."""
         self._ticks += 1

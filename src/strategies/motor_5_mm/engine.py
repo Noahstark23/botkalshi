@@ -47,6 +47,7 @@ from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_maker_fee_cents
 from src.math.quantities import fixed_count, signed_fixed_count
 from src.monitoring.health import BotState
+from src.monitoring.motor_telemetry import observed_tick
 from src.risk.exposure import contract_risk_cents, exposure_count
 from src.risk.manager import RiskManager
 from src.storage.models import (
@@ -714,6 +715,7 @@ class Motor5Engine:
             )
             self._forget_live_quote(ticker)
 
+    @observed_tick
     async def _tick(self) -> None:
         BotState.motor5_tick_started(experiment_id=self._experiment_id)
         now = datetime.now(UTC)

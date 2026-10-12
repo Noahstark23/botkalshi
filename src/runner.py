@@ -30,6 +30,7 @@ from loguru import logger
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.monitoring.health import BotState, app
+from src.monitoring.motor_telemetry import bind_component, create_telemetry
 from src.monitoring.telegram_alerts import alert_shutdown, alert_startup, send_alert
 from src.risk.manager import RiskManager
 from src.storage.models import (
@@ -56,6 +57,7 @@ class ProductionRunner:
         self._capture: DataCaptureService | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._bot_run_id: int | None = None
+        self._motor_telemetry = create_telemetry(self.settings)
 
     # =====================================================
     # DB tracking
@@ -147,9 +149,11 @@ class ProductionRunner:
         if self.settings.TRADING_ENABLED:
             async with KalshiRestClient() as rest_client:
                 self._capture = DataCaptureService(rest_client=rest_client)
+                bind_component(self._motor_telemetry, "capture", self._capture)
                 await self._capture.run()
         else:
             self._capture = DataCaptureService()
+            bind_component(self._motor_telemetry, "capture", self._capture)
             await self._capture.run()
 
     async def _rehydrate_kill_switch(self) -> None:
@@ -217,7 +221,7 @@ class ProductionRunner:
         try:
             from src.strategies.motor_3_clv.engine import Motor3Engine
 
-            await Motor3Engine(
+            engine = Motor3Engine(
                 trading_enabled=(
                     self.settings.TRADING_ENABLED and self.settings.MOTOR_3_EXECUTION_ENABLED
                 ),
@@ -227,7 +231,9 @@ class ProductionRunner:
                 trailing_drop=self.settings.MOTOR_3_TRAILING_DROP_CENTS,
                 manages_orphans=self.settings.MOTOR_3_MANAGES_ORPHANS,
                 min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
-            ).run(self._stop_event)
+            )
+            bind_component(self._motor_telemetry, "m3_loop", engine)
+            await engine.run(self._stop_event)
         except Exception as e:
             msg = f"motor3_clv runner: {type(e).__name__}: {e}"
             logger.exception(msg)
@@ -278,7 +284,7 @@ class ProductionRunner:
                     "client_factory": KalshiDemoReadOnlyClient,
                     "demo_football_fee_validation": True,
                 }
-            await Motor5Engine(
+            engine = Motor5Engine(
                 **demo_options,
                 max_tickers=self.settings.MOTOR_MM_MAX_TICKERS,
                 series_csv=self.settings.MOTOR_MM_SERIES,
@@ -303,7 +309,9 @@ class ProductionRunner:
                 fair_odds_regions=self.settings.ODDS_API_REGIONS,
                 fair_sport_keys_config=self.settings.ODDS_API_SPORT_KEYS,
                 fair_cache_ttl_sec=self.settings.ODDS_API_CACHE_TTL_SEC,
-            ).run(self._stop_event)
+            )
+            bind_component(self._motor_telemetry, "m5_loop", engine)
+            await engine.run(self._stop_event)
         except Exception as e:
             msg = f"motor5_mm runner: {type(e).__name__}: {e}"
             logger.exception(msg)
@@ -344,9 +352,13 @@ class ProductionRunner:
             if self.settings.TRADING_ENABLED and self.settings.MOTOR_1_EXECUTION_ENABLED:
                 async with KalshiRestClient() as client:
                     executor = ArbitrageExecutor(client, RiskManager())
-                    await Motor1Engine(manager, executor=executor).run(self._stop_event)
+                    engine = Motor1Engine(manager, executor=executor)
+                    bind_component(self._motor_telemetry, "m1_loop", engine)
+                    await engine.run(self._stop_event)
             else:
-                await Motor1Engine(manager).run(self._stop_event)
+                engine = Motor1Engine(manager)
+                bind_component(self._motor_telemetry, "m1_loop", engine)
+                await engine.run(self._stop_event)
         except Exception as e:
             msg = f"motor1_arb runner: {type(e).__name__}: {e}"
             logger.exception(msg)
@@ -366,11 +378,13 @@ class ProductionRunner:
             f"{self.settings.MOTOR_6_MOVE_MIN_PP}pp, edge_min={self.settings.MOTOR_6_EDGE_MIN_PP}pp, "
             f"max={self.settings.MOTOR_6_MAX_EDGE_PP}pp) — F1: solo observa"
         )
-        return Motor6LineMoveShadow(
+        observer = Motor6LineMoveShadow(
             move_min_pp=self.settings.MOTOR_6_MOVE_MIN_PP,
             edge_min_pp=self.settings.MOTOR_6_EDGE_MIN_PP,
             max_edge_pp=self.settings.MOTOR_6_MAX_EDGE_PP,
         )
+        bind_component(self._motor_telemetry, "m6_observer", observer)
+        return observer
 
     async def _run_motor2_shadow(self) -> None:
         """
@@ -481,6 +495,7 @@ class ProductionRunner:
                         burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
                         linemove=self._build_motor6_shadow(),
                     )
+                    bind_component(self._motor_telemetry, "m2_poll", poller)
                     await poller.run(self._stop_event)
             else:
                 poller = Motor2ShadowPoller(
@@ -499,6 +514,7 @@ class ProductionRunner:
                     burst_window_min=self.settings.MOTOR_2_BURST_WINDOW_MIN,
                     linemove=self._build_motor6_shadow(),
                 )
+                bind_component(self._motor_telemetry, "m2_poll", poller)
                 await poller.run(self._stop_event)
         except Exception as e:
             msg = f"motor2 runner: {type(e).__name__}: {e}"
@@ -520,7 +536,7 @@ class ProductionRunner:
         try:
             from src.strategies.motor_2_consensus.exit_engine import Motor2ExitEngine
 
-            await Motor2ExitEngine(
+            engine = Motor2ExitEngine(
                 trading_enabled=(
                     self.settings.TRADING_ENABLED and self.settings.MOTOR_2_EXECUTION_ENABLED
                 ),
@@ -530,7 +546,9 @@ class ProductionRunner:
                 trailing_drop=self.settings.MOTOR_2_TRAILING_DROP_CENTS,
                 min_sell_bid_cents=self.settings.MOTOR_3_MIN_SELL_BID_CENTS,
                 publish_bid_marks=not self.settings.EXPERIMENT_DYNAMIC_MULTI_ENABLED,
-            ).run(self._stop_event)
+            )
+            bind_component(self._motor_telemetry, "m2_exit", engine)
+            await engine.run(self._stop_event)
         except Exception as e:
             msg = f"motor2_exits runner: {type(e).__name__}: {e}"
             logger.exception(msg)
@@ -793,6 +811,7 @@ class ProductionRunner:
             # Inicialización
             logger.info(f"🚀 Bot arrancando en {self.settings.KALSHI_ENV.upper()}")
             logger.info(f"Capital (config/fallback): ${self.settings.ACTIVE_CAPITAL_USD}")
+            BotState.motor_telemetry = self._motor_telemetry
             logger.info(f"Trading enabled: {self.settings.TRADING_ENABLED}")
 
             init_db()

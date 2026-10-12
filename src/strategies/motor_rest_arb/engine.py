@@ -36,6 +36,7 @@ from src.math.arbitrage import (
     detect_multi_outcome_arb,
     select_hard_leg,
 )
+from src.monitoring.motor_telemetry import observed_tick
 from src.monitoring.telegram_alerts import alert_trade
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.data_capture import parse_price_to_cents
@@ -165,6 +166,7 @@ class RestArbEngine:
             f"evaluables(≥{self.MULTI_MIN_LEGS} patas)={n_events}"
         )
 
+    @observed_tick
     async def on_ticker(self, raw_msg: dict[str, Any]) -> None:
         """Handler del canal `ticker`: evaluar trigger y, si hay señal, grabar shadow."""
         self._tickers_evaluated += 1

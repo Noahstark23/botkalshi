@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from src.monitoring.motor_telemetry import observed_tick
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_8_ofi.detector import OfiSignal, OfiTracker
 
@@ -70,6 +71,7 @@ class Motor8OfiShadow:
         self._measured = 0
         self._dropped = 0
 
+    @observed_tick
     def observe_delta(self, ticker: str, side: str, delta: int, now: float | None = None) -> None:
         """Un delta del WS: alimenta el tracker + empuja las mediciones maduras.
 

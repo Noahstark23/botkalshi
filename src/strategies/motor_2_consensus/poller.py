@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from src.monitoring.motor_telemetry import observed_tick
 from src.storage.models import EdgeWindow, FairKickoffSnapshot, Motor2FunnelSnapshot, get_session
 from src.strategies.fair_value_book import FairProvenance, FairValueBook
 from src.strategies.motor_2_consensus.detector import MIN_EDGE_PCT, ConsensusSignal, find_signals
@@ -119,6 +120,7 @@ class Motor2ShadowPoller:
             return self._risk.effective_capital_usd()
         return self._capital_usd_static
 
+    @observed_tick
     async def poll_once(self) -> list[ConsensusSignal]:
         """Un ciclo: extrae, cruza, detecta, (persiste + apuesta si live). Devuelve las señales."""
         kalshi_events = await self._kalshi.fetch()
