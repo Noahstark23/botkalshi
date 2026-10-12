@@ -65,3 +65,36 @@ tras observar resultados y llamar a eso validación prospectiva.
 
 El resultado sintético histórico sigue100→98.6643USD. Esta capacidad mayor no
 demuestra rentabilidad, permisos Perps ni preparación para operaciones reales.
+
+## Revisión diferencial V2.7.1
+
+El límite de100.000 eventos se comprueba en el plan en memoria antes de crear
+una DB persistente; una regresión fuerza agotamiento y comprueba que no existe
+archivo parcial. Más frames no eliminan este límite. La serialización del
+historial de órdenes crece con su cantidad; el ensayo de alta rotación se
+registra por separado, sin atribuir los recursos del panel al evaluador.
+
+Se conserva el orden part01..partNN para esta evaluación completa; no renombrar
+tramos posteriores ni elegir submuestras según resultados. Un gap que exceda
+max_gap_ms invalida el ensamblado global. Si la captura pierde continuidad,
+informar esa limitación y fijar otro protocolo explícito antes de una evaluación
+parcial; no resetear capital ni truncar silenciosamente para conseguir un pase.
+
+Los precios opcionales de settlement son escenarios, aun siendo finitos y
+menores de1e9; el rango no acredita su procedencia económica. El informe cuenta
+los overrides declarados y procesados y marca que no están contrastados con el
+venue. No se inventa una tolerancia contra mark ni un settlement observado.
+
+### Medición sintética de alta rotación
+
+En9c9c3f3, Python3.14/macOS arm64, sin sockets y con límite600s de CPU:
+1.000frames/499órdenes:11.215s,66.13MB pico;
+7.141frames/3.569órdenes/28.561eventos:608.64s de pared,208.34MB pico,
+SQLite7.48MB, cero órdenes reales. Es una ejecución completa de build_plan más
+persistencia, con precios y capital inventados; no incluye reinicio completo del
+caso de alta rotación (sí existe regresión larga de reinicio con baja rotación).
+La serialización de órdenes históricas sigue creciendo aproximadamente de forma
+cuadrática: esta medida acotada no acredita peor caso de8192órdenes/100000eventos
+ni rendimiento en otro hardware. No correr el evaluador bajo el límite96MiB del
+panel/capturador; no fue instalado allí. Reproductor Unix y resultados en
+evidence/V2_7_1/benchmark_long.py y BENCHMARK_*.json.

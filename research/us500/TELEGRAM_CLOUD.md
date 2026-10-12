@@ -133,3 +133,19 @@ publica. M6/REST/M8/M9 siguen con flags/tareas individuales desconocidos. Cualqu
 función real continúa fuera del panel y de esta reparación.
 
 Referencia: [Telegram ResponseParameters](https://core.telegram.org/bots/api#responseparameters).
+
+## Revisión diferencial V2.7.1
+
+TG-07: ambas unidades añaden PrivateUsers, ProtectHostname, SystemCallFilter
+@system-service, SystemCallArchitectures=native y ocultan /data/coolify y
+/var/lib/docker. El panel también deniega 143.110.151.94/32, dirección pública
+del host verificada el12oct2026. Revalidar las direcciones propias al migrar;
+esto no es una lista exclusiva de destinos Telegram. Validar filtros efectivos
+y lectura de caché después del reinicio aislado.
+
+TG-06 queda como limitación explícita: lectura ordenada de10 updates por ciclo,
+sin prioridad especial de pausa dentro de un backlog. Durante429 el permiso ya
+está pausado y no existe runner automático. Respetar retry_after del proveedor,
+incluso si supera300s: recortarlo provocaría consultas antes del plazo autorizado.
+Una futura integración de ejecución requeriría su propio control de parada;
+este panel no ofrece esa garantía ni está autorizado a controlar trading real.

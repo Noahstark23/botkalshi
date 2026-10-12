@@ -1,5 +1,7 @@
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,36 @@ from verify_package import verify
 
 
 class InventoryTests(unittest.TestCase):
+    def test_isolated_entrypoint_rejects_shadow_without_importing_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = Path(__file__).resolve().parents[1] / "verify_package.py"
+            (root / source.name).write_bytes(source.read_bytes())
+            (root / "MANIFIESTO_V2.json").write_text(
+                json.dumps(
+                    {
+                        "version": "test",
+                        "files": {
+                            source.name: hashlib.sha256(source.read_bytes()).hexdigest()
+                        },
+                    }
+                )
+            )
+            (root / "pathlib.py").write_text(
+                "open('SHADOW_EXECUTED', 'w').write('bad')\nraise RuntimeError('SHADOW')\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", str(root / source.name)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MANIFEST_FILE_SET_MISMATCH", result.stderr)
+            self.assertFalse((root / "SHADOW_EXECUTED").exists())
+
     def test_exact_inventory_hash_and_symlink_protection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

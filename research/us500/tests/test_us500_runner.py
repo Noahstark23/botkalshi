@@ -114,8 +114,13 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(self.db.exists())
         data = session()
         data["frames"][2]["variation_margin_settlement_price"] = "999999999.9999"
-        events, _ = build_plan(data)
+        events, report = build_plan(data)
         self.assertTrue(any(e["type"] == "variation_margin" for e in events))
+        provenance = report["input_provenance"]
+        self.assertEqual(provenance["settlement_overrides_declared"], 1)
+        self.assertEqual(provenance["settlement_events_processed"], 1)
+        self.assertTrue(provenance["economic_inputs_are_scenarios"])
+        self.assertFalse(provenance["settlement_inputs_verified_against_venue"])
 
     def test_partial_depth_never_invents_a_full_fill(self):
         data = session(depth="1")

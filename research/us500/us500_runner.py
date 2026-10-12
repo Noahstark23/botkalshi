@@ -446,6 +446,14 @@ def build_plan(data):
                 f["snapshot"].get("synthetic") is False for f in data["frames"]
             ),
             "source_authenticity_verified": False,
+            "economic_inputs_are_scenarios": True,
+            "settlement_inputs_verified_against_venue": False,
+            "settlement_overrides_declared": sum(
+                "variation_margin_settlement_price" in f for f in data["frames"]
+            ),
+            "settlement_events_processed": sum(
+                e["type"] == "variation_margin" for e in events
+            ),
             "complete_market_session_verified": False,
             "independence_verified": False,
             "requested_frames": len(data["frames"]),

@@ -24,6 +24,10 @@ UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
+PrivateUsers=true
+ProtectHostname=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
@@ -39,6 +43,9 @@ RemoveIPC=true
 # TG-02: deny loopback runtime and private networks; only resolver stub excepted.
 IPAddressDeny=localhost link-local 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.0.0.53/32
+# This installation's public host IP must also be denied (TG-07).
+# Revalidate against host addresses on migration; this is not a Telegram allowlist.
+IPAddressDeny=143.110.151.94/32
 ReadOnlyPaths=/var/lib/botkalshi-status
 LockPersonality=true
 RestrictRealtime=true
@@ -46,7 +53,7 @@ RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
-InaccessiblePaths=-/etc/botkalshi-runtime -/etc/botkalshi-research.env -/opt/botkalshi-runtime -/opt/botkalshi-live -/opt/botkalshi-research -/var/lib/botkalshi-runtime -/var/lib/botkalshi-research -/var/run/docker.sock
+InaccessiblePaths=-/etc/botkalshi-runtime -/etc/botkalshi-research.env -/opt/botkalshi-runtime -/opt/botkalshi-live -/opt/botkalshi-research -/var/lib/botkalshi-runtime -/var/lib/botkalshi-research -/var/run/docker.sock -/data/coolify -/var/lib/docker
 MemoryHigh=64M
 MemoryMax=96M
 MemorySwapMax=0

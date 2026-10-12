@@ -14,7 +14,7 @@ from test_us500_session import change_market, shift_snapshot
 
 from example_session import session
 from us500_engine import DataError
-from us500_ledger import PaperLedger
+from us500_ledger import LedgerError, PaperLedger
 from us500_long_evaluation import SCHEMA, assemble, evaluate
 from us500_runner import build_plan
 from us500_session import load_package
@@ -81,6 +81,15 @@ def bundle(count=7141, sizes=(1500, 1500, 1500, 1500, 1141)):
 
 
 class LongEvaluationTests(unittest.TestCase):
+    def test_event_capacity_rejected_before_persistent_database_creation(self):
+        data = bundle(10, (5, 5))
+        with (
+            patch("us500_ledger.MAX_EVENTS", 5),
+            self.assertRaisesRegex(LedgerError, "EVENT_CAPACITY_EXHAUSTED"),
+        ):
+            evaluate(data, self.db)
+        self.assertFalse(self.db.exists())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

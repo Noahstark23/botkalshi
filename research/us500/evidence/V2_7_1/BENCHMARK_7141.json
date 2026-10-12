@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "frames": 7141,
+  "elapsed_seconds": 608.6394583330257,
+  "maxrss_bytes": 208338944,
+  "db_bytes": 7483392,
+  "ledger_events": 28561,
+  "orders": 3569,
+  "fill_frames": 3569,
+  "actual_orders": 0,
+  "source_commit": "9c9c3f3cbe7e5c0f8b69cd8acef46b882d23e471",
+  "system": "Darwin arm64, Python 3.14",
+  "cpu_limit_seconds": 600,
+  "network_denied": true
+}

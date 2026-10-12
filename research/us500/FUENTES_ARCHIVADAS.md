@@ -50,6 +50,7 @@ PY
 ## Alcance de la revisión offline
 
 - **OpenAPI:** quedó archivada exactamente la versión citada con hash `27e4b0b76a686f797342f1526a08df5b8f60d8104a81b65c94073d3d89b54308`. Permite revisar los esquemas técnicos sin depender del sitio. No acredita comportamiento de una cuenta ni equivalencia económica con el filing.
+- **Ejemplo de maker fee:** el OpenAPI archivado incluye `0.0005` (5bps) como ejemplo de formato en `maker_fee`; no respalda el supuesto de 2bps ni determina una tarifa vigente para esta cuenta.
 - **CFTC:** el PDF corresponde al filing inicial del 18 de agosto de 2026. El registro HTML identifica `US500PERP`, estado `Approved` y fecha `2026-10-03`. No se archivaron ni verificaron todas las enmiendas posteriores; no se declara que el filing sea el contrato íntegro actualmente aplicable.
 - **Fees:** la explicación oficial archivada respalda cálculo sobre nocional y cobro en apertura/cierre, pero no muestra las tasas `0,120%` y `0,020%`. La descarga directa del tarifario devolvió **429**. Por tanto, esas tasas previamente mencionadas siguen sin respaldo archivado del tarifario en este paquete. No se infieren tarifas privadas, tiers, redondeos ni cargos efectivos.
 - **Developer Agreement:** se conserva el PDF público recibido y su versión visible `v1.1`. Capturarlo no determina su vigencia para una cuenta, licencia de redistribución específica ni aceptación de términos.

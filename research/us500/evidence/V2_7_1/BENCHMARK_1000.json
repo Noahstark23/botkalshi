@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "frames": 1000,
+  "elapsed_seconds": 11.214579457999207,
+  "maxrss_bytes": 66125824,
+  "db_bytes": 1036288,
+  "ledger_events": 3998,
+  "orders": 499,
+  "fill_frames": 499,
+  "actual_orders": 0,
+  "source_commit": "9c9c3f3cbe7e5c0f8b69cd8acef46b882d23e471",
+  "system": "Darwin arm64, Python 3.14",
+  "units_note": "ru_maxrss on macOS is bytes"
+}
