@@ -3,7 +3,7 @@ Cliente REST asíncrono para Kalshi API v2.
 
 Features:
     - Auth automática RSA-PSS por request
-    - Retries con backoff exponencial (tenacity)
+    - Lecturas con backoff exponencial; mutaciones con un solo intento
     - Distinción de errores retryables vs no-retryables
     - Logging estructurado de cada request
     - Async context manager para session management
@@ -43,7 +43,7 @@ class _WriteThrottle:
     Techo interno conservador de 5 operaciones/seg, no una copia del tier de Kalshi.
     Kalshi usa presupuestos de tokens: create=10, cancel=2 por orden, incluso en batch.
     acquire(n) espera lo necesario (n>capacidad se degrada a esperar n/rate). Es
-    PREVENTIVO: el retry del 429 sigue existiendo como red reactiva aguas abajo.
+    PREVENTIVO: una escritura rechazada con 429 se propaga sin reenviarla.
     time_fn/sleep_fn inyectables para tests determinísticos.
     """
 
@@ -101,11 +101,11 @@ class KalshiAuthError(KalshiAPIError):
 
 
 class KalshiRateLimitError(KalshiAPIError):
-    """429 - retry con backoff."""
+    """429 - backoff sólo en lecturas."""
 
 
 class KalshiServerError(KalshiAPIError):
-    """5xx - retry."""
+    """5xx - reintento sólo en lecturas; una mutación queda incierta."""
 
 
 class KalshiClientError(KalshiAPIError):
@@ -428,8 +428,8 @@ class KalshiRestClient:
         )
         self.base_url = self.settings.rest_url
         self._client: httpx.AsyncClient | None = None
-        # Throttle preventivo de WRITES (Motor 5 F2): hoy solo hay retry REACTIVO al 429;
-        # un MM que cotiza N tickers por tick puede rafaguear writes. Techo interno
+        # Throttle preventivo de WRITES (Motor 5 F2): un MM que cotiza N tickers
+        # por tick puede rafaguear writes. Las escrituras no se reintentan. Techo interno
         # conservador de 5 operaciones/s; no sustituye el presupuesto tokenizado del tier.
         self._write_throttle = _WriteThrottle()
 
@@ -479,16 +479,20 @@ class KalshiRestClient:
         params: dict | None = None,
         json: dict | None = None,
     ) -> dict[str, Any]:
-        """Request firmado con retries automáticos."""
+        """Request firmado; sólo las lecturas admiten reintentos automáticos."""
         if self._client is None:
             raise RuntimeError("Cliente no inicializado. Usar `async with KalshiRestClient()`")
 
         # La firma va SOBRE EL PATH BASE (sin querystring); los params van en la URL.
         sign_path = self._build_sign_path(path)
 
+        # Un ACK perdido no demuestra que la mutación no ocurrió. Propagar el
+        # error original permite conciliarla sin duplicar órdenes ni cancelaciones.
+        max_attempts = 4 if method.upper() in {"GET", "HEAD"} else 1
+
         try:
             async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(4),
+                stop=stop_after_attempt(max_attempts),
                 # Kalshi no envía Retry-After; backoff puro: 1s, 2s, 4s... cap 60s
                 wait=wait_exponential(multiplier=1, min=1, max=60),
                 retry=retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
@@ -513,7 +517,7 @@ class KalshiRestClient:
                         err = self._classify_error(resp.status_code, resp.text[:500])
                         if isinstance(err, KalshiRateLimitError):
                             logger.warning(
-                                f"{method} {path} → 429 (attempt {attempt_num}/4): "
+                                f"{method} {path} → 429 (attempt {attempt_num}/{max_attempts}): "
                                 f"{resp.text[:200]}"
                             )
                         else:
