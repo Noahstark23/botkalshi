@@ -65,6 +65,7 @@ async def test_boot_m1_off_recovers_only_enabled_motor(strategy, flag):
         intent(name, name)
     client = AsyncMock()
     client.get_orders.return_value = {
+        "cursor": "",
         "orders": [
             {
                 "client_order_id": strategy,
@@ -72,7 +73,7 @@ async def test_boot_m1_off_recovers_only_enabled_motor(strategy, flag):
                 "fill_count_fp": "0.25",
                 "fill_count": None,
             },
-        ]
+        ],
     }
     with (
         patch("src.runner.get_settings", return_value=settings),
@@ -109,7 +110,7 @@ async def test_boot_unknown_or_live_order_keeps_risk_and_durable_pause(orders):
     intent("motor_2_consensus", "pending")
     client = AsyncMock()
     client.__aenter__.return_value = client
-    client.get_orders.return_value = {"orders": orders}
+    client.get_orders.return_value = {"cursor": "", "orders": orders}
     settings = Settings.model_construct(
         MOTOR_1_ARBITRAGE_ENABLED=False,
         MOTOR_2_SPORTSBOOK_ENABLED=True,

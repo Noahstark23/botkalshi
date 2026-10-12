@@ -152,7 +152,7 @@ async def test_arbitrage_nonterminal_hard_leg_never_triggers_guessed_rollback(mo
     order = {"status": "resting", "fill_count_fp": fill, "remaining_count_fp": "0.75"}
     client = AsyncMock()
     client.place_order.return_value = {"order": order}
-    client.get_orders.return_value = {"orders": []}
+    client.get_orders.return_value = {"cursor": "", "orders": []}
     opp = _opp()
     if motor == "rest":
         result = await RestExecutor(client).execute(opp)
@@ -437,7 +437,10 @@ async def test_rest_reconcile_regressive_zero_keeps_fill_floor_and_never_sells()
 
     async def orders(**kwargs):
         return {
-            "orders": [{"client_order_id": coids[0], "status": "canceled", "fill_count_fp": "0.00"}]
+            "cursor": "",
+            "orders": [
+                {"client_order_id": coids[0], "status": "canceled", "fill_count_fp": "0.00"}
+            ],
         }
 
     client.place_order.side_effect = place
@@ -461,6 +464,7 @@ async def test_restart_after_split_never_restores_original_cumulative_fill():
         s.commit()
     client = AsyncMock()
     client.get_orders.return_value = {
+        "cursor": "",
         "orders": [
             {
                 "client_order_id": "buy",
@@ -480,7 +484,7 @@ async def test_restart_after_split_never_restores_original_cumulative_fill():
                 "status": "executed",
                 "fill_count_fp": "0.15",
             },
-        ]
+        ],
     }
     wire_exit_fills(client, [("yes", Fraction("0.15"), 50, 1)])
     await reconcile_pending_orders(client, strategies=("motor_1_arbitrage",))
@@ -508,6 +512,7 @@ async def test_restart_reconciles_cancelled_order_with_fraction_instead_of_zero(
         s.commit()
     client = AsyncMock()
     client.get_orders.return_value = {
+        "cursor": "",
         "orders": [
             {
                 "client_order_id": "ioc",
@@ -516,7 +521,7 @@ async def test_restart_reconciles_cancelled_order_with_fraction_instead_of_zero(
                 "fill_count": None,
                 "fill_count_fp": "0.25",
             }
-        ]
+        ],
     }
     await reconcile_pending_orders(client, strategies=("motor_2_consensus",))
     (row,) = rows()

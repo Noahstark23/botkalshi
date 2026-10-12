@@ -7,6 +7,7 @@ from loguru import logger
 from sqlalchemy import text
 from sqlmodel import select
 
+from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import api_count, terminal_fill
 from src.storage.exit_capture import collect_exit_execution
@@ -21,6 +22,7 @@ from src.storage.quantities import (
 )
 from src.storage.reductions import REDUCTION_PREFIX, finalize_reduction
 
+_RECONCILE_PAGE_LIMIT = 200
 RECOVERABLE_STRATEGIES = frozenset({"motor_1_arbitrage", "motor_2_consensus", "motor_rest_arb"})
 
 
@@ -149,8 +151,11 @@ async def reconcile_pending_orders(
 ) -> ReconciliationResult:
     """Sólo procesa estrategias explícitas y conserva toda incertidumbre pendiente.
 
-    El listado está limitado a 100 órdenes. Una ausencia, duplicado, status vivo,
-    cantidad inválida o fallo de red nunca demuestra cero fills: el caller debe
+    Lee la colección COMPLETA (cursor hasta "") antes de mutar nada. Una página
+    caída, cursor ausente/repetido, respuesta malformada u order_id repetido deja
+    sin veredicto a todo el barrido. Una ausencia (las terminales viejas migran a /historical/orders),
+    duplicado, status vivo, cantidad inválida o fallo de red nunca demuestra cero
+    fills: el caller debe
     pausar entradas mientras ``unresolved`` no esté vacío. Los SELL de CLV quedan
     pendientes para su reconciliador, que conoce la atribución FIFO original.
     """
@@ -173,12 +178,16 @@ async def reconcile_pending_orders(
         return ReconciliationResult()
     unresolved = {row.client_order_id for row in pending}
     try:
-        response = await client.get_orders(limit=100)
-        orders = response.get("orders")
-        if not isinstance(orders, list) or any(not isinstance(o, dict) for o in orders):
-            raise ValueError("listado de órdenes inválido")
+        # Barrido ÚNICO con el presupuesto TOTAL del cliente: ≤100 páginas (llamadas a
+        # get_orders, cada una con los reintentos propios de _request) y ≤30 s en conjunto.
+        # Colección completa o excepción. Nada se muta antes de cerrar el
+        # snapshot. get_all_orders se invoca sobre el get_orders de ESTE client.
+        orders = await KalshiRestClient.get_all_orders(client, limit=_RECONCILE_PAGE_LIMIT)
+        order_ids = [o["order_id"] for o in orders if o.get("order_id") is not None]
+        if len(order_ids) != len(set(order_ids)):
+            raise ValueError("order_id repetido en el barrido: lectura no atómica")
     except Exception as exc:
-        logger.error("Reconcile GET falló: {}", exc)
+        logger.error("Reconcile GET incompleto: {}", exc)
         return ReconciliationResult(len(pending), 0, tuple(sorted(unresolved)))
 
     for row in pending:

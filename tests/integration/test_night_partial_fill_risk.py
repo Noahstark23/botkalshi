@@ -173,7 +173,7 @@ class PartialTransport:
         }
 
     async def get_orders(self, **kwargs):
-        return {"orders": list(self.orders.values())}
+        return {"cursor": "", "orders": list(self.orders.values())}
 
     async def get_fills(self, *, order_id, ticker, subaccount, limit, **kwargs):
         assert subaccount == 0 and limit == 100 and not kwargs

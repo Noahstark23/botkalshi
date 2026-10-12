@@ -101,7 +101,7 @@ async def test_uncertain_ack_then_get_and_new_connection_preserve_money(monkeypa
         observation = order(fill="0.50", gross="0.210050", fee="0.000250")
         observation["client_order_id"] = row.client_order_id
         reader = AsyncMock()
-        reader.get_orders.return_value = {"orders": [observation]}
+        reader.get_orders.return_value = {"cursor": "", "orders": [observation]}
         report = await reconcile_pending_orders(reader, strategies=("motor_2_consensus",))
         assert report.resolved == 1 and not report.unresolved
         row = _trade()
@@ -144,7 +144,7 @@ async def test_invalid_money_keeps_quantity_and_original_reservation():
     observation = order()  # Ni un replay posterior válido levanta esta contradicción.
     observation["client_order_id"] = row.client_order_id
     reader = AsyncMock()
-    reader.get_orders.return_value = {"orders": [observation]}
+    reader.get_orders.return_value = {"cursor": "", "orders": [observation]}
     assert (await reconcile_pending_orders(reader, strategies=("motor_2_consensus",))).unresolved
     assert _trade().status == "pending" and _trade().fill_cost_usd_fp is None
     assert await SettlementPoller(Resolved()).settle_once() == 0
@@ -156,7 +156,7 @@ async def test_regressive_money_replay_cannot_rehabilitate_observed_cost():
     data = order(fill="0.50", gross="0.080000", fee="0.000250")
     data["client_order_id"] = row.client_order_id
     reader = AsyncMock()
-    reader.get_orders.return_value = {"orders": [data]}
+    reader.get_orders.return_value = {"cursor": "", "orders": [data]}
     for _ in range(2):
         result = await reconcile_pending_orders(reader, strategies=("motor_2_consensus",))
         assert result.unresolved and result.resolved == 0
@@ -172,6 +172,7 @@ async def test_new_fill_without_totals_cannot_reuse_previous_money():
     row = _trade()
     reader = AsyncMock()
     reader.get_orders.return_value = {
+        "cursor": "",
         "orders": [
             {
                 "client_order_id": row.client_order_id,
@@ -180,7 +181,7 @@ async def test_new_fill_without_totals_cannot_reuse_previous_money():
                 "fill_count_fp": "0.50",
                 "remaining_count_fp": "0.00",
             }
-        ]
+        ],
     }
     assert (await reconcile_pending_orders(reader, strategies=("motor_2_consensus",))).resolved == 1
     row = _trade()
@@ -202,7 +203,7 @@ async def test_get_rechecks_order_identity_after_await():
             session.commit()
         data = order(fill="0.50", gross="0.210050", fee="0.000250")
         data["client_order_id"] = original.client_order_id
-        return {"orders": [data]}
+        return {"cursor": "", "orders": [data]}
 
     reader = AsyncMock()
     reader.get_orders.side_effect = changing_get

@@ -299,6 +299,7 @@ async def test_reconcile_matches_executed_kalshi_order(executor, mock_client):
         s.commit()
 
     mock_client.get_orders.return_value = {
+        "cursor": "",
         "orders": [
             {
                 "client_order_id": coid,
@@ -306,7 +307,7 @@ async def test_reconcile_matches_executed_kalshi_order(executor, mock_client):
                 "status": "executed",
                 "fill_count_fp": "5.00",
             }
-        ]
+        ],
     }
 
     await executor.reconcile_pending_trades()
@@ -338,7 +339,7 @@ async def test_reconcile_missing_keeps_pending_exposure(executor, mock_client):
         s.commit()
 
     # Kalshi returns empty orders — trade not found
-    mock_client.get_orders.return_value = {"orders": []}
+    mock_client.get_orders.return_value = {"cursor": "", "orders": []}
 
     with patch(
         "src.strategies.motor_1_arbitrage.executor.alert_error",
@@ -373,6 +374,7 @@ async def test_reconcile_marks_canceled_trade(executor, mock_client):
         s.commit()
 
     mock_client.get_orders.return_value = {
+        "cursor": "",
         "orders": [
             {
                 "client_order_id": coid,
@@ -380,7 +382,7 @@ async def test_reconcile_marks_canceled_trade(executor, mock_client):
                 "status": "canceled",
                 "fill_count_fp": "0.00",
             }
-        ]
+        ],
     }
     await executor.reconcile_pending_trades()
 
@@ -409,7 +411,8 @@ async def test_reconcile_unknown_quantity_keeps_pending_exposure(executor, mock_
         s.commit()
 
     mock_client.get_orders.return_value = {
-        "orders": [{"client_order_id": coid, "order_id": "k-y", "status": "resting"}]
+        "cursor": "",
+        "orders": [{"client_order_id": coid, "order_id": "k-y", "status": "resting"}],
     }
     await executor.reconcile_pending_trades()
 
