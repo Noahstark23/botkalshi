@@ -129,3 +129,35 @@ La consulta pública separada de la serie NFL devolvió `fee_type=quadratic` y
 El test negativo confirma el rechazo. Esta etapa **no se alcanzó en el ensayo
 conectado**, porque faltó el fair: el contador conectado `skip_fee_policy=0`
 no significa que la tarifa sea compatible. No se sustituyó metadata para aprobar.
+
+## Identidades NFL observadas el 12 de octubre de 2026
+
+El ensayo de `KXNFLGAME-26OCT12BUFLAR` obtuvo dos libros y 111 frames WS, pero
+ningún fair. La reproducción con las capturas originales mostró `reject_absent`:
+el catálogo devolvía `Buffalo` y `Los Angeles R`, mientras el snapshot conservaba
+`Buffalo Bills` y `Los Angeles Rams`. La tabla NFL sólo cubría Philadelphia y
+Jacksonville. Cero en `reject_names` no excluía un problema de nombres: ningún
+nombre del partido coincidía y el diagnóstico lo clasificaba como ausente.
+
+Se ampliaron aliases y códigos de ticker para los 28 equipos observados en los
+15 partidos de esa consulta. Los nombres proceden del catálogo Demo y del snapshot
+NFL; la captura mínima queda en `tests/fixtures/nfl_demo_identity_20261012.json`.
+Las tablas siguen restringidas a NFL y no interpretan ciudades ambiguas como
+`Los Angeles` o `New York`. El código del ticker verifica por separado que el
+nombre no pertenece al rival; intercambiar nombres, liga o fecha bloquea el fair.
+
+La reproducción local de los mismos inputs pasó de cero partidos coincidentes a
+15 y produjo 30 valores fair. Es evidencia de identidad y cálculo con una captura,
+no de continuidad, equivalencia contractual ni ejecución. Los precios de las
+pruebas unitarias de identidad son sintéticos y se mantienen separados del ensayo
+conectado. No se cambiaron umbrales, fechas, fees ni flags de ejecución.
+
+El siguiente ensayo NFL conectado de 90s completó `HYBRID_READ_ONLY`: 15 GET
+HTTP 200, dos libros, 110 frames WS, un ciclo M2, dos ciclos M5, dos valores fair
+y dos propuestas shadow. Los siete servicios arrancaron y el apagado fue limpio;
+cero filas financieras, órdenes o violaciones de los límites. El snapshot mantuvo
+SHA256 `9a301822665ec6923aba0c56885d559b2ac951d0e5fc20ebc411f6ad5a4c363f`.
+La selección explícita acredita únicamente el recorrido Bills–Rams. MLB quedó
+`INCOMPLETE` por catálogo vacío y no hubo snapshot NCAA para ejecutar su ensayo.
+`strategy_readiness`, `execution_validated` y `payoff_equivalence_verified`
+permanecieron en falso, tal como exige el alcance de lectura.
