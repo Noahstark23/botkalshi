@@ -40,6 +40,8 @@ _SACRED = [
     "motor_permissions",
     "motor_permission_commands",  # revisiones y command_id jamás reciclados
     "motor_permission_admissions",  # atribución original de cada intent financiero
+    "financial_fence",  # revisión/época: copiar, jamás recalcular al reconstruir
+    "financial_receipt_state",  # intento/recibo finito; el binding no se reinicia
     "portfolio_positions",
     "risk_events",
     "daily_pnl",
@@ -98,7 +100,8 @@ def main() -> int:
         new.execute("PRAGMA auto_vacuum=INCREMENTAL")
         new.execute("PRAGMA journal_mode=WAL")
 
-        # 1. Replicar el schema EXACTO de la DB vieja (tablas + índices), sea cual sea.
+        # 1. Replicar tablas/índices. Los triggers se instalan DESPUÉS de copiar:
+        # ejecutarlos durante la copia alteraría la revisión financiera original.
         tables = [
             (name, sql)
             for name, sql in old.execute(
@@ -108,6 +111,9 @@ def main() -> int:
         ]
         for _name, sql in tables:
             new.execute(sql)
+        triggers = dict(
+            old.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'").fetchall()
+        )
         for (sql,) in old.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
         ):
@@ -131,6 +137,10 @@ def main() -> int:
                 copied[t] = new.execute(f"SELECT count(*) FROM main.{t}").fetchone()[0]
         new.commit()
         new.execute("DETACH DATABASE old")
+        for sql in triggers.values():
+            new.execute(sql)
+        if dict(new.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) != triggers:
+            raise RuntimeError("rebuild: triggers no preservados")
         new.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         new.commit()
     finally:
@@ -160,6 +170,16 @@ def main() -> int:
             print(f"  {t:22s} vieja={old_n}  nueva={new_n}  {ok}")
             if old_n != new_n:
                 mismatches.append(f"{t}: vieja={old_n} nueva={new_n}")
+            # Son tablas singleton acotadas: conteo igual no prueba que la
+            # época, secuencia, binding y recibo se hayan conservado.
+            if t in {"financial_fence", "financial_receipt_state"} and list(
+                old_ro.execute(f"SELECT * FROM {t}")  # noqa: S608
+            ) != list(new_ro.execute(f"SELECT * FROM {t}")):  # noqa: S608
+                mismatches.append(f"{t}: contenido modificado")
+        if dict(old_ro.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) != dict(
+            new_ro.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")
+        ):
+            mismatches.append("triggers: definición modificada")
         opstate = list(new_ro.execute("SELECT key, value, reason FROM operational_state"))
     finally:
         old_ro.close()
