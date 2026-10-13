@@ -1,0 +1,7 @@
+{
+  "us500_control.py": "0c02a8194a065252ef33ee2e09a4bf01c34af6e7820dee496b41dfabb7f21d59",
+  "us500_telegram.py": "d41a8e72ecafb700b5efd61ea914aa7208594bfc80f40b3b05d3eb8d697225b7",
+  "bot_motor_panel.py": "67bb3dca6fae11b8e9a2ac0eba200691e05101cbf5579e90ae548d8f2d448672",
+  "motor_status_readonly.py": "da5d150cefdb1db59c2630aed759d40de3ac5f1bf4c2520f3aad61ed8db4077b",
+  "runtime_telemetry_contract.py": "4cf6f88411137aa2b59f56f0649f0a44a0ec7340381f06eff8edf8a6d5644826"
+}

@@ -11,14 +11,17 @@ veces. Ahora el remanente queda con fees prorrateadas y la hija lleva las suyas.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlmodel import select
 
 from src.math.fees import kalshi_fee_cents
+from src.risk.manager import RiskManager
+from src.storage.accounting import EXIT_ALLOCATED, REALIZED_PNL
 from src.storage.models import PortfolioPosition, Trade, get_session
 from src.strategies.motor_3_clv.executor import Motor3ExitExecutor
+from src.utils.config import Settings
 from tests.exit_fill_fixtures import wire_exit_fills
 
 TICKER = "KXACCT"
@@ -30,7 +33,7 @@ def _client(*, fill_count: int) -> MagicMock:
     c.place_order = AsyncMock(
         return_value={"order": {"remaining_count": 0, "order_id": "o", "fill_count": fill_count}}
     )
-    c.get_orders = AsyncMock(return_value={"orders": []})
+    c.get_orders = AsyncMock(return_value={"orders": [], "cursor": ""})
     wire_exit_fills(c, [("yes", fill_count, 60, {4: 7, 10: 17}[fill_count])])
     return c
 
@@ -59,6 +62,20 @@ def _rows() -> list[Trade]:
         return list(s.exec(select(Trade).where(Trade.action == "buy")))
 
 
+def _assert_reader_counts_buy_pnl_once():
+    with get_session() as session:
+        rows = list(session.exec(select(Trade).where(Trade.status == "settled")))
+        sells = [r for r in rows if r.action == "sell"]
+        buys = [r for r in rows if r.action == "buy"]
+        assert sells and all(
+            r.accounting_role == EXIT_ALLOCATED and r.pnl_cents is None for r in sells
+        )
+        assert buys and all(r.accounting_role == REALIZED_PNL for r in buys)
+        with patch("src.risk.manager.get_settings", return_value=Settings.model_construct()):
+            snap = RiskManager()._stop_loss_snapshot(session=session, capital_usd=100)
+        assert all(w["pnl_usd"] == sum(r.pnl_cents for r in buys) / 100 for w in snap["windows"])
+
+
 @pytest.mark.asyncio
 async def test_partial_split_prorates_entry_fees():
     """BUY 10 @45 con fees pagadas fee(10,45); exit llena 4 → remanente queda con
@@ -76,6 +93,8 @@ async def test_partial_split_prorates_entry_fees():
     assert rows["rem"].count == 6 and rows["rem"].fees_cents == paid - tramo
     assert rows["child"].count == 4 and rows["child"].fees_cents == tramo
     assert rows["rem"].fees_cents + rows["child"].fees_cents == paid
+    assert rows["rem"].accounting_role is None
+    _assert_reader_counts_buy_pnl_once()
 
 
 @pytest.mark.asyncio
@@ -101,3 +120,4 @@ async def test_exit_fee_allocated_cumulatively_across_legs():
         - 2 * kalshi_fee_cents(5, 45)  # fees de entrada por pata (órdenes separadas)
     )
     assert total_pnl == expected
+    _assert_reader_counts_buy_pnl_once()

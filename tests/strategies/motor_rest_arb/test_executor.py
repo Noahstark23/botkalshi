@@ -113,7 +113,8 @@ async def test_error_red_cheap_reconciles_filled_rolls_back_both():
                         "client_order_id"
                     ],
                 }
-            ]
+            ],
+            "cursor": "",
         }
     )
     client.get_positions = AsyncMock(
@@ -139,7 +140,7 @@ async def test_error_red_sources_discrepancy_assumes_exposed():
     client.place_order = AsyncMock(
         side_effect=[_filled_resp(), ConnectionError("y"), _filled_resp(), _filled_resp()]
     )  # rollbacks
-    client.get_orders = AsyncMock(return_value={"orders": []})  # fuente 1: no llena
+    client.get_orders = AsyncMock(return_value={"orders": [], "cursor": ""})
     client.get_positions = AsyncMock(
         return_value={"market_positions": [{"ticker": "KXWC-26-ARG", "position": 5}]}
     )  # fuente 2: SÍ posición → discrepancia
@@ -325,7 +326,7 @@ async def test_other_409_is_error_red_not_kill():
     other_409 = KalshiClientError(409, "Client error", "", error_code="market_closed")
     # Secuenciado: la hard=no → 409 de otra causa → ERROR_RED → reconcilia (barata no se envía).
     client.place_order = AsyncMock(side_effect=[other_409])
-    client.get_orders = AsyncMock(return_value={"orders": []})
+    client.get_orders = AsyncMock(return_value={"orders": [], "cursor": ""})
     client.get_positions = AsyncMock(return_value={"market_positions": []})
     ex = RestExecutor(client)
 

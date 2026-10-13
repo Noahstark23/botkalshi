@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, text
 from sqlmodel import col, or_, select
 
+from src.control.permissions import DurablePermissionAdapter
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import fixed_count
 from src.risk.exposure import MM_STRATEGY, exposure_count, open_risk_cents
@@ -96,10 +97,17 @@ def reserve_m1_intents(
     limits: dict | None = None,
     now=None,
     fee_observations: dict | None = None,
+    permissions: DurablePermissionAdapter | None = None,
 ) -> bool:
     if any(t.strategy != "motor_1_arbitrage" or t.action != "buy" for t in trades):
         raise ValueError("sólo intents BUY M1 pendientes")
-    return reserve_trade_intents(trades, limits=limits, now=now, fee_observations=fee_observations)
+    return reserve_trade_intents(
+        trades,
+        limits=limits,
+        now=now,
+        fee_observations=fee_observations,
+        **({"permissions": permissions} if permissions is not None else {}),
+    )
 
 
 def validate_multi_fee(ticker: str, observation: object, *, now: datetime) -> None:
@@ -128,6 +136,7 @@ def reserve_trade_intents(
     limits: dict | None = None,
     now=None,
     fee_observations: dict | None = None,
+    permissions: DurablePermissionAdapter | None = None,
 ) -> bool:
     """True sólo para reserva nueva; replay idéntico no reenvía órdenes.
 
@@ -315,6 +324,16 @@ def reserve_trade_intents(
                 total = lifetime_committed_cents(session, now=now)
                 if total + proposed > cap:
                     raise ValueError("reserva M1 excede presupuesto histórico")
+        if permissions is not None:
+            strategies = {trade.strategy for trade in trades}
+            if len(strategies) != 1:
+                raise ValueError("grupo de admisión mezcla estrategias")
+            scope = {
+                "motor_1_arbitrage": "m1.entries",
+                "motor_2_consensus": "m2.entries",
+                MM_STRATEGY: "m5.quotes",
+            }[trades[0].strategy]
+            permissions.admit(session, scope, trades)
         for trade, commitment in zip(trades, commitments, strict=True):
             trade.commitment_origin_id = commitment.client_order_id
             trade.placed_at = now.replace(tzinfo=UTC)

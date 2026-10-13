@@ -89,7 +89,7 @@ class FakeGetOnly:
 
     async def get_orders(self, **params):
         self.calls.append(params)
-        return {"orders": self.orders}
+        return {"orders": self.orders, "cursor": ""}
 
 
 @pytest.mark.parametrize(
@@ -114,7 +114,9 @@ async def test_m3_terminal_zero_identity_conflict_cannot_release_reservation(cha
     )
     assert persisted("m3-sell").model_dump() == before
     assert BotState.is_paused and models.kill_switch_engaged()[0]
-    assert client.calls == [{"ticker": "FIXTURE-EXIT"}]
+    assert client.calls == [
+        {"ticker": "FIXTURE-EXIT", "status": None, "limit": 200, "cursor": None}
+    ]
 
 
 @pytest.mark.parametrize("conflicting", [False, True])

@@ -12,6 +12,7 @@ from loguru import logger
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiAPIError, KalshiRestClient
+from src.control.permissions import DurablePermissionAdapter
 from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
@@ -82,8 +83,10 @@ class ArbitrageExecutor:
         max_rollback_retries: int = 3,
         rollback_window_minutes: int = 60,
         circuit_breaker_threshold: int = 3,
+        permissions: DurablePermissionAdapter | None = None,
     ) -> None:
         self.client = rest_client
+        self._permissions = permissions
         self.risk_manager = risk_manager
         self.max_slippage_pct = max_slippage_pct
         self.max_rollback_retries = max_rollback_retries
@@ -1023,7 +1026,12 @@ class ArbitrageExecutor:
                 notes=f"arb_id={arb_id}",
             )
             trades.append(trade)
-        return reserve_m1_intents(trades, limits=limits, fee_observations=fee_observations)
+        return reserve_m1_intents(
+            trades,
+            limits=limits,
+            fee_observations=fee_observations,
+            **({"permissions": self._permissions} if self._permissions is not None else {}),
+        )
 
     def _update_trade_status(self, coid: str, status: str) -> None:
         """Update trade status (and filled_at if status='filled')."""

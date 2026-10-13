@@ -16,6 +16,7 @@ from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiRestClient
 from src.storage.models import Trade, get_session
+from src.strategies.motor_5_mm.cancel_intent import prepare_protective_cancel
 from src.strategies.motor_5_mm.executor import COID_PREFIX, STRATEGY
 from src.strategies.motor_5_mm.incidents import latch_incident
 from src.strategies.motor_5_mm.ledger import confirmed_fill, record_fill, record_order_fill
@@ -82,6 +83,39 @@ class MMReconciler:
             self._uncertain(report, durable=False)
             return report
 
+        deferred_error: Exception | None = None
+        # Retirar fantasmas no depende de persistir las órdenes conocidas.
+        # Un fallo posterior conserva reservas y bloquea el cierre, pero no
+        # impide intentar estos DELETE de identidades ya validadas.
+        pending_coids = {row.client_order_id for row in pending}
+        for coid, order in api_orders.items():
+            if (
+                not coid.startswith(COID_PREFIX)
+                or coid in pending_coids
+                or str(order.get("status", "")).lower() != "resting"
+            ):
+                continue
+            # Sin ledger no se reconstruyen exposición/fees: ni un cancel confirmado
+            # elimina la discrepancia ni autoriza nuevas quotes.
+            ticker = order.get("ticker")
+            self._uncertain(report, ticker if isinstance(ticker, str) else None, durable=False)
+            try:
+                # Revocar dueño antes de red; si la DB falla, el marcador de
+                # sesión previo mantiene bloqueo al reiniciar. No omitir retiro.
+                latch_incident("fantasma M5 sin ledger; requiere revisión")
+            except Exception as exc:
+                deferred_error = deferred_error or exc
+            try:
+                response = await self._client.cancel_order(order["order_id"])
+                terminal = response.get("order", response) if isinstance(response, dict) else None
+                if (
+                    terminal_fill_count(terminal, order_id=order["order_id"], client_order_id=coid)
+                    is not None
+                ):
+                    report.phantom_cancelled += 1
+            except Exception:
+                logger.exception("motor5.reconcile.phantom_cancel_unconfirmed")
+
         for row in pending:
             report.pending_checked += 1
             if COUNT_QUARANTINE_NOTE in (row.notes or ""):
@@ -98,7 +132,7 @@ class MMReconciler:
                     # El ledger no representa esta evidencia. El marcador se
                     # preserva en DB: otro cancel o reinicio no la convierte en cero.
                     if not self._update(row.client_order_id, note=COUNT_QUARANTINE_NOTE):
-                        # Sin registrar el bloqueo, no continuar hacia otros cancels.
+                        # Sin registrar el bloqueo, no continuar con las órdenes conocidas.
                         latch_incident("no se pudo persistir cuarentena de cantidad M5")
                         raise RuntimeError("no se pudo persistir cuarentena de cantidad M5")
                     self._uncertain(report, row.ticker)
@@ -119,7 +153,15 @@ class MMReconciler:
                 row.kalshi_order_id = order["order_id"]
                 record_fill(row, observed_fill)
                 if live_coids is not None and row.client_order_id not in live_coids:
-                    await self._cancel_orphan(row, order, report)
+                    try:
+                        await self._cancel_orphan(row, order, report)
+                    except Exception as exc:
+                        deferred_error = deferred_error or exc
+                    continue
+                if row.cancel_requested_at_ms is not None:
+                    # Una observación resting no resuelve el DELETE incierto.
+                    # Sin dueño sano se retira arriba; aquí nunca se acredita resting.
+                    self._uncertain(report, row.ticker)
                     continue
                 # El engine reconstruye el inventario desde esta cantidad durable
                 # ANTES de cotizar; pending conserva la reserva de la orden completa.
@@ -127,29 +169,8 @@ class MMReconciler:
             else:
                 self._resolve_terminal(row, order, report, note="reconcile: terminal")
 
-        pending_coids = {row.client_order_id for row in pending}
-        for coid, order in api_orders.items():
-            if (
-                not coid.startswith(COID_PREFIX)
-                or coid in pending_coids
-                or str(order.get("status", "")).lower() != "resting"
-            ):
-                continue
-            # Sin ledger no se reconstruyen exposición/fees: ni un cancel confirmado
-            # elimina la discrepancia ni autoriza nuevas quotes.
-            ticker = order.get("ticker")
-            self._uncertain(report, ticker if isinstance(ticker, str) else None)
-            try:
-                response = await self._client.cancel_order(order["order_id"])
-                terminal = response.get("order", response) if isinstance(response, dict) else None
-                if (
-                    terminal_fill_count(terminal, order_id=order["order_id"], client_order_id=coid)
-                    is not None
-                ):
-                    report.phantom_cancelled += 1
-            except Exception:
-                logger.exception("motor5.reconcile.phantom_cancel_unconfirmed")
-
+        if deferred_error is not None:
+            raise deferred_error
         report.complete = report.discrepancies == 0
         if report.pending_checked or report.discrepancies:
             logger.info(
@@ -242,6 +263,23 @@ class MMReconciler:
     async def _cancel_orphan(self, row: Trade, order: dict, report: MMReconcileReport) -> None:
         oid = row.kalshi_order_id or order["order_id"]
         # Identidad y mínimo fill conocido ya persistidos por la rama resting común.
+        can_send, intent_error = prepare_protective_cancel(row.client_order_id, oid)
+        if not can_send:
+            self._uncertain(report, row.ticker, durable=False)
+            if intent_error is not None:
+                raise intent_error
+            return
+        try:
+            await self._send_orphan_cancel(row, oid, report)
+        finally:
+            # El fallo previo no se transforma en cierre sano aunque llegue un
+            # terminal. No reemplazar CancelledError por una excepción de DB.
+            if intent_error is not None:
+                self._uncertain(report, row.ticker, durable=False)
+        if intent_error is not None:
+            raise intent_error
+
+    async def _send_orphan_cancel(self, row: Trade, oid: str, report: MMReconcileReport) -> None:
         try:
             response = await self._client.cancel_order(oid)
         except BaseException as exc:

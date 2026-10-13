@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from loguru import logger
 
+from src.monitoring.motor_telemetry import observed_tick
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_2_consensus.detector import KalshiEventQuotes
 from src.strategies.motor_6_linemove.detector import LineMoveSignal, find_linemove_signals
@@ -40,6 +41,7 @@ class Motor6LineMoveShadow:
         self._fair_prev: dict[str, float] = {}
         self._signals_seen = 0
 
+    @observed_tick
     def observe(
         self,
         kalshi_events: list[KalshiEventQuotes],

@@ -33,6 +33,7 @@ from loguru import logger
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
+from src.control.permissions import DurablePermissionAdapter
 from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import api_count, fixed_count, terminal_fill
@@ -46,6 +47,8 @@ from src.storage.quantities import (
     filled_fields,
     hold_uncertain_order,
     quantity_fields,
+    requested_quantity,
+    validate_order_identity,
 )
 from src.storage.reductions import finalize_reduction, persist_reduction
 
@@ -112,8 +115,11 @@ class RestExecutor:
     ROLLBACK_MAX_RETRIES = 3  # reintentos del rollback limit antes de kill-switch
     ROLLBACK_PRICE_CENTS = 1  # sell agresivo a 1¢ para consumir cualquier bid
 
-    def __init__(self, client: KalshiRestClient) -> None:
+    def __init__(
+        self, client: KalshiRestClient, *, permissions: DurablePermissionAdapter | None = None
+    ) -> None:
         self.client = client
+        self._permissions = permissions
         self._rollback_timestamps: list[float] = []  # monotonic, dentro de la ventana
         self._paused = False
 
@@ -171,6 +177,13 @@ class RestExecutor:
         # Paso 1: disparar SOLO la pata hard y esperarla.
         hard_result = await self._place_fok(hard_leg, coids[hard_leg])
         self._apply_leg_result_to_trade(hard_result)
+        if self._paused:
+            # Un fill que no pudo guardarse no autoriza a comprar más patas.
+            # La reserva queda pendiente para boot/revisión; no inventar un cierre.
+            self._cancel_unsent_legs(other_legs, coids)
+            return ExecutionOutcome(
+                filled=False, leg_states=[hard_result.state], kill_switch_fired=True
+            )
 
         # Caso KILL de la hard: no se compró nada → no-op, cero exposición. Las patas
         # baratas NO se envían (su fila pending se cierra como cancelada).
@@ -207,6 +220,11 @@ class RestExecutor:
         results = [hard_result, *cheap_results]
         states = [r.state for r in results]
         outcome = ExecutionOutcome(filled=False, leg_states=states)
+        if self._paused:
+            # Las baratas ya fueron enviadas: conservar sus reservas/evidencia sin
+            # anunciar un arb confirmado cuando alguna persistencia falló.
+            outcome.kill_switch_fired = True
+            return outcome
 
         # Caso 1: todas FILL → arb capturado completo.
         if all(s is LegState.FILL for s in states):
@@ -232,6 +250,8 @@ class RestExecutor:
         """
         if not r.terminal:
             order = {"fill_count_fp": fixed_count(r.fill_count)} if r.fill_count is not None else {}
+            if r.order_id is not None:
+                order["order_id"] = r.order_id
             hold_uncertain_order(r.client_order_id, order)
         elif r.fill_count is not None and r.fill_count > 0:
             self._update_trade(
@@ -316,8 +336,20 @@ class RestExecutor:
             )
             return LegResult(leg=leg, state=LegState.ERROR_RED, client_order_id=coid)
 
-        order = resp.get("order", resp) if isinstance(resp, dict) else {}
-        order_id = str(order.get("order_id", "")) or None
+        order = resp.get("order", resp) if isinstance(resp, dict) else None
+        try:
+            with get_session() as s:
+                row = s.exec(select(Trade).where(Trade.client_order_id == coid)).one()
+                self._validate_buy_identity(row, leg, order)
+                if order.get("order_id") is not None:
+                    row.kalshi_order_id = order["order_id"]
+                    s.add(row)
+                    s.commit()
+        except Exception:
+            # Un ACK ajeno no acredita ni cero-fill ni inventario vendible.
+            logger.warning("REST: ACK sin identidad atribuible a la intención pendiente")
+            return LegResult(leg, LegState.ERROR_RED, coid, None, None, False)
+        order_id = order.get("order_id")
         fill = terminal_fill(order, leg.count, placement=True)
         if fill is None:
             observed = api_count(order, "fill_count")
@@ -353,6 +385,30 @@ class RestExecutor:
     # =====================================================
     # Reconciliación de ERROR_RED (estado desconocido)
     # =====================================================
+
+    @staticmethod
+    def _validate_buy_identity(row: Trade, leg: ArbLeg, order: object) -> None:
+        """Identidad presente coherente con la reserva, incluidos campos del API v2."""
+        if (
+            row.status != "pending"
+            or row.action != "buy"
+            or row.strategy != "motor_rest_arb"
+            or row.ticker != leg.market_ticker
+            or row.side != leg.side
+            or requested_quantity(row) != leg.count
+        ):
+            raise ValueError("la pata no corresponde a una compra REST pendiente")
+        validate_order_identity(row, order)
+        for key, expected in (
+            ("outcome_side", row.side),
+            ("book_side", "bid" if row.side == "yes" else "ask"),
+        ):
+            if key in order and order[key] != expected:
+                raise ValueError("identidad v2 contradictoria")
+        if "subaccount_number" in order and (
+            type(order["subaccount_number"]) is not int or order["subaccount_number"] != 0
+        ):
+            raise ValueError("subcuenta contradictoria")
 
     async def _resolve_exposure(
         self, results: list[LegResult], outcome: ExecutionOutcome
@@ -394,22 +450,32 @@ class RestExecutor:
 
     async def _reconcile_leg(self, r: LegResult) -> Fraction | None:
         try:
-            response = await self.client.get_orders(ticker=r.leg.market_ticker)
-            orders = response.get("orders", []) if isinstance(response, dict) else []
-            matched = [
-                o
-                for o in orders
-                if isinstance(o, dict) and o.get("client_order_id") == r.client_order_id
-            ]
+            # No resolver un prefijo: la página siguiente puede fallar o contradecirlo.
+            orders = await KalshiRestClient.get_all_orders(self.client, ticker=r.leg.market_ticker)
+            seen_ids: set[str] = set()
+            for order in orders:
+                oid = order.get("order_id")
+                if oid is not None:
+                    if not isinstance(oid, str) or not oid or oid in seen_ids:
+                        return None
+                    seen_ids.add(oid)
+            matched = [o for o in orders if o.get("client_order_id") == r.client_order_id]
             if len(matched) != 1:
                 return None
             order = matched[0]
-            fill = terminal_fill(order, r.leg.count)
             with get_session() as s:
                 row = s.exec(select(Trade).where(Trade.client_order_id == r.client_order_id)).one()
+                self._validate_buy_identity(row, r.leg, order)
+                if r.order_id is not None and order.get("order_id", r.order_id) != r.order_id:
+                    return None
+                fill = terminal_fill(order, r.leg.count)
                 observed = confirmed_fill(row)
-            if fill is not None and observed is not None and fill < observed:
-                return None  # Nunca borrar un piso confirmado con un acumulado regresivo.
+                if fill is not None and observed is not None and fill < observed:
+                    return None  # Nunca borrar un piso confirmado con un acumulado regresivo.
+                if order.get("order_id") is not None:
+                    row.kalshi_order_id = order["order_id"]
+                    s.add(row)
+                    s.commit()
             if fill is None:
                 hold_uncertain_order(r.client_order_id, order)
                 return None
@@ -522,8 +588,9 @@ class RestExecutor:
         """
         try:
             with get_session() as s:
+                trades = []
                 for leg in opp.legs:
-                    s.add(
+                    trades.append(
                         Trade(
                             client_order_id=coids[leg],
                             ticker=leg.market_ticker,
@@ -537,6 +604,11 @@ class RestExecutor:
                             notes=f"arb_id={arb_id}",
                         )
                     )
+                if self._permissions is None:
+                    for trade in trades:
+                        s.add(trade)
+                else:
+                    self._permissions.admit(s, "rest.entries", trades)
                 s.commit()
             return True
         except Exception:

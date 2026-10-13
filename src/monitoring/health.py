@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Query
 from loguru import logger
 from sqlmodel import select
 
+from src.monitoring.motor_telemetry import MotorTelemetry, telemetry_snapshot
 from src.storage.models import DailyPnL, RiskEvent, Trade, get_session
 from src.utils.config import get_settings
 
@@ -53,6 +54,7 @@ class BotState:
     Servicios externos (capture, strategies) actualizan este estado.
     """
 
+    motor_telemetry: MotorTelemetry | None = None
     started_at: datetime = datetime.now(UTC)
     last_ws_message: datetime | None = None
     ws_connected: bool = False
@@ -510,6 +512,7 @@ async def status() -> dict[str, Any]:
             for r in recent_risks
         ],
         "orderbook_manager_v2": v2_info,
+        "motor_telemetry": telemetry_snapshot(BotState.motor_telemetry),
     }
 
 

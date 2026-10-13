@@ -32,11 +32,14 @@ from typing import ClassVar
 
 from loguru import logger
 from sqlalchemy import text
-from sqlmodel import col, select
+from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
+from src.control.channel import ControlError
+from src.control.permissions import DurablePermissionAdapter
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
+from src.storage.accounting import EXIT_ALLOCATED, REALIZED_PNL, stamp_accounting_role
 from src.storage.cost_allocation import allocate_entry, usd_text
 from src.storage.exit_capture import apply_exit_execution, exit_execution_note
 from src.storage.exit_fills import ExitFillSummary
@@ -46,6 +49,7 @@ from src.storage.models import (
     _naive_utc_now,
     engage_kill_switch,
     get_session,
+    kill_switch_engaged,
 )
 from src.storage.order_reconciliation import (
     capture_terminal_sell_execution,
@@ -63,6 +67,7 @@ from src.storage.quantities import (
 )
 from src.storage.reductions import estimated_exit_note, validated_exit_fee
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
+from src.strategies.motor_3_clv.attribution import attributable_buys
 
 STRATEGY = "motor_3_clv"
 
@@ -97,8 +102,12 @@ class Motor3ExitExecutor:
         entry_origin: tuple[str, ...] = ("motor_2_consensus",),
         include_motor1_orphans: bool = False,
         min_sell_bid_cents: int = 0,
+        permissions: DurablePermissionAdapter | None = None,
     ) -> None:
         self.client = client
+        # Opt-in de construcción, aún sin provisionar/conectar desde el runner.
+        # Una instancia conectada nunca vuelve al camino legacy ante fallo.
+        self._permissions = permissions
         # Estrategia con la que se audita la fila SELL del exit. Default motor_3_clv; Motor 2
         # reusa este executor pasando "motor_2_consensus" para que el audit quede atribuido al
         # motor que disparó el cierre (las patas BUY que cierra _settle_originals ya se marcan
@@ -172,42 +181,13 @@ class Motor3ExitExecutor:
             return await self._exit_locked(position.ticker, position.side, count)
 
     def _attributable_buys(self, s, ticker: str, side: str) -> list[Trade]:
-        """BUYs 'filled' abiertos atribuibles para (ticker, side): los de entry_origin y — con
-        include_motor1_orphans — las HUÉRFANAS de Motor 1. La orfandad se decide mirando AMBOS
-        sides del arb (por eso la query de motor_1 va por ticker completo): un arb con las dos
-        patas vivas es un hedge y queda fuera SIEMPRE. Ordenado FIFO por placed_at (mismo
-        criterio de settle de siempre)."""
-        from src.strategies.motor_3_clv.orphans import motor1_orphan_buys
-
-        buys = [
-            b
-            for b in s.exec(
-                select(Trade).where(
-                    Trade.ticker == ticker,
-                    Trade.side == side,
-                    Trade.action == "buy",
-                    Trade.status == "filled",
-                    col(Trade.strategy).in_(self._entry_origin),
-                )
-            )
-            if not b.closed_by_clv and b.count > 0
-        ]
-        if self._include_motor1_orphans:
-            m1_all_sides = [
-                b
-                for b in s.exec(
-                    select(Trade).where(
-                        Trade.ticker == ticker,
-                        Trade.action == "buy",
-                        Trade.status == "filled",
-                        Trade.strategy == "motor_1_arbitrage",
-                    )
-                )
-                if not b.closed_by_clv and b.count > 0
-            ]
-            buys.extend(o for o in motor1_orphan_buys(m1_all_sides) if o.side == side)
-        buys.sort(key=lambda b: b.placed_at)
-        return buys
+        return attributable_buys(
+            s,
+            ticker,
+            side,
+            entry_origin=self._entry_origin,
+            include_motor1_orphans=self._include_motor1_orphans,
+        )
 
     def _open_attributable_count(self, ticker: str, side: str) -> int:
         """Contratos BUY 'filled' aún abiertos (no closed_by_clv) atribuibles para
@@ -255,7 +235,11 @@ class Motor3ExitExecutor:
         # fantasma (posición contraria) + PnL doble vía settlement. Nota: mientras esté
         # 'pending' cuenta en la exposición del RiskManager (su query no filtra por
         # action) — sobrestima temporal y conservador.
-        if not self._persist_sell_intent(coid, ticker, side, count, bid):
+        try:
+            persisted = self._persist_sell_intent(coid, ticker, side, count, bid)
+        except ControlError as error:
+            return Motor3ExitOutcome(False, False, reason=f"permission:{error}")
+        if not persisted:
             return Motor3ExitOutcome(False, False, reason="persist_intent_failed")
         try:
             resp = await self.client.place_order(
@@ -278,6 +262,13 @@ class Motor3ExitExecutor:
             )
             return Motor3ExitOutcome(False, False, reason="trading_disabled", client_order_id=coid)
         except KalshiClientError as exc:
+            if exc.status_code in (408, 409):
+                # La venta pudo entrar: mantener el intent impide otra venta del
+                # mismo inventario antes de conciliarla, incluso tras reiniciar.
+                reason = f"ambiguous_http_{exc.status_code}"
+                self._update_sell_intent(coid, critical=False, notes_append=reason)
+                logger.warning(f"motor3.exit.{reason} ticker={ticker} coid={coid}")
+                return Motor3ExitOutcome(True, False, reason=reason, client_order_id=coid)
             # 4xx determinístico: la orden NO entró — sin posición, intent liberado.
             logger.warning(
                 f"motor3.exit.client_error ticker={ticker} status={exc.status_code}: {exc}"
@@ -380,25 +371,59 @@ class Motor3ExitExecutor:
     def _persist_sell_intent(
         self, coid: str, ticker: str, side: str, count: int, price: int
     ) -> bool:
-        """Escribe la fila SELL 'pending' ANTES de tocar la red (patrón A.1). False si falla
-        (→ el caller ABORTA sin vender: sin rastro no hay reconciliación posible)."""
+        """Reserva inventario bajo lock SQLite ANTES de red, compartido entre motores.
+
+        Revalida tras los await: pudo entrar una pausa o cambiar el inventario.
+        False obliga al caller a abortar sin vender; no se reutiliza inventario incierto.
+        """
         try:
             with get_session() as s:
-                s.add(
-                    Trade(
-                        client_order_id=coid,
-                        ticker=ticker,
-                        side=side,
-                        action="sell",
-                        **quantity_fields(count),
-                        price_cents=price,
-                        strategy=self._strategy,
-                        status="pending",
-                        notes="clv_exit_intent",
+                s.exec(text("BEGIN IMMEDIATE"))
+                from src.monitoring.health import BotState
+
+                # La comprobación inicial precede a reconciliación/libro (await).
+                # No admitir una SELL nueva después de una pausa; DB desconocida
+                # también aborta, sin reparar el estado ni tocar órdenes previas.
+                if BotState.is_paused or kill_switch_engaged(session=s)[0]:
+                    return False
+                pending = s.exec(
+                    select(Trade.id)
+                    .where(
+                        Trade.ticker == ticker,
+                        Trade.side == side,
+                        Trade.action == "sell",
+                        Trade.status == "pending",
                     )
+                    .limit(1)
+                ).first()
+                if pending is not None:
+                    return False
+                available = sum(open_quantity(b) for b in self._attributable_buys(s, ticker, side))
+                if count <= 0 or count > available:
+                    return False
+                trade = Trade(
+                    client_order_id=coid,
+                    ticker=ticker,
+                    side=side,
+                    action="sell",
+                    **quantity_fields(count),
+                    price_cents=price,
+                    strategy=self._strategy,
+                    status="pending",
+                    notes="clv_exit_intent",
                 )
+                if self._permissions is None:
+                    s.add(trade)
+                else:
+                    scope = {
+                        "motor_3_clv": "m3.exits",
+                        "motor_2_consensus": "m2.exits",
+                    }.get(self._strategy)
+                    self._permissions.admit(s, scope, [trade])
                 s.commit()
             return True
+        except ControlError:
+            raise
         except Exception:
             logger.critical(
                 f"motor3.exit.persist_intent_failed coid={coid} → ABORT (sin rastro no se vende)"
@@ -499,6 +524,7 @@ class Motor3ExitExecutor:
             sell.kalshi_order_id = order_id
             sell.filled_at = now
             sell.settled_at = now
+            stamp_accounting_role(sell, EXIT_ALLOCATED)
             if execution is not None:
                 sell.notes = exit_execution_note(
                     sell.notes, "clv_exit_filled", entry_observed=False
@@ -513,6 +539,8 @@ class Motor3ExitExecutor:
     async def _reconcile_pending_sells(self, ticker: str, side: str) -> bool:
         """Resuelve intents SELL 'pending' (ERROR_RED previo) contra get_orders, por coid.
 
+        Lee todas las páginas antes de mutar el ledger: un prefijo terminal no
+        descarta una identidad contradictoria ni prueba un barrido completo.
         Devuelve True si el camino quedó limpio para una venta nueva. False si algún
         intent sigue irresoluble (la orden no aparece / la API falla / la persistencia del
         fill reconciliado falla) → el caller NO vende este tick.
@@ -529,7 +557,6 @@ class Motor3ExitExecutor:
                             Trade.side == side,
                             Trade.action == "sell",
                             Trade.status == "pending",
-                            Trade.strategy == self._strategy,
                         )
                     )
                 )
@@ -538,16 +565,25 @@ class Motor3ExitExecutor:
             return False
         if not pending:
             return True
+        if any(t.strategy != self._strategy for t in pending):
+            # Los motores comparten inventario: una venta incierta ajena también
+            # bloquea. Su dueño conserva la conciliación y la atribución contable.
+            logger.warning(f"motor3.exit.shared_pending_sell ticker={ticker} side={side}")
+            return False
         try:
-            resp = await self.client.get_orders(ticker=ticker)
+            # Reusar el presupuesto acotado del cliente (100 páginas / 30s), sin
+            # cortar por página corta/vacía. Un fallo conserva todas las reservas.
+            orders = await KalshiRestClient.get_all_orders(self.client, ticker=ticker, limit=200)
+            order_ids = [o["order_id"] for o in orders if o.get("order_id") is not None]
+            if len(order_ids) != len(set(order_ids)):
+                # Una identidad repetida conserva la pausa durable que ya exigía
+                # el reconciliador para coid duplicado; no es un fallo de red.
+                for trade in pending:
+                    self._engage_preventive_pause(trade.client_order_id)
+                return False
         except Exception as exc:
             logger.warning(f"motor3.exit.reconcile_get_orders_failed ticker={ticker}: {exc}")
             return False
-        orders = [
-            o
-            for o in (resp.get("orders", []) if isinstance(resp, dict) else [])
-            if isinstance(o, dict)
-        ]
         clear = True
         for t in pending:
             matches = [o for o in orders if o.get("client_order_id") == t.client_order_id]
@@ -706,6 +742,7 @@ class Motor3ExitExecutor:
                         b.settled_at = now
                         b.pnl_usd_fp = usd_text(pnl / 100)
                         b.pnl_cents = floor(pnl)
+                        stamp_accounting_role(b, REALIZED_PNL)
                         for field, value in allocation.closed_fields.items():
                             setattr(b, field, value)
                         if observed_exit_gross_cents is not None:
@@ -743,6 +780,7 @@ class Motor3ExitExecutor:
                                 closed_by_clv=True,
                                 settled_at=now,
                                 pnl_cents=floor(pnl),
+                                accounting_role=REALIZED_PNL,
                                 pnl_usd_fp=usd_text(pnl / 100),
                                 **allocation.closed_fields,
                                 notes=exit_execution_note(

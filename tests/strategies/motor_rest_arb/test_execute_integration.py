@@ -127,7 +127,8 @@ class HarnessClient:
             resp = self.buy[kw["side"]]
             if isinstance(resp, BaseException):
                 raise resp
-            return resp
+            # Cada buy ficticio tiene identidad propia también al consultar GetOrders.
+            return {"order": {**resp["order"], "order_id": f"OID-{kw['client_order_id']}"}}
         # sell = rollback
         return self.sell_result or _create_order_nofill(kw["count"])
 
@@ -142,12 +143,12 @@ class HarnessClient:
                 "fill_count_fp": f"{c['count']}.00"
                 if self.reconcile_status == "executed"
                 else "0.00",
-                "order_id": "OID",
+                "order_id": f"OID-{c['client_order_id']}",
             }
             for m, c in self.calls
             if m == "place_order" and c.get("action") == "buy" and c.get("ticker") == ticker
         ]
-        return {"orders": orders}
+        return {"orders": orders, "cursor": ""}
 
     async def get_positions(self, **kw: Any) -> dict:
         self.calls.append(("get_positions", kw))
@@ -335,19 +336,20 @@ async def test_persist_intents_failure_aborts_without_placing_orders():
 
 
 @pytest.mark.asyncio
-async def test_update_failure_post_fill_engages_preventive_pause():
-    """Fallo del update DESPUÉS de un fill real → pausa preventiva (ii): kill-switch persistente."""
+async def test_identity_read_failure_post_ack_keeps_unknown_and_pauses():
+    """Sin leer la intención tras el ACK, no acreditar fill ni comprar más patas."""
     client = HarnessClient()
     client.buy = {"yes": _create_order_fill(), "no": _create_order_fill()}
     executor = RestExecutor(client)
-    # Los intents (solo add) pasan; los updates (usan select) fallan → crítico post-fill.
+    # Los intents pasan; la lectura posterior al ACK y la conciliación fallan.
     with patch(
         "src.strategies.motor_rest_arb.executor.select",
         side_effect=RuntimeError("db down post-fill"),
     ):
         outcome = await executor.execute(_opp())
 
-    assert outcome.filled is True  # el trade real ocurrió
-    assert executor.is_paused is True  # pero el motor se PAUSÓ preventivamente
+    assert outcome.filled is False and outcome.kill_switch_fired
+    assert len(client.buys()) == 1 and len(client.sells()) == 0
+    assert executor.is_paused is True
     engaged, reason = models.kill_switch_engaged()
-    assert engaged is True and "RiskManager ciego" in (reason or "")
+    assert engaged is True and "cantidad desconocida" in (reason or "")

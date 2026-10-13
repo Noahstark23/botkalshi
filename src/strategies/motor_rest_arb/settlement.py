@@ -40,6 +40,7 @@ from sqlmodel import col, select
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import precise_usd
 from src.risk.exposure import exposure_count
+from src.storage.accounting import REALIZED_PNL, stamp_accounting_role
 from src.storage.cost_allocation import usd_text
 from src.storage.models import Trade, get_session
 from src.storage.order_costs import COST_QUARANTINE_NOTE
@@ -331,6 +332,7 @@ class SettlementPoller:
                         row.fees_cents = ceil(fee)
                     row.status = "settled"
                     row.settled_at = now
+                    stamp_accounting_role(row, REALIZED_PNL)
                     row.notes = _settlement_notes(row.notes, amounts.observed_costs)
                     s.add(row)
                 s.commit()

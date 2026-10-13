@@ -47,6 +47,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Identidad declarada del artefacto para observabilidad. Vacío o inválido deja
+    # telemetría individual desconocida; nunca cambia permisos ni frena el arranque.
+    SOURCE_COMMIT: str = Field(default="", description="SHA completo del artefacto instalado")
+
     # === Kalshi ===
     KALSHI_ENV: Literal["demo", "production"] = "demo"
     KALSHI_API_KEY_ID: str = Field(..., min_length=10)

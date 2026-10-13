@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from src.math.fees import kalshi_fee_cents
+from src.monitoring.motor_telemetry import observed_tick
 from src.storage.models import EdgeWindow, get_session
 from src.strategies.motor_9_spillover.detector import SpilloverTracker, SpilloverTrigger
 
@@ -101,6 +102,7 @@ class Motor9SpilloverShadow:
         self._measured = 0
         self._dropped = 0
 
+    @observed_tick
     def observe(self, ticker: str, now: float | None = None) -> None:
         """Un delta del WS ya aplicado al book: lee el mid actual, alimenta el tracker y
         empuja las mediciones maduras. Best-effort TOTAL (Lección 7): jamás rompe el feed."""

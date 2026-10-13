@@ -27,6 +27,21 @@ def _columns(engine, table: str) -> set[str]:
         return models._existing_columns(conn, table)
 
 
+def test_cancel_intent_migration_never_invents_history(tmp_path):
+    engine, settings = _sqlite_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("CREATE TABLE trades (id INTEGER PRIMARY KEY, status TEXT)")
+        conn.exec_driver_sql("INSERT INTO trades VALUES (1, 'pending')")
+    with patch("src.storage.models.get_settings", return_value=settings):
+        models.apply_migrations(engine)
+        models.apply_migrations(engine)
+    with engine.begin() as conn:
+        assert conn.exec_driver_sql("SELECT status, cancel_requested_at_ms FROM trades").one() == (
+            "pending",
+            None,
+        )
+
+
 def test_fresh_db_has_new_columns_and_migration_is_noop(tmp_path):
     """En DB nueva, create_all ya trae las columnas → apply_migrations no rompe nada."""
     engine, settings = _sqlite_engine(tmp_path)
@@ -118,10 +133,10 @@ def test_fractional_columns_preserve_legacy_fills_and_are_idempotent(tmp_path):
         models.apply_migrations(engine)
     with engine.begin() as conn:
         row = conn.exec_driver_sql(
-            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp,count_fp,fill_cost_usd_fp,fees_usd_fp FROM trades"
+            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp,count_fp,fill_cost_usd_fp,fees_usd_fp,accounting_role FROM trades"
         ).one()
         position = conn.exec_driver_sql("SELECT count,count_fp FROM portfolio_positions").one()
-    assert row == (10, 3, -5, None, None, None, None, None)
+    assert row == (10, 3, -5, None, None, None, None, None, None)
     assert position == (7, None)
     assert "inventory_fp" in _columns(engine, "mm_quotes")
     assert "inventory_abs_fp" in _columns(engine, "mm_funnel_snapshots")

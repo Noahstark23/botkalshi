@@ -40,10 +40,16 @@ from src.clients.kalshi_rest import (
     KalshiOrderConfirmationError,
     KalshiRestClient,
 )
+from src.control.permissions import DurablePermissionAdapter
 from src.risk.commitments import reserve_trade_intents, validate_multi_fee
 from src.risk.exposure import open_risk_cents
 from src.risk.manager import RiskManager
 from src.storage.models import Trade, get_session
+from src.strategies.motor_5_mm.cancel_intent import (
+    CancelIntentMismatchError,
+    prepare_protective_cancel,
+    record_cancel_requests,
+)
 from src.strategies.motor_5_mm.incidents import incident_status, latch_incident
 from src.strategies.motor_5_mm.ledger import confirmed_fill, record_order_fill
 from src.strategies.motor_5_mm.order_state import (
@@ -84,8 +90,10 @@ class Motor5Executor:
         risk: RiskManager | None = None,
         *,
         max_exposure_usd: float | None = None,
+        permissions: DurablePermissionAdapter | None = None,
     ) -> None:
         self._client = client
+        self._permissions = permissions
         self._risk = risk if risk is not None else RiskManager()
         # Canary cap F3 (plan §5): techo ABSOLUTO del costo abierto del MM (pending +
         # filled), independiente del headroom global. None = sin cap propio (demo).
@@ -244,9 +252,17 @@ class Motor5Executor:
                             max_strategy_usd=self._max_exposure_usd
                         ),
                         fee_observations={ticker: fee_observation},
+                        **(
+                            {"permissions": self._permissions}
+                            if self._permissions is not None
+                            else {}
+                        ),
                     )
                 with get_session() as session:
-                    session.add(intent)
+                    if self._permissions is None:
+                        session.add(intent)
+                    else:
+                        self._permissions.admit(session, "m5.quotes", [intent])
                     session.commit()
                 return True
             except ValueError as exc:
@@ -337,6 +353,12 @@ class Motor5Executor:
         if live.kalshi_order_id is None:
             self._latch_corruption(ticker, "cancel_without_order_id")
             return False
+        if not self._record_cancels([(ticker, live)]):
+            return False
+        return await self._send_cancel(ticker, live)
+
+    async def _send_cancel(self, ticker: str, live: LiveOrder) -> bool:
+        """Sólo tras preparar el intent normal o el retiro protector del objetivo."""
         try:
             resp = await self._client.cancel_order(live.kalshi_order_id)
         except asyncio.CancelledError as exc:
@@ -477,13 +499,25 @@ class Motor5Executor:
         pending = [
             (ticker, live) for ticker, sides in self._live.items() for live in sides.values()
         ]
-        ids = [live.kalshi_order_id for _, live in pending if live.kalshi_order_id]
         self.corrupted.update(ticker for ticker, _ in pending)
+        eligible: list[tuple[str, LiveOrder]] = []
+        deferred_error: Exception | None = None
+        for ticker, live in pending:
+            if not live.kalshi_order_id:
+                continue
+            can_send, error = prepare_protective_cancel(live.client_order_id, live.kalshi_order_id)
+            deferred_error = deferred_error or error
+            if can_send:
+                eligible.append((ticker, live))
+        ids = [live.kalshi_order_id for _, live in eligible]
         if not ids:
+            if deferred_error is not None:
+                raise deferred_error
             return 0
         confirmed = 0
         batch_orders: dict[str, dict] = {}
-        live_by_id = {live.kalshi_order_id: (ticker, live) for ticker, live in pending}
+        unpersisted_evidence = False
+        live_by_id = {live.kalshi_order_id: (ticker, live) for ticker, live in eligible}
         try:
             response = await self._client.batch_cancel_orders(ids)
         except BaseException as exc:
@@ -498,11 +532,14 @@ class Motor5Executor:
                         if target is not None:
                             self._preserve_error_observations(*target, [observed])
                 latch_incident("cancelación batch M5 incompleta; revisar órdenes")
-            except Exception:
+            except Exception as persist_error:
                 if not isinstance(exc, Exception):
                     logger.exception("motor5.batch_evidence_failed_preserving_cancellation")
                     raise exc from None
-                raise
+                # Ya no hay dueño sano. Continuar el retiro por objetivo; el
+                # supervisor recibirá el fallo sin declarar un cierre limpio.
+                deferred_error = deferred_error or persist_error
+                unpersisted_evidence = True
             if not isinstance(exc, Exception):
                 raise
             logger.exception("motor5.exec.batch_cancel_error → fallback secuencial")
@@ -519,10 +556,14 @@ class Motor5Executor:
                         oid = item.get("order_id")
                         target = live_by_id.get(oid) if isinstance(oid, str) else None
                         if target is not None:
-                            self._preserve_error_observations(
-                                *target,
-                                [*item.get("observed_orders", []), item.get("observed_order")],
-                            )
+                            try:
+                                self._preserve_error_observations(
+                                    *target,
+                                    [*item.get("observed_orders", []), item.get("observed_order")],
+                                )
+                            except Exception as persist_error:
+                                deferred_error = deferred_error or persist_error
+                                unpersisted_evidence = True
                         continue
                     order = item.get("order", item)
                     if not isinstance(order, dict):
@@ -537,18 +578,45 @@ class Motor5Executor:
                     batch_orders[oid] = order
             for oid in duplicates:
                 del batch_orders[oid]
-        for ticker, live in pending:
+        for ticker, live in eligible:
             order = batch_orders.get(live.kalshi_order_id or "")
-            if (
-                order is not None
-                and self._confirm_cancel(ticker, live, order, note=f"cancel_all: {reason[:50]}")
-            ) or await self._cancel(ticker, live):
-                confirmed += 1
+            try:
+                if unpersisted_evidence:
+                    # Retirar sigue siendo protector, pero una respuesta posterior
+                    # no puede borrar un fill/cuarentena que la DB no conservó.
+                    # Mantener pending y el incidente para resolución operativa.
+                    await self._client.cancel_order(live.kalshi_order_id)
+                    continue
+                if (
+                    order is not None
+                    and self._confirm_cancel(ticker, live, order, note=f"cancel_all: {reason[:50]}")
+                ) or await self._send_cancel(ticker, live):
+                    confirmed += 1
+            except Exception as exc:
+                # Un fallo al guardar este resultado no impide retirar los demás.
+                deferred_error = deferred_error or exc
+        if deferred_error is not None:
+            raise deferred_error
         logger.warning(
             f"motor5.exec.cancel_all confirmed={confirmed} remaining={len(self.live_coids())} "
             f"reason={reason}"
         )
         return confirmed
+
+    def _record_cancels(self, targets: list[tuple[str, LiveOrder]]) -> bool:
+        try:
+            record_cancel_requests(
+                [(live.client_order_id, live.kalshi_order_id) for _, live in targets]
+            )
+        except CancelIntentMismatchError:
+            self.corrupted.update(ticker for ticker, _ in targets)
+            latch_incident("intent de cancelación M5 no atribuible; no se envía DELETE")
+            return False
+        except Exception:
+            self.corrupted.update(ticker for ticker, _ in targets)
+            latch_incident("no se pudo persistir intent de cancelación M5; no se envía DELETE")
+            raise
+        return True
 
     def _mm_open_cost_usd(self) -> float:
         """Costo abierto TOTAL del Motor 5 (pending reserva completo; filled usa

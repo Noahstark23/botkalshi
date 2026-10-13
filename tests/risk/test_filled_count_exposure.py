@@ -93,6 +93,14 @@ def test_quotes_paused_roundtrip_persistent():
     assert mm_quotes_paused() == (False, None)
 
 
+def test_unknown_quote_pause_cannot_enable_quotes():
+    with get_session() as session:
+        session.add(models.OperationalState(key="mm_quotes_paused", value="unknown"))
+        session.commit()
+    with pytest.raises(ValueError, match="MM_QUOTES_PAUSE_STATE_INVALID"):
+        mm_quotes_paused()
+
+
 def test_quotes_paused_is_independent_of_kill_switch():
     """quotes_paused NO toca el kill-switch: son niveles distintos de pausa."""
     set_mm_quotes_paused(True, "x")

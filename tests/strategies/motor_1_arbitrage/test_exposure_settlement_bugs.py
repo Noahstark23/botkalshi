@@ -20,7 +20,7 @@ netean en vivo aunque el mercado tarde en resolver.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlmodel import select
@@ -121,7 +121,7 @@ async def test_persist_intents_writes_shared_arb_id_in_notes():
 
     opp = detect_binary_arb("T-ARB", 40, 300, 45, 300)
     assert opp is not None
-    ex = ArbitrageExecutor.__new__(ArbitrageExecutor)  # sin __init__ (no client/risk)
+    ex = ArbitrageExecutor(MagicMock(), MagicMock())
     ex._persist_intents(opp, 10, ["coid-a", "coid-b"])
     with get_session() as s:
         rows = list(s.exec(select(Trade)))
@@ -171,7 +171,7 @@ async def test_persist_intents_registra_el_fee_de_entrada():
 
     opp = detect_binary_arb("T-FEE", 40, 300, 45, 300)
     assert opp is not None
-    ex = ArbitrageExecutor.__new__(ArbitrageExecutor)
+    ex = ArbitrageExecutor(MagicMock(), MagicMock())
     ex._persist_intents(opp, 10, ["coid-fee-a", "coid-fee-b"])
     with get_session() as s:
         rows = list(s.exec(select(Trade)))

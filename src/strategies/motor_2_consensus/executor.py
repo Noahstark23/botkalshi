@@ -32,6 +32,7 @@ from sqlalchemy import text
 from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
+from src.control.permissions import DurablePermissionAdapter
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
@@ -85,8 +86,10 @@ class Motor2Executor:
         min_entry_cents: int = 1,
         underdog_filter_enabled: bool = False,
         one_bet_per_event: bool = True,
+        permissions: DurablePermissionAdapter | None = None,
     ) -> None:
         self.client = client
+        self._permissions = permissions
         self.risk = risk_manager
         # Scope del dedup cross-ciclo (fix auditoría 2026-07-01): True → una posición
         # abierta por EVENTO (la promesa del flag MOTOR_2_ONE_BET_PER_EVENT); False →
@@ -219,6 +222,15 @@ class Motor2Executor:
                 False, False, reason="trading_disabled", client_order_id=coid
             )
         except KalshiClientError as exc:
+            if exc.status_code in (408, 409):
+                # Timeout/conflicto no prueban rechazo de este IOC: conservar la
+                # reserva previa y el dedup hasta obtener evidencia correlacionada.
+                reason = f"ambiguous_http_{exc.status_code}"
+                self._update_trade(coid, critical=False, notes_append=reason)
+                logger.warning(f"motor2.exec.{reason} ticker={signal.market_ticker} coid={coid}")
+                return Motor2ExecutionOutcome(
+                    True, False, uncertain=True, reason=reason, client_order_id=coid
+                )
             # 4xx determinístico (saldo, mercado cerrado, precio inválido): sin posición.
             self._update_trade(
                 coid,
@@ -387,6 +399,18 @@ class Motor2Executor:
             return None, None
         return 100 - bid, size
 
+    def _open_position_query(self, signal: ConsensusSignal):
+        """Mismo scope de dedup para el filtro temprano y la reserva atómica."""
+        stmt = select(Trade.id).where(
+            Trade.strategy == STRATEGY,
+            col(Trade.status).in_(("pending", "filled")),
+        )
+        if self._one_bet_per_event and signal.event_key:
+            stmt = stmt.where(col(Trade.ticker).like(f"{signal.event_key}-%"))
+        else:
+            stmt = stmt.where(Trade.ticker == signal.market_ticker)
+        return stmt.limit(1)
+
     def _open_position_exists(self, signal: ConsensusSignal) -> bool:
         """True si hay un Trade vivo (pending/filled) de Motor 2 en el evento/ticker.
 
@@ -398,15 +422,7 @@ class Motor2Executor:
         """
         try:
             with get_session() as s:
-                stmt = select(Trade).where(
-                    Trade.strategy == STRATEGY,
-                    col(Trade.status).in_(("pending", "filled")),
-                )
-                if self._one_bet_per_event and signal.event_key:
-                    stmt = stmt.where(col(Trade.ticker).like(f"{signal.event_key}-%"))
-                else:
-                    stmt = stmt.where(Trade.ticker == signal.market_ticker)
-                return s.exec(stmt.limit(1)).first() is not None
+                return s.exec(self._open_position_query(signal)).first() is not None
         except Exception:
             logger.exception(
                 f"motor2.exec.dedup_check_failed ticker={signal.market_ticker} → skip conservador"
@@ -442,22 +458,32 @@ class Motor2Executor:
                     [trade],
                     limits=self.risk.reservation_limits(),
                     fee_observations={trade.ticker: fee_observation},
+                    **({"permissions": self._permissions} if self._permissions is not None else {}),
                 )
             with get_session() as s:
-                s.add(
-                    Trade(
-                        client_order_id=coid,
-                        ticker=signal.market_ticker,
-                        side=side,
-                        action="buy",
-                        **quantity_fields(count),
-                        price_cents=price,
-                        strategy=STRATEGY,
-                        estimated_edge_pct=signal.edge_pct,
-                        status="pending",
-                        notes=f"motor2 fair={signal.odds_api_fair_prob}",
-                    )
+                # El book se espera después del primer dedup: otra llamada puede
+                # haber reservado mientras tanto. Releer bajo el mismo lock SQLite
+                # que el INSERT protege también entre instancias/procesos.
+                s.connection().execute(text("BEGIN IMMEDIATE"))
+                if s.exec(self._open_position_query(signal)).first() is not None:
+                    logger.info(f"motor2.exec.dedup_at_reservation ticker={signal.market_ticker}")
+                    return False
+                trade = Trade(
+                    client_order_id=coid,
+                    ticker=signal.market_ticker,
+                    side=side,
+                    action="buy",
+                    **quantity_fields(count),
+                    price_cents=price,
+                    strategy=STRATEGY,
+                    estimated_edge_pct=signal.edge_pct,
+                    status="pending",
+                    notes=f"motor2 fair={signal.odds_api_fair_prob}",
                 )
+                if self._permissions is None:
+                    s.add(trade)
+                else:
+                    self._permissions.admit(s, "m2.entries", [trade])
                 s.commit()
             return True
         except Exception:

@@ -69,7 +69,36 @@ MLB_TICKER_CODES: dict[str, str] = {
 }
 
 # Códigos observados en las capturas Demo; cobertura parcial, sin deducir otros.
-NFL_TICKER_CODES = {"PHI": "philadelphia eagles", "JAC": "jacksonville jaguars"}
+NFL_TICKER_CODES = {
+    "ARI": "arizona cardinals",
+    "ATL": "atlanta falcons",
+    "BAL": "baltimore ravens",
+    "BUF": "buffalo bills",
+    "CAR": "carolina panthers",
+    "CHI": "chicago bears",
+    "CLE": "cleveland browns",
+    "DAL": "dallas cowboys",
+    "DEN": "denver broncos",
+    "GB": "green bay packers",
+    "HOU": "houston texans",
+    "IND": "indianapolis colts",
+    "JAC": "jacksonville jaguars",
+    "KC": "kansas city chiefs",
+    "LAC": "los angeles chargers",
+    "LAR": "los angeles rams",
+    "LV": "las vegas raiders",
+    "NE": "new england patriots",
+    "NO": "new orleans saints",
+    "NYG": "new york giants",
+    "NYJ": "new york jets",
+    "PHI": "philadelphia eagles",
+    "PIT": "pittsburgh steelers",
+    "SEA": "seattle seahawks",
+    "SF": "san francisco 49ers",
+    "TB": "tampa bay buccaneers",
+    "TEN": "tennessee titans",
+    "WAS": "washington commanders",
+}
 NCAAF_TICKER_CODES = {
     "ALA": "alabama crimson tide",
     "UGA": "georgia bulldogs",

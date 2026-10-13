@@ -1,0 +1,74 @@
+name: Executor review offline
+
+on:
+  pull_request:
+    branches: [codex/live-readiness-20261006]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: executor-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  candidate:
+    if: github.head_ref == 'codex/executor-single-attempt-20261012'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Panel de referencia inmutable (sin ejecutar servicios)
+        uses: actions/checkout@v4
+        with:
+          ref: 22522c3aa70f1b61ff662476cf7257fe3e93c0c1
+          path: compat-panel
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Identificar el candidato y sus dependencias
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          mkdir -p qa-artifacts
+          git rev-parse HEAD > qa-artifacts/commit.txt
+          printf '%s\n' "$BASE_SHA" > qa-artifacts/base.txt
+          python --version > qa-artifacts/python.txt
+          python -m pip install -e ".[dev]" "ruff==0.16.9"
+          python -m pip freeze > qa-artifacts/dependencies.txt
+      - name: Lint completo y formato de todos los Python del candidato
+        run: |
+          ruff check src/ tests/ infra/digitalocean-shadow/ scripts/test_simulator_isolated.py scripts/rebuild_db.py
+          python - <<'PY'
+          import os
+          import subprocess
+
+          paths = subprocess.check_output(
+              ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z",
+               os.environ["BASE_SHA"], os.environ["HEAD_SHA"], "--", "*.py"]
+          ).decode().split("\0")
+          paths = [path for path in paths if path]
+          if paths:
+              subprocess.run(["ruff", "format", "--check", "--", *paths], check=True)
+          PY
+      - name: Suite completa con entorno vacío, SQLite temporal y red externa bloqueada
+        shell: bash
+        run: |
+          set -o pipefail
+          python -I scripts/test_simulator_isolated.py --panel-source compat-panel/research/us500 2>&1 | tee qa-artifacts/tests.log
+      - name: Conservar evidencia incluso cuando falla la verificación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executor-review-${{ github.event.pull_request.head.sha }}
+          path: qa-artifacts/
+          retention-days: 14
+          if-no-files-found: warn

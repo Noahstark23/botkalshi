@@ -1,0 +1,247 @@
+{
+  "source": "GET /trade-api/v2/events/{event_ticker} en Demo y snapshot NFL local; nombres observados, precios de tests sinteticos",
+  "observed_at": "2026-10-12T17:19:44.524103+00:00",
+  "snapshot_fetched_at": "2026-10-12T17:16:11.911528+00:00",
+  "cases": [
+    {
+      "event_ticker": "KXNFLGAME-26OCT12BUFLAR",
+      "codes": [
+        "LAR",
+        "BUF"
+      ],
+      "short_names": [
+        "Los Angeles R",
+        "Buffalo"
+      ],
+      "long_names": [
+        "Los Angeles Rams",
+        "Buffalo Bills"
+      ],
+      "commence_time": "2026-10-13T00:15:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT15SEADEN",
+      "codes": [
+        "DEN",
+        "SEA"
+      ],
+      "short_names": [
+        "Denver",
+        "Seattle"
+      ],
+      "long_names": [
+        "Denver Broncos",
+        "Seattle Seahawks"
+      ],
+      "commence_time": "2026-10-16T00:15:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18HOUJAC",
+      "codes": [
+        "JAC",
+        "HOU"
+      ],
+      "short_names": [
+        "Jacksonville",
+        "Houston"
+      ],
+      "long_names": [
+        "Jacksonville Jaguars",
+        "Houston Texans"
+      ],
+      "commence_time": "2026-10-18T13:30:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18BALCLE",
+      "codes": [
+        "CLE",
+        "BAL"
+      ],
+      "short_names": [
+        "Cleveland",
+        "Baltimore"
+      ],
+      "long_names": [
+        "Cleveland Browns",
+        "Baltimore Ravens"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18CARPHI",
+      "codes": [
+        "PHI",
+        "CAR"
+      ],
+      "short_names": [
+        "Philadelphia",
+        "Carolina"
+      ],
+      "long_names": [
+        "Philadelphia Eagles",
+        "Carolina Panthers"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18CHIATL",
+      "codes": [
+        "ATL",
+        "CHI"
+      ],
+      "short_names": [
+        "Atlanta",
+        "Chicago"
+      ],
+      "long_names": [
+        "Atlanta Falcons",
+        "Chicago Bears"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18NONYG",
+      "codes": [
+        "NYG",
+        "NO"
+      ],
+      "short_names": [
+        "New York G",
+        "New Orleans"
+      ],
+      "long_names": [
+        "New York Giants",
+        "New Orleans Saints"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18NYJNE",
+      "codes": [
+        "NE",
+        "NYJ"
+      ],
+      "short_names": [
+        "New England",
+        "New York J"
+      ],
+      "long_names": [
+        "New England Patriots",
+        "New York Jets"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18PITTB",
+      "codes": [
+        "TB",
+        "PIT"
+      ],
+      "short_names": [
+        "Tampa Bay",
+        "Pittsburgh"
+      ],
+      "long_names": [
+        "Tampa Bay Buccaneers",
+        "Pittsburgh Steelers"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18TENIND",
+      "codes": [
+        "IND",
+        "TEN"
+      ],
+      "short_names": [
+        "Indianapolis",
+        "Tennessee"
+      ],
+      "long_names": [
+        "Indianapolis Colts",
+        "Tennessee Titans"
+      ],
+      "commence_time": "2026-10-18T17:00:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18ARILAR",
+      "codes": [
+        "LAR",
+        "ARI"
+      ],
+      "short_names": [
+        "Los Angeles R",
+        "Arizona"
+      ],
+      "long_names": [
+        "Los Angeles Rams",
+        "Arizona Cardinals"
+      ],
+      "commence_time": "2026-10-18T20:05:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18BUFLV",
+      "codes": [
+        "LV",
+        "BUF"
+      ],
+      "short_names": [
+        "Las Vegas",
+        "Buffalo"
+      ],
+      "long_names": [
+        "Las Vegas Raiders",
+        "Buffalo Bills"
+      ],
+      "commence_time": "2026-10-18T20:25:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18LACKC",
+      "codes": [
+        "KC",
+        "LAC"
+      ],
+      "short_names": [
+        "Kansas City",
+        "Los Angeles C"
+      ],
+      "long_names": [
+        "Kansas City Chiefs",
+        "Los Angeles Chargers"
+      ],
+      "commence_time": "2026-10-18T20:25:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT18DALGB",
+      "codes": [
+        "GB",
+        "DAL"
+      ],
+      "short_names": [
+        "Green Bay",
+        "Dallas"
+      ],
+      "long_names": [
+        "Green Bay Packers",
+        "Dallas Cowboys"
+      ],
+      "commence_time": "2026-10-19T00:20:00Z"
+    },
+    {
+      "event_ticker": "KXNFLGAME-26OCT19WASSF",
+      "codes": [
+        "SF",
+        "WAS"
+      ],
+      "short_names": [
+        "San Francisco",
+        "Washington"
+      ],
+      "long_names": [
+        "San Francisco 49ers",
+        "Washington Commanders"
+      ],
+      "commence_time": "2026-10-20T00:15:00Z"
+    }
+  ]
+}

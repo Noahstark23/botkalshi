@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlmodel import select
 
+from src.storage.accounting import REALIZED_PNL, settled_pnl_cents
 from src.storage.models import Trade, get_session
 from src.strategies.motor_5_mm.ledger import record_order_fill
 from src.strategies.motor_rest_arb.settlement import (
@@ -88,6 +89,8 @@ async def test_fractional_partial_fill_preserves_microdollars(result, pnl, cents
     assert saved.fees_cents == 1
     assert saved.fees_usd_fp == "0.000125"
     assert "settlement_observed_costs" in saved.notes
+    assert saved.accounting_role == REALIZED_PNL
+    assert settled_pnl_cents(saved) == cents
 
 
 @pytest.mark.asyncio
@@ -186,6 +189,17 @@ async def test_sell_known_fee_and_unknown_cost_is_estimated(result, expected):
     assert saved.pnl_usd_fp == expected
     assert "settlement_estimated" in saved.notes
     assert saved.fill_cost_usd_fp is None
+    assert saved.accounting_role == REALIZED_PNL
+    assert settled_pnl_cents(saved) == saved.pnl_cents != 0
+
+
+@pytest.mark.asyncio
+async def test_contradictory_accounting_role_rolls_back_settlement():
+    insert(observed_trade(accounting_role="exit_allocated"))
+    before = read()[0].model_dump()
+    with pytest.raises(ValueError, match="CONTRADICTORY_ACCOUNTING_ROLE"):
+        await SettlementPoller(Resolution()).settle_once()
+    assert read()[0].model_dump() == before
 
 
 def test_sell_observed_cost_has_no_proven_semantics():

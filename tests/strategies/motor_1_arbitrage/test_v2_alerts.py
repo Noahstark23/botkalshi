@@ -8,6 +8,8 @@ old-entry pruning, and alert send failure isolation.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -212,70 +214,86 @@ async def test_alert_failure_does_not_propagate():
 
 
 @pytest.mark.asyncio
-async def test_alert_failure_does_not_break_recovery():
-    """
-    Even if alert fails, handle_message still raises SidGapError and recovery completes.
-    """
-    mgr = make_v2()
-    mgr._tickers_by_sid[1] = {"TICKER-A"}
-    mgr._books["TICKER-A"] = MagicMock()
-    mgr._last_seq_by_sid[1] = 10
+@pytest.mark.parametrize("send_fails", [False, True], ids=["delivered", "send-failed"])
+async def test_scheduled_alert_does_not_block_book_recovery(send_fails):
+    """A slow/failing alert cannot serve stale prices or prevent snapshot recovery."""
+    from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
 
-    snap_msg = {
+    mgr = make_v2()
+    snapshot = {
         "type": "orderbook_snapshot",
         "sid": 1,
-        "seq": 5,  # gap: expected 11, got 5
-        "msg": {"market_ticker": "TICKER-A"},
+        "seq": 10,
+        "msg": {
+            "market_ticker": "TICKER-A",
+            "yes_dollars_fp": [["0.4500", "5.00"]],
+            "no_dollars_fp": [["0.4500", "5.00"]],
+        },
     }
-
-    # Make alert send fail
-    with (
-        patch(
-            "src.monitoring.telegram_alerts.alert_orderbook_anomaly",
-            new=AsyncMock(side_effect=Exception("send failed")),
-        ),
-        patch("asyncio.create_task"),
-    ):
-        # Trigger the gap — even with failing alert, SidGapError must raise
-        from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
-
-        with pytest.raises(SidGapError):
-            await mgr.handle_message(snap_msg)
-
-        # Recovery was initiated (mark_stale called on books)
-        assert 1 in mgr._recovering
-
-
-# =====================================================
-# Integration: asyncio.create_task is called when threshold met
-# =====================================================
-
-
-@pytest.mark.asyncio
-async def test_create_task_called_when_alert_fires():
-    """asyncio.create_task is scheduled when _record_gap_and_should_alert returns non-None."""
-    mgr = make_v2()
-    mgr._last_seq_by_sid[1] = 100
+    await mgr.handle_message(snapshot)
+    assert mgr.get_top_of_book("TICKER-A", "yes") is not None
 
     # Pre-load state so next gap fires warning (consecutive_warning=2, count=6)
-    import time
-
     now = time.monotonic()
     mgr._gap_timestamps = [now - 1] * 6
     mgr._consecutive_warning = 2
-
     gap_msg = {
         "type": "orderbook_delta",
         "sid": 1,
-        "seq": 999,  # gap: expected 101
+        "seq": 999,  # gap: expected 11
         "msg": {"market_ticker": "TICKER-A"},
     }
-    mgr._tickers_by_sid[1] = {"TICKER-A"}
 
-    from src.strategies.motor_1_arbitrage.orderbook_manager_v2 import SidGapError
+    release_sender = asyncio.Event()
 
-    with patch("asyncio.create_task") as mock_create_task:
-        with pytest.raises(SidGapError):
-            await mgr.handle_message(gap_msg)
-        # create_task must have been called with the alert coroutine
-        assert mock_create_task.called
+    async def send_alert(*_args):
+        await release_sender.wait()
+        if send_fails:
+            raise RuntimeError("Telegram down")
+
+    create_task = asyncio.create_task
+    tasks = []
+
+    def record_task(coro):
+        task = create_task(coro)
+        tasks.append(task)
+        return task
+
+    with (
+        patch(
+            "src.monitoring.telegram_alerts.alert_orderbook_anomaly",
+            new=AsyncMock(side_effect=send_alert),
+        ) as sender,
+        patch("asyncio.create_task", side_effect=record_task),
+    ):
+        try:
+            # The gap must raise while delivery is still blocked on the event.
+            with pytest.raises(SidGapError):
+                await asyncio.wait_for(mgr.handle_message(gap_msg), timeout=1)
+            assert len(tasks) == 1
+            assert not tasks[0].done()
+            assert 1 in mgr._recovering
+            assert mgr.get_top_of_book("TICKER-A", "yes") is None
+            mgr._ws.send_command.assert_awaited_once_with(
+                "update_subscription",
+                action="get_snapshot",
+                params={"market_tickers": ["TICKER-A"], "sids": [1]},
+            )
+
+            release_sender.set()
+            await asyncio.wait_for(tasks[0], timeout=1)
+            sender.assert_awaited_once_with("sid_gap_warning", "gaps_last_60s=7")
+            assert tasks[0].exception() is None
+            # Delivery alone must never restore a suspect book.
+            assert mgr.get_top_of_book("TICKER-A", "yes") is None
+
+            await mgr.handle_message({**snapshot, "id": 1, "seq": 1000})
+            assert 1 not in mgr._recovering
+            assert mgr._pending_snapshot_requests == {}
+            assert mgr._last_seq_by_sid[1] == 1000
+            assert mgr.get_top_of_book("TICKER-A", "yes") is not None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)

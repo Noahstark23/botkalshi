@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -14,7 +15,7 @@ from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 from loguru import logger
-from sqlmodel import col, or_, select
+from sqlmodel import Session, col, or_, select
 
 from src.math.arbitrage import ArbLeg, ArbOpportunity
 from src.math.balance import available_cash_usd
@@ -33,8 +34,10 @@ from src.risk.exposure import (
     exposure_count,
     open_risk_cents,
 )
+from src.storage.accounting import settled_pnl_cents
 from src.storage.models import RiskEvent, Trade, engage_kill_switch, get_session
 from src.storage.quantities import filled_quantity
+from src.storage.read_scope import financial_read_scope
 from src.strategies.motor_5_mm.incidents import incident_status
 from src.strategies.motor_5_mm.order_state import COUNT_QUARANTINE_NOTE
 from src.strategies.motor_rest_arb.settlement import arb_group_key
@@ -54,6 +57,14 @@ class _RiskMark:
     ask_cents: int | None
     observed_at: datetime
     fee_multiplier: Fraction | None
+
+
+@dataclass(frozen=True, slots=True)
+class CachedCash:
+    """Cash de la caché local; conserva adquisición, no acredita identidad de cuenta."""
+
+    amount_usd: float
+    acquired_at: datetime
 
 
 def _exact_usd_cents(value: object) -> Fraction:
@@ -156,6 +167,11 @@ class RiskManager:
 
     def _fresh_cash_usd(self) -> float | None:
         """La última lectura cruda limita el suavizado; un retiro no aumenta el margen."""
+        observation = self.cash_observation()
+        return observation.amount_usd if observation is not None else None
+
+    def cash_observation(self, *, now: datetime | None = None) -> CachedCash | None:
+        """Lectura sin fallback, red ni rejuvenecer una observación al consumirla."""
         cached = RiskManager._cached_capital_usd
         raw = RiskManager._last_raw_balance_usd
         last = RiskManager._last_balance_at
@@ -163,13 +179,14 @@ class RiskManager:
             return None
         if not all(math.isfinite(v) and v > 0 for v in (cached, raw)):
             return None
-        age = (datetime.now(UTC).replace(tzinfo=None) - self._as_utc_naive(last)).total_seconds()
+        acquired = self._as_utc_naive(last)
+        age = (self._as_utc_naive(now or datetime.now(UTC)) - acquired).total_seconds()
         ttl = self.settings.BALANCE_MAX_AGE_SECONDS
         if self._experiment_enabled():
             ttl = min(ttl, self.settings.EXPERIMENT_BALANCE_MAX_AGE_SEC)
         if age < 0 or age > ttl:
             return None
-        return min(cached, raw)
+        return CachedCash(min(cached, raw), acquired)
 
     # =========================================================
     # C-01 — Capital base efectivo (balance real de Kalshi)
@@ -424,7 +441,13 @@ class RiskManager:
             return None
         return parsed.astimezone(UTC).replace(tzinfo=None)
 
-    def _experiment_accounting_snapshot(self) -> dict:
+    def _experiment_accounting_snapshot(
+        self,
+        *,
+        session: Session | None = None,
+        now: datetime | None = None,
+        capital_usd: float | None = None,
+    ) -> dict:
         """Ledger derivado para el perfil opt-in; no hace red y no muta estado."""
         if not self._experiment_enabled():
             return {}
@@ -433,14 +456,17 @@ class RiskManager:
         if start is None:
             return {"valid": False, "reason": "EXPERIMENT_START_AT inválido o ausente"}
 
-        now_utc = datetime.now(UTC)
+        now_utc = self._as_utc_naive(now or datetime.now(UTC)).replace(tzinfo=UTC)
         la = ZoneInfo("America/Los_Angeles")
         now_la = now_utc.astimezone(la)
         week_date = now_la.date() - timedelta(days=now_la.weekday())
         week_start_la = datetime.combine(week_date, time.min, tzinfo=la)
         week_start = week_start_la.astimezone(UTC).replace(tzinfo=None)
 
-        with get_session() as s:
+        with (
+            get_session() if session is None else nullcontext(session) as s,
+            financial_read_scope(s),
+        ):
             try:
                 committed_cents = daily_committed_cents(s, start=start, now=now_utc)
                 lifetime_cents = (
@@ -450,16 +476,35 @@ class RiskManager:
                 return {"valid": False, "reason": str(exc)}
             settled_query = select(Trade).where(Trade.status == "settled")
             if not self._controlled_m1_enabled():
-                settled_query = settled_query.where(Trade.settled_at >= start)
+                settled_query = settled_query.where(
+                    or_(Trade.settled_at >= start, col(Trade.settled_at).is_(None))
+                    if session is not None
+                    else Trade.settled_at >= start
+                )
             settled = list(s.exec(settled_query))
 
         weekly_cents = 0
         cumulative_cents = 0
         for trade in settled:
-            if self._controlled_m1_enabled() and (
-                trade.settled_at is None
-                or type(trade.pnl_cents) is not int
-                or self._as_utc_naive(trade.settled_at) > now_utc.replace(tzinfo=None)
+            if session is not None:
+                if trade.settled_at is None or self._as_utc_naive(
+                    trade.settled_at
+                ) > now_utc.replace(tzinfo=None):
+                    return {"valid": False, "reason": "UNKNOWN_SETTLEMENT_DATE"}
+                try:
+                    pnl = settled_pnl_cents(trade)
+                except ValueError as exc:
+                    return {"valid": False, "reason": str(exc)}
+            else:
+                pnl = trade.pnl_cents or 0
+            if (
+                session is None
+                and self._controlled_m1_enabled()
+                and (
+                    trade.settled_at is None
+                    or type(trade.pnl_cents) is not int
+                    or self._as_utc_naive(trade.settled_at) > now_utc.replace(tzinfo=None)
+                )
             ):
                 return {"valid": False, "reason": "settlement sin fecha/PnL verificable"}
             if trade.settled_at is None:
@@ -467,12 +512,11 @@ class RiskManager:
             settled_at = self._as_utc_naive(trade.settled_at)
             if settled_at < start and not self._controlled_m1_enabled():
                 continue
-            pnl = trade.pnl_cents or 0
             cumulative_cents += pnl
             if settled_at >= week_start:
                 weekly_cents += pnl
 
-        limits = self._experiment_limits(self._get_effective_capital_usd())
+        limits = self._experiment_limits(self._snapshot_capital(session, capital_usd))
         return {
             "valid": True,
             "start_utc": start.isoformat(),
@@ -875,7 +919,7 @@ class RiskManager:
             max_total = min(max_total, float(self._experiment_limits(capital_usd).max_open_usd))
         return max_total - self._get_current_exposure_usd()
 
-    def _get_current_exposure_usd(self) -> float:
+    def _get_current_exposure_usd(self, *, session: Session | None = None) -> float:
         """
         Capital EN RIESGO en posiciones abiertas (pending/filled, todos los motores).
 
@@ -888,7 +932,10 @@ class RiskManager:
         ante la duda, sobrestimar (frena antes, nunca después).
         """
         try:
-            with get_session() as s:
+            with (
+                get_session() if session is None else nullcontext(session) as s,
+                financial_read_scope(s),
+            ):
                 stmt = select(Trade).where(
                     or_(
                         col(Trade.status).in_(["pending", "filled"]),
@@ -897,11 +944,13 @@ class RiskManager:
                     )
                 )
                 active_trades = list(s.exec(stmt))
-            total_cents = sum(open_risk_cents(trade) for trade in active_trades)
+                return self._exposure_from_trades(active_trades, session=s)
         except Exception:
             logger.exception("risk.exposure_unknown → bloquea riesgo adicional")
             return float("inf")
 
+    def _exposure_from_trades(self, active_trades: list[Trade], *, session: Session) -> float:
+        total_cents = sum(open_risk_cents(trade) for trade in active_trades)
         if not active_trades:
             return 0.0
 
@@ -932,11 +981,15 @@ class RiskManager:
                 cost_no = sum(open_risk_cents(t) for t in no_legs) / cnt_no
                 total_cents -= int(paired * (cost_yes + cost_no))
                 continue
-            total_cents -= self._multi_outcome_hedge_discount_cents(legs=legs, arb_id=arb_id)
+            total_cents -= self._multi_outcome_hedge_discount_cents(
+                legs=legs, arb_id=arb_id, session=session
+            )
 
         return max(total_cents, 0) / 100.0
 
-    def _multi_outcome_hedge_discount_cents(self, *, legs: list[Trade], arb_id: str) -> int:
+    def _multi_outcome_hedge_discount_cents(
+        self, *, legs: list[Trade], arb_id: str, session: Session | None = None
+    ) -> int:
         """
         Descuento de exposición de un arb MULTI-OUTCOME hedged (auditoría rentabilidad
         2026-07-07: el netting solo reconocía el caso binario intra-ticker — un
@@ -970,7 +1023,10 @@ class RiskManager:
         if len(events) != 1:
             return 0  # patas de eventos distintos: no es un set del mismo partido
         try:
-            with get_session() as sess:
+            with (
+                get_session() if session is None else nullcontext(session) as sess,
+                financial_read_scope(sess),
+            ):
                 siblings = list(
                     sess.exec(select(Trade).where(col(Trade.notes).contains(f"arb_id={arb_id}")))
                 )
@@ -990,7 +1046,43 @@ class RiskManager:
             return 0  # el set cuesta >= payout: no hay hedge que descontar
         return int(paired * set_cost)
 
-    def _stop_loss_snapshot(self) -> dict:
+    def _snapshot_capital(self, session: Session | None, capital_usd: float | None) -> float:
+        """Una lectura prestada exige capital explícito: nunca activa el fallback.
+
+        El caller conserva la responsabilidad de verificar origen/frescura del
+        capital. Un número válido por sí solo no acredita fondos ni GateFacts.
+        """
+        if capital_usd is None:
+            if session is not None:
+                raise ValueError("CONFIRMED_CAPITAL_REQUIRED")
+            return self._get_effective_capital_usd()
+        if (
+            type(capital_usd) not in (int, float)
+            or not math.isfinite(capital_usd)
+            or capital_usd <= 0
+        ):
+            raise ValueError("INVALID_SNAPSHOT_CAPITAL")
+        return capital_usd
+
+    @staticmethod
+    def first_stop_loss_breach(snapshot: dict) -> dict | None:
+        """La misma comparación del freno, sin alertas ni latch; preserva el orden."""
+        for window in snapshot["windows"]:
+            if (
+                not window.get("gate_disabled")
+                and window["pnl_usd"] < 0
+                and abs(window["pnl_usd"]) >= window["limit_usd"]
+            ):
+                return window
+        return None
+
+    def _stop_loss_snapshot(
+        self,
+        *,
+        session: Session | None = None,
+        now: datetime | None = None,
+        capital_usd: float | None = None,
+    ) -> dict:
         """
         Foto ÚNICA de todas las ventanas de stop-loss: PnL settled + límite efectivo +
         % usado, por ventana (rolling / mensual / semanal / diario, ordenadas MÁS severa
@@ -1006,7 +1098,7 @@ class RiskManager:
         es False, la ventana sale con gate_disabled=True y el check la salta (se ve el
         drawdown venir sin que frene — el freno lo decide el operador con el flag).
         """
-        now = datetime.now(UTC).replace(tzinfo=None)
+        now = self._as_utc_naive(now or datetime.now(UTC))
         today_start = datetime.combine(now.date(), time.min)
         week_start = datetime.combine(now.date() - timedelta(days=now.weekday()), time.min)
         month_start = datetime.combine(now.date().replace(day=1), time.min)
@@ -1017,24 +1109,38 @@ class RiskManager:
         # antigua — el lunes puede caer en el mes anterior y el rolling siempre es el
         # más largo. Filtrar cada ventana en memoria desde el set completo.
         range_start = min(month_start, week_start, rolling_start)
-        with get_session() as s:
+        with (
+            get_session() if session is None else nullcontext(session) as s,
+            financial_read_scope(s),
+        ):
             stmt = select(Trade).where(
                 Trade.status == "settled",
-                col(Trade.settled_at) >= range_start,
+                or_(col(Trade.settled_at) >= range_start, col(Trade.settled_at).is_(None))
+                if session is not None
+                else col(Trade.settled_at) >= range_start,
             )
             all_trades = list(s.exec(stmt))
 
+        if session is not None and any(
+            t.settled_at is None or self._as_utc_naive(t.settled_at) > now for t in all_trades
+        ):
+            raise ValueError("UNKNOWN_SETTLEMENT")
+        # Sólo las ramas prestadas exigen el nuevo rol. Nunca marcar historia
+        # legacy ni asumir que todo SELL es salida (M5 también vende al entrar).
+        amounts = {
+            id(t): settled_pnl_cents(t) if session is not None else (t.pnl_cents or 0)
+            for t in all_trades
+        }
+
         def _pnl_since(start: datetime) -> float:
             return (
-                sum(
-                    (t.pnl_cents or 0) for t in all_trades if t.settled_at and t.settled_at >= start
-                )
+                sum(amounts[id(t)] for t in all_trades if t.settled_at and t.settled_at >= start)
                 / 100.0
             )
 
         # C-01: límites sobre el capital base REAL. Límite efectivo = max(capital × %,
         # piso USD) — con capital chico los % puros daban límites de ruido (2026-07-12).
-        capital_usd = self._get_effective_capital_usd()
+        capital_usd = self._snapshot_capital(session, capital_usd)
 
         def _window(name: str, pnl: float, pct: float, floor: float, disabled: bool = False):
             limit = max(capital_usd * (pct / 100.0), floor)
@@ -1083,7 +1189,7 @@ class RiskManager:
         per_motor: dict[str, float] = {}
         for t in all_trades:
             if t.settled_at and t.settled_at >= month_start:
-                per_motor[t.strategy] = per_motor.get(t.strategy, 0.0) + (t.pnl_cents or 0) / 100.0
+                per_motor[t.strategy] = per_motor.get(t.strategy, 0.0) + amounts[id(t)] / 100.0
 
         return {"capital_usd": capital_usd, "windows": windows, "per_motor_month": per_motor}
 
@@ -1212,7 +1318,9 @@ class RiskManager:
             raise ValueError("INVALID_ENTRY_PRICE")
         return price * quantity, fees, observed is None
 
-    def _closing_mark(self, ticker: str, quantity: Fraction, now: datetime) -> tuple[int, Fraction]:
+    def _closing_mark(
+        self, ticker: str, quantity: Fraction, now: datetime
+    ) -> tuple[int, Fraction, datetime]:
         """Una sola liquidación del neto YES; acepta el BBO NO complementario real."""
         ttl = self.settings.UNREALIZED_MARK_TTL_SEC
         if not isinstance(ttl, (int, float)) or not math.isfinite(ttl) or ttl <= 0:
@@ -1239,10 +1347,12 @@ class RiskManager:
             if mark.fee_multiplier is None:
                 problems.append("MISSING_CLOSE_FEE")
                 continue
-            return (price if side == "yes" else 100 - price), mark.fee_multiplier
+            return (price if side == "yes" else 100 - price), mark.fee_multiplier, mark.observed_at
         raise ValueError("/".join(dict.fromkeys(problems)))
 
-    def _unrealized_snapshot(self) -> dict:
+    def _unrealized_snapshot(
+        self, *, session: Session | None = None, now: datetime | None = None
+    ) -> dict:
         """PnL de cierre conservador desde cantidades realmente ejecutadas.
 
         Normaliza BUY YES/SELL NO a +YES y SELL YES/BUY NO a -YES. Los pares
@@ -1250,8 +1360,11 @@ class RiskManager:
         cobrarles spread ni fee de cierre otra vez. El sobrante sí requiere mark.
         Un arb_id, por sí solo, no prueba que una pata esté cubierta.
         """
-        now = datetime.now(UTC).replace(tzinfo=None)
-        with get_session() as session:
+        now = self._as_utc_naive(now or datetime.now(UTC))
+        with (
+            get_session() if session is None else nullcontext(session) as session,
+            financial_read_scope(session),
+        ):
             trades = list(
                 session.exec(
                     select(Trade).where(
@@ -1295,11 +1408,13 @@ class RiskManager:
                 unknown.append(f"{trade.ticker}:{exc}")
         pnl = sum(cash.values(), Fraction(0))
         covered = 0
+        oldest_mark_at = None
         for ticker, quantity in net.items():
             if not quantity:
                 continue
             try:
-                price, multiplier = self._closing_mark(ticker, quantity, now)
+                price, multiplier, acquired_at = self._closing_mark(ticker, quantity, now)
+                oldest_mark_at = min(oldest_mark_at, acquired_at) if oldest_mark_at else acquired_at
                 pnl += quantity * price - kalshi_fee_cents(
                     abs(quantity), price, fee_multiplier=multiplier
                 )
@@ -1310,6 +1425,7 @@ class RiskManager:
             "pnl_cents": None if unknown else pnl,
             "unknown": unknown,
             "covered": covered,
+            "oldest_mark_at": oldest_mark_at,
             "executed_rows": executed_rows,
             "limit_price_rows": limit_rows,
             "net_contracts": net,
@@ -1396,28 +1512,25 @@ class RiskManager:
         # primero, lo taparía. El ROLLING va primero: es la ventana más larga (la sangría
         # gradual que las de calendario dejan pasar — auditoría 2026-07-17, M2 −$430
         # repartidos jun→jul sin un solo breach mensual).
-        for window in snapshot["windows"]:
+        window = self.first_stop_loss_breach(snapshot)
+        if window is not None:
             period_name = window["name"]
             pnl_usd = window["pnl_usd"]
             max_loss_usd = window["limit_usd"]
             max_pct = window["pct"]
             floor_usd = window["floor_usd"]
-            if window.get("gate_disabled"):
-                continue
-            if pnl_usd < 0 and abs(pnl_usd) >= max_loss_usd:
-                if period_name == "Diario" and self.settings.DAILY_STOP_ENTRIES_ONLY:
-                    # Respuesta escalonada (2026-07-12): un día malo pausa SOLO las entradas
-                    # nuevas y se auto-recupera en el rollover UTC (la ventana se recomputa
-                    # de DB en cada check). NO latchea el kill-switch persistente ni
-                    # BotState.is_paused — semanal/mensual (arriba) siguen siendo nucleares.
-                    await self._notify_daily_stop(pnl_usd, max_loss_usd, max_pct)
-                    return period_name
-                await self._trigger_kill_switch(
-                    f"Stop-Loss {period_name} superado: PnL=${pnl_usd:.2f}, "
-                    f"límite=${-max_loss_usd:.2f} ({max_pct}% o piso ${floor_usd:.2f})"
-                )
+            if period_name == "Diario" and self.settings.DAILY_STOP_ENTRIES_ONLY:
+                # Respuesta escalonada (2026-07-12): un día malo pausa SOLO las entradas
+                # nuevas y se auto-recupera en el rollover UTC (la ventana se recomputa
+                # de DB en cada check). NO latchea el kill-switch persistente ni
+                # BotState.is_paused — semanal/mensual (arriba) siguen siendo nucleares.
+                await self._notify_daily_stop(pnl_usd, max_loss_usd, max_pct)
                 return period_name
-
+            await self._trigger_kill_switch(
+                f"Stop-Loss {period_name} superado: PnL=${pnl_usd:.2f}, "
+                f"límite=${-max_loss_usd:.2f} ({max_pct}% o piso ${floor_usd:.2f})"
+            )
+            return period_name
         return None
 
     # Anti-spam del aviso del stop diario soft: fecha UTC del último aviso (estado de CLASE,

@@ -20,6 +20,7 @@ from sqlmodel import col, select
 from src.clients.kalshi_rest import KalshiRestClient
 from src.math.fees import kalshi_fee_cents
 from src.monitoring.health import BotState
+from src.monitoring.motor_telemetry import observed_tick
 from src.risk.manager import RiskManager
 from src.storage.models import PortfolioPosition, Trade, _naive_utc_now, get_session
 from src.storage.quantities import open_quantity, quantity_fields, requested_quantity
@@ -106,6 +107,7 @@ class Motor3Engine:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=self.LOOP_INTERVAL_SEC)
 
+    @observed_tick
     async def _tick(self) -> None:
         """Un ciclo: refresca cartera, detecta salidas (tiempo + take-profit), y liquida."""
         try:

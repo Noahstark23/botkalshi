@@ -14,13 +14,16 @@ el check → skip conservador.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlmodel import select
 
 import src.storage.models as models
-from src.risk.manager import TradeDecision
+from src.risk.manager import RiskManager, TradeDecision
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 
@@ -177,3 +180,108 @@ async def test_db_error_in_dedup_check_skips_conservador(monkeypatch):
     outcome = await ex.execute(_signal())
     assert not outcome.placed and outcome.reason == "already_open"
     client.place_order.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "one_per_event,event_key,competing_ticker",
+    [(True, EVENT, TICKER_JOR), (False, EVENT, TICKER_ARG), (True, "", TICKER_ARG)],
+    ids=["event", "ticker-flag", "ticker-fallback"],
+)
+@pytest.mark.parametrize("status", ["pending", "filled", "settled", "cancelled"])
+async def test_position_appearing_during_book_read_is_revalidated(
+    one_per_event, event_key, competing_ticker, status
+):
+    """La admisión debe usar el ledger vigente, no el check anterior al await."""
+    client, risk = _FakeClient(), _FakeRisk()
+    ex = Motor2Executor(client, risk, one_bet_per_event=one_per_event)
+
+    async def book_read(*_args):
+        _seed_trade(ticker=competing_ticker, status=status)
+        return 40, 5
+
+    ex._current_ask = AsyncMock(side_effect=book_read)
+    outcome = await ex.execute(_signal(event_key=event_key))
+    if status in {"pending", "filled"}:
+        assert not outcome.placed
+        client.place_order.assert_not_awaited()
+        assert _trade_count() == 1
+    else:
+        assert outcome.placed and outcome.filled
+        client.place_order.assert_awaited_once()
+        assert _trade_count() == 2
+
+
+async def test_overlapping_entries_keep_only_one_uncertain_reservation():
+    """Dos callers pasan el check inicial; un ACK perdido no permite otra compra."""
+    client = _FakeClient()
+    client.place_order = AsyncMock(side_effect=TimeoutError("lost ACK"))
+    with patch("src.risk.manager.get_settings", return_value=MagicMock()):
+        risk = RiskManager()
+    # Usar check_and_reserve y su lock reales. Sólo se fija la aprobación de sizing:
+    # esta regresión verifica el dedup, no sustituye las pruebas de caps/stop-loss.
+    risk._check_pre_trade_locked = AsyncMock(return_value=TradeDecision(True, "Aprobado", 5))
+    risk.multi_profile_enabled = lambda: False
+    executors = [Motor2Executor(client, risk) for _ in range(2)]
+    both_reading = asyncio.Event()
+    readers = 0
+
+    async def book_read(*_args):
+        nonlocal readers
+        readers += 1
+        if readers == 2:
+            both_reading.set()
+        await both_reading.wait()
+        return 40, 5
+
+    for ex in executors:
+        ex._current_ask = AsyncMock(side_effect=book_read)
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(
+            executors[0].execute(_signal(ticker=TICKER_ARG)),
+            executors[1].execute(_signal(ticker=TICKER_JOR)),
+        ),
+        timeout=5,
+    )
+    assert sum(outcome.placed for outcome in outcomes) == 1
+    assert sum(outcome.uncertain for outcome in outcomes) == 1
+    client.place_order.assert_awaited_once()
+    assert _trade_count() == 1
+    with models.get_session() as s:
+        assert s.exec(select(models.Trade)).one().status == "pending"
+    # Una nueva instancia tampoco puede sustituir la intención incierta.
+    restarted = Motor2Executor(client, _FakeRisk())
+    assert (await restarted.execute(_signal())).reason == "already_open"
+    client.place_order.assert_awaited_once()
+
+
+def test_entry_reservation_rechecks_event_in_same_sqlite_transaction():
+    """El último gate no depende sólo del lock asyncio de un proceso."""
+    barrier = Barrier(2, timeout=5)
+
+    def reserve(ticker):
+        ex = Motor2Executor(_FakeClient(), _FakeRisk())
+        barrier.wait()
+        return ex._persist_intent(_signal(ticker=ticker), "yes", 40, 5, f"fake-{ticker}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, [TICKER_ARG, TICKER_JOR]))
+    assert sorted(results) == [False, True]
+    assert _trade_count() == 1
+
+
+async def test_db_failure_after_book_read_aborts_before_place(monkeypatch):
+    client, risk = _FakeClient(), _FakeRisk()
+    ex = Motor2Executor(client, risk)
+
+    def unavailable():
+        raise RuntimeError("DB unavailable after initial check")
+
+    async def book_read(*_args):
+        monkeypatch.setattr("src.strategies.motor_2_consensus.executor.get_session", unavailable)
+        return 40, 5
+
+    ex._current_ask = AsyncMock(side_effect=book_read)
+    outcome = await ex.execute(_signal())
+    assert not outcome.placed
+    client.place_order.assert_not_awaited()
+    assert _trade_count() == 0

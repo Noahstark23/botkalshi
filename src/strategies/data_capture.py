@@ -27,6 +27,7 @@ from loguru import logger
 from src.clients.kalshi_rest import KalshiRestClient
 from src.clients.kalshi_ws import KalshiWebSocket
 from src.monitoring.health import BotState
+from src.monitoring.motor_telemetry import bind_child, observed_tick
 from src.storage.disk_guard import DiskGuard
 from src.storage.models import MarketSnapshot, OrderbookEvent, get_session
 from src.utils.config import get_settings
@@ -509,6 +510,7 @@ class DataCaptureService:
     # Discovery
     # =====================================================
 
+    @observed_tick
     async def _discover_markets(self) -> set[str]:
         """
         Descubre markets activos por SERIES EXACTAS y devuelve los NUEVOS (delta).
@@ -918,6 +920,9 @@ class DataCaptureService:
                 f"motor1={self.settings.MOTOR_1_ARBITRAGE_ENABLED})"
             )
 
+        bind_child(self, "m8_observer", self._ofi)
+        bind_child(self, "m9_observer", self._spillover)
+
         # Motor REST — shadow mode. Estrictamente condicionado por MOTOR_REST_ENABLED.
         # SHADOW: detecta arbitraje sobre el canal `ticker` y graba EdgeWindow; NUNCA
         # ejecuta órdenes (TRADING_ENABLED es el muro; el engine no instancia ejecución).
@@ -974,6 +979,7 @@ class DataCaptureService:
             # ya corrió cuando se registran los handlers; el re-discovery lo refresca.
             self._rest_engine.update_universe(self._tracked_tickers)
             self.ws.on("ticker", self._rest_engine.on_ticker)
+            bind_child(self, "rest_observer", self._rest_engine)
             mode = "LIVE: ejecuta" if executor is not None else "SHADOW: detecta y graba EdgeWindow"
             logger.info(
                 f"Motor REST registered ({mode}, trading_enabled={self.settings.TRADING_ENABLED})"

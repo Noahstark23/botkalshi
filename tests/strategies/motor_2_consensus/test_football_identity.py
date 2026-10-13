@@ -4,7 +4,9 @@ Fixtures sintéticas: ni la coincidencia ni el fair numérico certifican reglas 
 liquidación. No se publica en FairValueBook ni se construye un ejecutor.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -49,6 +51,23 @@ CASES = [
         datetime(2026, 10, 9, 23, tzinfo=UTC),
     ),
 ]
+
+# Capturas independientes del catálogo Demo y del snapshot del proveedor. Se
+# comprueba el detector completo, incluyendo nombres cruzados y fechas/ligas malas.
+NFL_CAPTURE = json.loads(
+    (Path(__file__).parents[2] / "fixtures/nfl_demo_identity_20261012.json").read_text()
+)["cases"]
+CASES.extend(
+    (
+        row["event_ticker"],
+        "americanfootball_nfl",
+        tuple(row["codes"]),
+        tuple(row["short_names"]),
+        tuple(row["long_names"]),
+        datetime.fromisoformat(row["commence_time"].replace("Z", "+00:00")),
+    )
+    for row in NFL_CAPTURE
+)
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -159,3 +178,18 @@ def test_football_aliases_do_not_leak_across_sports_or_legacy():
     assert canonical_name("Georgia", "soccer_fifa_world_cup") == "georgia"
     assert canonical_name("Georgia", "americanfootball_nfl") == "georgia"
     assert canonical_name("Florida State", "americanfootball_ncaaf") == "florida state seminoles"
+
+
+@pytest.mark.parametrize("row", NFL_CAPTURE, ids=lambda row: row["event_ticker"])
+def test_observed_nfl_names_stay_scoped_to_their_league(row):
+    for short, full in zip(row["short_names"], row["long_names"], strict=True):
+        expected = full.lower()
+        assert canonical_name(short, "americanfootball_nfl") == expected
+        for sport in ("americanfootball_ncaaf", "baseball_mlb", "basketball_nba", None):
+            assert canonical_name(short, sport) != expected
+
+
+@pytest.mark.parametrize("ambiguous", ["Los Angeles", "New York"])
+def test_ambiguous_nfl_city_is_not_assigned_to_a_team(ambiguous):
+    assert canonical_name(ambiguous, "americanfootball_nfl") == ambiguous.lower()
+    assert check_ticker_team("KXNFLGAME-26OCT12BUFLAR-LAR", ambiguous) == "UNKNOWN"

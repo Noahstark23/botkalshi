@@ -311,13 +311,39 @@ _MLB_ALIASES: dict[str, str] = {
 
 TEAM_ALIASES: dict[str, str] = {**_GENERIC_ALIASES, **_MLB_ALIASES}
 
-# Nombres comprobados en las capturas Demo NFL/NCAAF del 9–10 de octubre.
+# Nombres comprobados en las capturas Demo NFL/NCAAF del 9–12 de octubre.
 # Cobertura deliberadamente parcial; no se extrapolan apodos ni ciudades a otras
 # ligas, y el comportamiento histórico sin sport_key conserva sólo sus aliases.
 _FOOTBALL_ALIASES = {
     "americanfootball_nfl": {
-        "philadelphia": "philadelphia eagles",
+        "arizona": "arizona cardinals",
+        "atlanta": "atlanta falcons",
+        "baltimore": "baltimore ravens",
+        "buffalo": "buffalo bills",
+        "carolina": "carolina panthers",
+        "chicago": "chicago bears",
+        "cleveland": "cleveland browns",
+        "dallas": "dallas cowboys",
+        "denver": "denver broncos",
+        "green bay": "green bay packers",
+        "houston": "houston texans",
+        "indianapolis": "indianapolis colts",
         "jacksonville": "jacksonville jaguars",
+        "kansas city": "kansas city chiefs",
+        "las vegas": "las vegas raiders",
+        "los angeles c": "los angeles chargers",
+        "los angeles r": "los angeles rams",
+        "new england": "new england patriots",
+        "new orleans": "new orleans saints",
+        "new york g": "new york giants",
+        "new york j": "new york jets",
+        "philadelphia": "philadelphia eagles",
+        "pittsburgh": "pittsburgh steelers",
+        "san francisco": "san francisco 49ers",
+        "seattle": "seattle seahawks",
+        "tampa bay": "tampa bay buccaneers",
+        "tennessee": "tennessee titans",
+        "washington": "washington commanders",
     },
     "americanfootball_ncaaf": {
         "alabama": "alabama crimson tide",

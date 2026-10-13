@@ -9,14 +9,15 @@ single-leg (PnL realizado que alimenta el stop-loss). DB temporal: conftest del 
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlmodel import select
 
 import src.storage.models as models
 from src.clients.kalshi_rest import KalshiClientError, TradingDisabledError
-from src.risk.manager import TradeDecision
+from src.risk.manager import RiskManager, TradeDecision
+from src.storage.order_reconciliation import reconcile_pending_orders
 from src.strategies.motor_2_consensus.detector import ConsensusSignal
 from src.strategies.motor_2_consensus.executor import Motor2Executor
 from src.strategies.motor_rest_arb.settlement import MarketResolution, SettlementPoller
@@ -72,6 +73,12 @@ class _FakeClient:
 def _trade() -> models.Trade | None:
     with models.get_session() as s:
         return s.exec(select(models.Trade).where(models.Trade.ticker == TICKER)).first()
+
+
+def _exposure_usd() -> float:
+    # El cálculo consulta el ledger real temporal; no necesita claves ni configuración de cuenta.
+    with patch("src.risk.manager.get_settings", return_value=MagicMock()):
+        return RiskManager()._get_current_exposure_usd()
 
 
 @pytest.mark.asyncio
@@ -193,6 +200,104 @@ async def test_client_error_4xx_no_position():
     outcome = await ex.execute(_signal())
     assert outcome.placed and not outcome.filled
     assert _trade().status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 409])
+@pytest.mark.parametrize(
+    "code", [None, "duplicate_client_order_id", "fill_or_kill_insufficient_resting_volume"]
+)
+async def test_ambiguous_http_retains_exposure_and_blocks_after_restart(
+    status, code, _tmp_db_engine, monkeypatch
+):
+    """Ni el status ni un código FOK contradictorio prueban cero fill de un IOC."""
+    from sqlmodel import create_engine
+
+    client = _FakeClient(exc=KalshiClientError(status, "respuesta incierta", error_code=code))
+    risk = _FakeRisk(TradeDecision(True, "Aprobado", 3))
+    signal = _signal(price=40)
+    signal.event_key = TICKER.rsplit("-", 1)[0]
+    outcome = await Motor2Executor(client, risk).execute(signal)
+
+    assert _trade().status == "pending"
+    assert outcome.placed and not outcome.filled and outcome.uncertain
+    assert outcome.reason == f"ambiguous_http_{status}"
+    assert _trade().count == 3 and _trade().count_fp == "3.00"
+    assert _exposure_usd() == 1.20
+    client.place_order.assert_awaited_once()
+
+    # Reabrir SQLite y construir instancias nuevas, sin conservar estado del executor.
+    url = _tmp_db_engine.url
+    _tmp_db_engine.dispose()
+    reopened = create_engine(url)
+    monkeypatch.setattr(models, "_engine", reopened)
+    try:
+        recovery_client = _FakeClient()
+        recovery_client.get_orders = AsyncMock(return_value={"orders": [], "cursor": ""})
+        result = await reconcile_pending_orders(recovery_client, strategies=("motor_2_consensus",))
+        assert result.checked == 1 and result.resolved == 0
+        assert result.unresolved == (outcome.client_order_id,)
+        assert _trade().status == "pending"
+        assert _exposure_usd() == 1.20
+        restarted = Motor2Executor(recovery_client, risk)
+        assert (await restarted.execute(signal)).reason == "already_open"
+        signal.market_ticker = f"{signal.event_key}-JOR"
+        assert (await restarted.execute(signal)).reason == "already_open"
+        recovery_client.place_order.assert_not_awaited()
+        assert risk.calls == 1
+    finally:
+        reopened.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 409])
+@pytest.mark.parametrize("filled", ["0.00", "0.25"])
+async def test_ambiguous_http_resolves_only_with_correlated_terminal_evidence(status, filled):
+    client = _FakeClient(exc=KalshiClientError(status, "incierto"))
+    out = await Motor2Executor(client, _FakeRisk(TradeDecision(True, "Aprobado", 3))).execute(
+        _signal(price=40)
+    )
+    client.get_orders = AsyncMock(
+        return_value={
+            "cursor": "",
+            "orders": [
+                {
+                    "order_id": "fake-terminal",
+                    "client_order_id": out.client_order_id,
+                    "ticker": TICKER,
+                    "side": "yes",
+                    "action": "buy",
+                    "status": "canceled",
+                    "initial_count_fp": "3.00",
+                    "fill_count_fp": filled,
+                    "remaining_count_fp": "0.00",
+                    "maker_fill_cost_dollars": "0.00",
+                    "taker_fill_cost_dollars": "0.00" if filled == "0.00" else "0.10",
+                    "maker_fees_dollars": "0.00",
+                    "taker_fees_dollars": "0.00" if filled == "0.00" else "0.01",
+                }
+            ],
+        }
+    )
+    result = await reconcile_pending_orders(client, strategies=("motor_2_consensus",))
+    assert result.resolved == 1 and not result.unresolved
+    row = _trade()
+    assert row.kalshi_order_id == "fake-terminal" and row.filled_count_fp == filled
+    assert row.status == ("cancelled" if filled == "0.00" else "filled")
+    assert _exposure_usd() == (0 if filled == "0.00" else 0.10)
+    client.place_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 422])
+async def test_definitive_http_rejection_releases_entry_reservation(status):
+    client = _FakeClient(exc=KalshiClientError(status, "rechazo definitivo ficticio"))
+    out = await Motor2Executor(client, _FakeRisk(TradeDecision(True, "Aprobado", 3))).execute(
+        _signal()
+    )
+    assert not out.uncertain and out.reason == f"client_error_{status}"
+    assert _trade().status == "cancelled"
+    assert _exposure_usd() == 0
 
 
 @pytest.mark.asyncio

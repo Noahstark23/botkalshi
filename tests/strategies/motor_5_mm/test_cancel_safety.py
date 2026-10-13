@@ -187,7 +187,7 @@ async def test_real_client_preserves_rejected_count_before_retry_zero(
 
 
 @pytest.mark.parametrize("fill", ["0.50", "4.00"])
-async def test_batch_quarantine_write_failure_aborts_before_fallback(fill):
+async def test_batch_quarantine_write_failure_attempts_retirement_without_releasing(fill):
     client = FakeClient()
     executor = Motor5Executor(client)
     await executor.sync_quotes(quote(ask=None))
@@ -205,8 +205,11 @@ async def test_batch_quarantine_write_failure_aborts_before_fallback(fill):
         pytest.raises(OSError, match="disk"),
     ):
         await executor.cancel_all("test")
-    assert client.cancelled == []
+    # Retirar es protector; no aceptar su terminal después de perder evidencia.
+    assert client.cancelled == ["K1"]
     assert rows()[0].status == "pending"
+    assert executor.live_order_ids() == ["K1"]
+    assert "T" in executor.corrupted
 
 
 @pytest.mark.parametrize("fill", ["11.00", "4.00"])
