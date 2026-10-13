@@ -23,7 +23,7 @@ def _client(positions: list[dict]) -> AsyncMock:
     client = AsyncMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
-    client.get_positions = AsyncMock(return_value={"market_positions": positions, "cursor": None})
+    client.get_positions = AsyncMock(return_value={"market_positions": positions, "cursor": ""})
     client.get_market = AsyncMock(return_value={"market": {"close_time": "2026-06-26T20:00:00Z"}})
     return client
 
@@ -220,7 +220,8 @@ async def test_repeated_cursor_stops_pagination(monkeypatch):
     client.get_positions = AsyncMock(return_value={"market_positions": [], "cursor": "STUCK"})
     poller = PortfolioPoller(client_factory=lambda: client)
 
-    await poller.sync_once()  # sin guard, esto no retornaba nunca
+    with pytest.raises(ValueError, match="cursor repetido"):
+        await poller.sync_once()  # sin guard, esto no retornaba nunca
     assert client.get_positions.await_count <= 3
 
 

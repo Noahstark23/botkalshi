@@ -97,6 +97,7 @@ class PortfolioPoller:
     # parcial) borraría TODAS las filas de golpe y el trailing perdería sus peaks. Un
     # resultado vacío con filas existentes se confirma en el tick siguiente antes de purgar.
     _MAX_PAGES = 20  # tope defensivo de paginación (~2000 posiciones; hoy son <100)
+    _FETCH_TIMEOUT_SEC = 30.0
 
     def __init__(
         self, *, client_factory: Callable[[], KalshiRestClient] = KalshiRestClient
@@ -128,6 +129,9 @@ class PortfolioPoller:
         """Un tick: trae posiciones, resuelve close_time, upsert + purga. Devuelve nº abiertas."""
         # close_time cacheado: vale mientras el cierre esté LEJOS; dentro de la ventana de
         # refresh se re-consulta (el close_time de deportes cambia: prórroga/early close).
+        previous_empty_syncs = self._empty_syncs
+        # Un tick fallido/cancelado rompe la confirmación de vacíos consecutivos.
+        self._empty_syncs = 0
         now = _naive_utc_now()
         with get_session() as s:
             cached_close = {
@@ -187,31 +191,58 @@ class PortfolioPoller:
                     close_times[ticker] = cached
                 await asyncio.sleep(self._GET_MARKET_PAUSE_SEC)
 
+        self._empty_syncs = previous_empty_syncs
         self._persist(open_now, close_times)
         return len(open_now)
 
     async def _fetch_all_positions(self, client: KalshiRestClient) -> list[dict]:
-        """Todas las market_positions, paginando por cursor. Tope de páginas + detección de
-        cursor repetido (deuda auditoría: un cursor pegado colgaba el tick para siempre)."""
+        """Colección completa o error: nunca purgar a partir de un prefijo.
+
+        Cursor final explícito, páginas acotadas, cantidades e identidades válidas.
+        La exhaustividad del recorrido no acredita un snapshot atómico de cuenta.
+        """
         out: list[dict] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
-        for _page in range(self._MAX_PAGES):
-            resp = await client.get_positions(limit=100, cursor=cursor)
-            if not isinstance(resp, dict):
-                break
-            out.extend(resp.get("market_positions", resp.get("positions", [])) or [])
-            cursor = resp.get("cursor") or None
-            if not cursor:
-                return out
-            if cursor in seen_cursors:
-                logger.warning("motor3.poller.cursor_repetido — corto la paginación")
-                return out
-            seen_cursors.add(cursor)
-        logger.warning(
-            f"motor3.poller.max_pages alcanzado ({self._MAX_PAGES}) — resultado truncado"
-        )
-        return out
+        tickers: set[str] = set()
+        async with asyncio.timeout(self._FETCH_TIMEOUT_SEC):
+            for _page in range(self._MAX_PAGES):
+                resp = await client.get_positions(limit=100, cursor=cursor)
+                if not isinstance(resp, dict):
+                    raise ValueError("portfolio snapshot: página inválida")
+                rows = resp.get("market_positions", resp.get("positions"))
+                if not isinstance(rows, list) or len(rows) > 100:
+                    raise ValueError("portfolio snapshot: lista ausente o excedida")
+                if "market_positions" in resp and "positions" in resp and resp["positions"] != rows:
+                    raise ValueError("portfolio snapshot: listas contradictorias")
+                for row in rows:
+                    ticker = row.get("ticker") if isinstance(row, dict) else None
+                    if (
+                        not isinstance(ticker, str)
+                        or not ticker.strip()
+                        or ticker != ticker.strip()
+                        or ticker in tickers
+                        or api_count(row, "position", signed=True) is None
+                    ):
+                        raise ValueError(
+                            "portfolio snapshot: identidad/cantidad inválida o duplicada"
+                        )
+                    tickers.add(ticker)
+                next_cursor = resp.get("cursor")
+                if (
+                    not isinstance(next_cursor, str)
+                    or len(next_cursor) > 4096
+                    or (next_cursor and not next_cursor.strip())
+                ):
+                    raise ValueError("portfolio snapshot: cursor ausente o inválido")
+                out.extend(rows)
+                if not next_cursor:
+                    return out
+                if next_cursor in seen_cursors:
+                    raise ValueError("portfolio snapshot: cursor repetido")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        raise ValueError("portfolio snapshot: max_pages sin cursor final")
 
     def _persist(
         self,

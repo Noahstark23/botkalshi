@@ -91,6 +91,23 @@ incidentes, dependencias y requisitos específicos del scope. Los hechos vencido
 desconocidos o no disponibles bloquean. El adaptador además lee el kill-switch durable
 bajo la misma transacción; no lo levanta ni repara. Cero filas no prueba cuenta vacía.
 
+El poller de posiciones M3 rechaza recorridos truncados, páginas/cursores inválidos,
+identidades duplicadas y cantidades inválidas antes de actualizar o purgar la caché.
+Tiene un límite de 20 páginas de 100 posiciones y 30 segundos para el recorrido. Un
+fallo o cancelación interrumpe la confirmación de vacíos consecutivos. Esto preserva
+la caché previa, sin renovar su fecha; el engine conserva su política de usar caché
+tras un fallo de sync. No existe todavía un recibo durable de barrido completo ni
+un snapshot atómico de cuenta. Dos vacíos completos permiten la purga de caché según
+la regla existente, pero no resuelven UNKNOWN ni acreditan readiness financiero.
+
+El contrato terminal exige cursor string vacío explícito y lista de posiciones. La
+[documentación oficial de Get Positions](https://docs.kalshi.com/api-reference/portfolio/get-positions)
+consultada el 13-oct-2026 describe un array requerido y cursor string con valor vacío
+al terminar, pero no marca cursor como requerido. Falta un fixture real saneado de
+la última página/cuenta vacía antes de merge o instalación: si el entorno omite el
+cursor o entrega null, el sync se rechaza y conserva caché anterior. No se acredita
+compatibilidad de cuenta mediante mocks ni se relaja el rechazo para forzar pase.
+
 **Ese proveedor del runtime aún no está implementado.** Los tests lo sustituyen por
 hechos ficticios explícitos. Por tanto, el backend SQLite y los hooks probados no
 acreditan una fuente financiera conectada ni control operativo. Ningún scope se registra
