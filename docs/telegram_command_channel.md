@@ -100,3 +100,15 @@ Existe ahora un backend SQLite y hooks opcionales de admisión descritos en
 hechos del runtime, ensamblado y transporte: el párrafo inicial sigue describiendo el
 estado de instalación. Las pruebas nuevas usan permisos persistidos reales en una DB
 temporal y hechos financieros ficticios; no convierten esos hechos en evidencia de cuenta.
+
+
+## Recuperación de instancia sin reenvíos
+
+El backend conserva ahora el binding completo y su cadena de transiciones en la
+misma DB. `historical_write(intent)` devuelve evidencia de una escritura exacta;
+no cambia estados del journal, no vuelve a llamar apply y no acredita retirada M5.
+CLAIMED/UNKNOWN antiguos permanecen pendientes; una ausencia no se convierte en
+NOT_APPLIED. PROPOSED/CONFIRMED antiguos siguen sujetos a identidad, TTL y CAS.
+La consulta histórica no sustituye la observación actual del canal.
+El router opcional de parada tiene una transición separada autenticada que conserva
+su DB e historial, descrita en [permission_recovery.md](permission_recovery.md).

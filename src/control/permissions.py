@@ -8,6 +8,7 @@ transacción recibida; nunca hace red, commit ni inventa gates por falta de dato
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from contextlib import closing, contextmanager
@@ -21,6 +22,7 @@ from sqlmodel import Field, Session, SQLModel, select
 from src.control.channel import (
     EXITS,
     MAX_AGE_MS,
+    ControlError,
     Intent,
     Observation,
     _canonical,
@@ -28,7 +30,7 @@ from src.control.channel import (
     _integer,
     _require,
 )
-from src.control.entry_stop import EntryStopStatus, StopRequest
+from src.control.entry_stop import BINDING_FIELDS, EntryStopStatus, StopRequest
 from src.storage.models import Trade, kill_switch_engaged
 
 # Sólo estos scopes tienen un punto de admisión de órdenes identificable.
@@ -40,6 +42,9 @@ STRATEGIES = {
     "m5.quotes": ("motor_5_mm", {"buy", "sell"}),
     "rest.entries": ("motor_rest_arb", {"buy"}),
 }
+
+
+MAX_REBINDS = 128
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,7 @@ class PermissionBinding:
     max_commands: int = 1000
     max_admissions: int = 100000
 
-    def digest(self):
+    def canonical(self):
         _require(
             _integer(self.actor_id, 1)
             and _integer(self.chat_id, 1)
@@ -78,7 +83,35 @@ class PermissionBinding:
         )
         value = asdict(self)
         value.update(scopes=sorted(self.scopes), boot_allowed=sorted(self.boot_allowed))
-        return hashlib.sha256(_canonical(value).encode()).hexdigest()
+        return _canonical(value)
+
+    def digest(self):
+        return hashlib.sha256(self.canonical().encode()).hexdigest()
+
+    @classmethod
+    def parse(cls, raw):
+        _require(type(raw) is str and len(raw.encode()) <= 8192, "INVALID_BINDING_METADATA")
+        try:
+            value = json.loads(raw)
+            _require(
+                type(value) is dict and set(value) == set(cls.__dataclass_fields__),
+                "INVALID_BINDING_METADATA",
+            )
+            for name in ("scopes", "boot_allowed"):
+                _require(type(value[name]) is list, "INVALID_BINDING_METADATA")
+                value[name] = frozenset(value[name])
+            binding = cls(**value)
+            _require(binding.canonical() == raw, "INVALID_BINDING_METADATA")
+            return binding
+        except (TypeError, ValueError, RecursionError):
+            raise ControlError("INVALID_BINDING_METADATA") from None
+
+    def stable(self):
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if key not in {"source_sha", "instance_id"}
+        }
 
 
 @dataclass(frozen=True)
@@ -119,6 +152,8 @@ class _Meta(_Model, table=True):
     __tablename__ = "motor_permissions_meta"
     id: int = Field(default=1, primary_key=True)
     binding_digest: str
+    binding_json: str
+    binding_generation: int = 0
     last_seen_ms: int
     command_count: int = 0
     admission_count: int = 0
@@ -134,15 +169,43 @@ class _Permission(_Model, table=True):
     state: str = "disabled"
     revision: int = 0
     command_id: str | None = None
+    transition_generation: int | None = None
 
 
 class _Applied(_Model, table=True):
     __tablename__ = "motor_permission_commands"
     command_id: str = Field(primary_key=True)
     intent_digest: str
+    binding_digest: str
+    binding_generation: int
     scope: str
     revision: int
     state: str
+
+
+class _Transition(_Model, table=True):
+    """Auditoría propia: no se hace pasar por comando humano ni consume su cupo."""
+
+    __tablename__ = "motor_permission_transitions"
+    generation: int = Field(primary_key=True)
+    from_json: str
+    to_json: str
+    at_ms: int
+    resets_json: str
+
+
+@dataclass(frozen=True)
+class HistoricalPermissionWrite:
+    command_id: str
+    intent_digest: str
+    binding_digest: str
+    binding_generation: int
+    revision: int
+    enabled: bool
+    fenced: bool
+    # Prueba de escritura, nunca recibo de retirada M5 ni autoridad presente.
+    current_permission_proven: bool = False
+    quotes_retired_proven: bool = False
 
 
 class Admission(_Model, table=True):
@@ -199,7 +262,13 @@ class DurablePermissionAdapter:
             _Model.metadata.create_all(session.connection())
             now = self.clock()
             _require(_integer(now, 946684800000), "INVALID_TIME")
-            session.add(_Meta(binding_digest=self.digest, last_seen_ms=now))
+            session.add(
+                _Meta(
+                    binding_digest=self.digest,
+                    binding_json=self.binding.canonical(),
+                    last_seen_ms=now,
+                )
+            )
             for scope in sorted(self.binding.scopes):
                 session.add(_Permission(scope=scope))
             session.commit()
@@ -221,13 +290,14 @@ class DurablePermissionAdapter:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA query_only=ON")
             row = db.execute(
-                "SELECT binding_digest,entry_stop_state,entry_stop_request_id,"
+                "SELECT binding_digest,binding_json,binding_generation,entry_stop_state,entry_stop_request_id,"
                 "entry_stop_request_digest,entry_stop_at_ms FROM motor_permissions_meta WHERE id=1"
             ).fetchone()
             _require(
                 row is not None and row["binding_digest"] == self.digest,
                 "PERMISSION_BINDING_CHANGED",
             )
+            self._stored_binding(SimpleNamespace(**dict(row)))
             request.authorize(self.binding, self.clock())
             return self._stop_status(SimpleNamespace(**dict(row)))
 
@@ -254,6 +324,7 @@ class DurablePermissionAdapter:
                 meta is not None and meta.binding_digest == self.digest,
                 "PERMISSION_BINDING_CHANGED",
             )
+            self._stored_binding(meta)
             _require(_integer(meta.last_seen_ms, 946684800000), "CLOCK_REGRESSION")
             now = self.clock()
             request.authorize(self.binding, now)
@@ -274,10 +345,21 @@ class DurablePermissionAdapter:
             session.commit()
             return result
 
-    def _check_meta(self, meta, now):
+    @staticmethod
+    def _stored_binding(meta):
+        _require(meta is not None, "PERMISSION_BINDING_CHANGED")
+        binding = PermissionBinding.parse(meta.binding_json)
         _require(
-            meta is not None and meta.binding_digest == self.digest, "PERMISSION_BINDING_CHANGED"
+            binding.digest() == meta.binding_digest
+            and _integer(meta.binding_generation, 0, MAX_REBINDS),
+            "INVALID_BINDING_METADATA",
         )
+        return binding
+
+    def _check_meta(self, meta, now, *, binding=None):
+        binding = binding or self.binding
+        stored = self._stored_binding(meta)
+        _require(stored == binding, "PERMISSION_BINDING_CHANGED")
         self._stop_status(meta)
         _require(
             _integer(now, 946684800000)
@@ -286,20 +368,68 @@ class DurablePermissionAdapter:
             "CLOCK_REGRESSION",
         )
         _require(
-            _integer(meta.command_count, 0, self.binding.max_commands)
-            and _integer(meta.admission_count, 0, self.binding.max_admissions),
+            _integer(meta.command_count, 0, binding.max_commands)
+            and _integer(meta.admission_count, 0, binding.max_admissions),
             "PERMISSION_COUNTER_INVALID",
         )
 
-    def _check_rows(self, session, meta):
+    def _history(self, session, meta):
+        transitions = session.exec(
+            select(_Transition).order_by(_Transition.generation).limit(MAX_REBINDS + 1)
+        ).all()
+        _require(len(transitions) == meta.binding_generation, "PERMISSION_TRANSITION_MISMATCH")
+        bindings, effects = {}, {}
+        previous, at_ms, nonces = None, 0, set()
+        for generation, transition in enumerate(transitions, 1):
+            before = PermissionBinding.parse(transition.from_json)
+            after = PermissionBinding.parse(transition.to_json)
+            _require(
+                transition.generation == generation
+                and (previous is None or before == previous)
+                and before.stable() == after.stable()
+                and before.instance_id != after.instance_id
+                and after.instance_id not in nonces
+                and _integer(transition.at_ms, 946684800000)
+                and at_ms <= transition.at_ms <= meta.last_seen_ms,
+                "PERMISSION_TRANSITION_MISMATCH",
+            )
+            nonces.add(before.instance_id)
+            _require(after.instance_id not in nonces, "PERMISSION_TRANSITION_MISMATCH")
+            nonces.add(after.instance_id)
+            bindings[generation - 1] = before
+            bindings[generation] = after
+            try:
+                resets = json.loads(transition.resets_json)
+                _require(
+                    type(resets) is dict and _canonical(resets) == transition.resets_json,
+                    "PERMISSION_TRANSITION_MISMATCH",
+                )
+                for scope, revision in resets.items():
+                    _require(
+                        scope in before.scopes - EXITS and _integer(revision, 2),
+                        "PERMISSION_TRANSITION_MISMATCH",
+                    )
+                    effects[generation, scope] = revision
+            except (ValueError, TypeError, RecursionError):
+                raise ControlError("PERMISSION_TRANSITION_MISMATCH") from None
+            previous, at_ms = after, transition.at_ms
+        stored = self._stored_binding(meta)
+        _require(previous is None or previous == stored, "PERMISSION_TRANSITION_MISMATCH")
+        bindings[meta.binding_generation] = stored
+        return bindings, effects
+
+    def _check_rows(self, session, meta, *, binding=None):
+        binding = binding or self.binding
+        bindings, effects = self._history(session, meta)
         _require(
-            session.exec(select(func.count()).select_from(_Applied)).one() == meta.command_count
+            session.exec(select(func.count()).select_from(_Meta)).one() == 1
+            and session.exec(select(func.count()).select_from(_Applied)).one() == meta.command_count
             and session.exec(select(func.count()).select_from(Admission)).one()
             == meta.admission_count,
             "PERMISSION_HISTORY_MISMATCH",
         )
         rows = session.exec(select(_Permission)).all()
-        _require({p.scope for p in rows} == self.binding.scopes, "PERMISSION_ROWS_CHANGED")
+        _require({p.scope for p in rows} == binding.scopes, "PERMISSION_ROWS_CHANGED")
         for row in rows:
             _require(
                 row.state in {"enabled", "disabled"} and _integer(row.revision),
@@ -307,7 +437,18 @@ class DurablePermissionAdapter:
             )
             if row.revision == 0:
                 _require(
-                    row.command_id is None and row.state == "disabled", "PERMISSION_STATE_INVALID"
+                    row.command_id is None
+                    and row.transition_generation is None
+                    and row.state == "disabled",
+                    "PERMISSION_STATE_INVALID",
+                )
+            elif row.transition_generation is not None:
+                _require(
+                    _integer(row.transition_generation, 1, meta.binding_generation)
+                    and row.command_id is None
+                    and row.state == "disabled"
+                    and effects.get((row.transition_generation, row.scope)) == row.revision,
+                    "PERMISSION_ATTRIBUTION_INVALID",
                 )
             else:
                 _require(_hex(row.command_id, 32), "PERMISSION_STATE_INVALID")
@@ -316,9 +457,138 @@ class DurablePermissionAdapter:
                     applied is not None
                     and applied.scope == row.scope
                     and applied.revision == row.revision
-                    and applied.state == row.state,
+                    and applied.state == row.state
+                    and applied.binding_generation in bindings
+                    and applied.binding_digest == bindings[applied.binding_generation].digest(),
                     "PERMISSION_ATTRIBUTION_INVALID",
                 )
+
+    def rebind_instance(self, *, expected_previous_digest, expected_generation):
+        """Procedimiento local explícito con escritores detenidos, nunca boot/Telegram.
+
+        CAS no equivale a autorización. No necesita el nonce muerto en memoria.
+        Entradas habilitadas requieren nueva aprobación; salidas/latch/historia
+        se conservan. No migra esquemas legacy ni renueva capacidades.
+        """
+        _require(
+            _hex(expected_previous_digest, 64) and _integer(expected_generation, 0, MAX_REBINDS),
+            "INVALID_REBIND_CAS",
+        )
+        _require(self._identity() == self.identity, "LEDGER_REPLACED")
+        with Session(self.engine) as session:
+            session.exec(text("BEGIN IMMEDIATE"))
+            meta = session.get(_Meta, 1)
+            previous = self._stored_binding(meta)
+            now = self.clock()
+            self._check_meta(meta, now, binding=previous)
+            self._check_rows(session, meta, binding=previous)
+            _require(
+                meta.binding_digest == expected_previous_digest
+                and meta.binding_generation == expected_generation,
+                "REBIND_CONFLICT",
+            )
+            _require(previous.stable() == self.binding.stable(), "REBIND_STABLE_IDENTITY_CHANGED")
+            bindings, _ = self._history(session, meta)
+            _require(
+                self.binding.instance_id not in {b.instance_id for b in bindings.values()},
+                "REBIND_INSTANCE_REUSED",
+            )
+            _require(meta.binding_generation < MAX_REBINDS, "REBIND_CAPACITY")
+            generation = meta.binding_generation + 1
+            resets = {}
+            for row in session.exec(select(_Permission)).all():
+                if row.scope not in EXITS and row.state == "enabled":
+                    _require(_integer(row.revision, 0, 2**53 - 2), "PERMISSION_REVISION_EXHAUSTED")
+                    row.state, row.command_id = "disabled", None
+                    row.revision += 1
+                    row.transition_generation = generation
+                    resets[row.scope] = row.revision
+                    session.add(row)
+            end = self._time_after(now)
+            session.add(
+                _Transition(
+                    generation=generation,
+                    from_json=previous.canonical(),
+                    to_json=self.binding.canonical(),
+                    at_ms=end,
+                    resets_json=_canonical(resets),
+                )
+            )
+            meta.binding_digest, meta.binding_json = self.digest, self.binding.canonical()
+            meta.binding_generation, meta.last_seen_ms = generation, end
+            session.add(meta)
+            session.flush()
+            self._check_rows(session, meta)
+            session.commit()
+            return generation
+
+    def recovery_announcement(self, auth, *, generation=None):
+        """Atestación de un corte conservado, emitida por el dueño actual.
+
+        Permite alcanzar al ledger sin perder cortes. No prueba que la instancia
+        de destino histórica siga viva; adoptar toda la cadena con panel detenido.
+        """
+        _require(self._identity() == self.identity, "LEDGER_REPLACED")
+        with Session(self.engine) as session:
+            session.exec(text("BEGIN"))
+            meta = session.get(_Meta, 1)
+            now = self.clock()
+            self._check_meta(meta, now)
+            self._check_rows(session, meta)
+            generation = meta.binding_generation if generation is None else generation
+            _require(_integer(generation, 1, meta.binding_generation), "NO_PERMISSION_TRANSITION")
+            transition = session.get(_Transition, generation)
+            _require(transition is not None, "NO_PERMISSION_TRANSITION")
+            previous = PermissionBinding.parse(transition.from_json)
+            target = PermissionBinding.parse(transition.to_json)
+            return auth.seal(
+                "entry-stop-rebind-v1",
+                {
+                    "from_identity": {k: getattr(previous, k) for k in BINDING_FIELDS},
+                    "to_identity": {k: getattr(target, k) for k in BINDING_FIELDS},
+                    "from_permission_digest": previous.digest(),
+                    "to_permission_digest": target.digest(),
+                    "permission_generation": generation,
+                    "issued_at_ms": now,
+                    "expires_at_ms": now + 60000,
+                },
+            )
+
+    def historical_write(self, intent):
+        """Prueba histórica exacta, sin apply/conciliación de órdenes ni cierre UNKNOWN."""
+        Intent.parse(asdict(intent))
+        _require(self._identity() == self.identity, "LEDGER_REPLACED")
+        with Session(self.engine) as session:
+            session.exec(text("BEGIN"))
+            meta = session.get(_Meta, 1)
+            self._check_meta(meta, self.clock())
+            self._check_rows(session, meta)
+            applied = session.get(_Applied, intent.command_id)
+            if applied is None:
+                return None  # Ausencia de prueba; jamás NOT_APPLIED.
+            bindings, _ = self._history(session, meta)
+            original = bindings.get(applied.binding_generation)
+            digest = hashlib.sha256(_canonical(asdict(intent)).encode()).hexdigest()
+            _require(
+                original is not None
+                and applied.binding_digest == original.digest()
+                and all(getattr(intent, k) == getattr(original, k) for k in BINDING_FIELDS)
+                and intent.scope in original.scopes
+                and applied.intent_digest == digest
+                and applied.scope == intent.scope
+                and applied.revision == intent.expected_revision + 1
+                and applied.state == ("enabled" if intent.enabled else "disabled"),
+                "HISTORICAL_PERMISSION_MISMATCH",
+            )
+            return HistoricalPermissionWrite(
+                intent.command_id,
+                digest,
+                applied.binding_digest,
+                applied.binding_generation,
+                applied.revision,
+                intent.enabled,
+                applied.binding_generation < meta.binding_generation,
+            )
 
     def _lock(self, session):
         _require(session.get_bind() is self.engine, "WRONG_RESERVATION_DATABASE")
@@ -441,6 +711,7 @@ class DurablePermissionAdapter:
             row.state = "enabled" if intent.enabled else "disabled"
             row.revision += 1
             row.command_id = intent.command_id
+            row.transition_generation = None
             meta.command_count += 1
             meta.last_seen_ms = end
             session.add(meta)
@@ -449,6 +720,8 @@ class DurablePermissionAdapter:
                 _Applied(
                     command_id=intent.command_id,
                     intent_digest=hashlib.sha256(_canonical(asdict(intent)).encode()).hexdigest(),
+                    binding_digest=self.digest,
+                    binding_generation=meta.binding_generation,
                     scope=intent.scope,
                     revision=row.revision,
                     state=row.state,

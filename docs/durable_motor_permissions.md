@@ -27,12 +27,12 @@ scopes realmente integrados y techo permitido al boot. `provision()` es una oper
 explícita sobre un ledger ya existente: todos los permisos nacen deshabilitados. El
 constructor, el runner y la admisión no provisionan nada. Reabrir no resetea permisos;
 un binding diferente o filas incompletas bloquean. Una nueva instancia/release requiere
-un procedimiento de migración/revinculación aún pendiente; no se reconstruye autoridad
-mediante defaults. El inode del ledger se comprueba antes de operar; esto no defiende
+la [transición local explícita](permission_recovery.md), preparada sin instalación;
+los esquemas legacy requieren migración separada. No se reconstruye autoridad con defaults. El inode del ledger se comprueba antes de operar; esto no defiende
 contra un administrador que restaura o modifica contenidos en el mismo inode.
 
 Una provisión nueva crea esquema y estado inicial en la misma transacción. Si ya
-existe cualquiera de las cuatro tablas, exige las cuatro y metadatos coherentes;
+existe cualquiera de las cinco tablas, exige las cinco y metadatos coherentes;
 no recrea una tabla perdida ni un meta borrado. Cada operación contrasta los conteos
 de comandos y atribuciones con los contadores durables. Esto detecta pérdidas de
 filas, no una reescritura administrativa coherente de filas y contadores ni el borrado
@@ -72,9 +72,9 @@ conservadoras permanecen; no constituyen una vía de parada operativa completa.
 Un salto del reloj hacia adelante puede persistir un `last_seen_ms` futuro: cuando
 el reloj retrocede al tiempo correcto se rechazan observación, comandos y admisiones,
 incluidas salidas. No hay reparación automática ni procedimiento de recuperación
-aprobado. Asimismo, vincular la instancia al UUID de telemetría por proceso bloquea
-tras un reinicio hasta una revinculación aún no diseñada. Ambos límites impiden la
-instalación operativa de este candidato.
+aprobado. La identidad nueva sigue bloqueada hasta la transición explícita de
+[permission_recovery.md](permission_recovery.md); no se adopta un UUID de telemetría
+como autorización. La recuperación del reloj continúa pendiente.
 
 Después de adquirir el lock se verifica `in_transaction` en la conexión SQLite real,
 no sólo el estado de SQLAlchemy. Una reserva en AUTOCOMMIT sin transacción explícita
@@ -96,8 +96,9 @@ identidades duplicadas y cantidades inválidas antes de actualizar o purgar la c
 Tiene un límite de 20 páginas de 100 posiciones y 30 segundos para el recorrido. Un
 fallo o cancelación interrumpe la confirmación de vacíos consecutivos. Esto preserva
 la caché previa, sin renovar su fecha; el engine conserva su política de usar caché
-tras un fallo de sync. No existe todavía un recibo durable de barrido completo ni
-un snapshot atómico de cuenta. Dos vacíos completos permiten la purga de caché según
+tras un fallo de sync. Ese poller no emite un recibo durable de barrido completo. El almacén opcional de
+[financial_receipts.md](financial_receipts.md) prepara barridos acotados separados,
+sin conectar al poller ni acreditar atomicidad remota o identidad de cuenta. Dos vacíos completos permiten la purga de caché según
 la regla existente, pero no resuelven UNKNOWN ni acreditan readiness financiero.
 
 El contrato terminal exige cursor string vacío explícito y lista de posiciones. La
@@ -163,8 +164,8 @@ guard contra autoflush; el selector usado durante el cierre conserva la transacc
 del escritor. Cero es sólo inventario local atribuible: no prueba ausencia de
 pending, cartera vacía ni reconciliación de la cuenta.
 
-Siguen sin existir fuentes durables de barrido completo de posiciones/órdenes y
-de quotes resting confirmadas. Un `pending` M5 no se convierte en resting por
+Existen recibos opcionales acotados de posiciones/órdenes, aún sin conexión a
+GateFacts ni prueba de identidad de cuenta. No acreditan quotes resting conciliadas. Un `pending` M5 no se convierte en resting por
 edad o presencia en memoria: con el adaptador conservador bloquea nuevas quotes.
 La composición del proveedor y sus recibos de datos ausentes siguen pendientes.
 Estos lectores no autorizan ensamblar ni

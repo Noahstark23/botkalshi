@@ -106,8 +106,9 @@ como integración aprobada. No hay fixture de respuesta de cuenta real en esta p
    No hay migración automática ni reparación de tablas. La provisión parcial y la
    reapertura antigua fallan cerradas. Definir una migración explícita revisada si
    existiera un ledger aprovisionado anterior; no resetearlo para instalar.
-2. No existe procedimiento aprobado para levantar el latch, revincular instancia,
-   recuperar reloj ni ampliar capacidad. No editar DB o identidad manualmente para
+2. La revinculación local de instancia está preparada en
+   [permission_recovery.md](permission_recovery.md), sin instalar. No existe procedimiento
+   aprobado para levantar el latch, recuperar reloj ni ampliar capacidad. No editar DB o identidad manualmente para
    eludirlo. Estos procedimientos requieren evidencia y revisión propias.
 3. Definir UID/GID, ACL y montaje del transporte, con `PrivateUsers` y el aislamiento
    del panel reales. La prueba de un usuario en temporales no valida acceso entre

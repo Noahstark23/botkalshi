@@ -18,7 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from src.control.entry_stop import BINDING_FIELDS, StopRequest, verify_receipt
-from src.control.wire import _canonical, _integer, _require
+from src.control.wire import _canonical, _hex, _integer, _require
 
 FORWARDED = {
     "forward_origin",
@@ -32,11 +32,13 @@ FORWARDED = {
 }
 PREFIX = "u5:entries:"
 MAX_STOP_REQUESTS = 2000
+MAX_ROUTER_REBINDS = 128
 TABLES = {
     "entry_stop_panel_meta",
     "entry_stop_panel_state",
     "entry_stop_panel_updates",
     "entry_stop_panel_history",
+    "entry_stop_panel_transitions",
 }
 LIMITATIONS = (
     "Sólo bloquea nuevas entradas y cotizaciones en rutas conectadas. "
@@ -81,18 +83,24 @@ class TelegramEntryStopRouter:
             db.execute("BEGIN IMMEDIATE")
             if created:
                 db.execute(
-                    "CREATE TABLE entry_stop_panel_meta (id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL, last_seen INTEGER NOT NULL, last_update INTEGER NOT NULL, stop_count INTEGER NOT NULL)"
+                    "CREATE TABLE entry_stop_panel_meta (id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL, last_seen INTEGER NOT NULL, last_update INTEGER NOT NULL, stop_count INTEGER NOT NULL, identity_json TEXT NOT NULL, generation INTEGER NOT NULL)"
                 )
                 db.execute(
                     "CREATE TABLE entry_stop_panel_state (id INTEGER PRIMARY KEY CHECK(id=1), nonce_hash TEXT, expires INTEGER, stop_request TEXT, status_request TEXT, stop_publication TEXT NOT NULL, status_publication TEXT NOT NULL)"
                 )
                 db.execute(
-                    "CREATE TABLE entry_stop_panel_updates (update_id INTEGER PRIMARY KEY, digest TEXT NOT NULL, response TEXT NOT NULL)"
+                    "CREATE TABLE entry_stop_panel_updates (update_id INTEGER PRIMARY KEY, digest TEXT NOT NULL, response TEXT NOT NULL, generation INTEGER NOT NULL)"
                 )
                 db.execute(
                     "CREATE TABLE entry_stop_panel_history (request_id TEXT PRIMARY KEY, request TEXT NOT NULL, publication TEXT NOT NULL)"
                 )
-                db.execute("INSERT INTO entry_stop_panel_meta VALUES(1,?,0,-1,0)", (self.config,))
+                db.execute(
+                    "CREATE TABLE entry_stop_panel_transitions (generation INTEGER PRIMARY KEY, announcement TEXT NOT NULL, at_ms INTEGER NOT NULL, nonce_hash TEXT, expires INTEGER)"
+                )
+                db.execute(
+                    "INSERT INTO entry_stop_panel_meta VALUES(1,?,0,-1,0,?,0)",
+                    (self.config, _canonical(identity)),
+                )
                 db.execute(
                     "INSERT INTO entry_stop_panel_state VALUES(1,NULL,NULL,NULL,NULL,'NOT_REQUESTED','NOT_REQUESTED')"
                 )
@@ -137,6 +145,12 @@ class TelegramEntryStopRouter:
             ),
             "INVALID_PUBLICATION_STATE",
         )
+        _require(
+            meta["identity_json"] == _canonical(dict(self.identity))
+            and _integer(meta["generation"], 0, MAX_ROUTER_REBINDS),
+            "PANEL_CONFIG_CHANGED",
+        )
+        self._transitions(db, meta)
         count = db.execute("SELECT count(*) FROM entry_stop_panel_history").fetchone()[0]
         _require(
             _integer(meta["stop_count"], 0, MAX_STOP_REQUESTS)
@@ -157,6 +171,201 @@ class TelegramEntryStopRouter:
                 "STOP_HISTORY_MISMATCH",
             )
         return meta, state
+
+    def _announcement(self, wire, now):
+        value = self.auth.open("entry-stop-rebind-v1", wire)
+        _require(
+            set(value)
+            == {
+                "from_identity",
+                "to_identity",
+                "from_permission_digest",
+                "to_permission_digest",
+                "permission_generation",
+                "issued_at_ms",
+                "expires_at_ms",
+            },
+            "INVALID_REBIND_ANNOUNCEMENT",
+        )
+        for name in ("from_identity", "to_identity"):
+            identity = value[name]
+            _require(
+                type(identity) is dict and set(identity) == set(BINDING_FIELDS),
+                "INVALID_REBIND_ANNOUNCEMENT",
+            )
+            StopRequest.parse(
+                {
+                    **identity,
+                    "operation": "status",
+                    "request_id": "0" * 32,
+                    "issued_at_ms": value["issued_at_ms"],
+                    "expires_at_ms": value["expires_at_ms"],
+                }
+            )
+        before, after = value["from_identity"], value["to_identity"]
+        _require(
+            before["environment"] == after["environment"] == "demo"
+            and all(
+                before[k] == after[k]
+                for k in BINDING_FIELDS
+                if k not in {"source_sha", "instance_id"}
+            )
+            and before["instance_id"] != after["instance_id"]
+            and _hex(value["from_permission_digest"], 64)
+            and _hex(value["to_permission_digest"], 64)
+            and value["from_permission_digest"] != value["to_permission_digest"]
+            and _integer(value["permission_generation"], 1, MAX_ROUTER_REBINDS)
+            and _integer(now, 946684800000)
+            and value["issued_at_ms"] <= now < value["expires_at_ms"],
+            "INVALID_REBIND_ANNOUNCEMENT",
+        )
+        return value
+
+    def _transitions(self, db, meta):
+        rows = db.execute(
+            "SELECT * FROM entry_stop_panel_transitions ORDER BY generation LIMIT ?",
+            (MAX_ROUTER_REBINDS + 1,),
+        ).fetchall()
+        _require(len(rows) == meta["generation"], "PANEL_TRANSITION_MISMATCH")
+        previous, nonces, prior_time = None, set(), 0
+        for generation, row in enumerate(rows, 1):
+            wire = row["announcement"].encode()
+            value = self._announcement(wire, row["at_ms"])
+            _require(
+                row["generation"] == value["permission_generation"] == generation
+                and (previous is None or value["from_identity"] == previous["to_identity"])
+                and (
+                    previous is None
+                    or value["from_permission_digest"] == previous["to_permission_digest"]
+                )
+                and prior_time <= row["at_ms"] <= meta["last_seen"]
+                and (row["nonce_hash"] is None or _hex(row["nonce_hash"], 64))
+                and (row["expires"] is None or _integer(row["expires"], 946684800000)),
+                "PANEL_TRANSITION_MISMATCH",
+            )
+            nonces.add(value["from_identity"]["instance_id"])
+            _require(value["to_identity"]["instance_id"] not in nonces, "PANEL_TRANSITION_MISMATCH")
+            nonces.add(value["to_identity"]["instance_id"])
+            previous, prior_time = value, row["at_ms"]
+        _require(
+            previous is None or previous["to_identity"] == dict(self.identity),
+            "PANEL_TRANSITION_MISMATCH",
+        )
+        return nonces
+
+    @classmethod
+    def rebind_instance(
+        cls,
+        path,
+        *,
+        control,
+        identity,
+        auth,
+        requests,
+        receipts,
+        announcement,
+        expected_previous_config,
+        expected_generation,
+        now_ms,
+    ):
+        """Adopción local explícita de un corte autenticado, misma DB e historial.
+
+        Sin constructor que recupere solo, callback Telegram, polling ni claves
+        nuevas. Requiere ambos escritores detenidos. CAS no es autorización.
+        """
+        path = Path(path).absolute()
+        # Leer metadata durable antes de construir; nunca crear una DB sustituta.
+        info = path.lstat()
+        _require(
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and info.st_uid == os.geteuid()
+            and info.st_mode & 0o077 == 0,
+            "INSECURE_PANEL_DATABASE",
+        )
+        db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        try:
+            row = db.execute(
+                "SELECT identity_json FROM entry_stop_panel_meta WHERE id=1"
+            ).fetchone()
+            _require(row is not None, "INVALID_PANEL_DATABASE")
+            previous = json.loads(row[0])
+            _require(_canonical(previous) == row[0], "PANEL_CONFIG_CHANGED")
+        finally:
+            db.close()
+        router = cls(
+            path,
+            control=control,
+            identity=previous,
+            auth=auth,
+            requests=requests,
+            receipts=receipts,
+        )
+        _require(router.file_identity == (info.st_dev, info.st_ino), "PANEL_DATABASE_REPLACED")
+        value = router._announcement(announcement, now_ms)
+        _require(
+            type(identity) is dict and value["to_identity"] == identity, "PANEL_TARGET_MISMATCH"
+        )
+        _require(
+            _hex(expected_previous_config, 64)
+            and _integer(expected_generation, 0, MAX_ROUTER_REBINDS),
+            "INVALID_REBIND_CAS",
+        )
+        with router._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            meta, state = router._meta(db)
+            _require(
+                meta["config"] == expected_previous_config
+                and meta["generation"] == expected_generation,
+                "REBIND_CONFLICT",
+            )
+            _require(now_ms >= meta["last_seen"], "CLOCK_REGRESSION")
+            _require(meta["generation"] < MAX_ROUTER_REBINDS, "REBIND_CAPACITY")
+            _require(
+                value["from_identity"] == dict(router.identity)
+                and value["permission_generation"] == meta["generation"] + 1,
+                "PANEL_TRANSITION_MISMATCH",
+            )
+            if meta["generation"]:
+                prior = db.execute(
+                    "SELECT announcement,at_ms FROM entry_stop_panel_transitions WHERE generation=?",
+                    (meta["generation"],),
+                ).fetchone()
+                prior_value = router._announcement(prior["announcement"].encode(), prior["at_ms"])
+                _require(
+                    value["from_permission_digest"] == prior_value["to_permission_digest"],
+                    "PANEL_TRANSITION_MISMATCH",
+                )
+            nonces = router._transitions(db, meta) | {previous["instance_id"]}
+            _require(identity["instance_id"] not in nonces, "REBIND_INSTANCE_REUSED")
+            db.execute(
+                "INSERT INTO entry_stop_panel_transitions VALUES(?,?,?,?,?)",
+                (
+                    meta["generation"] + 1,
+                    announcement.decode(),
+                    now_ms,
+                    state["nonce_hash"],
+                    state["expires"],
+                ),
+            )
+            # El nonce pendiente queda en auditoría, sin autoridad sobre otra instancia.
+            db.execute("UPDATE entry_stop_panel_state SET nonce_hash=NULL,expires=NULL WHERE id=1")
+            config = auth.mac(
+                "entry-stop-panel-config-v1",
+                {"identity": identity, "max_stop_requests": MAX_STOP_REQUESTS},
+            )
+            db.execute(
+                "UPDATE entry_stop_panel_meta SET config=?,identity_json=?,generation=generation+1,last_seen=? WHERE id=1",
+                (config, _canonical(identity), now_ms),
+            )
+        return cls(
+            path,
+            control=control,
+            identity=identity,
+            auth=auth,
+            requests=requests,
+            receipts=receipts,
+        )
 
     def snapshot(self):
         # Es el permiso de US500, no el estado del latch del runtime.
@@ -263,6 +472,10 @@ class TelegramEntryStopRouter:
             raw = state[operation + "_request"]
             _require(raw is not None, "NO_STOP_REQUEST")
             request = StopRequest.parse(json.loads(raw))
+            _require(
+                all(getattr(request, k) == self.identity[k] for k in BINDING_FIELDS),
+                "HISTORICAL_STOP_REQUEST",
+            )
             wire = self.receipts.read(operation)
             status = verify_receipt(self.auth, request, wire, now_ms=now)
         except Exception:
@@ -294,11 +507,17 @@ class TelegramEntryStopRouter:
             db.execute("BEGIN IMMEDIATE")
             meta, state = self._meta(db)
             prior = db.execute(
-                "SELECT digest,response FROM entry_stop_panel_updates WHERE update_id=?",
+                "SELECT digest,response,generation FROM entry_stop_panel_updates WHERE update_id=?",
                 (update["update_id"],),
             ).fetchone()
             if prior:
                 _require(prior["digest"] == digest, "UPDATE_ID_CONFLICT")
+                if prior["generation"] != meta["generation"]:
+                    return [
+                        self._message(
+                            "Respuesta histórica de otra instancia. Consultá el estado actual; no se reenvía la solicitud."
+                        )
+                    ]
                 return json.loads(prior["response"])
             if update["update_id"] <= meta["last_update"]:
                 return []
@@ -433,8 +652,8 @@ class TelegramEntryStopRouter:
                         )
                     ]
             db.execute(
-                "INSERT INTO entry_stop_panel_updates VALUES(?,?,?)",
-                (update["update_id"], digest, _canonical(responses)),
+                "INSERT INTO entry_stop_panel_updates VALUES(?,?,?,?)",
+                (update["update_id"], digest, _canonical(responses), meta["generation"]),
             )
             db.execute(
                 "UPDATE entry_stop_panel_meta SET last_seen=?,last_update=? WHERE id=1",
@@ -448,14 +667,16 @@ class TelegramEntryStopRouter:
         if publication is not None:
             operation, wire = publication
             outcome = "PUBLISH_UNCONFIRMED"
-            try:
-                self.requests.publish(operation, wire)
-                outcome = "PUBLISHED_AWAITING_RECEIPT"
-            except Exception:
-                pass  # Se conserva el intento incierto; jamás copiar texto del fallo.
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 self._meta(db)
+                # El corte de identidad usa este mismo lock. Una publicación
+                # vieja no puede pisar el buzón después del commit del rebind.
+                try:
+                    self.requests.publish(operation, wire)
+                    outcome = "PUBLISHED_AWAITING_RECEIPT"
+                except Exception:
+                    pass  # El intento durable sigue incierto, sin texto privado.
                 db.execute(
                     f"UPDATE entry_stop_panel_state SET {operation}_publication=? WHERE id=1 AND {operation}_request=?",
                     (outcome, _canonical(asdict(request))),

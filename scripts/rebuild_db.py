@@ -38,6 +38,7 @@ _SACRED = [
     "risk_commitments",  # presupuesto original: jamás reiniciar por rebuild/cierre
     "motor_permissions_meta",  # binding, reloj y presupuestos finitos de autoridad
     "motor_permissions",
+    "motor_permission_transitions",  # cortes de autoridad, nunca borrar ni recrear
     "motor_permission_commands",  # revisiones y command_id jamás reciclados
     "motor_permission_admissions",  # atribución original de cada intent financiero
     "financial_fence",  # revisión/época: copiar, jamás recalcular al reconstruir
