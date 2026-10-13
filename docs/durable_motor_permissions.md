@@ -153,12 +153,55 @@ MTM expone la adquisición del mark más antiguo realmente usado; si no usa ning
 devuelve `None`, que no acredita valoración de una cuenta vacía. Ninguna de estas
 lecturas convierte cero filas locales en prueba de conciliación completa.
 
+`motor_3_clv.attribution` comparte con el executor las BUY atribuibles por ticker,
+lado y política explícita (`entry_origin`, `include_motor1_orphans`), ordenadas FIFO.
+Conserva la exclusión de hedges M1 y filas cerradas. Cantidades confirmadas en cero
+se excluyen; cantidades desconocidas o contradictorias se rechazan, incluso en
+el lado opuesto M1 necesario para determinar orfandad. No basta `count > 0` para
+acreditar el inventario. `attributable_quantity` usa la Session prestada y el mismo
+guard contra autoflush; el selector usado durante el cierre conserva la transacción
+del escritor. Cero es sólo inventario local atribuible: no prueba ausencia de
+pending, cartera vacía ni reconciliación de la cuenta.
+
 Siguen sin existir fuentes durables de barrido completo de posiciones/órdenes y
 de quotes resting confirmadas. Un `pending` M5 no se convierte en resting por
 edad o presencia en memoria: con el adaptador conservador bloquea nuevas quotes.
-La atribución compartida de salidas, la composición del proveedor y sus recibos
-de datos ausentes siguen pendientes. Estos lectores no autorizan ensamblar ni
+La composición del proveedor y sus recibos de datos ausentes siguen pendientes.
+Estos lectores no autorizan ensamblar ni
 instalar controles de Telegram o declarar motores listos.
+
+### Intención durable de cancelación M5
+
+Antes del DELETE de reemplazo normal, el candidato confirma
+`Trade.cancel_requested_at_ms` bajo `BEGIN IMMEDIATE`. El helper atómico valida
+coid/order_id, estrategia M5 y status pendiente; un fallo impide ese reemplazo.
+El retiro protector (`cancel_all` y huérfanas) prepara cada objetivo por separado:
+una identidad/status desfasado excluye sólo esa orden. Un fallo de DB o reloj
+revoca el dueño sano, intenta enclavar incidente y permite el DELETE de los IDs
+ya conocidos, preservando el error hasta terminar los intentos protectores.
+No puede declararse cierre sano; un fallo del latch no evita retirar las demás.
+La sesión activa durable previa sigue bloqueando el reinicio si la DB cayó.
+Sólo terminales íntegros persistidos liberan reservas; un error o ausencia las
+conserva. Si el batch observa un fill/cuarentena que no se logra persistir, se
+pueden intentar los DELETE protectores restantes, pero ninguna respuesta posterior
+de ese retiro libera reservas o rebaja esa evidencia; queda incidente y error al
+supervisor para revisión operativa. No hay garantía de retiro cuando red/API/DB fallan ni se evita un fill
+que gane la carrera. La intervención operativa independiente sigue pendiente. El error diferido de
+una huérfana se propaga después de intentar retirar también las fantasmas; un
+latch fallido no impide el DELETE de éstas ni de las siguientes. Esto exige haber
+obtenido un barrido válido y leído el ledger: DB ilegible no acredita identidad
+ni permite reconstruir ese conjunto. El fallo previo al intent en la persistencia
+de un fill resting sigue siendo fatal y requiere recuperación operativa.
+
+La primera fecha no se renueva en reintentos ni se elimina. Un `pending` marcado
+no cuenta como resting sano aunque el barrido posterior lo vea resting; el camino
+de huérfanas puede seguir intentando retirarlo conforme a la política anterior.
+Una respuesta terminal íntegra y persistida cambia status y conserva el marcador
+histórico. No se liberan reservas por edad, ausencia o reinicio. Las fantasmas sin
+ledger conservan el incidente durable y nunca acreditan un barrido limpio: no se
+crea una Trade ficticia para ellas. NULL legacy no prueba ausencia histórica de
+cancelaciones y la migración no inventa fechas. Esto prepara una condición necesaria
+para recibos de resting; no implementa esos recibos ni valida identidad de cuenta.
 
 Los executors conservan el camino anterior cuando se construyen sin adaptador. Si se
 les pasa uno, fallo/ausencia de permiso o DB nunca vuelven al camino anterior. Falta que

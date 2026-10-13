@@ -27,6 +27,21 @@ def _columns(engine, table: str) -> set[str]:
         return models._existing_columns(conn, table)
 
 
+def test_cancel_intent_migration_never_invents_history(tmp_path):
+    engine, settings = _sqlite_engine(tmp_path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("CREATE TABLE trades (id INTEGER PRIMARY KEY, status TEXT)")
+        conn.exec_driver_sql("INSERT INTO trades VALUES (1, 'pending')")
+    with patch("src.storage.models.get_settings", return_value=settings):
+        models.apply_migrations(engine)
+        models.apply_migrations(engine)
+    with engine.begin() as conn:
+        assert conn.exec_driver_sql("SELECT status, cancel_requested_at_ms FROM trades").one() == (
+            "pending",
+            None,
+        )
+
+
 def test_fresh_db_has_new_columns_and_migration_is_noop(tmp_path):
     """En DB nueva, create_all ya trae las columnas → apply_migrations no rompe nada."""
     engine, settings = _sqlite_engine(tmp_path)

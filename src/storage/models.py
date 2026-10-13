@@ -103,6 +103,9 @@ class Trade(SQLModel, table=True):
     # Se escribe con el cierre contable. NULL legacy requiere revisión explícita;
     # una migración de esquema nunca infiere ni rellena este rol.
     accounting_role: str | None = Field(default=None, max_length=24)
+    # Primer intent de cancelación M5, persistido antes del DELETE. No se borra
+    # ni renueva por retries/resting: pending con marca sigue siendo incierto.
+    cancel_requested_at_ms: int | None = None
 
     # Motor 3 (CLV): la posición se cerró con un SELL anticipado de Motor 3, NO por
     # resolución del mercado. El SettlementPoller SALTEA estas filas → no doble-cuenta
@@ -631,6 +634,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("portfolio_positions", "count_fp", "VARCHAR(32)"),
     ("trades", "pnl_usd_fp", "VARCHAR(40)"),
     ("trades", "accounting_role", "VARCHAR(24)"),
+    ("trades", "cancel_requested_at_ms", "BIGINT"),
     ("mm_quotes", "inventory_fp", "VARCHAR(40)"),
     ("mm_funnel_snapshots", "inventory_abs_fp", "VARCHAR(40)"),
     # Motor 5 fair-at-fill: sin el fair del momento del fill, el A/B no puede separar

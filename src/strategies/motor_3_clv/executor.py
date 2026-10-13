@@ -32,7 +32,7 @@ from typing import ClassVar
 
 from loguru import logger
 from sqlalchemy import text
-from sqlmodel import col, select
+from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
 from src.control.channel import ControlError
@@ -67,6 +67,7 @@ from src.storage.quantities import (
 )
 from src.storage.reductions import estimated_exit_note, validated_exit_fee
 from src.strategies.data_capture import _top_bid, rest_orderbook_sides
+from src.strategies.motor_3_clv.attribution import attributable_buys
 
 STRATEGY = "motor_3_clv"
 
@@ -180,42 +181,13 @@ class Motor3ExitExecutor:
             return await self._exit_locked(position.ticker, position.side, count)
 
     def _attributable_buys(self, s, ticker: str, side: str) -> list[Trade]:
-        """BUYs 'filled' abiertos atribuibles para (ticker, side): los de entry_origin y — con
-        include_motor1_orphans — las HUÉRFANAS de Motor 1. La orfandad se decide mirando AMBOS
-        sides del arb (por eso la query de motor_1 va por ticker completo): un arb con las dos
-        patas vivas es un hedge y queda fuera SIEMPRE. Ordenado FIFO por placed_at (mismo
-        criterio de settle de siempre)."""
-        from src.strategies.motor_3_clv.orphans import motor1_orphan_buys
-
-        buys = [
-            b
-            for b in s.exec(
-                select(Trade).where(
-                    Trade.ticker == ticker,
-                    Trade.side == side,
-                    Trade.action == "buy",
-                    Trade.status == "filled",
-                    col(Trade.strategy).in_(self._entry_origin),
-                )
-            )
-            if not b.closed_by_clv and b.count > 0
-        ]
-        if self._include_motor1_orphans:
-            m1_all_sides = [
-                b
-                for b in s.exec(
-                    select(Trade).where(
-                        Trade.ticker == ticker,
-                        Trade.action == "buy",
-                        Trade.status == "filled",
-                        Trade.strategy == "motor_1_arbitrage",
-                    )
-                )
-                if not b.closed_by_clv and b.count > 0
-            ]
-            buys.extend(o for o in motor1_orphan_buys(m1_all_sides) if o.side == side)
-        buys.sort(key=lambda b: b.placed_at)
-        return buys
+        return attributable_buys(
+            s,
+            ticker,
+            side,
+            entry_origin=self._entry_origin,
+            include_motor1_orphans=self._include_motor1_orphans,
+        )
 
     def _open_attributable_count(self, ticker: str, side: str) -> int:
         """Contratos BUY 'filled' aún abiertos (no closed_by_clv) atribuibles para
