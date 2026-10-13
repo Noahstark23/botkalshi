@@ -62,9 +62,15 @@ base viva. Una instancia vieja rechaza sustitución del archivo por inode.
 
 Abrir con un SHA/nonce distinto bloquea read/collect/provision; no se reutiliza el
 nonce viejo para hacer pasar el reloj monotónico. Con escritores detenidos,
-`rebind_instance(previous, expected_generation)` permite una transición CAS del
-binding completo anterior al nuevo, conservando entorno/host/credencial/cuenta/
-subcuenta. Vacía el recibo, avanza generación y conserva ledger/secuencia/reloj.
+`rebind_instance(expected_previous_digest, expected_generation)` permite una
+transición CAS al nuevo binding, conservando entorno/host/credencial/cuenta/subcuenta.
+Los campos no secretos del binding anterior, incluido el nonce, se guardan como
+JSON canónico en la misma fila durable. Se verifican formato, digest y coincidencia
+de identidad estable dentro de la transacción: no hace falta conservar el objeto
+del proceso muerto ni recuperar su nonce desde logs o telemetría. El digest y la
+generación esperados proceden de una inspección explícita de la DB local; no son
+autorización ni deben derivarse de una caché remota no autenticada. Vacía el recibo,
+avanza generación y conserva ledger/secuencia/reloj.
 Una adquisición de la instancia anterior no puede publicar después de la transición.
 No hay CLI ni llamada automática; la autorización y provisión de un despliegue
 deben resolver quién puede ejecutarla. Otra cuenta/subcuenta no se acepta por esta vía.
@@ -77,6 +83,14 @@ la misma transacción. No repara triggers perdidos. El caller debe hacer rollbac
 ante cualquier excepción; no confirmar parcialmente. El hash esperado debe venir
 de la migración revisada, nunca calcularse de la base instalada para aprobarla a
 ciegas. Los recibos viejos permanecen inválidos y hace falta una adquisición nueva.
+
+El procedimiento debe detener escritores y conservar el `Fence` válido anterior
+antes de ejecutar la migración; no se reconstruye retrospectivamente un token de
+esquema anterior para hacer pasar el control. Si una migración corre al arrancar,
+su coordinación debe resolverse antes de ese arranque. Cuando coinciden migración
+y reinicio, el orden es aceptar el esquema revisado y después cambiar la instancia.
+El formato anterior que sólo guardaba el digest no se migra automáticamente: esta
+preparación aún no está instalada y ese formato incompleto se rechaza.
 
 No hay recuperación automática de reloj adelantado, identidad estable cambiada,
 contador/generación agotados, tablas/recibos perdidos o triggers ausentes. Esos

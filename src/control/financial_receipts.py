@@ -30,16 +30,19 @@ MAX_AGE_MS = 30000
 DDL = (
     "CREATE TABLE financial_receipt_state (id INTEGER PRIMARY KEY CHECK(id=1), "
     "binding TEXT NOT NULL, generation INTEGER NOT NULL, last_wall_ms INTEGER NOT NULL, "
-    "status TEXT NOT NULL, payload TEXT, payload_sha256 TEXT)"
+    "status TEXT NOT NULL, payload TEXT, payload_sha256 TEXT, binding_json TEXT NOT NULL)"
 )
 
 
-def _json(value):
+def _json(value, *, max_bytes=None):
     try:
         result = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, RecursionError):
         raise ValueError("RECEIPT_INVALID_JSON") from None
-    require(len(result.encode()) <= MAX_BYTES, "RECEIPT_BYTE_LIMIT")
+    require(
+        len(result.encode()) <= (MAX_BYTES if max_bytes is None else max_bytes),
+        "RECEIPT_BYTE_LIMIT",
+    )
     return result
 
 
@@ -163,6 +166,7 @@ class FinancialReceiptStore:
         )
         self.engine, self.binding = engine, binding
         self.binding_digest = binding.validate()
+        self.binding_json = _json(asdict(binding), max_bytes=8192)
         self.path = Path(engine.url.database).absolute()
         self.identity = self._identity()
         self.wall = wall or (lambda: time.time_ns() // 1000000)
@@ -191,57 +195,69 @@ class FinancialReceiptStore:
         )
         return db
 
-    def _state(self, db):
+    def _state(self, db, *, expected_binding=None):
         schema = db.execute(
             "SELECT sql FROM sqlite_master WHERE name='financial_receipt_state'"
         ).fetchone()
         require(schema is not None and schema[0] == DDL, "RECEIPT_SCHEMA_CHANGED")
         rows = db.execute(
-            "SELECT binding,generation,last_wall_ms,status,payload,payload_sha256 "
+            "SELECT binding,generation,last_wall_ms,status,payload,payload_sha256,binding_json "
             "FROM financial_receipt_state WHERE id=1"
         ).fetchall()
-        require(len(rows) == 1 and rows[0][0] == self.binding_digest, "RECEIPT_BINDING_CHANGED")
+        require(len(rows) == 1, "RECEIPT_STATE_INVALID")
         state = rows[0]
         require(_integer(state[1]) and _integer(state[2], 946684800000), "RECEIPT_STATE_INVALID")
+        require(type(state[6]) is str and len(state[6].encode()) <= 8192, "RECEIPT_BINDING_INVALID")
+        try:
+            stored = SourceBinding(**json.loads(state[6]))
+            stored_digest = stored.validate()
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("RECEIPT_BINDING_INVALID") from None
+        require(
+            stored_digest == state[0] and _json(asdict(stored), max_bytes=8192) == state[6],
+            "RECEIPT_BINDING_INVALID",
+        )
+        require(
+            state[0] == (self.binding_digest if expected_binding is None else expected_binding),
+            "RECEIPT_BINDING_CHANGED",
+        )
         return state
 
-    def rebind_instance(self, *, previous: SourceBinding, expected_generation: int):
+    def rebind_instance(self, *, expected_previous_digest: str, expected_generation: int):
         """Transición explícita con escritores detenidos; nunca llamada al arrancar.
 
         Sólo cambia SHA/nonce. Cuenta/entorno/host/credencial/subcuenta requieren
         un procedimiento separado. Conserva secuencia, ledger y reloj de pared.
         """
-        previous_digest = previous.validate()
-        require(_integer(expected_generation), "RECEIPT_REBIND_INVALID")
+        require(
+            _hex(expected_previous_digest, 64) and _integer(expected_generation),
+            "RECEIPT_REBIND_INVALID",
+        )
 
         def stable(b):
             return {k: v for k, v in asdict(b).items() if k not in {"source_sha", "instance_id"}}
 
-        require(
-            stable(previous) == stable(self.binding)
-            and previous.instance_id != self.binding.instance_id,
-            "RECEIPT_REBIND_INVALID",
-        )
-        # Validar el formato con el binding antiguo sin permitirlo en read/collect.
-        old_store = FinancialReceiptStore(
-            self.engine, previous, wall=self.wall, monotonic=self.monotonic
-        )
         with Session(self.engine) as s:
             s.exec(text("BEGIN IMMEDIATE"))
             db = self._db(s)
-            state = old_store._state(db)
-            read_fence(db)
+            # La identidad anterior viene de la DB validada, incluso si el proceso
+            # murió sin conservar su nonce. El digest/generación son el CAS explícito.
+            state = self._state(db, expected_binding=expected_previous_digest)
+            previous = SourceBinding(**json.loads(state[6]))
             require(
-                state[0] == previous_digest and state[1] == expected_generation,
-                "RECEIPT_REBIND_CONFLICT",
+                stable(previous) == stable(self.binding)
+                and previous.instance_id != self.binding.instance_id,
+                "RECEIPT_REBIND_INVALID",
             )
+            read_fence(db)
+            require(state[1] == expected_generation, "RECEIPT_REBIND_CONFLICT")
             require(state[1] < 2**53 - 1, "RECEIPT_CAPACITY_EXHAUSTED")
             now = self.wall()
             require(_integer(now, state[2]), "RECEIPT_CLOCK_INVALID")
             db.execute(
-                "UPDATE financial_receipt_state SET binding=?,generation=generation+1,"
+                "UPDATE financial_receipt_state SET binding=?,binding_json=?,generation=generation+1,"
                 "last_wall_ms=?,status='EMPTY',payload=NULL,payload_sha256=NULL WHERE id=1",
-                (self.binding_digest, now),
+                (self.binding_digest, self.binding_json, now),
             )
             s.commit()
 
@@ -261,8 +277,8 @@ class FinancialReceiptStore:
             now = self.wall()
             require(_integer(now, 946684800000), "RECEIPT_CLOCK_INVALID")
             db.execute(
-                "INSERT INTO financial_receipt_state VALUES(1,?,0,?,'EMPTY',NULL,NULL)",
-                (self.binding_digest, now),
+                "INSERT INTO financial_receipt_state VALUES(1,?,0,?,'EMPTY',NULL,NULL,?)",
+                (self.binding_digest, now, self.binding_json),
             )
             s.commit()
 

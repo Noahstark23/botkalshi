@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import json
 import sqlite3
-from dataclasses import replace
+import subprocess
+import sys
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -394,7 +396,10 @@ async def test_rebuild_preserves_counter_receipt_and_triggers(setup, monkeypatch
         assert (
             dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'")) == TRIGGERS
         )
-        payload = db.execute("SELECT payload FROM financial_receipt_state").fetchone()[0]
+        payload, metadata = db.execute(
+            "SELECT payload,binding_json FROM financial_receipt_state"
+        ).fetchone()
+        assert json.loads(metadata) == asdict(store.binding)
         assert json.loads(payload)["generation"] == 1
         db.execute("UPDATE operational_state SET value='on'")
         assert read_fence(db).sequence == before.sequence + 1
@@ -637,9 +642,9 @@ async def test_explicit_instance_transition_invalidates_old_and_allows_new_acqui
         monotonic=lambda: clock.mono,
     )
     with pytest.raises(ValueError, match="REBIND_CONFLICT"):
-        other.rebind_instance(previous=store.binding, expected_generation=0)
+        other.rebind_instance(expected_previous_digest=store.binding_digest, expected_generation=0)
     assert read(store)["generation"] == 1
-    other.rebind_instance(previous=store.binding, expected_generation=1)
+    other.rebind_instance(expected_previous_digest=store.binding_digest, expected_generation=1)
     assert fence(other) == before
     with pytest.raises(ValueError, match="BINDING_CHANGED"):
         await store.collect(Client())
@@ -670,7 +675,7 @@ async def test_instance_transition_never_changes_account_binding(setup, change):
         monotonic=lambda: clock.mono,
     )
     with pytest.raises(ValueError, match="REBIND_INVALID"):
-        other.rebind_instance(previous=store.binding, expected_generation=1)
+        other.rebind_instance(expected_previous_digest=store.binding_digest, expected_generation=1)
     assert read(store)["generation"] == 1
 
 
@@ -693,7 +698,7 @@ async def test_old_inflight_collector_cannot_publish_after_explicit_rebinding(se
         wall=lambda: clock.wall,
         monotonic=lambda: clock.mono,
     )
-    other.rebind_instance(previous=store.binding, expected_generation=1)
+    other.rebind_instance(expected_previous_digest=store.binding_digest, expected_generation=1)
     current = await other.collect(Client())
     release.set()
     with pytest.raises(ValueError, match="BINDING_CHANGED"):
@@ -748,3 +753,107 @@ def test_reviewed_migration_rollback_restores_old_schema_and_fence(setup):
         accept_reviewed_schema(db, previous=before, expected_tables_sha256=approved)
         conn.rollback()
     assert fence(store) == before
+
+
+def test_restart_recovery_without_previous_nonce_in_parent_memory(setup):
+    store, clock = setup
+    # Un proceso distinto confirma un nonce aleatorio y muere sin exportarlo.
+    # El recuperador sólo conserva digest/generación leídos de la DB local.
+    child = r"""
+import json, os, sys, uuid
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.getcwd())
+from dataclasses import replace
+from sqlmodel import create_engine
+from src.control.financial_receipts import FinancialReceiptStore, SourceBinding
+engine = create_engine(sys.argv[1])
+with engine.connect() as c:
+    row = c.exec_driver_sql('SELECT binding,generation,binding_json FROM financial_receipt_state').one()
+binding = replace(SourceBinding(**json.loads(row[2])), instance_id=uuid.uuid4().hex)
+store = FinancialReceiptStore(engine, binding, wall=lambda: 1791900000000)
+store.rebind_instance(expected_previous_digest=row[0], expected_generation=row[1])
+os._exit(0)
+"""
+    subprocess.run(
+        [sys.executable, "-I", "-c", child, str(store.engine.url)], check=True, timeout=20
+    )
+    with store.engine.connect() as c:
+        previous_digest, generation = c.exec_driver_sql(
+            "SELECT binding,generation FROM financial_receipt_state"
+        ).one()
+    assert previous_digest != store.binding_digest and generation == 1
+    recovered = FinancialReceiptStore(
+        store.engine,
+        replace(store.binding, instance_id="e" * 32),
+        wall=lambda: clock.wall,
+        monotonic=lambda: clock.mono,
+    )
+    recovered.rebind_instance(
+        expected_previous_digest=previous_digest, expected_generation=generation
+    )
+    with store.engine.connect() as c:
+        row = c.exec_driver_sql(
+            "SELECT binding,generation,status,payload,binding_json FROM financial_receipt_state"
+        ).one()
+    assert row[:4] == (recovered.binding_digest, 2, "EMPTY", None)
+    assert json.loads(row[4]) == asdict(recovered.binding)
+    assert fence(recovered).sequence == 0
+
+
+@pytest.mark.parametrize(
+    "damage", ["json", "field", "digest", "extra", "noncanonical", "invalid_type", "oversized"]
+)
+def test_damaged_durable_identity_blocks_read_collect_and_recovery(setup, damage):
+    store, clock = setup
+    metadata = asdict(store.binding)
+    if damage == "field":
+        metadata["subaccount"] += 1
+    if damage == "extra":
+        metadata["unreviewed"] = True
+    if damage == "invalid_type":
+        metadata["environment"] = []
+    encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    if damage == "json":
+        encoded = "{"
+    if damage == "noncanonical":
+        encoded += " "
+    if damage == "oversized":
+        encoded = " " * 8193
+    with store.engine.begin() as c:
+        c.exec_driver_sql(
+            "UPDATE financial_receipt_state SET binding_json=?,binding=?",
+            (encoded, "f" * 64 if damage == "digest" else store.binding_digest),
+        )
+    recovered = FinancialReceiptStore(
+        store.engine, replace(store.binding, instance_id="e" * 32), wall=lambda: clock.wall
+    )
+    for action in (
+        lambda: read(store),
+        store._start,
+        lambda: recovered.rebind_instance(
+            expected_previous_digest=store.binding_digest, expected_generation=0
+        ),
+    ):
+        with pytest.raises(ValueError, match="BINDING_INVALID"):
+            action()
+    with store.engine.connect() as c:
+        assert c.exec_driver_sql("SELECT generation,status FROM financial_receipt_state").one() == (
+            0,
+            "EMPTY",
+        )
+
+
+def test_rebinding_requires_matching_digest_and_new_nonce(setup):
+    store, clock = setup
+    other = FinancialReceiptStore(
+        store.engine, replace(store.binding, instance_id="e" * 32), wall=lambda: clock.wall
+    )
+    with pytest.raises(ValueError, match="BINDING_CHANGED"):
+        other.rebind_instance(expected_previous_digest="f" * 64, expected_generation=0)
+    with pytest.raises(ValueError, match="REBIND_INVALID"):
+        store.rebind_instance(expected_previous_digest=store.binding_digest, expected_generation=0)
+    with store.engine.connect() as c:
+        assert c.exec_driver_sql("SELECT generation,status FROM financial_receipt_state").one() == (
+            0,
+            "EMPTY",
+        )
