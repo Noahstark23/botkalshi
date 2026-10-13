@@ -100,6 +100,9 @@ class Trade(SQLModel, table=True):
     fill_price_cents: int | None = None
     fees_cents: int | None = None
     pnl_cents: int | None = None
+    # Se escribe con el cierre contable. NULL legacy requiere revisión explícita;
+    # una migración de esquema nunca infiere ni rellena este rol.
+    accounting_role: str | None = Field(default=None, max_length=24)
 
     # Motor 3 (CLV): la posición se cerró con un SELL anticipado de Motor 3, NO por
     # resolución del mercado. El SettlementPoller SALTEA estas filas → no doble-cuenta
@@ -627,6 +630,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("trades", "commitment_origin_id", "VARCHAR(100)"),
     ("portfolio_positions", "count_fp", "VARCHAR(32)"),
     ("trades", "pnl_usd_fp", "VARCHAR(40)"),
+    ("trades", "accounting_role", "VARCHAR(24)"),
     ("mm_quotes", "inventory_fp", "VARCHAR(40)"),
     ("mm_funnel_snapshots", "inventory_abs_fp", "VARCHAR(40)"),
     # Motor 5 fair-at-fill: sin el fair del momento del fill, el A/B no puede separar
@@ -773,7 +777,10 @@ def kill_switch_engaged(*, session: Session | None = None) -> tuple[bool, str | 
     if session is None:
         with get_session() as s:
             return kill_switch_engaged(session=s)
-    row = session.get(OperationalState, _KILL_SWITCH_KEY)
+    from src.storage.read_scope import financial_read_scope
+
+    with financial_read_scope(session):
+        row = session.get(OperationalState, _KILL_SWITCH_KEY)
     if row is None or row.value == "clear":
         return False, None
     if row.value != "engaged":
@@ -806,14 +813,21 @@ def set_mm_quotes_paused(paused: bool, reason: str | None = None) -> None:
         s.commit()
 
 
-def mm_quotes_paused() -> tuple[bool, str | None]:
+def mm_quotes_paused(*, session: Session | None = None) -> tuple[bool, str | None]:
     """(paused, reason). Propaga si la DB falla — el engine asume paused ante error
     (fail-safe: no cotizar es el estado seguro)."""
-    with get_session() as s:
-        row = s.get(OperationalState, _MM_QUOTES_PAUSED_KEY)
-        if row is None or row.value != "paused":
-            return False, None
-        return True, row.reason
+    from src.storage.read_scope import financial_read_scope
+
+    if session is None:
+        with get_session() as s:
+            return mm_quotes_paused(session=s)
+    with financial_read_scope(session):
+        row = session.get(OperationalState, _MM_QUOTES_PAUSED_KEY)
+    if row is None or row.value == "clear":
+        return False, None
+    if row.value != "paused":
+        raise ValueError("MM_QUOTES_PAUSE_STATE_INVALID")
+    return True, row.reason
 
 
 def clear_kill_switch() -> None:

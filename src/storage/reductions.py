@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlmodel import select
 
 from src.math.fees import kalshi_fee_cents
+from src.storage.accounting import EXIT_ALLOCATED, REALIZED_PNL, stamp_accounting_role
 from src.storage.cost_allocation import allocate_entry, usd_text
 from src.storage.exit_capture import apply_exit_execution, exit_execution_note
 from src.storage.exit_fills import ExitFillSummary
@@ -176,6 +177,7 @@ def finalize_reduction(
         closed.settled_at = now
         closed.pnl_usd_fp = usd_text(pnl / 100)
         closed.pnl_cents = floor(pnl)
+        stamp_accounting_role(closed, REALIZED_PNL)
         for field, value in allocation.closed_fields.items():
             setattr(closed, field, value)
         if execution is not None:
@@ -194,6 +196,7 @@ def finalize_reduction(
         sell.fees_cents = ceil(exit_fee)
         sell.kalshi_order_id = order_id
         sell.filled_at = sell.settled_at = now
+        stamp_accounting_role(sell, EXIT_ALLOCATED)
         # El prefijo de atribución se consume antes de esta marca terminal;
         # mientras la respuesta es incierta notes permanece reduction_for=<coid>.
         if execution is not None:

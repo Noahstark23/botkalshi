@@ -13,6 +13,7 @@ from src.clients.kalshi_rest import build_order_body
 from src.math.quantities import api_count, terminal_fill
 from src.monitoring.health import BotState
 from src.risk.exposure import open_risk_cents
+from src.storage.accounting import EXIT_ALLOCATED, REALIZED_PNL, settled_pnl_cents
 from src.storage.order_reconciliation import reconcile_pending_orders
 from src.storage.quantities import (
     filled_fields,
@@ -377,8 +378,9 @@ def test_m3_crash_during_close_rolls_back_entire_transaction(monkeypatch):
     assert all(r.status == "settled" for r in rows())
 
 
-def test_reduction_partial_and_restart_do_not_oversell():
-    buy(strategy="motor_1_arbitrage")
+@pytest.mark.parametrize("strategy", ["motor_1_arbitrage", "motor_rest_arb"])
+def test_reduction_partial_and_restart_do_not_oversell(strategy):
+    buy(strategy=strategy)
     persist_reduction("buy", "sell1", Fraction(1, 4), 50)
     finalize_reduction("sell1", Fraction(1, 10))
     assert open_quantity(next(r for r in rows() if r.client_order_id == "buy")) == Fraction(3, 20)
@@ -393,6 +395,10 @@ def test_reduction_partial_and_restart_do_not_oversell():
     assert sum(open_quantity(r) for r in buys) == Fraction(1, 4)
     assert all(r.status == "settled" for r in buys)
     assert sum(Fraction(r.pnl_usd_fp) for r in buys) == Fraction("-0.0175")
+    assert all(r.accounting_role == REALIZED_PNL for r in buys)
+    sells = [r for r in rows() if r.action == "sell"]
+    assert all(r.accounting_role == EXIT_ALLOCATED and settled_pnl_cents(r) == 0 for r in sells)
+    assert sum(settled_pnl_cents(r) for r in rows()) == sum(r.pnl_cents for r in buys)
 
 
 def test_reduction_replay_rejects_different_fill_and_identity():

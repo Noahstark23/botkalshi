@@ -114,6 +114,52 @@ acreditan una fuente financiera conectada ni control operativo. Ningún scope se
 automáticamente a partir de flags. M2 fair y M6/M8/M9 no son admitidos por este backend;
 US500 conserva su permiso paper independiente.
 
+### Lectores locales preparados para esa transacción
+
+`incident_status(session=)` y `mm_quotes_paused(session=)` admiten la Session del
+caller, igual que el kill-switch. La pausa de quotes sólo admite ausencia inicial,
+`clear` o `paused`; otro valor falla y el engine conserva su bloqueo ante error.
+Los snapshots de exposición (incluida la consulta de patas hermanas REST), stops
+realizados, presupuesto experimental y MTM admiten esa misma Session. No abren una
+segunda, no hacen autoflush, commit o rollback y conservan las matemáticas comunes.
+Un cambio financiero ORM aún sin flush es desconocido, no se omite del SELECT ni
+se escribe desde el lector. El caller adquiere su lock y lee antes de añadir la
+nueva reserva; estas funciones por sí solas no adquieren un lock ni concilian cuenta.
+
+Los snapshots de stops y experimento con Session prestada exigen capital explícito
+finito y positivo. Eso evita el fallback diagnóstico; todavía corresponde al proveedor
+verificar procedencia/frescura/vinculación del capital. Los stops prestados rechazan
+settlement sin fecha, fecha futura o rol contable desconocido/contradictorio.
+La comparación pura de breach es
+compartida con el check async, que conserva en exclusiva alertas y latch. El diario
+suave sigue siendo un bloqueo de entradas; no se cambia la política de salidas.
+
+`Trade.accounting_role` identifica quién porta el PnL: `realized_pnl` en BUY
+liquidadas y entradas SELL de M5; `exit_allocated` en SELL de salida M2/M3 o rollback
+M1/REST cuyo resultado ya está asignado a las BUY cerradas. Esos escritores estampan
+el rol dentro del mismo commit del cierre, incluso al dividir una BUY parcial.
+Los lectores prestados de stops/experimento no duplican ese resultado ni tratan
+todo SELL con PnL NULL como cero. Una marca previa contradictoria aborta el cierre.
+La migración sólo añade una columna nullable: no etiqueta ni reescribe historia.
+Un settlement legacy sin rol dentro de la ventana consultada sigue bloqueando;
+uno sin fecha bloquea aunque pudiera ser antiguo. Antes de instalar hace falta
+auditar y atribuir esa historia con evidencia; no existe backfill automático.
+Las ramas legacy sin Session prestada conservan su política anterior.
+
+`cash_observation()` conserva `_last_balance_at` y el menor entre cash crudo y
+suavizado; no renueva el tiempo al consultar. Es caché local, sin recibo de identidad
+de cuenta/entorno, y su fecha actual corresponde al refresco previo existente. El
+MTM expone la adquisición del mark más antiguo realmente usado; si no usa ninguno,
+devuelve `None`, que no acredita valoración de una cuenta vacía. Ninguna de estas
+lecturas convierte cero filas locales en prueba de conciliación completa.
+
+Siguen sin existir fuentes durables de barrido completo de posiciones/órdenes y
+de quotes resting confirmadas. Un `pending` M5 no se convierte en resting por
+edad o presencia en memoria: con el adaptador conservador bloquea nuevas quotes.
+La atribución compartida de salidas, la composición del proveedor y sus recibos
+de datos ausentes siguen pendientes. Estos lectores no autorizan ensamblar ni
+instalar controles de Telegram o declarar motores listos.
+
 Los executors conservan el camino anterior cuando se construyen sin adaptador. Si se
 les pasa uno, fallo/ausencia de permiso o DB nunca vuelven al camino anterior. Falta que
 el ensamblado de runtime valide que todos los executors esperados reciben el mismo

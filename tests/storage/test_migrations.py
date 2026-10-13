@@ -118,10 +118,10 @@ def test_fractional_columns_preserve_legacy_fills_and_are_idempotent(tmp_path):
         models.apply_migrations(engine)
     with engine.begin() as conn:
         row = conn.exec_driver_sql(
-            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp,count_fp,fill_cost_usd_fp,fees_usd_fp FROM trades"
+            "SELECT count,filled_count,pnl_cents,filled_count_fp,pnl_usd_fp,count_fp,fill_cost_usd_fp,fees_usd_fp,accounting_role FROM trades"
         ).one()
         position = conn.exec_driver_sql("SELECT count,count_fp FROM portfolio_positions").one()
-    assert row == (10, 3, -5, None, None, None, None, None)
+    assert row == (10, 3, -5, None, None, None, None, None, None)
     assert position == (7, None)
     assert "inventory_fp" in _columns(engine, "mm_quotes")
     assert "inventory_abs_fp" in _columns(engine, "mm_funnel_snapshots")

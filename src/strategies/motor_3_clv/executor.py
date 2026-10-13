@@ -39,6 +39,7 @@ from src.control.channel import ControlError
 from src.control.permissions import DurablePermissionAdapter
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
+from src.storage.accounting import EXIT_ALLOCATED, REALIZED_PNL, stamp_accounting_role
 from src.storage.cost_allocation import allocate_entry, usd_text
 from src.storage.exit_capture import apply_exit_execution, exit_execution_note
 from src.storage.exit_fills import ExitFillSummary
@@ -551,6 +552,7 @@ class Motor3ExitExecutor:
             sell.kalshi_order_id = order_id
             sell.filled_at = now
             sell.settled_at = now
+            stamp_accounting_role(sell, EXIT_ALLOCATED)
             if execution is not None:
                 sell.notes = exit_execution_note(
                     sell.notes, "clv_exit_filled", entry_observed=False
@@ -768,6 +770,7 @@ class Motor3ExitExecutor:
                         b.settled_at = now
                         b.pnl_usd_fp = usd_text(pnl / 100)
                         b.pnl_cents = floor(pnl)
+                        stamp_accounting_role(b, REALIZED_PNL)
                         for field, value in allocation.closed_fields.items():
                             setattr(b, field, value)
                         if observed_exit_gross_cents is not None:
@@ -805,6 +808,7 @@ class Motor3ExitExecutor:
                                 closed_by_clv=True,
                                 settled_at=now,
                                 pnl_cents=floor(pnl),
+                                accounting_role=REALIZED_PNL,
                                 pnl_usd_fp=usd_text(pnl / 100),
                                 **allocation.closed_fields,
                                 notes=exit_execution_note(

@@ -6,13 +6,15 @@ La sesión activa es un marcador previo a cualquier orden: un kill -9/OOM deja
 evidencia para el próximo arranque aun si no alcanzó a registrar el incidente.
 """
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from loguru import logger
-from sqlmodel import or_, select, update
+from sqlmodel import Session, or_, select, update
 
 from src.storage.models import OperationalState, Trade, get_session
+from src.storage.read_scope import financial_read_scope
 from src.strategies.motor_5_mm.order_state import COUNT_QUARANTINE_NOTE
 
 INCIDENT_KEY = "mm_execution_incident"
@@ -45,10 +47,13 @@ def latch_incident(reason: str) -> None:
     logger.error(f"motor5.incident_latched requiere revisión manual: {reason[:500]}")
 
 
-def incident_status() -> tuple[bool, str | None]:
+def incident_status(*, session: Session | None = None) -> tuple[bool, str | None]:
     """Incidente, sesión abandonada o DB ilegible bloquean aun si M5 está apagado."""
     try:
-        with get_session() as session:
+        with (
+            get_session() if session is None else nullcontext(session) as session,
+            financial_read_scope(session),
+        ):
             row = session.get(OperationalState, INCIDENT_KEY)
             if row is not None and row.value != "clear":
                 return True, row.reason or "incidente M5 sin motivo; requiere revisión manual"
