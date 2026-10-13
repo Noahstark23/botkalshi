@@ -84,6 +84,38 @@ class MMReconciler:
             return report
 
         deferred_error: Exception | None = None
+        # Retirar fantasmas no depende de persistir las órdenes conocidas.
+        # Un fallo posterior conserva reservas y bloquea el cierre, pero no
+        # impide intentar estos DELETE de identidades ya validadas.
+        pending_coids = {row.client_order_id for row in pending}
+        for coid, order in api_orders.items():
+            if (
+                not coid.startswith(COID_PREFIX)
+                or coid in pending_coids
+                or str(order.get("status", "")).lower() != "resting"
+            ):
+                continue
+            # Sin ledger no se reconstruyen exposición/fees: ni un cancel confirmado
+            # elimina la discrepancia ni autoriza nuevas quotes.
+            ticker = order.get("ticker")
+            self._uncertain(report, ticker if isinstance(ticker, str) else None, durable=False)
+            try:
+                # Revocar dueño antes de red; si la DB falla, el marcador de
+                # sesión previo mantiene bloqueo al reiniciar. No omitir retiro.
+                latch_incident("fantasma M5 sin ledger; requiere revisión")
+            except Exception as exc:
+                deferred_error = deferred_error or exc
+            try:
+                response = await self._client.cancel_order(order["order_id"])
+                terminal = response.get("order", response) if isinstance(response, dict) else None
+                if (
+                    terminal_fill_count(terminal, order_id=order["order_id"], client_order_id=coid)
+                    is not None
+                ):
+                    report.phantom_cancelled += 1
+            except Exception:
+                logger.exception("motor5.reconcile.phantom_cancel_unconfirmed")
+
         for row in pending:
             report.pending_checked += 1
             if COUNT_QUARANTINE_NOTE in (row.notes or ""):
@@ -100,7 +132,7 @@ class MMReconciler:
                     # El ledger no representa esta evidencia. El marcador se
                     # preserva en DB: otro cancel o reinicio no la convierte en cero.
                     if not self._update(row.client_order_id, note=COUNT_QUARANTINE_NOTE):
-                        # Sin registrar el bloqueo, no continuar hacia otros cancels.
+                        # Sin registrar el bloqueo, no continuar con las órdenes conocidas.
                         latch_incident("no se pudo persistir cuarentena de cantidad M5")
                         raise RuntimeError("no se pudo persistir cuarentena de cantidad M5")
                     self._uncertain(report, row.ticker)
@@ -136,35 +168,6 @@ class MMReconciler:
                 report.still_resting += 1
             else:
                 self._resolve_terminal(row, order, report, note="reconcile: terminal")
-
-        pending_coids = {row.client_order_id for row in pending}
-        for coid, order in api_orders.items():
-            if (
-                not coid.startswith(COID_PREFIX)
-                or coid in pending_coids
-                or str(order.get("status", "")).lower() != "resting"
-            ):
-                continue
-            # Sin ledger no se reconstruyen exposición/fees: ni un cancel confirmado
-            # elimina la discrepancia ni autoriza nuevas quotes.
-            ticker = order.get("ticker")
-            self._uncertain(report, ticker if isinstance(ticker, str) else None, durable=False)
-            try:
-                # Revocar dueño antes de red; si la DB falla, el marcador de
-                # sesión previo mantiene bloqueo al reiniciar. No omitir retiro.
-                latch_incident("fantasma M5 sin ledger; requiere revisión")
-            except Exception as exc:
-                deferred_error = deferred_error or exc
-            try:
-                response = await self._client.cancel_order(order["order_id"])
-                terminal = response.get("order", response) if isinstance(response, dict) else None
-                if (
-                    terminal_fill_count(terminal, order_id=order["order_id"], client_order_id=coid)
-                    is not None
-                ):
-                    report.phantom_cancelled += 1
-            except Exception:
-                logger.exception("motor5.reconcile.phantom_cancel_unconfirmed")
 
         if deferred_error is not None:
             raise deferred_error

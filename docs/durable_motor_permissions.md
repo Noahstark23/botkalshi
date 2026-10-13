@@ -190,8 +190,10 @@ que gane la carrera. La intervención operativa independiente sigue pendiente. E
 una huérfana se propaga después de intentar retirar también las fantasmas; un
 latch fallido no impide el DELETE de éstas ni de las siguientes. Esto exige haber
 obtenido un barrido válido y leído el ledger: DB ilegible no acredita identidad
-ni permite reconstruir ese conjunto. El fallo previo al intent en la persistencia
-de un fill resting sigue siendo fatal y requiere recuperación operativa.
+ni permite reconstruir ese conjunto. La pasada de fantasmas se realiza antes de
+procesar las filas conocidas: un fallo posterior al persistir un fill o un
+incidente de esas filas no omite su retiro. Dicho fallo sigue siendo fatal,
+conserva las reservas y requiere recuperación operativa.
 
 La primera fecha no se renueva en reintentos ni se elimina. Un `pending` marcado
 no cuenta como resting sano aunque el barrido posterior lo vea resting; el camino

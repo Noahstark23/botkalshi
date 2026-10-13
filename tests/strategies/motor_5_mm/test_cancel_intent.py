@@ -346,7 +346,7 @@ async def test_deferred_orphan_error_does_not_skip_phantom_retirement(monkeypatc
     monkeypatch.setattr(Session, "commit", fail_intent)
     with pytest.raises(RuntimeError, match="intent failure"):
         await MMReconciler(client).reconcile(live_coids=set())
-    assert [call.args for call in client.cancel_order.await_args_list] == [("K1",), ("G1",)]
+    assert [call.args for call in client.cancel_order.await_args_list] == [("G1",), ("K1",)]
     assert set(rows()) == {"m5mm-a"}
 
 
@@ -375,3 +375,27 @@ async def test_failed_phantom_latch_does_not_prevent_retiring_all_phantoms(monke
     assert [call.args for call in client.cancel_order.await_args_list] == [("G1",), ("G2",)]
     assert rows() == {}
     assert incidents.incident_status()[0]
+
+
+@pytest.mark.parametrize("failure", ["update", "incident"])
+async def test_pending_row_write_failure_does_not_skip_phantom_retirement(monkeypatch, failure):
+    seed(notes=COUNT_QUARANTINE_NOTE if failure == "incident" else None)
+    client = AsyncMock()
+    client.get_all_orders.return_value = [
+        order(status="resting", fill_count_fp="3.00"),
+        order("m5mm-ghost", "G1", status="resting"),
+    ]
+    client.cancel_order.return_value = {"order": order("m5mm-ghost", "G1")}
+    real_commit = Session.commit
+
+    def fail_commit(session):
+        if failure == "incident" or any(isinstance(row, Trade) for row in session.dirty):
+            raise RuntimeError("simulated write failure")
+        return real_commit(session)
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    with pytest.raises(RuntimeError):
+        await MMReconciler(client).reconcile(live_coids=set())
+    client.cancel_order.assert_awaited_once_with("G1")
+    assert rows()["m5mm-a"].status == "pending"
+    assert set(rows()) == {"m5mm-a"}
