@@ -5,6 +5,7 @@ lee claves reales ni envía órdenes. Los tests WebSocket crean servidores local
 Argumentos opcionales: rutas/nodos pytest relativos al checkout candidato.
 """
 
+import argparse
 import ipaddress
 import os
 import socket
@@ -75,6 +76,11 @@ Settings.model_config["env_file"] = None
 
 import pytest  # noqa: E402
 
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--panel-source")
+options, selected_tests = parser.parse_known_args()
+panel_args = ["--panel-source", options.panel_source] if options.panel_source else []
+
 raise SystemExit(
     pytest.main(
         [
@@ -86,13 +92,14 @@ raise SystemExit(
             "-p",
             "no:cacheprovider",
             *(
-                sys.argv[1:]
+                selected_tests
                 or [
                     "tests",
                     "infra/digitalocean-shadow/tests",
                     "infra/digitalocean-shadow/test_collector.py",
                 ]
             ),
+            *panel_args,
         ]
     )
 )

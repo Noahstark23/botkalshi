@@ -8,10 +8,12 @@ transacción recibida; nunca hace red, commit ni inventa gates por falta de dato
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import MetaData, func, inspect, text
 from sqlmodel import Field, Session, SQLModel, select
@@ -26,6 +28,7 @@ from src.control.channel import (
     _integer,
     _require,
 )
+from src.control.entry_stop import EntryStopStatus, StopRequest
 from src.storage.models import Trade, kill_switch_engaged
 
 # Sólo estos scopes tienen un punto de admisión de órdenes identificable.
@@ -119,6 +122,10 @@ class _Meta(_Model, table=True):
     last_seen_ms: int
     command_count: int = 0
     admission_count: int = 0
+    entry_stop_state: str = "clear"
+    entry_stop_request_id: str | None = None
+    entry_stop_request_digest: str | None = None
+    entry_stop_at_ms: int | None = None
 
 
 class _Permission(_Model, table=True):
@@ -197,10 +204,81 @@ class DurablePermissionAdapter:
                 session.add(_Permission(scope=scope))
             session.commit()
 
+    @staticmethod
+    def _stop_status(meta):
+        _require(meta.entry_stop_state in {"clear", "latched"}, "INVALID_ENTRY_STOP")
+        return EntryStopStatus(
+            meta.entry_stop_state == "latched",
+            meta.entry_stop_request_id,
+            meta.entry_stop_request_digest,
+            meta.entry_stop_at_ms,
+        ).validate()
+
+    def _read_entry_stop(self, request):
+        # Una consulta no adquiere lock de escritura ni adelanta last_seen_ms.
+        # mode=ro impide crear/reparar el ledger por una ruta equivocada.
+        with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute(
+                "SELECT binding_digest,entry_stop_state,entry_stop_request_id,"
+                "entry_stop_request_digest,entry_stop_at_ms FROM motor_permissions_meta WHERE id=1"
+            ).fetchone()
+            _require(
+                row is not None and row["binding_digest"] == self.digest,
+                "PERMISSION_BINDING_CHANGED",
+            )
+            request.authorize(self.binding, self.clock())
+            return self._stop_status(SimpleNamespace(**dict(row)))
+
+    def entry_stop(self, request: StopRequest):
+        """Latch fijo, sin journal, datos de mercado ni límites de admisión.
+
+        El reloj regresivo no impide esta acción unidireccional. Se preserva el
+        máximo last_seen_ms; ninguna habilitación ni admisión elude ese bloqueo.
+        Lo admitido antes, las salidas, reservas y UNKNOWN no se modifican.
+        """
+        _require(type(request) is StopRequest, "INVALID_STOP_REQUEST")
+        request.authorize(self.binding, self.clock())
+        _require(self._identity() == self.identity, "LEDGER_REPLACED")
+        if request.operation == "status":
+            return self._read_entry_stop(request)
+        with Session(self.engine) as session:
+            session.exec(text("BEGIN IMMEDIATE"))
+            _require(
+                session.connection().connection.driver_connection.in_transaction is True,
+                "RESERVATION_TRANSACTION_REQUIRED",
+            )
+            meta = session.get(_Meta, 1)
+            _require(
+                meta is not None and meta.binding_digest == self.digest,
+                "PERMISSION_BINDING_CHANGED",
+            )
+            _require(_integer(meta.last_seen_ms, 946684800000), "CLOCK_REGRESSION")
+            now = self.clock()
+            request.authorize(self.binding, now)
+            status = self._stop_status(meta)
+            if request.operation == "stop" and not status.latched:
+                meta.entry_stop_state = "latched"
+                meta.entry_stop_request_id = request.request_id
+                meta.entry_stop_request_digest = request.digest()
+                meta.entry_stop_at_ms = now
+            elif status.first_request_id == request.request_id:
+                _require(status.first_request_digest == request.digest(), "STOP_ID_CONFLICT")
+            # Revalidar vencimiento inmediatamente antes de persistir.
+            after = self._time_after(now)
+            request.authorize(self.binding, after)
+            meta.last_seen_ms = max(meta.last_seen_ms, after)
+            session.add(meta)
+            result = self._stop_status(meta)
+            session.commit()
+            return result
+
     def _check_meta(self, meta, now):
         _require(
             meta is not None and meta.binding_digest == self.digest, "PERMISSION_BINDING_CHANGED"
         )
+        self._stop_status(meta)
         _require(
             _integer(now, 946684800000)
             and _integer(meta.last_seen_ms, 946684800000)
@@ -293,7 +371,9 @@ class DurablePermissionAdapter:
             boot_allowed=scope in self.binding.boot_allowed,
             available=facts.available,
             enabled=row.state == "enabled",
-            gates_clear=facts.gates_clear and not killed,
+            gates_clear=facts.gates_clear
+            and not killed
+            and (scope in EXITS or not self._stop_status(session.get(_Meta, 1)).latched),
             open_positions=facts.open_positions,
             resting_orders=facts.resting_orders,
             uncertain_orders=facts.uncertain_orders,
@@ -383,6 +463,8 @@ class DurablePermissionAdapter:
         Tras commit las órdenes ya admitidas conservan su política en vuelo.
         """
         meta, now = self._lock(session)
+        _require(scope in self.binding.scopes, "SCOPE_UNAVAILABLE")
+        _require(scope in EXITS or not self._stop_status(meta).latched, "NEW_ENTRIES_BLOCKED")
         value, checked_at = self._value(session, scope, now)
         self._policy(value, True)
         _require(value.enabled and value.applied_command_id is not None, "PERMISSION_DISABLED")

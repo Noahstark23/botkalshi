@@ -25,6 +25,12 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Panel de referencia inmutable (sin ejecutar servicios)
+        uses: actions/checkout@v4
+        with:
+          ref: 22522c3aa70f1b61ff662476cf7257fe3e93c0c1
+          path: compat-panel
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -57,7 +63,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python -I scripts/test_simulator_isolated.py 2>&1 | tee qa-artifacts/tests.log
+          python -I scripts/test_simulator_isolated.py --panel-source compat-panel/research/us500 2>&1 | tee qa-artifacts/tests.log
       - name: Conservar evidencia incluso cuando falla la verificación
         if: always()
         uses: actions/upload-artifact@v4
