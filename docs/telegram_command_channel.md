@@ -92,3 +92,11 @@ financieros. Faltan transporte, adaptador CAS durable real y gates de motores, U
 propuesta/confirmación con dedup de updates y recorrido conectado dentro del entorno
 confirmado. La IOC Demo UNKNOWN y sus reservas siguen intactas. No se declara preparación
 real, rentabilidad ni control instalado por aprobar estas pruebas.
+
+## Incremento de backend durable (13-oct-2026)
+
+Existe ahora un backend SQLite y hooks opcionales de admisión descritos en
+[durable_motor_permissions.md](durable_motor_permissions.md). Falta el proveedor de
+hechos del runtime, ensamblado y transporte: el párrafo inicial sigue describiendo el
+estado de instalación. Las pruebas nuevas usan permisos persistidos reales en una DB
+temporal y hechos financieros ficticios; no convierten esos hechos en evidencia de cuenta.

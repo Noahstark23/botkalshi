@@ -483,3 +483,74 @@ async def test_unchanged_m5_quote_retires_on_uncovered_fee_and_keeps_partial_flo
         assert trade.filled_count_fp == ("0.25" if invalid else "0.00")
     assert client.cancel_order.await_count == int(invalid)
     assert bool(executor.live_coids()) is not invalid
+
+
+@pytest.mark.parametrize(
+    "strategy,action,scope",
+    [
+        ("motor_1_arbitrage", "buy", "m1.entries"),
+        ("motor_2_consensus", "buy", "m2.entries"),
+        ("motor_5_mm", "buy", "m5.quotes"),
+        ("motor_5_mm", "sell", "m5.quotes"),
+    ],
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_permission_and_multi_commitment_share_transaction(multi, strategy, action, scope, enabled):
+    from src.control.channel import ControlError, Intent
+    from src.control.permissions import (
+        Admission,
+        DurablePermissionAdapter,
+        GateFacts,
+        PermissionBinding,
+    )
+
+    _, engine, _ = multi
+    now_ms = int(NOW.timestamp() * 1000)
+    binding = PermissionBinding(
+        11, 22, "demo", "a" * 40, "b" * 32, "c" * 64, frozenset({scope}), frozenset({scope})
+    )
+    permissions = DurablePermissionAdapter(
+        engine, binding, lambda *_: GateFacts(now_ms, True, True, 0, 0, 0), clock=lambda: now_ms
+    )
+    permissions.provision()
+    if enabled:
+        permissions.apply_if_current(
+            Intent(
+                "d" * 32,
+                11,
+                22,
+                "demo",
+                "a" * 40,
+                "b" * 32,
+                "c" * 64,
+                scope,
+                True,
+                0,
+                now_ms,
+                now_ms + 60000,
+            )
+        )
+
+    def attempt():
+        candidate = row("permission-test", strategy, action=action)
+        return reserve_trade_intents(
+            [candidate],
+            limits=bounds(),
+            now=NOW,
+            fee_observations={candidate.ticker: fee(candidate.ticker)},
+            permissions=permissions,
+        )
+
+    if enabled:
+        assert attempt()
+        assert attempt() is False  # replay no reenvía ni agrega atribución
+    else:
+        with pytest.raises(ControlError, match="PERMISSION_DISABLED"):
+            attempt()
+    with models.get_session() as session:
+        assert len(session.exec(select(models.Trade)).all()) == int(enabled)
+        assert len(session.exec(select(models.RiskCommitment)).all()) == int(enabled)
+        rows = session.exec(select(Admission)).all()
+        assert len(rows) == int(enabled)
+        if enabled:
+            assert (rows[0].scope, rows[0].permission_revision) == (scope, 1)

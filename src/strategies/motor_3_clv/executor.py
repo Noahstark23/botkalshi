@@ -35,6 +35,8 @@ from sqlalchemy import text
 from sqlmodel import col, select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient, TradingDisabledError
+from src.control.channel import ControlError
+from src.control.permissions import DurablePermissionAdapter
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import terminal_fill
 from src.storage.cost_allocation import allocate_entry, usd_text
@@ -98,8 +100,12 @@ class Motor3ExitExecutor:
         entry_origin: tuple[str, ...] = ("motor_2_consensus",),
         include_motor1_orphans: bool = False,
         min_sell_bid_cents: int = 0,
+        permissions: DurablePermissionAdapter | None = None,
     ) -> None:
         self.client = client
+        # Opt-in de construcción, aún sin provisionar/conectar desde el runner.
+        # Una instancia conectada nunca vuelve al camino legacy ante fallo.
+        self._permissions = permissions
         # Estrategia con la que se audita la fila SELL del exit. Default motor_3_clv; Motor 2
         # reusa este executor pasando "motor_2_consensus" para que el audit quede atribuido al
         # motor que disparó el cierre (las patas BUY que cierra _settle_originals ya se marcan
@@ -256,7 +262,11 @@ class Motor3ExitExecutor:
         # fantasma (posición contraria) + PnL doble vía settlement. Nota: mientras esté
         # 'pending' cuenta en la exposición del RiskManager (su query no filtra por
         # action) — sobrestima temporal y conservador.
-        if not self._persist_sell_intent(coid, ticker, side, count, bid):
+        try:
+            persisted = self._persist_sell_intent(coid, ticker, side, count, bid)
+        except ControlError as error:
+            return Motor3ExitOutcome(False, False, reason=f"permission:{error}")
+        if not persisted:
             return Motor3ExitOutcome(False, False, reason="persist_intent_failed")
         try:
             resp = await self.client.place_order(
@@ -418,21 +428,29 @@ class Motor3ExitExecutor:
                 available = sum(open_quantity(b) for b in self._attributable_buys(s, ticker, side))
                 if count <= 0 or count > available:
                     return False
-                s.add(
-                    Trade(
-                        client_order_id=coid,
-                        ticker=ticker,
-                        side=side,
-                        action="sell",
-                        **quantity_fields(count),
-                        price_cents=price,
-                        strategy=self._strategy,
-                        status="pending",
-                        notes="clv_exit_intent",
-                    )
+                trade = Trade(
+                    client_order_id=coid,
+                    ticker=ticker,
+                    side=side,
+                    action="sell",
+                    **quantity_fields(count),
+                    price_cents=price,
+                    strategy=self._strategy,
+                    status="pending",
+                    notes="clv_exit_intent",
                 )
+                if self._permissions is None:
+                    s.add(trade)
+                else:
+                    scope = {
+                        "motor_3_clv": "m3.exits",
+                        "motor_2_consensus": "m2.exits",
+                    }.get(self._strategy)
+                    self._permissions.admit(s, scope, [trade])
                 s.commit()
             return True
+        except ControlError:
+            raise
         except Exception:
             logger.critical(
                 f"motor3.exit.persist_intent_failed coid={coid} → ABORT (sin rastro no se vende)"

@@ -33,6 +33,7 @@ from loguru import logger
 from sqlmodel import select
 
 from src.clients.kalshi_rest import KalshiClientError, KalshiRestClient
+from src.control.permissions import DurablePermissionAdapter
 from src.math.arbitrage import ArbLeg, ArbOpportunity, select_hard_leg
 from src.math.fees import kalshi_fee_cents
 from src.math.quantities import api_count, fixed_count, terminal_fill
@@ -114,8 +115,11 @@ class RestExecutor:
     ROLLBACK_MAX_RETRIES = 3  # reintentos del rollback limit antes de kill-switch
     ROLLBACK_PRICE_CENTS = 1  # sell agresivo a 1¢ para consumir cualquier bid
 
-    def __init__(self, client: KalshiRestClient) -> None:
+    def __init__(
+        self, client: KalshiRestClient, *, permissions: DurablePermissionAdapter | None = None
+    ) -> None:
         self.client = client
+        self._permissions = permissions
         self._rollback_timestamps: list[float] = []  # monotonic, dentro de la ventana
         self._paused = False
 
@@ -584,8 +588,9 @@ class RestExecutor:
         """
         try:
             with get_session() as s:
+                trades = []
                 for leg in opp.legs:
-                    s.add(
+                    trades.append(
                         Trade(
                             client_order_id=coids[leg],
                             ticker=leg.market_ticker,
@@ -599,6 +604,11 @@ class RestExecutor:
                             notes=f"arb_id={arb_id}",
                         )
                     )
+                if self._permissions is None:
+                    for trade in trades:
+                        s.add(trade)
+                else:
+                    self._permissions.admit(s, "rest.entries", trades)
                 s.commit()
             return True
         except Exception:

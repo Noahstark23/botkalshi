@@ -36,6 +36,10 @@ from pathlib import Path
 _SACRED = [
     "trades",
     "risk_commitments",  # presupuesto original: jamás reiniciar por rebuild/cierre
+    "motor_permissions_meta",  # binding, reloj y presupuestos finitos de autoridad
+    "motor_permissions",
+    "motor_permission_commands",  # revisiones y command_id jamás reciclados
+    "motor_permission_admissions",  # atribución original de cada intent financiero
     "portfolio_positions",
     "risk_events",
     "daily_pnl",

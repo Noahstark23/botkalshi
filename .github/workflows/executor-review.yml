@@ -40,7 +40,7 @@ jobs:
           python -m pip freeze > qa-artifacts/dependencies.txt
       - name: Lint completo y formato de todos los Python del candidato
         run: |
-          ruff check src/ tests/ infra/digitalocean-shadow/ scripts/test_simulator_isolated.py
+          ruff check src/ tests/ infra/digitalocean-shadow/ scripts/test_simulator_isolated.py scripts/rebuild_db.py
           python - <<'PY'
           import os
           import subprocess

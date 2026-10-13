@@ -40,6 +40,7 @@ from src.clients.kalshi_rest import (
     KalshiOrderConfirmationError,
     KalshiRestClient,
 )
+from src.control.permissions import DurablePermissionAdapter
 from src.risk.commitments import reserve_trade_intents, validate_multi_fee
 from src.risk.exposure import open_risk_cents
 from src.risk.manager import RiskManager
@@ -84,8 +85,10 @@ class Motor5Executor:
         risk: RiskManager | None = None,
         *,
         max_exposure_usd: float | None = None,
+        permissions: DurablePermissionAdapter | None = None,
     ) -> None:
         self._client = client
+        self._permissions = permissions
         self._risk = risk if risk is not None else RiskManager()
         # Canary cap F3 (plan §5): techo ABSOLUTO del costo abierto del MM (pending +
         # filled), independiente del headroom global. None = sin cap propio (demo).
@@ -244,9 +247,17 @@ class Motor5Executor:
                             max_strategy_usd=self._max_exposure_usd
                         ),
                         fee_observations={ticker: fee_observation},
+                        **(
+                            {"permissions": self._permissions}
+                            if self._permissions is not None
+                            else {}
+                        ),
                     )
                 with get_session() as session:
-                    session.add(intent)
+                    if self._permissions is None:
+                        session.add(intent)
+                    else:
+                        self._permissions.admit(session, "m5.quotes", [intent])
                     session.commit()
                 return True
             except ValueError as exc:
