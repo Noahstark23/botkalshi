@@ -46,6 +46,7 @@ from src.storage.models import (
     _naive_utc_now,
     engage_kill_switch,
     get_session,
+    kill_switch_engaged,
 )
 from src.storage.order_reconciliation import (
     capture_terminal_sell_execution,
@@ -389,12 +390,19 @@ class Motor3ExitExecutor:
     ) -> bool:
         """Reserva inventario bajo lock SQLite ANTES de red, compartido entre motores.
 
-        Revalida tras el await del libro: otra salida pudo reservar o cerrar las BUY.
+        Revalida tras los await: pudo entrar una pausa o cambiar el inventario.
         False obliga al caller a abortar sin vender; no se reutiliza inventario incierto.
         """
         try:
             with get_session() as s:
                 s.exec(text("BEGIN IMMEDIATE"))
+                from src.monitoring.health import BotState
+
+                # La comprobación inicial precede a reconciliación/libro (await).
+                # No admitir una SELL nueva después de una pausa; DB desconocida
+                # también aborta, sin reparar el estado ni tocar órdenes previas.
+                if BotState.is_paused or kill_switch_engaged(session=s)[0]:
+                    return False
                 pending = s.exec(
                     select(Trade.id)
                     .where(

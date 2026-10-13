@@ -763,19 +763,22 @@ def engage_kill_switch(reason: str) -> None:
         s.commit()
 
 
-def kill_switch_engaged() -> tuple[bool, str | None]:
+def kill_switch_engaged(*, session: Session | None = None) -> tuple[bool, str | None]:
     """(engaged, reason) de un estado conocido; falla ante DB/valor desconocido.
 
     Sólo ausencia inicial o clear explícito permiten continuar. No normalizar ni
     reparar aquí un valor inválido: borraría evidencia y podría levantar una pausa.
+    Una reserva puede proporcionar su transacción para serializar lectura y admisión.
     """
-    with get_session() as s:
-        row = s.get(OperationalState, _KILL_SWITCH_KEY)
-        if row is None or row.value == "clear":
-            return False, None
-        if row.value != "engaged":
-            raise ValueError("KILL_SWITCH_STATE_INVALID")
-        return True, row.reason
+    if session is None:
+        with get_session() as s:
+            return kill_switch_engaged(session=s)
+    row = session.get(OperationalState, _KILL_SWITCH_KEY)
+    if row is None or row.value == "clear":
+        return False, None
+    if row.value != "engaged":
+        raise ValueError("KILL_SWITCH_STATE_INVALID")
+    return True, row.reason
 
 
 _MM_QUOTES_PAUSED_KEY = "mm_quotes_paused"
